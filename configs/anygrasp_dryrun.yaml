@@ -1,0 +1,41 @@
+# Visual annotation pipeline - dry-run configuration
+# Only runs object discovery layer to validate extraction quality
+
+dataset_path: /mnt/oss/Data/anygrasp/task_001155/batch_000000
+dataset_type: lerobot_v3
+camera_names:
+  - observation.images.top
+
+dry_run: true  # Only run discovery, output queries mapping
+
+discovery:
+  mode: instruction  # Extract objects from task instructions
+  extractor: rule  # Switch to qwen after real Qwen deployment
+  always_include:
+    - robot hand
+    - gripper
+  qwen_model_path: null  # TODO: Set after Qwen deployment
+  instruction_source: episode_field
+  instruction_field: expand_task
+  default_instruction: ""
+
+segmentation:
+  model_path: null  # Not used in dry-run
+  confidence_threshold: 0.5
+
+depth:
+  model_path: null  # Not used in dry-run
+  output_metric: true
+
+storage:
+  output_dir: ./outputs/anygrasp_dryrun
+  overwrite: false
+
+qc:
+  enabled: false  # No QC in dry-run mode
+  num_frames_per_episode: 5
+
+checkpoint_dir: null  # Uses storage.output_dir/.checkpoints
+num_workers: 1
+max_episodes: 5
+log_level: INFO

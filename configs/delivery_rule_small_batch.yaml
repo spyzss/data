@@ -1,0 +1,62 @@
+# Delivery check: real AnyGrasp small-batch rule-query pipeline.
+
+dataset_path: /mnt/oss/Data/anygrasp/task_001155/batch_000000
+dataset_type: lerobot_v3
+camera_names:
+  - observation.images.top
+
+dry_run: false
+
+discovery:
+  mode: instruction
+  extractor: rule
+  always_include:
+    - robot hand
+    - gripper
+  qwen_model_path: null
+  manual_queries: {}
+  instruction_source: episode_field
+  instruction_field: expand_task
+  default_instruction: ""
+  vocab_file: null
+
+segmentation:
+  model_path: models/sam3
+  model_type: sam3
+  confidence_threshold: 0.5
+  mask_threshold: 0.5
+  max_instances_per_query: 10
+
+depth:
+  model_path: depth-anything/DA3METRIC-LARGE
+  model_type: depth_anything_v3
+  output_metric: true
+  debug_depth_range: false
+  process_res: 504
+  process_res_method: upper_bound_resize
+  use_ray_pose: false
+  fx: 369.81
+  fy: 341.14
+  calibration_width: 832
+  calibration_height: 480
+
+storage:
+  output_dir: ./outputs/delivery_checks/rule_small_batch
+  mask_format: parquet
+  depth_format: png16
+  overwrite: false
+
+qc:
+  enabled: true
+  num_frames_per_episode: 5
+  output_dir: null
+  colormap: turbo
+
+checkpoint_dir: null
+num_workers: 1
+episode_indices:
+  - 0
+  - 1
+  - 2
+sample_frames_per_episode: 5
+log_level: INFO

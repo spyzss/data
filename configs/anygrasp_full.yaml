@@ -1,0 +1,58 @@
+# Visual annotation pipeline - full configuration
+# Runs complete pipeline: discovery → segmentation + depth → storage → QC
+
+dataset_path: /mnt/oss/Data/anygrasp/task_001155/batch_000000
+dataset_type: lerobot_v3
+camera_names:
+  - observation.images.top
+
+dry_run: false  # Run full pipeline
+
+discovery:
+  mode: instruction  # Extract objects from task instructions
+  extractor: rule  # Switch to qwen after real Qwen deployment
+  always_include:
+    - robot hand
+    - gripper
+  qwen_model_path: null  # TODO: Set after Qwen deployment
+  instruction_source: episode_field
+  instruction_field: expand_task
+  default_instruction: ""
+  vocab_file: null  # Only used if mode == "vocab"
+
+segmentation:
+  model_path: models/sam3  # Local SAM3 weights
+  model_type: sam3
+  confidence_threshold: 0.5
+  mask_threshold: 0.5  # SAM3 mask binarization threshold
+  max_instances_per_query: 10
+
+depth:
+  model_path: depth-anything/DA3METRIC-LARGE  # Official metric DA3 checkpoint
+  model_type: depth_anything_v3
+  output_metric: true  # true=metric depth (meters), false=relative depth
+  debug_depth_range: true  # Enable to log depth value ranges for debugging
+  process_res: 504
+  process_res_method: upper_bound_resize
+  use_ray_pose: false
+  # GR3 + OAK-D-W-97 calibration at 832x480.
+  fx: 369.81
+  fy: 341.14
+  calibration_width: 832
+  calibration_height: 480
+
+storage:
+  output_dir: ./outputs/anygrasp_full
+  mask_format: parquet  # Compressed RLE in parquet
+  depth_format: png16  # 16-bit PNG
+  overwrite: false  # Skip already-annotated frames
+
+qc:
+  enabled: true
+  num_frames_per_episode: 5  # Sample N frames per episode for QC
+  output_dir: null  # Uses storage.output_dir/qc if null
+  colormap: turbo  # Matplotlib colormap for depth visualization
+
+checkpoint_dir: null  # Uses storage.output_dir/.checkpoints
+num_workers: 1  # Future: parallel processing
+log_level: INFO
