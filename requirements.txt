@@ -14,6 +14,9 @@ matplotlib>=3.7.0
 # Config management
 pyyaml>=6.0.0
 
+# HTTP clients
+requests>=2.31.0
+
 # Optional: For actual model deployment (to be installed when models are ready)
 # torch>=2.0.0
 # transformers>=4.30.0

@@ -1,18 +1,62 @@
-"""Qwen-based object extractor for discovery layer."""
+"""Qwen HTTP client object extractor for discovery layer."""
 
+from __future__ import annotations
+
+import json
 import logging
+import re
 from pathlib import Path
+from typing import Any
+
+import requests
 
 from .base import ObjectDiscoverer
 
 logger = logging.getLogger(__name__)
 
 
+SYSTEM_PROMPT = """You are an object extractor for robot operation datasets.
+Given one task instruction, output the concrete objects that should be visually segmented.
+Rules:
+- Output only short noun phrases for specific visible objects, such as "green bottle" or "blue basket".
+- Do not output full sentences, verbs, actions, or robot commands.
+- Do not output generic labels such as "object", "item", "thing", or "toy".
+- Include color or attributes only when they distinguish the object.
+- Output exactly one JSON string array and no extra text."""
+
+FEW_SHOT_MESSAGES = [
+    {
+        "role": "user",
+        "content": "Pick the green bottle from the table and place it inside the blue basket.",
+    },
+    {"role": "assistant", "content": '["green bottle", "blue basket"]'},
+    {
+        "role": "user",
+        "content": "Open the drawer, retrieve the spoon, then put the spoon into the white bowl.",
+    },
+    {"role": "assistant", "content": '["drawer", "spoon", "white bowl"]'},
+    {
+        "role": "user",
+        "content": (
+            "Move the red toy drill away from the yellow box, pick up the small screw, "
+            "and drop it into the metal tray."
+        ),
+    },
+    {
+        "role": "assistant",
+        "content": '["red toy drill", "yellow box", "small screw", "metal tray"]',
+    },
+]
+
+GENERIC_OBJECT_NAMES = {
+    "object", "objects", "item", "items", "thing", "things", "toy", "toys"
+}
+
+
 class QwenExtractor(ObjectDiscoverer):
     """
-    Extract objects from task instructions using Qwen LLM.
-
-    Uses a small local Qwen model for offline extraction.
+    Extract objects from task instructions using an existing OpenAI-compatible
+    Qwen chat/completions service.
     """
 
     def __init__(self, model_path: Path | None = None):
@@ -20,126 +64,155 @@ class QwenExtractor(ObjectDiscoverer):
         Initialize Qwen extractor.
 
         Args:
-            model_path: Path to Qwen model checkpoint
+            model_path: Deprecated compatibility argument. Qwen is called over
+                HTTP and is never loaded in this process.
         """
-        self.model_path = model_path
-        self.model = None
-        self.tokenizer = None
-
-        if model_path and model_path.exists():
-            self._load_model()
-        else:
+        if model_path is not None:
             logger.warning(
-                f"Qwen model path not set or doesn't exist: {model_path}. "
-                "Will use mock extraction."
+                "qwen_model_path is deprecated and ignored; configure "
+                "qwen_endpoint and qwen_model instead."
             )
-
-    def _load_model(self) -> None:
-        """
-        Load Qwen model and tokenizer.
-
-        TODO: Implement actual model loading after Qwen deployment.
-        """
-        # TODO: verify API after Qwen deployment
-        # Expected API (HuggingFace Transformers style):
-        # from transformers import AutoModelForCausalLM, AutoTokenizer
-        # self.model = AutoModelForCausalLM.from_pretrained(self.model_path)
-        # self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        logger.info(f"Loading Qwen model from {self.model_path}")
-        logger.warning("Qwen model loading not implemented yet - using mock extraction")
+        self._cache: dict[str, list[str]] = {}
 
     def discover_objects(self, instruction: str, config: dict) -> list[str]:
         """
-        Extract objects from instruction using Qwen.
+        Extract objects from instruction using a Qwen HTTP service.
 
         Args:
             instruction: Task instruction string
-            config: Discovery config dict (uses always_include)
+            config: Discovery config dict
 
         Returns:
-            Deduplicated list of object query strings
+            Deduplicated list of object query strings. Shared always_include
+            handling is applied by NormalizingDiscoverer in factory.py.
         """
-        if self.model is None:
-            # Mock extraction for testing before model deployment
-            return self._mock_extract(instruction, config)
+        cache_key = " ".join(str(instruction or "").split())
+        if cache_key in self._cache:
+            logger.debug("QwenExtractor: cache hit for instruction")
+            return list(self._cache[cache_key])
 
-        # TODO: verify API after Qwen deployment
-        # Construct prompt
-        prompt = self._build_prompt(instruction)
+        if not cache_key:
+            logger.warning("QwenExtractor: empty instruction; using fallback queries")
+            self._cache[cache_key] = []
+            return []
 
-        # Generate
-        # inputs = self.tokenizer(prompt, return_tensors="pt")
-        # outputs = self.model.generate(**inputs, max_new_tokens=100)
-        # response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        endpoint = str(config.get("qwen_endpoint") or "").strip()
+        model = str(config.get("qwen_model") or "").strip()
+        if not endpoint or not model:
+            logger.warning(
+                "QwenExtractor: qwen_endpoint or qwen_model missing; using fallback queries"
+            )
+            self._cache[cache_key] = []
+            return []
 
-        # Parse response
-        # objects = self._parse_response(response)
+        try:
+            response_text = self._request_completion(cache_key, config)
+            objects = self._parse_response(response_text)
+        except Exception as exc:
+            logger.warning("QwenExtractor: request/parse failed: %s", exc)
+            objects = []
 
-        # Add always_include
-        always_include = config.get("always_include", [])
-        # objects.extend(always_include)
+        self._cache[cache_key] = objects
+        logger.info("QwenExtractor: extracted %d objects", len(objects))
+        logger.debug("  Instruction: %s", instruction)
+        logger.debug("  Objects: %s", objects)
+        return list(objects)
 
-        # Normalize
-        # return self._normalize_queries(objects)
+    def _request_completion(self, instruction: str, config: dict) -> str:
+        """Call the configured OpenAI-compatible chat/completions endpoint."""
+        headers = {"Content-Type": "application/json"}
+        api_key = config.get("qwen_api_key")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
 
-        return self._mock_extract(instruction, config)
+        payload = {
+            "model": config["qwen_model"],
+            "messages": self._build_messages(instruction),
+            "temperature": float(config.get("qwen_temperature", 0.0)),
+            "max_tokens": int(config.get("qwen_max_tokens", 128)),
+        }
 
-    def _build_prompt(self, instruction: str) -> str:
-        """
-        Build prompt for Qwen model.
+        response = requests.post(
+            config["qwen_endpoint"],
+            headers=headers,
+            json=payload,
+            timeout=float(config.get("qwen_timeout", 30.0)),
+        )
+        response.raise_for_status()
+        data = response.json()
 
-        Args:
-            instruction: Task instruction
+        choices = data.get("choices") or []
+        if not choices:
+            raise ValueError("missing choices in Qwen response")
 
-        Returns:
-            Formatted prompt string
-        """
-        prompt = f"""Given a robot manipulation task instruction, extract all objects that need to be detected/segmented.
-Return a comma-separated list of object names.
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if content is None:
+            content = choices[0].get("text")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("missing assistant content in Qwen response")
+        return content
 
-Instruction: {instruction}
-
-Objects:"""
-        return prompt
+    def _build_messages(self, instruction: str) -> list[dict[str, str]]:
+        """Build OpenAI chat messages for object extraction."""
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *FEW_SHOT_MESSAGES,
+            {"role": "user", "content": instruction},
+        ]
 
     def _parse_response(self, response: str) -> list[str]:
         """
-        Parse Qwen response to extract object list.
-
-        Args:
-            response: Raw model output
-
-        Returns:
-            List of object strings
+        Parse a Qwen JSON-array response with tolerance for markdown fences and
+        surrounding text.
         """
-        # Extract after "Objects:" marker
-        if "Objects:" in response:
-            response = response.split("Objects:")[-1]
+        text = self._strip_markdown_fence(response).strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\[[\s\S]*\]", text)
+            if not match:
+                raise ValueError(f"Qwen response is not a JSON array: {response!r}")
+            parsed = json.loads(match.group(0))
 
-        # Split by comma
-        objects = [obj.strip() for obj in response.split(",")]
-        return [obj for obj in objects if obj]
+        if not isinstance(parsed, list):
+            raise ValueError("Qwen response JSON must be an array")
+
+        return self._normalize_queries(parsed)
+
+    def _strip_markdown_fence(self, text: str) -> str:
+        """Remove a single surrounding markdown code fence if present."""
+        stripped = text.strip()
+        fence_match = re.fullmatch(
+            r"```(?:json)?\s*([\s\S]*?)\s*```", stripped, re.IGNORECASE
+        )
+        if fence_match:
+            return fence_match.group(1)
+        return stripped
+
+    def _normalize_queries(self, queries: list[Any]) -> list[str]:
+        """Normalize, filter generic labels, and deduplicate query strings."""
+        normalized = set()
+        for query in queries:
+            if not isinstance(query, str):
+                continue
+            value = " ".join(query.strip().lower().split())
+            value = re.sub(r"^(?:a|an|the)\s+", "", value)
+            if value and value not in GENERIC_OBJECT_NAMES:
+                normalized.add(value)
+        return sorted(normalized)
 
     def _mock_extract(self, instruction: str, config: dict) -> list[str]:
         """
         Mock extraction for testing before model deployment.
 
         Uses simple heuristics similar to rule-based extractor.
-
-        Args:
-            instruction: Task instruction
-            config: Discovery config
-
-        Returns:
-            List of object queries
         """
-        logger.debug(f"Using mock extraction for: {instruction}")
+        logger.debug("Using mock extraction for: %s", instruction)
 
-        # Simple mock: extract words that look like objects
         instruction_lower = instruction.lower()
         mock_objects = set()
 
-        # Look for common object keywords
         object_keywords = [
             "cup", "block", "drawer", "spoon", "fork", "knife",
             "plate", "bowl", "bottle", "can", "box", "toy",
@@ -150,34 +223,16 @@ Objects:"""
         for i, word in enumerate(words):
             word_clean = word.strip(".,!?")
             if word_clean in object_keywords:
-                # Check if preceded by color
-                if i > 0 and words[i - 1].strip(".,!?") in ["red", "blue", "green", "yellow", "black", "white"]:
+                if i > 0 and words[i - 1].strip(".,!?") in [
+                    "red", "blue", "green", "yellow", "black", "white"
+                ]:
                     mock_objects.add(f"{words[i - 1].strip('.,!?')} {word_clean}")
                 else:
                     mock_objects.add(word_clean)
 
-        # Add always_include
         always_include = config.get("always_include", [])
         mock_objects.update(item.lower() for item in always_include)
 
         result = sorted(mock_objects)
-        logger.info(f"QwenExtractor (mock): extracted {len(result)} objects")
-
+        logger.info("QwenExtractor (mock): extracted %d objects", len(result))
         return result
-
-    def _normalize_queries(self, queries: list[str]) -> list[str]:
-        """
-        Normalize and deduplicate queries.
-
-        Args:
-            queries: List of raw queries
-
-        Returns:
-            Normalized list
-        """
-        normalized = set()
-        for q in queries:
-            q = q.strip().lower()
-            if q:
-                normalized.add(q)
-        return sorted(normalized)

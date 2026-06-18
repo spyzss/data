@@ -10,3 +10,7 @@ class MockExtractor(QwenExtractor):
 
     def __init__(self) -> None:
         super().__init__(model_path=None)
+
+    def discover_objects(self, instruction: str, config: dict) -> list[str]:
+        """Return deterministic mock queries without making HTTP requests."""
+        return self._mock_extract(instruction, config)
