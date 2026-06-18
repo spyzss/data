@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from pathlib import Path
+import time
 from typing import Any
 
 import requests
@@ -59,19 +59,8 @@ class QwenExtractor(ObjectDiscoverer):
     Qwen chat/completions service.
     """
 
-    def __init__(self, model_path: Path | None = None):
-        """
-        Initialize Qwen extractor.
-
-        Args:
-            model_path: Deprecated compatibility argument. Qwen is called over
-                HTTP and is never loaded in this process.
-        """
-        if model_path is not None:
-            logger.warning(
-                "qwen_model_path is deprecated and ignored; configure "
-                "qwen_endpoint and qwen_model instead."
-            )
+    def __init__(self):
+        """Initialize Qwen extractor."""
         self._cache: dict[str, list[str]] = {}
 
     def discover_objects(self, instruction: str, config: dict) -> list[str]:
@@ -132,10 +121,10 @@ class QwenExtractor(ObjectDiscoverer):
             "max_tokens": int(config.get("qwen_max_tokens", 128)),
         }
 
-        response = requests.post(
+        response = self._post_with_retry(
             config["qwen_endpoint"],
             headers=headers,
-            json=payload,
+            payload=payload,
             timeout=float(config.get("qwen_timeout", 30.0)),
         )
         response.raise_for_status()
@@ -152,6 +141,31 @@ class QwenExtractor(ObjectDiscoverer):
         if not isinstance(content, str) or not content.strip():
             raise ValueError("missing assistant content in Qwen response")
         return content
+
+    def _post_with_retry(
+        self,
+        endpoint: str,
+        headers: dict[str, str],
+        payload: dict,
+        timeout: float,
+    ) -> requests.Response:
+        """Post with one retry for transient network/timeout failures."""
+        retry_errors = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                return requests.post(
+                    endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout,
+                )
+            except retry_errors as exc:
+                last_error = exc
+                if attempt == 0:
+                    logger.warning("QwenExtractor: HTTP request failed, retrying: %s", exc)
+                    time.sleep(1.0)
+        raise last_error if last_error is not None else RuntimeError("Qwen request failed")
 
     def _build_messages(self, instruction: str) -> list[dict[str, str]]:
         """Build OpenAI chat messages for object extraction."""
@@ -201,38 +215,3 @@ class QwenExtractor(ObjectDiscoverer):
             if value and value not in GENERIC_OBJECT_NAMES:
                 normalized.add(value)
         return sorted(normalized)
-
-    def _mock_extract(self, instruction: str, config: dict) -> list[str]:
-        """
-        Mock extraction for testing before model deployment.
-
-        Uses simple heuristics similar to rule-based extractor.
-        """
-        logger.debug("Using mock extraction for: %s", instruction)
-
-        instruction_lower = instruction.lower()
-        mock_objects = set()
-
-        object_keywords = [
-            "cup", "block", "drawer", "spoon", "fork", "knife",
-            "plate", "bowl", "bottle", "can", "box", "toy",
-            "red", "blue", "green", "yellow", "black", "white",
-        ]
-
-        words = instruction_lower.split()
-        for i, word in enumerate(words):
-            word_clean = word.strip(".,!?")
-            if word_clean in object_keywords:
-                if i > 0 and words[i - 1].strip(".,!?") in [
-                    "red", "blue", "green", "yellow", "black", "white"
-                ]:
-                    mock_objects.add(f"{words[i - 1].strip('.,!?')} {word_clean}")
-                else:
-                    mock_objects.add(word_clean)
-
-        always_include = config.get("always_include", [])
-        mock_objects.update(item.lower() for item in always_include)
-
-        result = sorted(mock_objects)
-        logger.info("QwenExtractor (mock): extracted %d objects", len(result))
-        return result

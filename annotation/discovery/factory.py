@@ -36,5 +36,5 @@ def create_discoverer(config: dict) -> ObjectDiscoverer:
         return NormalizingDiscoverer(ManualExtractor())
     if extractor == "qwen":
         # QwenExtractor calls an already-running OpenAI-compatible service.
-        return NormalizingDiscoverer(QwenExtractor(model_path=config.get("qwen_model_path")))
+        return NormalizingDiscoverer(QwenExtractor())
     raise ValueError(f"Unsupported discovery extractor: {extractor}")
