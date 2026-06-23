@@ -452,6 +452,14 @@ def load_config_from_yaml(config_path: Path) -> PipelineConfig:
     with open(config_path) as f:
         config_dict = yaml.safe_load(f)
 
+    # Allow stage-specific configs (e.g. segmentation-only) to omit unrelated sections.
+    # Missing sections are filled with dataclass defaults; explicit configs are unaffected.
+    config_dict.setdefault("discovery", {})
+    config_dict.setdefault("segmentation", {})
+    config_dict.setdefault("depth", {})
+    config_dict.setdefault("sampling", {})
+    config_dict.setdefault("qc", {})
+
     # Convert string paths to Path objects
     config_dict["dataset_path"] = Path(config_dict["dataset_path"])
     config_dict["storage"]["output_dir"] = Path(config_dict["storage"]["output_dir"])
