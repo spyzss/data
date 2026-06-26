@@ -1,0 +1,62 @@
+dataset_path: /mnt/oss/Data/xingji   # 桶可读后改成实际根目录(hdf5/ 和 video/ 的父目录)
+dataset_type: xingji
+camera_names:
+  - observation.images.head
+
+dry_run: true
+
+discovery:
+  mode: instruction
+  extractor: qwen
+  always_include:
+    - hand
+  qwen_model_path: null
+  qwen_endpoint: http://localhost:8000/v1/chat/completions
+  qwen_model: qwen3
+  qwen_temperature: 0.0
+  qwen_max_tokens: 128
+  qwen_timeout: 30.0
+  instruction_source: episode_field
+  instruction_field: expand_task
+  default_instruction: ""
+  vocab_file: null
+
+segmentation:
+  model_path: models/sam3
+  model_type: sam3
+  confidence_threshold: 0.6
+  mask_threshold: 0.5
+  max_instances_per_query: 10
+
+depth:
+  model_path: depth-anything/DA3METRIC-LARGE
+  model_type: depth_anything_v3
+  output_metric: true
+  debug_depth_range: false
+  process_res: 504
+  process_res_method: upper_bound_resize
+  use_ray_pose: false
+  fx: 1000.0
+  fy: 1000.0
+  calibration_width: 1280
+  calibration_height: 720
+
+sampling:
+  mode: uniform
+  stride_frames: 90
+
+storage:
+  output_dir: ./outputs/xingji_dryrun
+  mask_format: parquet
+  depth_format: png16
+  overwrite: false
+
+qc:
+  enabled: false
+  num_frames_per_episode: 5
+  output_dir: null
+  colormap: turbo
+
+checkpoint_dir: null
+num_workers: 1
+log_level: INFO
