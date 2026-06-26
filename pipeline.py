@@ -240,7 +240,23 @@ class AnnotationPipeline:
                 max_frames_per_episode=self.config.max_frames_per_episode,
                 load_frames=not self.config.dry_run,
             )
+        
+        if dataset_type == "xingji":
+            from annotation.xingji_dataset import XingjiDataset
 
+            return XingjiDataset(
+                dataset_path=self.config.dataset_path,
+                camera_names=self.config.camera_names,
+                instruction_config=asdict(self.config.discovery),
+                episode_indices=self.config.episode_indices,
+                frame_indices=self.config.frame_indices,
+                sample_frames_per_episode=self.config.sample_frames_per_episode,
+                sampling_config=asdict(self.config.sampling),
+                max_episodes=self.config.max_episodes,
+                max_frames_per_episode=self.config.max_frames_per_episode,
+                load_frames=not self.config.dry_run,
+            )
+        
         logger.warning("Using mock dataset loader")
         from annotation.mock_dataset import MockLeRobotDataset
 
