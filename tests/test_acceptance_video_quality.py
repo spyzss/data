@@ -1,4 +1,3 @@
-import csv
 import json
 from pathlib import Path
 
@@ -15,7 +14,8 @@ from acceptance_pull.video_quality import (
     main,
     run_video_quality_check,
 )
-from tests.fixtures import solid_frame, write_quality_hdf5, write_quality_hdf5_with_text, write_test_video
+from tests.fixtures import solid_frame, write_quality_hdf5, write_test_video
+from tests.fixtures import write_quality_hdf5_with_text
 
 
 def textured_frame(offset: int, width: int = 32, height: int = 24) -> np.ndarray:
@@ -211,7 +211,7 @@ def test_hdf5_alignment_missing_warn_does_not_fail(tmp_path: Path) -> None:
     assert "hdf5_missing" not in evaluation.reasons
 
 
-def test_run_video_quality_check_writes_reports_and_returns_zero(tmp_path: Path) -> None:
+def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tmp_path: Path) -> None:
     batch = tmp_path
     video_dir = batch / "video"
     video_dir.mkdir()
@@ -222,23 +222,14 @@ def test_run_video_quality_check_writes_reports_and_returns_zero(tmp_path: Path)
     exit_code = run_video_quality_check(batch)
 
     assert exit_code == 0
-    csv_path = batch / "reports" / "video_quality.csv"
-    summary_path = batch / "reports" / "video_quality_summary.json"
-    assert csv_path.is_file()
-    assert summary_path.is_file()
-
-    rows = list(csv.DictReader(csv_path.open("r", encoding="utf-8")))
-    assert rows[0]["asset_id"] == "408817"
-    assert rows[0]["passed"] == "true"
-
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    assert summary["batch_status"] == "passed"
-    assert summary["total_videos"] == 1
-    assert summary["failed_videos"] == 0
-    assert summary["effective_config"]["sample_count"] == 10
+    assert not (batch / "reports").exists()
+    report = json.loads((batch / "quality_archive" / "408817.json").read_text(encoding="utf-8"))
+    assert report["asset_id"] == "408817"
+    assert report["qc_summary"]["status"] == "passed"
+    assert report["video_quality"]["thresholds"]["min_sample_decode_ratio"] == 1.0
 
 
-def test_run_video_quality_check_writes_one_json_report_per_video_id(tmp_path: Path) -> None:
+def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path: Path) -> None:
     batch = tmp_path
     video_dir = batch / "video"
     video_dir.mkdir()
@@ -249,13 +240,19 @@ def test_run_video_quality_check_writes_one_json_report_per_video_id(tmp_path: P
     exit_code = run_video_quality_check(batch)
 
     assert exit_code == 0
-    report_path = batch / "reports" / "video_quality" / "408817.json"
+    report_path = batch / "quality_archive" / "408817.json"
     assert report_path.is_file()
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["schema_version"] == "video_quality_report.v1"
+    assert report["schema_version"] == "asset_qc_report.v1"
     assert report["asset_id"] == "408817"
-    assert report["evaluation"] == {"passed": True, "reasons": []}
+    assert report["qc_summary"] == {
+        "status": "passed",
+        "passed": True,
+        "completed_modules": ["video_quality"],
+        "failed_modules": [],
+        "reasons": [],
+    }
     assert report["source_files"]["video"]["path"] == str(video)
     assert report["source_files"]["hdf5"]["path"] == str(batch / "hdf5" / "408817_hdf5.hdf5")
     assert report["hdf5_text_info"]["alignment"]["status"] == "matched"
@@ -267,6 +264,7 @@ def test_run_video_quality_check_writes_one_json_report_per_video_id(tmp_path: P
         "task": "整理桌面",
     }
     assert report["video_quality"]["metadata"]["frame_count"] == 3
+    assert report["video_quality"]["evaluation"] == {"passed": True, "reasons": []}
     assert report["video_quality"]["sampling"]["decoded_sample_count"] >= 1
     assert report["video_quality"]["metrics"]["exposure"]["mean_over_dark_ratio"] < 0.1
     assert report["reference_quality"]["mode"] == "none"
@@ -281,23 +279,23 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     exit_code = run_video_quality_check(batch)
 
     assert exit_code == 2
-    summary = json.loads((batch / "reports" / "video_quality_summary.json").read_text(encoding="utf-8"))
-    assert summary["batch_status"] == "failed"
-    assert summary["failed_videos"] == 1
-    assert summary["reason_counts"]["cannot_open_video"] == 1
+    assert not (batch / "reports").exists()
+    report = json.loads((batch / "quality_archive" / "bad.json").read_text(encoding="utf-8"))
+    assert report["qc_summary"]["status"] == "failed"
+    assert report["qc_summary"]["failed_modules"] == ["video_quality"]
+    assert "cannot_open_video" in report["video_quality"]["evaluation"]["reasons"]
 
 
-def test_video_quality_main_accepts_config_and_reports_dir(tmp_path: Path) -> None:
+def test_video_quality_main_accepts_config_and_writes_quality_archive(tmp_path: Path) -> None:
     batch = tmp_path / "batch"
     video_dir = batch / "video"
-    reports = tmp_path / "custom-reports"
     video_dir.mkdir(parents=True)
     write_test_video(video_dir / "408817_video.mp4", [textured_frame(0), textured_frame(10)], fps=10.0)
     config = tmp_path / "quality.yaml"
     config.write_text("sample_count: 2\nalignment_mode: ignore\n", encoding="utf-8")
 
-    exit_code = main(["--batch", str(batch), "--config", str(config), "--reports-dir", str(reports)])
+    exit_code = main(["--batch", str(batch), "--config", str(config)])
 
     assert exit_code == 0
-    assert (reports / "video_quality.csv").is_file()
-    assert (reports / "video_quality_summary.json").is_file()
+    report = json.loads((batch / "quality_archive" / "408817.json").read_text(encoding="utf-8"))
+    assert report["video_quality"]["sampling"]["sample_count_configured"] == 2

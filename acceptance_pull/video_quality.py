@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-from collections import Counter
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -321,10 +319,6 @@ def evaluate_video_quality(
     return QualityEvaluation(passed=not unique_reasons, reasons=unique_reasons)
 
 
-def _format_bool(value: bool) -> str:
-    return "true" if value else "false"
-
-
 def _hdf5_object_path(name: str) -> str:
     return "/" if not name else f"/{name}"
 
@@ -393,14 +387,15 @@ def read_hdf5_text_fields(path: Path | None) -> dict[str, dict[str, Any]]:
     return text_fields
 
 
-def video_quality_result_to_json(result: VideoQualityResult, config: VideoQualityConfig) -> dict[str, Any]:
+def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConfig) -> dict[str, Any]:
     metrics = result.metrics
     alignment = result.alignment
     thresholds = asdict(config.thresholds)
     hdf5_exists = alignment.hdf5_path.is_file() if alignment.hdf5_path is not None else False
+    failed_modules = [] if result.evaluation.passed else ["video_quality"]
 
     return {
-        "schema_version": "video_quality_report.v1",
+        "schema_version": "asset_qc_report.v1",
         "asset_id": metrics.asset_id,
         "source_files": {
             "video": {
@@ -413,8 +408,11 @@ def video_quality_result_to_json(result: VideoQualityResult, config: VideoQualit
                 "exists": hdf5_exists,
             },
         },
-        "evaluation": {
+        "qc_summary": {
+            "status": "passed" if result.evaluation.passed else "failed",
             "passed": result.evaluation.passed,
+            "completed_modules": ["video_quality"],
+            "failed_modules": failed_modules,
             "reasons": list(result.evaluation.reasons),
         },
         "hdf5_text_info": {
@@ -428,6 +426,10 @@ def video_quality_result_to_json(result: VideoQualityResult, config: VideoQualit
             "text_fields": read_hdf5_text_fields(alignment.hdf5_path),
         },
         "video_quality": {
+            "evaluation": {
+                "passed": result.evaluation.passed,
+                "reasons": list(result.evaluation.reasons),
+            },
             "metadata": {
                 "opened": metrics.opened,
                 "frame_count": metrics.frame_count,
@@ -474,112 +476,26 @@ def video_quality_result_to_json(result: VideoQualityResult, config: VideoQualit
     }
 
 
-def write_per_video_json_reports(
-    reports_dir: Path,
+def write_per_asset_qc_json_reports(
+    quality_archive_dir: Path,
     results: list[VideoQualityResult],
     config: VideoQualityConfig,
 ) -> None:
-    json_dir = reports_dir / "video_quality"
-    json_dir.mkdir(parents=True, exist_ok=True)
+    quality_archive_dir.mkdir(parents=True, exist_ok=True)
     for result in results:
-        path = json_dir / f"{result.metrics.asset_id}.json"
+        path = quality_archive_dir / f"{result.metrics.asset_id}.json"
         path.write_text(
-            json.dumps(video_quality_result_to_json(result, config), ensure_ascii=False, indent=2),
+            json.dumps(asset_qc_result_to_json(result, config), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-
-
-def write_video_quality_reports(
-    reports_dir: Path,
-    results: list[VideoQualityResult],
-    config: VideoQualityConfig,
-) -> None:
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = reports_dir / "video_quality.csv"
-    fields = [
-        "asset_id",
-        "video_path",
-        "passed",
-        "reasons",
-        "frame_count",
-        "fps",
-        "duration_seconds",
-        "width",
-        "height",
-        "sampled_frame_count",
-        "decoded_sample_count",
-        "sample_decode_ratio",
-        "mean_brightness",
-        "mean_over_dark_ratio",
-        "mean_over_exposed_ratio",
-        "mean_blur_laplacian_var",
-        "black_frame_ratio",
-        "frozen_frame_ratio",
-        "hdf5_frame_count",
-        "frame_count_match",
-        "hdf5_alignment_status",
-    ]
-    with csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        for result in results:
-            metrics = result.metrics
-            alignment = result.alignment
-            writer.writerow(
-                {
-                    "asset_id": metrics.asset_id,
-                    "video_path": str(metrics.path),
-                    "passed": _format_bool(result.evaluation.passed),
-                    "reasons": ";".join(result.evaluation.reasons),
-                    "frame_count": metrics.frame_count,
-                    "fps": metrics.fps,
-                    "duration_seconds": metrics.duration_seconds,
-                    "width": metrics.width,
-                    "height": metrics.height,
-                    "sampled_frame_count": metrics.sampled_frame_count,
-                    "decoded_sample_count": metrics.decoded_sample_count,
-                    "sample_decode_ratio": metrics.sample_decode_ratio,
-                    "mean_brightness": metrics.mean_brightness,
-                    "mean_over_dark_ratio": metrics.mean_over_dark_ratio,
-                    "mean_over_exposed_ratio": metrics.mean_over_exposed_ratio,
-                    "mean_blur_laplacian_var": metrics.mean_blur_laplacian_var,
-                    "black_frame_ratio": metrics.black_frame_ratio,
-                    "frozen_frame_ratio": metrics.frozen_frame_ratio,
-                    "hdf5_frame_count": alignment.hdf5_frame_count if alignment.hdf5_frame_count is not None else "",
-                    "frame_count_match": "" if alignment.frame_count_match is None else _format_bool(alignment.frame_count_match),
-                    "hdf5_alignment_status": alignment.status,
-                }
-            )
-
-    reason_counts: Counter[str] = Counter()
-    for result in results:
-        reason_counts.update(result.evaluation.reasons)
-
-    failed = sum(1 for result in results if not result.evaluation.passed)
-    summary = {
-        "batch_status": "passed" if failed == 0 else "failed",
-        "total_videos": len(results),
-        "passed_videos": len(results) - failed,
-        "failed_videos": failed,
-        "reason_counts": dict(sorted(reason_counts.items())),
-        "effective_config": config.to_dict(),
-    }
-    (reports_dir / "video_quality_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    write_per_video_json_reports(reports_dir, results, config)
-
 
 
 def run_video_quality_check(
     batch_dir: Path,
     config_path: Path | None = None,
-    reports_dir: Path | None = None,
 ) -> int:
     config = load_video_quality_config(config_path)
     video_paths = discover_batch_videos(batch_dir)
-    output_dir = reports_dir or (batch_dir / "reports")
     results: list[VideoQualityResult] = []
 
     for video_path in video_paths:
@@ -588,7 +504,7 @@ def run_video_quality_check(
         evaluation = evaluate_video_quality(metrics, config, alignment)
         results.append(VideoQualityResult(metrics, alignment, evaluation))
 
-    write_video_quality_reports(output_dir, results, config)
+    write_per_asset_qc_json_reports(batch_dir / "quality_archive", results, config)
     return 0 if all(result.evaluation.passed for result in results) else 2
 
 
@@ -596,6 +512,5 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", required=True, type=Path)
     parser.add_argument("--config", type=Path)
-    parser.add_argument("--reports-dir", type=Path)
     args = parser.parse_args(argv)
-    return run_video_quality_check(args.batch, args.config, args.reports_dir)
+    return run_video_quality_check(args.batch, args.config)

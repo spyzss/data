@@ -96,7 +96,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 ```
 
 详细配置见 `ACCEPTANCE.md`。
-单视频 JSON 报告格式见 `docs/video-quality-json-format.md`。
+单条数据 QC 档案 JSON 格式见 `docs/asset-qc-json-format.md`。
 
 ### Subtask-aware 采样
 

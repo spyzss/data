@@ -6,7 +6,7 @@ the SAM3/DA3 annotation pipeline:
 - `acceptance_pull`: validate a supplier manifest, sample IDs by scene/task,
   and pull paired HDF5/video files into a local batch.
 - `acceptance_video_quality`: run no-reference video quality checks on a sampled
-  batch and write CSV/JSON reports.
+  batch and write per-asset QC JSON archives.
 
 ## Batch Sampling And Pull
 
@@ -74,10 +74,8 @@ After each run, a reviewer should check:
 - `reports/pull_report.csv` for failed pull operations.
 - `reports/summary.json` for actual sample size, scene/task coverage, seed,
   worker count, and sampling ratio.
-- `reports/video_quality_summary.json` for batch-level status and reason
-  counts.
-- `reports/video_quality/<asset_id>.json` for per-video machine-readable
-  evidence when a sample needs closer review.
+- `quality_archive/<asset_id>.json` for per-asset machine-readable evidence
+  when a sample needs closer review.
 
 ## OSS Batch Input
 
@@ -130,17 +128,29 @@ The video check writes:
 
 ```text
 sampled/XJGT_20260616/
+  hdf5/
+  video/
+  quality_archive/
+    <asset_id>.json
+```
+
+The video quality command writes each asset's QC result into
+`quality_archive/<asset_id>.json`, alongside `hdf5/` and `video/`. The schema is
+documented in `docs/asset-qc-json-format.md`; future batch-level summaries or
+tables can be generated from these archive files.
+
+The batch pull workflow still writes pull/sampling reports under:
+
+```text
+sampled/XJGT_20260616/
   reports/
-    video_quality.csv
-    video_quality_summary.json
-    video_quality/
-      <asset_id>.json
+    id_consistency.csv
+    sample_manifest.csv
+    pull_report.csv
+    summary.json
 ```
 
 It uses practical no-reference indicators: open/decode health, frame count,
 fps, duration, resolution, sampled-frame decode ratio, brightness, over-dark and
 over-exposure ratios, blur proxy, black-frame risk, frozen-frame risk, and
 optional HDF5 frame-count alignment.
-
-`video_quality/<asset_id>.json` is the per-video machine-readable report. Its
-schema is documented in `docs/video-quality-json-format.md`.
