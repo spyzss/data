@@ -17,6 +17,10 @@ import yaml
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi"}
 DEFAULT_SAMPLE_COUNT = 10
+DARK_PIXEL_THRESHOLD = 16
+OVER_EXPOSED_PIXEL_THRESHOLD = 245
+BLACK_FRAME_BRIGHTNESS_THRESHOLD = 16
+FROZEN_FRAME_MEAN_ABS_DIFF_THRESHOLD = 1.0
 
 
 class AlignmentMode(StrEnum):
@@ -198,14 +202,14 @@ def analyze_video(path: Path, config: VideoQualityConfig) -> VideoMetrics:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             brightness = float(np.mean(gray))
             brightness_values.append(brightness)
-            dark_values.append(float(np.mean(gray < 16)))
-            exposed_values.append(float(np.mean(gray > 245)))
+            dark_values.append(float(np.mean(gray < DARK_PIXEL_THRESHOLD)))
+            exposed_values.append(float(np.mean(gray > OVER_EXPOSED_PIXEL_THRESHOLD)))
             blur_values.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
-            black_values.append(1.0 if brightness < 16 else 0.0)
+            black_values.append(1.0 if brightness < BLACK_FRAME_BRIGHTNESS_THRESHOLD else 0.0)
 
             if previous_gray is not None:
                 diff = float(np.mean(cv2.absdiff(previous_gray, gray)))
-                if diff < 1.0:
+                if diff < FROZEN_FRAME_MEAN_ABS_DIFF_THRESHOLD:
                     frozen_pairs += 1
             previous_gray = gray
 
@@ -321,6 +325,170 @@ def _format_bool(value: bool) -> str:
     return "true" if value else "false"
 
 
+def _hdf5_object_path(name: str) -> str:
+    return "/" if not name else f"/{name}"
+
+
+def _parse_json_text_if_possible(text: str) -> Any:
+    stripped = text.strip()
+    if not stripped.startswith(("{", "[")):
+        return text
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return text
+
+
+def _decode_hdf5_text(value: Any) -> Any | None:
+    if isinstance(value, bytes | np.bytes_):
+        return _parse_json_text_if_possible(bytes(value).decode("utf-8", errors="replace"))
+    if isinstance(value, str | np.str_):
+        return _parse_json_text_if_possible(str(value))
+    if isinstance(value, np.ndarray):
+        if value.dtype.kind not in {"S", "U", "O"}:
+            return None
+        return _decode_hdf5_text(value.tolist())
+    if isinstance(value, list | tuple):
+        decoded = [_decode_hdf5_text(item) for item in value]
+        if any(item is None for item in decoded):
+            return None
+        return decoded
+    return None
+
+
+def _collect_hdf5_attrs(obj: h5py.Group | h5py.Dataset, path: str) -> dict[str, Any]:
+    attrs: dict[str, Any] = {}
+    for key, value in obj.attrs.items():
+        decoded = _decode_hdf5_text(value)
+        if decoded is not None:
+            attrs[str(key)] = decoded
+    return attrs
+
+
+def read_hdf5_text_fields(path: Path | None) -> dict[str, dict[str, Any]]:
+    text_fields: dict[str, dict[str, Any]] = {"attributes": {}, "datasets": {}}
+    if path is None or not path.is_file():
+        return text_fields
+
+    try:
+        with h5py.File(path, "r") as handle:
+            root_attrs = _collect_hdf5_attrs(handle, "/")
+            if root_attrs:
+                text_fields["attributes"]["/"] = root_attrs
+
+            def visit(name: str, obj: h5py.Group | h5py.Dataset) -> None:
+                object_path = _hdf5_object_path(name)
+                attrs = _collect_hdf5_attrs(obj, object_path)
+                if attrs:
+                    text_fields["attributes"][object_path] = attrs
+                if isinstance(obj, h5py.Dataset):
+                    decoded = _decode_hdf5_text(obj[()])
+                    if decoded is not None:
+                        text_fields["datasets"][object_path] = decoded
+
+            handle.visititems(visit)
+    except OSError:
+        return text_fields
+
+    return text_fields
+
+
+def video_quality_result_to_json(result: VideoQualityResult, config: VideoQualityConfig) -> dict[str, Any]:
+    metrics = result.metrics
+    alignment = result.alignment
+    thresholds = asdict(config.thresholds)
+    hdf5_exists = alignment.hdf5_path.is_file() if alignment.hdf5_path is not None else False
+
+    return {
+        "schema_version": "video_quality_report.v1",
+        "asset_id": metrics.asset_id,
+        "source_files": {
+            "video": {
+                "path": str(metrics.path),
+                "filename": metrics.path.name,
+                "extension": metrics.path.suffix.lower(),
+            },
+            "hdf5": {
+                "path": str(alignment.hdf5_path) if alignment.hdf5_path is not None else None,
+                "exists": hdf5_exists,
+            },
+        },
+        "evaluation": {
+            "passed": result.evaluation.passed,
+            "reasons": list(result.evaluation.reasons),
+        },
+        "hdf5_text_info": {
+            "alignment": {
+                "status": alignment.status,
+                "frame_count_source": "label/quality_hand",
+                "frame_count": alignment.hdf5_frame_count,
+                "frame_count_match": alignment.frame_count_match,
+                "reason": alignment.reason,
+            },
+            "text_fields": read_hdf5_text_fields(alignment.hdf5_path),
+        },
+        "video_quality": {
+            "metadata": {
+                "opened": metrics.opened,
+                "frame_count": metrics.frame_count,
+                "fps": metrics.fps,
+                "duration_seconds": metrics.duration_seconds,
+                "width": metrics.width,
+                "height": metrics.height,
+            },
+            "sampling": {
+                "sample_count_configured": config.sample_count,
+                "sampled_frame_count": metrics.sampled_frame_count,
+                "decoded_sample_count": metrics.decoded_sample_count,
+                "sample_decode_ratio": metrics.sample_decode_ratio,
+            },
+            "metrics": {
+                "brightness": {
+                    "mean": metrics.mean_brightness,
+                    "black_frame_ratio": metrics.black_frame_ratio,
+                    "black_frame_brightness_threshold": BLACK_FRAME_BRIGHTNESS_THRESHOLD,
+                },
+                "exposure": {
+                    "mean_over_dark_ratio": metrics.mean_over_dark_ratio,
+                    "mean_over_exposed_ratio": metrics.mean_over_exposed_ratio,
+                    "dark_pixel_threshold": DARK_PIXEL_THRESHOLD,
+                    "over_exposed_pixel_threshold": OVER_EXPOSED_PIXEL_THRESHOLD,
+                },
+                "sharpness": {
+                    "mean_blur_laplacian_var": metrics.mean_blur_laplacian_var,
+                },
+                "temporal": {
+                    "frozen_frame_ratio": metrics.frozen_frame_ratio,
+                    "frozen_frame_mean_abs_diff_threshold": FROZEN_FRAME_MEAN_ABS_DIFF_THRESHOLD,
+                },
+            },
+            "thresholds": thresholds,
+            "errors": list(metrics.errors),
+        },
+        "reference_quality": {
+            "mode": "none",
+            "reference_video_path": None,
+            "vmaf": None,
+            "note": "当前无标准对照视频，未计算 VMAF。",
+        },
+    }
+
+
+def write_per_video_json_reports(
+    reports_dir: Path,
+    results: list[VideoQualityResult],
+    config: VideoQualityConfig,
+) -> None:
+    json_dir = reports_dir / "video_quality"
+    json_dir.mkdir(parents=True, exist_ok=True)
+    for result in results:
+        path = json_dir / f"{result.metrics.asset_id}.json"
+        path.write_text(
+            json.dumps(video_quality_result_to_json(result, config), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
 def write_video_quality_reports(
     reports_dir: Path,
     results: list[VideoQualityResult],
@@ -400,6 +568,8 @@ def write_video_quality_reports(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    write_per_video_json_reports(reports_dir, results, config)
+
 
 
 def run_video_quality_check(

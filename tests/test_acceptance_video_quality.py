@@ -15,7 +15,7 @@ from acceptance_pull.video_quality import (
     main,
     run_video_quality_check,
 )
-from tests.fixtures import solid_frame, write_quality_hdf5, write_test_video
+from tests.fixtures import solid_frame, write_quality_hdf5, write_quality_hdf5_with_text, write_test_video
 
 
 def textured_frame(offset: int, width: int = 32, height: int = 24) -> np.ndarray:
@@ -236,6 +236,40 @@ def test_run_video_quality_check_writes_reports_and_returns_zero(tmp_path: Path)
     assert summary["total_videos"] == 1
     assert summary["failed_videos"] == 0
     assert summary["effective_config"]["sample_count"] == 10
+
+
+def test_run_video_quality_check_writes_one_json_report_per_video_id(tmp_path: Path) -> None:
+    batch = tmp_path
+    video_dir = batch / "video"
+    video_dir.mkdir()
+    video = video_dir / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=10.0)
+    write_quality_hdf5_with_text(batch / "hdf5" / "408817_hdf5.hdf5", 3)
+
+    exit_code = run_video_quality_check(batch)
+
+    assert exit_code == 0
+    report_path = batch / "reports" / "video_quality" / "408817.json"
+    assert report_path.is_file()
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["schema_version"] == "video_quality_report.v1"
+    assert report["asset_id"] == "408817"
+    assert report["evaluation"] == {"passed": True, "reasons": []}
+    assert report["source_files"]["video"]["path"] == str(video)
+    assert report["source_files"]["hdf5"]["path"] == str(batch / "hdf5" / "408817_hdf5.hdf5")
+    assert report["hdf5_text_info"]["alignment"]["status"] == "matched"
+    assert report["hdf5_text_info"]["text_fields"]["attributes"]["/"]["task"] == "pick up red cup"
+    assert report["hdf5_text_info"]["text_fields"]["attributes"]["/meta"]["scene"] == "kitchen"
+    assert report["hdf5_text_info"]["text_fields"]["datasets"]["/meta/instruction"] == "move the cup to the tray"
+    assert report["hdf5_text_info"]["text_fields"]["datasets"]["/meta/structured_label"] == {
+        "language": "zh",
+        "task": "整理桌面",
+    }
+    assert report["video_quality"]["metadata"]["frame_count"] == 3
+    assert report["video_quality"]["sampling"]["decoded_sample_count"] >= 1
+    assert report["video_quality"]["metrics"]["exposure"]["mean_over_dark_ratio"] < 0.1
+    assert report["reference_quality"]["mode"] == "none"
 
 
 def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path) -> None:

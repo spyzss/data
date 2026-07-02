@@ -50,6 +50,35 @@ Sampling uses the manifest/video/HDF5 ID intersection, keeps full scene
 coverage, and fills remaining quota with task diversity. `sample_ratio` defaults
 to `0.01`, using `ceil(valid_id_count * sample_ratio)` as the minimum size.
 
+## Manual Inputs And Confirmation Points
+
+The workflow intentionally keeps several choices as human-owned inputs:
+
+- `output`: choose the local destination directory for the sampled batch.
+- `sample_ratio`: choose the acceptance sampling ratio. The default is `0.01`
+  for 1%; set values such as `0.02` or `0.005` when the batch policy changes.
+- `workers`: choose pull concurrency for the current network and disk
+  environment. The default is `8`.
+- `seed`: leave blank to use the run date, or set an explicit value when a
+  historical sample must be reproduced.
+- Local source mode: provide `manifest`, `readme`, `hdf5.root`, and
+  `video.root`.
+- OSS source mode: provide `batch_uri` and `region`; do not put access keys,
+  tokens, or browser login state in YAML.
+- Video quality mode: confirm `alignment_mode` and threshold overrides before
+  using the pass/fail result as an acceptance gate.
+
+After each run, a reviewer should check:
+
+- `reports/id_consistency.csv` for missing or extra manifest/HDF5/video IDs.
+- `reports/pull_report.csv` for failed pull operations.
+- `reports/summary.json` for actual sample size, scene/task coverage, seed,
+  worker count, and sampling ratio.
+- `reports/video_quality_summary.json` for batch-level status and reason
+  counts.
+- `reports/video_quality/<asset_id>.json` for per-video machine-readable
+  evidence when a sample needs closer review.
+
 ## OSS Batch Input
 
 For local OSS testing with `oss-browser2`, keep credentials outside YAML and log
@@ -104,9 +133,14 @@ sampled/XJGT_20260616/
   reports/
     video_quality.csv
     video_quality_summary.json
+    video_quality/
+      <asset_id>.json
 ```
 
 It uses practical no-reference indicators: open/decode health, frame count,
 fps, duration, resolution, sampled-frame decode ratio, brightness, over-dark and
 over-exposure ratios, blur proxy, black-frame risk, frozen-frame risk, and
 optional HDF5 frame-count alignment.
+
+`video_quality/<asset_id>.json` is the per-video machine-readable report. Its
+schema is documented in `docs/video-quality-json-format.md`.

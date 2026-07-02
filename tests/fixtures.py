@@ -49,3 +49,15 @@ def write_quality_hdf5(path: Path, frame_count: int) -> None:
     with h5py.File(path, "w") as handle:
         label = handle.create_group("label")
         label.create_dataset("quality_hand", data=np.ones((frame_count, 2), dtype=np.float32))
+
+
+def write_quality_hdf5_with_text(path: Path, frame_count: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as handle:
+        handle.attrs["task"] = "pick up red cup"
+        meta = handle.create_group("meta")
+        meta.attrs["scene"] = "kitchen"
+        meta.create_dataset("instruction", data="move the cup to the tray")
+        meta.create_dataset("structured_label", data='{"language":"zh","task":"整理桌面"}')
+        label = handle.create_group("label")
+        label.create_dataset("quality_hand", data=np.ones((frame_count, 2), dtype=np.float32))
