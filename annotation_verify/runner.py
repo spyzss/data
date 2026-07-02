@@ -10,9 +10,11 @@ import pandas as pd
 
 from qc_common.io import (
     aggregate_results,
+    dataframe_to_json_records,
     read_existing_dataframe,
     results_to_dataframe,
     write_dataframe,
+    write_json_records,
 )
 from qc_common.types import CheckResult, ClipInputs
 
@@ -82,6 +84,10 @@ class AnnotationVerifyRunner:
             keep="last" if self.config.overwrite else "first",
         )
         result_path = write_dataframe(result_df, result_file)
+        result_json_path = write_json_records(
+            dataframe_to_json_records(result_df),
+            self.output_dir / "check_results.json",
+        )
         aggregate_df = pd.DataFrame(aggregate_results(results))
         aggregate_file = self.output_dir / "clip_aggregates.parquet"
         if not self.config.overwrite:
@@ -99,4 +105,14 @@ class AnnotationVerifyRunner:
             aggregate_df,
             aggregate_file,
         )
-        logger.info("Wrote annotation verification results to %s and %s", result_path, aggregate_path)
+        aggregate_json_path = write_json_records(
+            aggregate_df.to_dict(orient="records"),
+            self.output_dir / "clip_aggregates.json",
+        )
+        logger.info(
+            "Wrote annotation verification results to %s, %s, %s and %s",
+            result_path,
+            result_json_path,
+            aggregate_path,
+            aggregate_json_path,
+        )

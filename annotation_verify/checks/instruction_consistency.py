@@ -37,10 +37,9 @@ class InstructionConsistencyCheck(BaseCheck):
             CheckResult(
                 check=self.name,
                 episode_idx=clip.episode_idx,
-                frame_idx=clip.frame_idx_at(offset),
+                frame_idx=-1,
                 metrics=metrics,
                 flag=None,
                 reason=reason,
             )
-            for offset in range(num_frames)
         ]

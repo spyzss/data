@@ -1,131 +1,157 @@
-# Quick Start - Marmalade Visual Annotation
+# Quick Start
 
-This guide reflects the current verified AnyGrasp pipeline state.
+本指南按当前统一 workflow 组织：
 
-## Environment
+```text
+precheck -> optional SAM3 containment sidecar -> annotation -> annotation_verify
+```
+
+各模块可以独立运行。不要把这个顺序写死进 root modules。临时端到端测试可以串联这些命令，但应通过输出文件和配置对接。
+
+## 0. Setup
 
 ```bash
-cd /mnt/workspace/spy/marmalade/marmalade_annotation
-source .venv_annotation/bin/activate
+cd /path/to/marmalade_annotation
+source .venv/bin/activate  # 或你的云端环境
+```
+
+如需跑 SAM3 / DA3：
+
+```bash
 export HF_ENDPOINT=https://hf-mirror.com
 ```
 
-The verified environment is Python 3.12 with torch cu121, SAM3 weights at `models/sam3`, and DA3Metric loaded from `depth-anything/DA3METRIC-LARGE`.
+## 1. Precheck
 
-## 1. Dry-Run Discovery
+先改 `configs/precheck_example.yaml` 的 `input_paths` 和 `output_dir`。
 
-Dry-run reads real AnyGrasp `expand_task` metadata and writes instruction -> queries mappings. It does not decode video frames or run models.
+```bash
+python run_precheck.py configs/precheck_example.yaml
+```
+
+输出：
+
+```text
+outputs/precheck_example/check_results.json
+outputs/precheck_example/clip_aggregates.json
+```
+
+常看字段：
+
+- `text_integrity.missing_field_count`
+- `quality_score.pass_ratio`
+- `skeleton_quality_score.pass_ratio`
+- `skeleton_quality_score.mean_skeleton_score`
+- `composite_frame_verdict.count_suspect`
+
+## 2. SAM3 Keypoint Containment 抽检
+
+云端 GPU 上跑：
+
+```bash
+python tools/sam3_keypoint_containment.py \
+  --hdf5-dir /path/to/hdf5 \
+  --video-dir /path/to/mp4 \
+  --sam3-model /path/to/sam3 \
+  --output-dir outputs/sam3_keypoint_containment_smoke \
+  --sample-fraction 0.10 \
+  --max-clips 2 \
+  --max-sampled-frames-per-clip 5 \
+  --projection-mode auto
+```
+
+确认 OK 后去掉 smoke 限制：
+
+```bash
+python tools/sam3_keypoint_containment.py \
+  --hdf5-dir /path/to/hdf5 \
+  --video-dir /path/to/mp4 \
+  --sam3-model /path/to/sam3 \
+  --output-dir outputs/sam3_keypoint_containment \
+  --sample-fraction 0.10 \
+  --projection-mode auto
+```
+
+输出：
+
+```text
+frame_keypoint_containment.json
+clip_keypoint_containment.json
+run_manifest.json
+```
+
+核心字段：
+
+```text
+clip_keypoint_inside_ratio
+valid_projected_inside_ratio
+```
+
+## 3. Annotation
+
+Dry-run discovery：
 
 ```bash
 python run_dryrun.py configs/anygrasp_dryrun.yaml
-cat outputs/anygrasp_dryrun/discovery_queries.jsonl
 ```
 
-Expected ep0 instruction:
-
-```text
-Pick the green bottle from the table and place it inside the blue basket.
-```
-
-With the temporary rule extractor, expected queries include `green bottle`, `blue basket`, `robot hand`, and possibly one noisy long phrase.
-
-## 2. Full Annotation
+完整 annotation：
 
 ```bash
-HF_HOME=/tmp/hf-home MPLCONFIGDIR=/tmp/matplotlib \
 python run_annotate.py configs/anygrasp_full.yaml
 ```
 
-Outputs:
-
-```text
-<output_dir>/masks.parquet
-<output_dir>/depth/observation.images.top/episode_000000/frame_000000.png
-<output_dir>/depth/observation.images.top/episode_000000/frame_000000.json
-<output_dir>/qc/qc_ep000000_frame000000.png
-<output_dir>/.checkpoints/completed_episodes.json
-```
-
-Resume is automatic when the same config/output directory is rerun. Current CLI initializes models before entering the pipeline, so checkpoint skip avoids frame processing but not model startup cost.
-
-## 3. Delivery Checks
-
-Small multi-episode robustness check:
+只跑 SAM3 segmentation：
 
 ```bash
-HF_HOME=/tmp/hf-home MPLCONFIGDIR=/tmp/matplotlib \
-python run_annotate.py configs/delivery_rule_small_batch.yaml
+python run_annotate.py configs/seg_only.yaml --stage segmentation
 ```
 
-Clean-query ceiling check:
+只跑 DA3 depth：
 
 ```bash
-HF_HOME=/tmp/hf-home MPLCONFIGDIR=/tmp/matplotlib \
-python run_annotate.py configs/delivery_rule_clean_compare.yaml
-HF_HOME=/tmp/hf-home MPLCONFIGDIR=/tmp/matplotlib \
-python run_annotate.py configs/delivery_manual_clean_queries.yaml
+python run_annotate.py configs/depth_only.yaml --stage depth
 ```
 
-Comparison images:
+Mock 验证：
 
-```text
-outputs/delivery_checks/qc_comparisons/compare_ep000000_frame000170.png
-outputs/delivery_checks/qc_comparisons/compare_ep000001_frame000198.png
-outputs/delivery_checks/qc_comparisons/compare_ep000014_frame000180.png
+```bash
+python run_annotate.py configs/anygrasp_full.yaml --use-mock
 ```
 
-## 4. Key Config Fields
+## 4. Annotation Verify
 
-```yaml
-dataset_type: lerobot_v3
-episode_indices: [0, 1, 2]          # optional subset
-sample_frames_per_episode: 5        # optional uniform sampling
+当前是 semantic verification stub：
 
-discovery:
-  extractor: rule                   # rule | manual | qwen | mock
-  instruction_source: episode_field
-  instruction_field: expand_task
-  always_include:
-    - robot hand
-    - gripper
-
-segmentation:
-  model_path: models/sam3
-
-depth:
-  model_path: depth-anything/DA3METRIC-LARGE
-  output_metric: true
-  fx: 369.81
-  fy: 341.14
-  calibration_width: 832
-  calibration_height: 480
+```bash
+python run_annotation_verify.py configs/annotation_verify_example.yaml
 ```
 
-For another dataset, update YAML first. Do not hardcode dataset-specific paths in the pipeline.
+未来接 VLM 时仍只做语义一致性，不做 precheck signal-quality。
 
-Instruction source options:
+## 5. Validation
 
-- `episode_field`: read a text field from `meta/episodes/...parquet`.
-- `join_file`: read a separate parquet table and join by configured keys.
-- `none`: no language available; logs warning and falls back to defaults/vocab.
+轻量 smoke：
 
-## 5. Intern Handoff
-
-The pipeline wiring is done. The main remaining work is discovery quality.
-
-- Implement real Qwen loading and generation in `annotation/discovery/qwen_extractor.py`.
-- Keep `discover_objects(instruction, config) -> list[str]` unchanged.
-- Use `annotation/discovery/factory.py` and `discovery.extractor: qwen` to switch it on.
-- The rule extractor is intentionally temporary and can emit noisy broad/long queries.
-- Use `manual` extractor configs as an oracle reference for expected clean object names.
-
-## 6. Reading Outputs
-
-```python
-import pandas as pd
-
-df = pd.read_parquet('outputs/delivery_checks/manual_clean_queries/masks.parquet')
-print(df[['episode_idx', 'frame_idx', 'category', 'score', 'bbox']].head())
+```bash
+python -m pytest tests/test_qc_modules_smoke.py
+python -m compileall qc_common precheck annotation_verify annotation tools
 ```
 
-Depth PNGs are metric millimeters. Divide uint16 pixel values by 1000 to recover meters; the JSON sidecar records original min/max and conversion notes.
+## 6. Cloud Pull
+
+云端直接拉当前 feature branch：
+
+```bash
+git clone git@github.com:spyzss/data.git
+cd data
+git checkout feat/qc-modules
+```
+
+如果已经 clone：
+
+```bash
+git fetch origin
+git checkout feat/qc-modules
+git pull origin feat/qc-modules
+```

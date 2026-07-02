@@ -112,6 +112,27 @@ def _displacement_jump_clip(episode_idx: int) -> ClipInputs:
     )
 
 
+def _write_minimal_supplier_hdf5(path: Path, quality_hand: np.ndarray) -> None:
+    import h5py
+
+    num_frames = int(quality_hand.shape[0])
+    transforms = np.repeat(np.eye(4, dtype=np.float32)[None, :, :], num_frames, axis=0)
+    transforms[:, 2, 3] = 1.0
+    with h5py.File(path, "w") as handle:
+        transform_group = handle.create_group("transforms")
+        transform_group.create_dataset("leftHand", data=transforms)
+        transform_group.create_dataset("rightHand", data=transforms)
+        label_group = handle.create_group("label")
+        label_group.create_dataset("quality_hand", data=quality_hand.astype(np.float32))
+        handle.create_group("camera").create_dataset(
+            "intrinsic",
+            data=np.asarray(
+                [[1000.0, 0.0, 640.0], [0.0, 1000.0, 360.0], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            ),
+        )
+
+
 def test_qc_runners_smoke(tmp_path: Path) -> None:
     num_frames = 12
     keypoints = _synthetic_keypoints(num_frames)
@@ -199,7 +220,37 @@ def test_qc_runners_smoke(tmp_path: Path) -> None:
     verify_results = AnnotationVerifyRunner(verify_config).run([clip])
     assert verify_results
     assert all(result.check == "instruction_consistency" for result in verify_results)
+    assert all(result.frame_idx == -1 for result in verify_results)
     assert all(result.flag is None for result in verify_results)
+    assert (tmp_path / "verify" / "check_results.json").exists()
+    assert (tmp_path / "verify" / "clip_aggregates.json").exists()
+
+
+def test_precheck_directory_input_auto_adapter(tmp_path: Path) -> None:
+    hdf5_dir = tmp_path / "supplier_hdf5"
+    hdf5_dir.mkdir()
+    _write_minimal_supplier_hdf5(
+        hdf5_dir / "episode_000001.hdf5",
+        np.asarray([[1.0, 1.0], [0.0, 1.0]], dtype=np.float32),
+    )
+    _write_minimal_supplier_hdf5(
+        hdf5_dir / "episode_000002.hdf5",
+        np.asarray([[1.0, 1.0], [1.0, 1.0]], dtype=np.float32),
+    )
+
+    config = PrecheckConfig(
+        output_dir=tmp_path / "precheck_directory",
+        input_paths=[hdf5_dir],
+        enabled_checks=["quality_score"],
+        overwrite=True,
+    )
+    results = PrecheckRunner(config).run()
+
+    summaries = [result for result in results if result.frame_idx == -1]
+    assert len(summaries) == 2
+    assert [summary.episode_idx for summary in summaries] == [0, 1]
+    assert summaries[0].metrics["pass_ratio"] == 0.5
+    assert summaries[1].metrics["pass_ratio"] == 1.0
 
 
 def test_quality_score_check(tmp_path: Path) -> None:

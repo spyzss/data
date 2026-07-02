@@ -77,7 +77,7 @@ CheckResult(
     check: str,
     episode_idx: int,
     frame_idx: int,
-    metrics: dict[str, float],
+    metrics: dict[str, Any],
     flag: bool | None,
     reason: str,
 )

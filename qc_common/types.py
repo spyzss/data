@@ -19,7 +19,7 @@ class CheckResult:
     check: str
     episode_idx: int
     frame_idx: int
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(default_factory=dict)
     flag: bool | None = None
     reason: str = ""
 

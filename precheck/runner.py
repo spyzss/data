@@ -19,7 +19,7 @@ from qc_common.io import (
 )
 from qc_common.types import CheckResult, ClipInputs
 
-from .adapters import load_supplier_hdf5_clip
+from .adapters import load_precheck_inputs
 from .config import PrecheckConfig
 
 # Populate registry via decorators.
@@ -28,7 +28,7 @@ from .registry import create_check
 
 logger = logging.getLogger(__name__)
 
-ClipLoader = Callable[[Path, int | None, float | None], ClipInputs]
+ClipLoader = Callable[[Path, int | None, float | None], list[ClipInputs]]
 
 
 class PrecheckRunner:
@@ -40,7 +40,7 @@ class PrecheckRunner:
         clip_loader: ClipLoader | None = None,
     ) -> None:
         self.config = config
-        self.clip_loader = clip_loader or load_supplier_hdf5_clip
+        self.clip_loader = clip_loader or load_precheck_inputs
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.repair_records: list[dict] = []
@@ -84,8 +84,11 @@ class PrecheckRunner:
 
     def _load_configured_clips(self) -> list[ClipInputs]:
         clips: list[ClipInputs] = []
-        for offset, path in enumerate(self.config.input_paths):
-            clips.append(self.clip_loader(path, offset, self.config.fps))
+        next_episode_idx = 0
+        for path in self.config.input_paths:
+            loaded_clips = self.clip_loader(path, next_episode_idx, self.config.fps)
+            clips.extend(loaded_clips)
+            next_episode_idx += len(loaded_clips)
         return clips
 
     def _failure_rows(
