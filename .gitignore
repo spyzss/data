@@ -15,6 +15,10 @@ env/
 
 # === Large outputs / annotation results ===
 outputs/
+*.h5
+*.hdf5
+*.obdownload
+*.parquet
 *.png
 *.jpg
 *.jpeg
@@ -24,6 +28,7 @@ outputs/
 
 # === Debug archive (one-off diagnostic scripts/images) ===
 archive/
+inspect_rig.py
 
 # === Agent / tooling logs ===
 .agent_logs/

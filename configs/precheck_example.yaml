@@ -1,0 +1,155 @@
+composite_frame_verdict:
+  joint_acceleration_m_s2_max_threshold: 15.0
+  joint_angle_change_deg_max_threshold: 10.0
+  joint_displacement_m_max_threshold: 0.05
+  pass_threshold: 0.9
+  rotation_delta_max_threshold: 0.45
+enabled_checks:
+- keypoint_temporal
+- keypoint_missing
+- quality_score
+- text_integrity
+- skeleton_quality_score
+- composite_frame_verdict
+fps: 29.97
+input_paths:
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100003_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100030_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100044_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100560_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100655_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100669_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100677_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100679_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100682_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100695_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100698_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100701_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100706_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100712_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100713_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100716_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100721_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100723_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100724_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100728_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100730_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100735_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100739_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100743_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100744_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100745_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100746_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100750_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100751_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100752_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100755_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100756_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100758_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100760_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100763_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100765_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100766_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100774_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100776_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100778_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100780_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100782_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100784_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100785_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100787_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100789_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100791_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100793_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100794_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100799_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10079_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100800_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100802_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10081_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100823_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100824_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10082_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10083_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10084_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10085_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10090_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10091_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100946_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100950_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100952_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/100962_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10099_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10106_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10110_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10111_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10112_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10125_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10132_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/10135_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/102386_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/102387_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/102430_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/102435_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/102762_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/102779_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/102790_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/102791_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/102792_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104127_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104128_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104134_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104153_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104158_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104165_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104191_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104231_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104237_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104243_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104251_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104274_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104285_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104291_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104292_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104299_hdf5.hdf5
+- /Users/nathanlou/Downloads/XJGT_20260629_hdf5/hdf5/104306_hdf5.hdf5
+keypoint_missing:
+  allowed_missing_seconds: 1.0
+  fps: null
+  joint_names: null
+  sides:
+  - left
+  - right
+  window_seconds: 10.0
+keypoint_temporal:
+  fps: null
+  joint_names: null
+  max_angle_degrees: 175.0
+  min_angle_degrees: 5.0
+  project_2d: true
+  sides:
+  - left
+  - right
+mask_containment:
+  joint_names: null
+  sides:
+  - left
+  - right
+output_dir: outputs/precheck_example
+overexposure:
+  fraction_threshold: null
+  near_saturation: 250
+overwrite: false
+quality_score:
+  pass_threshold: 0.9
+skeleton_quality_score:
+  joint_acceleration_m_s2_max_threshold: 15.0
+  joint_angle_change_deg_max_threshold: 10.0
+  joint_displacement_m_max_threshold: 0.05
+  pass_threshold: 0.9
+  rotation_delta_max_threshold: 0.45
+text_integrity:
+  required_fields:
+  - scene
+  - task
+  - text_en

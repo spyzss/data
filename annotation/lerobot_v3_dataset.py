@@ -12,7 +12,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -442,4 +441,6 @@ class LeRobotV3Dataset:
                 ],
                 check=True,
             )
+            from PIL import Image
+
             return np.array(Image.open(tmp.name).convert("RGB"))
