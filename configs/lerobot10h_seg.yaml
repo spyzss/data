@@ -1,0 +1,54 @@
+# Segmentation-only config for a LeRobot v3 dataset.
+# Fill dataset_path, camera_names, and instruction_field for the target dataset.
+# Run with: python run_annotate.py configs/lerobot10h_seg.yaml --stage segmentation
+
+dataset_path: /path/to/lerobot_v3_dataset  # TODO: set LeRobot v3 dataset root
+dataset_type: lerobot_v3
+camera_names:
+  - observation.images.top  # TODO: set camera feature name(s)
+
+dry_run: false
+stage: segmentation
+
+sampling:
+  mode: subtask_aware
+  stride_frames: 30
+  keep_subtask_boundaries: true
+
+discovery:
+  mode: instruction
+  extractor: qwen
+  always_include:
+    - robot hand
+    - gripper
+  instruction_source: episode_field
+  instruction_field: expand_task  # TODO: set instruction field in episode metadata
+  default_instruction: ""
+  qwen_endpoint: http://qwen-service-host:8000/v1/chat/completions  # TODO: set service URL
+  qwen_model: qwen3-placeholder  # TODO: set served model name
+  qwen_temperature: 0.0
+  qwen_max_tokens: 128
+  qwen_timeout: 30.0
+  qwen_api_key: null
+
+segmentation:
+  model_path: models/sam3
+  model_type: sam3
+  confidence_threshold: 0.5
+  mask_threshold: 0.5
+  max_instances_per_query: 10
+
+storage:
+  output_dir: ./outputs/lerobot10h_seg
+  mask_format: parquet
+  overwrite: false
+
+qc:
+  enabled: true
+  num_frames_per_episode: 5
+  output_dir: null
+  colormap: turbo
+
+checkpoint_dir: null
+num_workers: 1
+log_level: INFO

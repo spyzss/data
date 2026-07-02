@@ -24,7 +24,13 @@ class DiscoveryConfig:
     extractor: Literal["qwen", "rule", "mock", "manual"] = "qwen"
     always_include: list[str] = field(default_factory=lambda: ["robot hand"])
     vocab_file: Path | None = None  # Required if mode == "vocab"
-    qwen_model_path: Path | None = None  # Required if extractor == "qwen"
+    qwen_model_path: Path | None = None  # Deprecated; Qwen now uses HTTP config below
+    qwen_endpoint: str = "http://localhost:8000/v1/chat/completions"
+    qwen_model: str = "qwen3-placeholder"
+    qwen_temperature: float = 0.0
+    qwen_max_tokens: int = 128
+    qwen_timeout: float = 30.0
+    qwen_api_key: str | None = None
     manual_queries: dict[str, list[str]] = field(default_factory=dict)
     instruction_source: Literal["episode_field", "join_file", "none"] = "episode_field"
     instruction_field: str = "expand_task"
