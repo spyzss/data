@@ -29,13 +29,14 @@ def load_supplier_hdf5_clip(
 
     hdf5_path = Path(path)
     with h5py.File(hdf5_path, "r") as handle:
-        transforms = handle["transforms"]
         keypoints: dict[str, np.ndarray] = {}
         rotations: dict[str, np.ndarray] = {}
-        for joint in transforms.keys():
-            matrix = np.asarray(transforms[joint], dtype=np.float32)
-            keypoints[joint] = matrix[:, :3, 3]
-            rotations[joint] = matrix[:, :3, :3]
+        if "transforms" in handle:
+            transforms = handle["transforms"]
+            for joint in transforms.keys():
+                matrix = np.asarray(transforms[joint], dtype=np.float32)
+                keypoints[joint] = matrix[:, :3, 3]
+                rotations[joint] = matrix[:, :3, :3]
 
         confidences: dict[str, np.ndarray] = {}
         if "confidences" in handle:
@@ -74,7 +75,12 @@ def load_supplier_hdf5_clip(
         if discovered_fps is None:
             discovered_fps = 30.0
 
-    num_frames = int(next(iter(keypoints.values())).shape[0]) if keypoints else 0
+    if keypoints:
+        num_frames = int(next(iter(keypoints.values())).shape[0])
+    elif quality_hand is not None:
+        num_frames = int(quality_hand.shape[0])
+    else:
+        num_frames = 0
     if episode_idx is None:
         digits = "".join(ch for ch in hdf5_path.stem if ch.isdigit())
         episode_idx = int(digits) if digits else 0

@@ -5,6 +5,7 @@ import numpy as np
 
 from annotation_verify.config import AnnotationVerifyConfig
 from annotation_verify.runner import AnnotationVerifyRunner
+from precheck.adapters.supplier_hdf5 import load_supplier_hdf5_clip
 from precheck.config import PrecheckConfig, SkeletonQualityScoreConfig
 from precheck.registry import available_checks
 from precheck.runner import PrecheckRunner
@@ -131,6 +132,36 @@ def _write_minimal_supplier_hdf5(path: Path, quality_hand: np.ndarray) -> None:
                 dtype=np.float32,
             ),
         )
+
+
+def test_supplier_hdf5_loader_without_transforms(tmp_path: Path) -> None:
+    import h5py
+
+    path = tmp_path / "no_transforms.h5"
+    quality_hand = np.asarray([[1.0, 1.0], [0.5, 1.0], [0.0, 1.0]], dtype=np.float32)
+    with h5py.File(path, "w") as handle:
+        label_group = handle.create_group("label")
+        label_group.create_dataset("quality_hand", data=quality_hand)
+        label_group.create_dataset(
+            "text_label",
+            data=json.dumps(
+                {"scene": "bedroom", "task": "fold clothes", "text_en": "Fold clothes."}
+            ).encode("utf-8"),
+        )
+
+    clip = load_supplier_hdf5_clip(path, episode_idx=12, fps=29.97)
+
+    assert clip.episode_idx == 12
+    assert clip.num_frames == 3
+    assert clip.frame_indices == [0, 1, 2]
+    assert clip.keypoints == {}
+    assert clip.rotations == {}
+    assert np.array_equal(clip.quality_hand, quality_hand)
+    assert clip.text_label == {
+        "scene": "bedroom",
+        "task": "fold clothes",
+        "text_en": "Fold clothes.",
+    }
 
 
 def test_qc_runners_smoke(tmp_path: Path) -> None:
