@@ -164,6 +164,40 @@ def test_supplier_hdf5_loader_without_transforms(tmp_path: Path) -> None:
     }
 
 
+def test_supplier_hdf5_loader_mano_joints3d_schema(tmp_path: Path) -> None:
+    import h5py
+
+    path = tmp_path / "mano_schema.h5"
+    num_frames = 4
+    left_joints = np.zeros((num_frames, 21, 3), dtype=np.float32)
+    right_joints = np.ones((num_frames, 21, 3), dtype=np.float32)
+    for frame_idx in range(num_frames):
+        left_joints[frame_idx, :, 0] = frame_idx
+        right_joints[frame_idx, :, 0] = frame_idx + 10
+
+    with h5py.File(path, "w") as handle:
+        hand = handle.create_group("hand")
+        left = hand.create_group("left")
+        left.create_dataset("joints3d", data=left_joints)
+        left.create_dataset("valid", data=np.asarray([1, 1, 0, 1], dtype=np.bool_))
+        right = hand.create_group("right")
+        right.create_dataset("joints3d", data=right_joints)
+        right.create_dataset("valid", data=np.asarray([1, 0, 1, 1], dtype=np.bool_))
+
+    clip = load_supplier_hdf5_clip(path, episode_idx=13, fps=29.97)
+
+    assert clip.num_frames == num_frames
+    assert len(clip.keypoints or {}) == 42
+    assert np.array_equal(clip.keypoints["leftHand"], left_joints[:, 0, :])
+    assert np.array_equal(clip.keypoints["leftThumbTip"], left_joints[:, 16, :])
+    assert np.array_equal(clip.keypoints["leftIndexFingerTip"], left_joints[:, 17, :])
+    assert np.array_equal(clip.keypoints["rightLittleFingerTip"], right_joints[:, 20, :])
+    assert np.array_equal(
+        clip.quality_hand,
+        np.asarray([[1.0, 1.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32),
+    )
+
+
 def test_qc_runners_smoke(tmp_path: Path) -> None:
     num_frames = 12
     keypoints = _synthetic_keypoints(num_frames)

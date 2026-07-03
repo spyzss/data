@@ -10,6 +10,31 @@ from qc_common.hdf5_loader import read_scalar_json
 from qc_common.types import ClipInputs
 
 
+MANO_JOINT_INDEX_TO_ACCEPTANCE_BASE = {
+    0: "Hand",
+    13: "ThumbKnuckle",
+    14: "ThumbIntermediateBase",
+    15: "ThumbIntermediateTip",
+    16: "ThumbTip",
+    1: "IndexFingerKnuckle",
+    2: "IndexFingerIntermediateBase",
+    3: "IndexFingerIntermediateTip",
+    17: "IndexFingerTip",
+    4: "MiddleFingerKnuckle",
+    5: "MiddleFingerIntermediateBase",
+    6: "MiddleFingerIntermediateTip",
+    18: "MiddleFingerTip",
+    10: "RingFingerKnuckle",
+    11: "RingFingerIntermediateBase",
+    12: "RingFingerIntermediateTip",
+    19: "RingFingerTip",
+    7: "LittleFingerKnuckle",
+    8: "LittleFingerIntermediateBase",
+    9: "LittleFingerIntermediateTip",
+    20: "LittleFingerTip",
+}
+
+
 def load_supplier_hdf5_clip(
     path: str | Path,
     episode_idx: int | None = None,
@@ -37,6 +62,8 @@ def load_supplier_hdf5_clip(
                 matrix = np.asarray(transforms[joint], dtype=np.float32)
                 keypoints[joint] = matrix[:, :3, 3]
                 rotations[joint] = matrix[:, :3, :3]
+        elif "hand" in handle:
+            keypoints.update(_load_mano_joints3d(handle))
 
         confidences: dict[str, np.ndarray] = {}
         if "confidences" in handle:
@@ -48,6 +75,8 @@ def load_supplier_hdf5_clip(
         quality_hand = None
         if "label" in handle and "quality_hand" in handle["label"]:
             quality_hand = np.asarray(handle["label"]["quality_hand"], dtype=np.float32)
+        elif "hand" in handle:
+            quality_hand = _load_mano_valid_as_quality_hand(handle)
 
         instruction = ""
         text_label = None
@@ -99,3 +128,33 @@ def load_supplier_hdf5_clip(
         intrinsics=intrinsics,
         fps=discovered_fps,
     )
+
+
+def _load_mano_joints3d(handle) -> dict[str, np.ndarray]:
+    """Map hand/<side>/joints3d MANO-style arrays into canonical hand joints."""
+    keypoints: dict[str, np.ndarray] = {}
+    hand_group = handle["hand"]
+    for side in ("left", "right"):
+        if side not in hand_group or "joints3d" not in hand_group[side]:
+            continue
+        joints = np.asarray(hand_group[side]["joints3d"], dtype=np.float32)
+        if joints.ndim != 3 or joints.shape[1] < 21 or joints.shape[2] < 3:
+            continue
+        for index, base_name in MANO_JOINT_INDEX_TO_ACCEPTANCE_BASE.items():
+            joint_name = f"{side}{base_name}"
+            keypoints[joint_name] = joints[:, index, :3]
+    return keypoints
+
+
+def _load_mano_valid_as_quality_hand(handle) -> np.ndarray | None:
+    """Use hand/<side>/valid as an optional supplier validity signal."""
+    hand_group = handle["hand"]
+    side_values: list[np.ndarray] = []
+    for side in ("left", "right"):
+        if side not in hand_group or "valid" not in hand_group[side]:
+            return None
+        side_values.append(np.asarray(hand_group[side]["valid"], dtype=np.float32))
+    num_frames = min(len(values) for values in side_values)
+    if num_frames == 0:
+        return None
+    return np.stack([values[:num_frames] for values in side_values], axis=1)
