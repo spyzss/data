@@ -53,3 +53,8 @@ hf-cache/
 *.swp
 .idea/
 .vscode/
+
+# QC generated artifacts
+outputs/
+*_outputs.tar.gz
+test_*_batch/quality_archive/

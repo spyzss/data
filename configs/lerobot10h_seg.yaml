@@ -18,18 +18,17 @@ sampling:
 discovery:
   mode: instruction
   extractor: qwen
+  instruction_source: episode_field
+  instruction_field: tasks
   always_include:
     - robot hand
     - gripper
-  instruction_source: episode_field
-  instruction_field: expand_task  # TODO: set instruction field in episode metadata
-  default_instruction: ""
-  qwen_endpoint: http://qwen-service-host:8000/v1/chat/completions  # TODO: set service URL
-  qwen_model: qwen3-placeholder  # TODO: set served model name
-  qwen_temperature: 0.0
-  qwen_max_tokens: 128
-  qwen_timeout: 30.0
+  qwen_endpoint: http://10.0.0.7:8000/v1/chat/completions
+  qwen_model: qwen3
   qwen_api_key: null
+  qwen_temperature: 0.0
+  qwen_max_tokens: 256
+  qwen_timeout: 60.0
 
 segmentation:
   model_path: models/sam3
