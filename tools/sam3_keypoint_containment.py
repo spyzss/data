@@ -68,6 +68,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-threshold", type=float, default=0.5)
     parser.add_argument("--max-instances-per-query", type=int, default=10)
     parser.add_argument(
+        "--abnormal-inside-ratio-threshold",
+        type=float,
+        default=1.0,
+        help=(
+            "Frame-level abnormal threshold. A sampled frame is abnormal when "
+            "keypoint_inside_ratio is below this value. The default 1.0 means "
+            "any expected acceptance keypoint outside the SAM3 mask, including "
+            "unprojectable keypoints, marks the frame abnormal."
+        ),
+    )
+    parser.add_argument(
         "--video-patterns",
         default="{episode_id}.mp4,{stem}.mp4,{stem_no_hdf5}.mp4",
         help=(
@@ -88,6 +99,8 @@ def main() -> None:
     )
     if not 0.0 < args.sample_fraction <= 1.0:
         raise ValueError("--sample-fraction must be in (0, 1]")
+    if not 0.0 <= args.abnormal_inside_ratio_threshold <= 1.0:
+        raise ValueError("--abnormal-inside-ratio-threshold must be in [0, 1]")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     hdf5_paths = sorted(args.hdf5_dir.glob("*.hdf5"))
@@ -130,6 +143,7 @@ def main() -> None:
                 sample_fraction=args.sample_fraction,
                 max_sampled_frames=args.max_sampled_frames_per_clip,
                 projection_mode=args.projection_mode,
+                abnormal_inside_ratio_threshold=args.abnormal_inside_ratio_threshold,
                 sam3_config={
                     "confidence_threshold": args.confidence_threshold,
                     "mask_threshold": args.mask_threshold,
@@ -152,6 +166,7 @@ def main() -> None:
             "sam3_model": str(args.sam3_model),
             "sample_fraction": args.sample_fraction,
             "queries": queries,
+            "abnormal_inside_ratio_threshold": args.abnormal_inside_ratio_threshold,
             "num_clips": len(clip_rows),
         },
         args.output_dir / "run_manifest.json",
@@ -167,6 +182,7 @@ def process_clip(
     sample_fraction: float,
     max_sampled_frames: int | None,
     projection_mode: str,
+    abnormal_inside_ratio_threshold: float,
     sam3_config: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import h5py
@@ -237,6 +253,16 @@ def process_clip(
             inside[in_bounds] = union_mask[rounded[in_bounds, 1], rounded[in_bounds, 0]]
 
         inside_count = int(np.sum(inside))
+        missing_from_mask_count = int(valid_count - inside_count)
+        expected_missing_from_mask_count = int(total_expected - inside_count)
+        valid_projected_inside_ratio = safe_ratio(inside_count, valid_count)
+        valid_projected_missing_ratio = safe_ratio(missing_from_mask_count, valid_count)
+        keypoint_inside_ratio = safe_ratio(inside_count, total_expected)
+        keypoint_missing_ratio = safe_ratio(expected_missing_from_mask_count, total_expected)
+        abnormal_frame = (
+            keypoint_inside_ratio is not None
+            and keypoint_inside_ratio < abnormal_inside_ratio_threshold
+        )
         mask_area = int(np.sum(union_mask)) if union_mask is not None else 0
         row = {
             "clip_id": clip_id_from_path(hdf5_path),
@@ -249,8 +275,14 @@ def process_clip(
             "sampled_keypoints": int(total_expected),
             "valid_projected_keypoints": valid_count,
             "inside_keypoints": inside_count,
-            "keypoint_inside_ratio": safe_ratio(inside_count, total_expected),
-            "valid_projected_inside_ratio": safe_ratio(inside_count, valid_count),
+            "missing_from_mask_keypoints": missing_from_mask_count,
+            "expected_missing_from_mask_keypoints": expected_missing_from_mask_count,
+            "keypoint_inside_ratio": keypoint_inside_ratio,
+            "keypoint_missing_ratio": keypoint_missing_ratio,
+            "valid_projected_inside_ratio": valid_projected_inside_ratio,
+            "valid_projected_missing_ratio": valid_projected_missing_ratio,
+            "abnormal_inside_ratio_threshold": abnormal_inside_ratio_threshold,
+            "abnormal_frame": abnormal_frame,
             "mask_instance_count": len(masks),
             "mask_area": mask_area,
             "mask_area_ratio": safe_ratio(mask_area, frame.shape[0] * frame.shape[1]),
@@ -261,6 +293,9 @@ def process_clip(
         totals["total_expected_keypoints"] += total_expected
         totals["valid_projected_keypoints"] += valid_count
         totals["inside_keypoints"] += inside_count
+        totals["missing_from_mask_keypoints"] += missing_from_mask_count
+        totals["expected_missing_from_mask_keypoints"] += expected_missing_from_mask_count
+        totals["abnormal_frames"] += int(abnormal_frame)
         totals["frames_with_mask"] += int(union_mask is not None and mask_area > 0)
         totals["frames_without_mask"] += int(union_mask is None or mask_area == 0)
         mode_counts[resolved_projection_mode] += 1
@@ -284,15 +319,31 @@ def process_clip(
         "total_expected_keypoints": int(totals["total_expected_keypoints"]),
         "valid_projected_keypoints": int(totals["valid_projected_keypoints"]),
         "inside_keypoints": int(totals["inside_keypoints"]),
+        "missing_from_mask_keypoints": int(totals["missing_from_mask_keypoints"]),
+        "expected_missing_from_mask_keypoints": int(
+            totals["expected_missing_from_mask_keypoints"]
+        ),
         "clip_keypoint_inside_ratio": safe_ratio(
             totals["inside_keypoints"], totals["total_expected_keypoints"]
+        ),
+        "clip_keypoint_missing_ratio": safe_ratio(
+            totals["expected_missing_from_mask_keypoints"],
+            totals["total_expected_keypoints"],
         ),
         "valid_projected_inside_ratio": safe_ratio(
             totals["inside_keypoints"], totals["valid_projected_keypoints"]
         ),
+        "valid_projected_missing_ratio": safe_ratio(
+            totals["missing_from_mask_keypoints"], totals["valid_projected_keypoints"]
+        ),
         "mean_frame_inside_ratio": float(np.mean(ratios)) if ratios else None,
         "mean_valid_projected_inside_ratio": (
             float(np.mean(valid_ratios)) if valid_ratios else None
+        ),
+        "abnormal_inside_ratio_threshold": abnormal_inside_ratio_threshold,
+        "abnormal_frames": int(totals["abnormal_frames"]),
+        "abnormal_frame_ratio": safe_ratio(
+            totals["abnormal_frames"], totals["sampled_frames"]
         ),
         "frames_with_mask": int(totals["frames_with_mask"]),
         "frames_without_mask": int(totals["frames_without_mask"]),
@@ -452,8 +503,14 @@ def error_clip_row(hdf5_path: Path, error: str, video_path: Path | None = None) 
         "total_expected_keypoints": 0,
         "valid_projected_keypoints": 0,
         "inside_keypoints": 0,
+        "missing_from_mask_keypoints": 0,
+        "expected_missing_from_mask_keypoints": 0,
         "clip_keypoint_inside_ratio": None,
+        "clip_keypoint_missing_ratio": None,
         "valid_projected_inside_ratio": None,
+        "valid_projected_missing_ratio": None,
+        "abnormal_frames": 0,
+        "abnormal_frame_ratio": None,
         "error": error,
     }
 

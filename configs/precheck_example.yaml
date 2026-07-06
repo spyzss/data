@@ -46,10 +46,22 @@ keypoint_temporal:
   max_angle_degrees: 175.0
 
 skeleton_quality_score:
+  # any_threshold preserves the original behavior. temporal_triage hard-flags
+  # strong temporal failures and routes moderate/rotation-only frames to mask review.
+  decision_mode: any_threshold
   joint_angle_change_deg_max_threshold: 10.0
   rotation_delta_max_threshold: 0.45
   joint_acceleration_m_s2_max_threshold: 15.0
   joint_displacement_m_max_threshold: 0.05
+  hard_exceeded_metric_count: 3
+  strong_acceleration_ratio: 2.5
+  strong_displacement_ratio: 1.8
+  rotation_mask_review_ratio: 1.0
+  promote_sustained_review: false
+  sustained_review_min_frames: 6
+  reject_missing_keypoints: true
+  reject_low_quality_hand: false
+  allowed_missing_keypoints_per_hand: 0
   pass_threshold: 0.90
 
 composite_frame_verdict:

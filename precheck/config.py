@@ -57,6 +57,16 @@ class SkeletonQualityScoreConfig:
     rotation_delta_max_threshold: float = 0.45
     joint_acceleration_m_s2_max_threshold: float = 15.0
     joint_displacement_m_max_threshold: float = 0.05
+    decision_mode: str = "any_threshold"
+    hard_exceeded_metric_count: int = 3
+    strong_acceleration_ratio: float = 2.5
+    strong_displacement_ratio: float = 1.8
+    rotation_mask_review_ratio: float = 1.0
+    promote_sustained_review: bool = False
+    sustained_review_min_frames: int = 6
+    reject_missing_keypoints: bool = True
+    reject_low_quality_hand: bool = False
+    allowed_missing_keypoints_per_hand: int = 0
     pass_threshold: float = 0.90
 
 
