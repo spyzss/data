@@ -79,9 +79,11 @@ class SkeletonQualityScoreConfig:
     projection_outside_count_threshold: int = 1
     projection_center_jump_px_threshold: float = 120.0
     projection_bbox_area_change_ratio_threshold: float = 3.0
+    candidate_gap_close_frames: int = 2
+    candidate_min_seed_run_frames: int = 3
     candidate_pre_context_frames: int = 10
     candidate_post_context_frames: int = 10
-    candidate_merge_gap_frames: int = 5
+    candidate_merge_overlapping_only: bool = True
     pass_threshold: float = 0.90
 
 

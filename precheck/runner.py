@@ -31,6 +31,18 @@ logger = logging.getLogger(__name__)
 ClipLoader = Callable[[Path, int | None, float | None], list[ClipInputs]]
 
 
+def _infer_asset_id_from_path(path: Path) -> str | None:
+    """Infer a human asset id from a configured single-file input path."""
+    if not path.is_file():
+        return None
+    stem = path.stem
+    for suffix in ("_hdf5", "-hdf5", "_video", "-video"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return stem or None
+
+
 class PrecheckRunner:
     """Run configured prechecks on clips without depending on annotation stages."""
 
@@ -91,6 +103,11 @@ class PrecheckRunner:
         next_episode_idx = 0
         for path in self.config.input_paths:
             loaded_clips = self.clip_loader(path, next_episode_idx, self.config.fps)
+            inferred_asset_id = _infer_asset_id_from_path(Path(path))
+            if inferred_asset_id is not None and len(loaded_clips) == 1:
+                clip = loaded_clips[0]
+                if getattr(clip, "asset_id", None) is None:
+                    setattr(clip, "asset_id", inferred_asset_id)
             clips.extend(loaded_clips)
             next_episode_idx += len(loaded_clips)
         return clips
@@ -171,9 +188,14 @@ class PrecheckRunner:
                 ),
                 encoding="utf-8",
             )
-            write_dataframe(
+            candidate_parquet_path = write_dataframe(
                 pd.DataFrame(self.candidate_window_records),
                 self.output_dir / "candidate_windows.parquet",
+            )
+            logger.info(
+                "Wrote candidate windows to %s and %s",
+                candidate_path,
+                candidate_parquet_path,
             )
         logger.info(
             "Wrote precheck results to %s, %s, %s and %s",

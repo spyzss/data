@@ -108,14 +108,18 @@ class SkeletonQualityScoreCheck(BaseCheck):
         self.projection_bbox_area_change_ratio_threshold = float(
             config.get("projection_bbox_area_change_ratio_threshold", 3.0)
         )
-        self.candidate_pre_context_frames = int(
-            config.get("candidate_pre_context_frames", 10)
+        self.candidate_gap_close_frames = int(
+            config.get("candidate_gap_close_frames", 2)
         )
+        self.candidate_min_seed_run_frames = int(
+            config.get("candidate_min_seed_run_frames", 3)
+        )
+        self.candidate_pre_context_frames = int(config.get("candidate_pre_context_frames", 10))
         self.candidate_post_context_frames = int(
             config.get("candidate_post_context_frames", 10)
         )
-        self.candidate_merge_gap_frames = int(
-            config.get("candidate_merge_gap_frames", 5)
+        self.candidate_merge_overlapping_only = bool(
+            config.get("candidate_merge_overlapping_only", True)
         )
         self.pass_threshold = float(config.get("pass_threshold", 0.90))
         self.temporal_check = KeypointTemporalCheck({})
@@ -548,38 +552,153 @@ class SkeletonQualityScoreCheck(BaseCheck):
         clip: ClipInputs,
         results: list[CheckResult],
     ) -> list[dict[str, Any]]:
-        triggers_by_hand: dict[str, list[dict[str, Any]]] = {"left": [], "right": [], "both": []}
+        asset_id = getattr(clip, "asset_id", None)
+        seeds: list[dict[str, Any]] = []
         for result in results:
-            metrics = result.metrics
             if result.frame_idx < 0:
                 continue
-            if bool(metrics.get("keypoint_presence_invalid", 0.0)):
-                continue
-            temporal_trigger = (
-                result.flag is True
-                and metrics.get("skeleton_verdict") == "suspect"
-            )
-            has_side_trigger = False
-            for side in ("left", "right"):
-                side_trigger = bool(metrics.get(f"{side}_needs_projection_review", 0.0)) or bool(
-                    metrics.get(f"{side}_needs_out_of_frame_review", 0.0)
-                ) or bool(metrics.get(f"{side}_needs_rotation_mask_review", 0.0))
-                if side_trigger:
-                    has_side_trigger = True
-                    triggers_by_hand[side].append(
-                        self.trigger_record(result, side)
-                    )
-            fallback_visual_trigger = (
-                bool(metrics.get("needs_visual_review", 0.0))
-                and not has_side_trigger
-            )
-            if temporal_trigger or fallback_visual_trigger:
-                triggers_by_hand["both"].append(self.trigger_record(result, "both"))
+            seed = self.temporal_seed_record(result, asset_id)
+            if seed is not None:
+                seeds.append(seed)
+        seed_runs = self.build_seed_runs(seeds)
+        kept_runs = [
+            run
+            for run in seed_runs
+            if len(run["seeds"]) >= self.candidate_min_seed_run_frames
+        ]
+        expanded = [
+            self.expand_seed_run_window(clip, run)
+            for run in kept_runs
+        ]
+        return self.merge_expanded_seed_windows(expanded)
 
-        windows: list[dict[str, Any]] = []
-        for side, triggers in triggers_by_hand.items():
-            windows.extend(self.merge_trigger_windows(clip, side, triggers))
-        return windows
+    def temporal_seed_record(
+        self,
+        result: CheckResult,
+        asset_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        metrics = result.metrics
+        if bool(metrics.get("keypoint_presence_invalid", 0.0)):
+            return None
+        exceeded = set(metrics.get("which_thresholds_exceeded", []))
+        acceleration_seed = (
+            "joint_acceleration_m_s2_max" in exceeded
+            and float(metrics.get("joint_acceleration_m_s2_max", 0.0))
+            > self.joint_acceleration_m_s2_max_threshold
+        )
+        displacement_seed = (
+            "joint_displacement_m_max" in exceeded
+            and float(metrics.get("joint_displacement_m_max", 0.0))
+            > self.joint_displacement_m_max_threshold
+        )
+        multi_signal_seed = len(exceeded.intersection(GEOMETRY_METRIC_NAMES)) >= 2
+        if not (acceleration_seed or displacement_seed or multi_signal_seed):
+            return None
+
+        reasons: list[str] = []
+        if acceleration_seed:
+            reasons.append("acceleration_seed")
+        if displacement_seed:
+            reasons.append("displacement_seed")
+        if multi_signal_seed:
+            reasons.append("multi_signal_seed")
+        return {
+            "episode_idx": result.episode_idx,
+            "asset_id": asset_id,
+            "hand_side": "both",
+            "frame_idx": result.frame_idx,
+            "trigger_reason": reasons,
+            "trigger_metrics": self.window_trigger_metrics(metrics, "both"),
+            "priority_score": self.temporal_seed_priority_score(metrics, reasons),
+        }
+
+    def temporal_seed_priority_score(
+        self,
+        metrics: dict[str, Any],
+        reasons: list[str],
+    ) -> float:
+        score = 0.0
+        if "multi_signal_seed" in reasons:
+            score += 35.0
+        acceleration_ratio = float(
+            metrics.get("joint_acceleration_m_s2_ratio", 0.0) or 0.0
+        )
+        displacement_ratio = float(
+            metrics.get("joint_displacement_m_ratio", 0.0) or 0.0
+        )
+        if "acceleration_seed" in reasons:
+            score += 25.0 + min(30.0, acceleration_ratio * 10.0)
+        if "displacement_seed" in reasons:
+            score += 25.0 + min(30.0, displacement_ratio * 10.0)
+        return score
+
+    def build_seed_runs(self, seeds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not seeds:
+            return []
+        sorted_seeds = sorted(seeds, key=lambda item: item["frame_idx"])
+        runs: list[dict[str, Any]] = []
+        active: dict[str, Any] | None = None
+        for seed in sorted_seeds:
+            frame_idx = int(seed["frame_idx"])
+            if (
+                active is None
+                or frame_idx > int(active["seed_run_end"]) + self.candidate_gap_close_frames + 1
+            ):
+                if active is not None:
+                    runs.append(active)
+                active = {
+                    "episode_idx": seed["episode_idx"],
+                    "asset_id": seed["asset_id"],
+                    "hand_side": seed["hand_side"],
+                    "seed_run_start": frame_idx,
+                    "seed_run_end": frame_idx,
+                    "seeds": [seed],
+                }
+            else:
+                active["seed_run_end"] = frame_idx
+                active["seeds"].append(seed)
+        if active is not None:
+            runs.append(active)
+        return runs
+
+    def expand_seed_run_window(
+        self,
+        clip: ClipInputs,
+        run: dict[str, Any],
+    ) -> dict[str, Any]:
+        max_frame = clip.frame_idx_at(clip.num_frames - 1) if clip.num_frames else 0
+        seed_run_start = int(run["seed_run_start"])
+        seed_run_end = int(run["seed_run_end"])
+        return {
+            **run,
+            "start_frame": max(0, seed_run_start - self.candidate_pre_context_frames),
+            "end_frame": min(max_frame, seed_run_end + self.candidate_post_context_frames),
+        }
+
+    def merge_expanded_seed_windows(
+        self,
+        windows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not windows:
+            return []
+        sorted_windows = sorted(windows, key=lambda item: item["start_frame"])
+        merged: list[dict[str, Any]] = []
+        active: dict[str, Any] | None = None
+        for window in sorted_windows:
+            if active is None or int(window["start_frame"]) > int(active["end_frame"]):
+                if active is not None:
+                    merged.append(self.finalize_window(active))
+                active = dict(window)
+            else:
+                active["end_frame"] = max(int(active["end_frame"]), int(window["end_frame"]))
+                active["seed_run_end"] = max(
+                    int(active["seed_run_end"]),
+                    int(window["seed_run_end"]),
+                )
+                active["seeds"].extend(window["seeds"])
+        if active is not None:
+            merged.append(self.finalize_window(active))
+        return merged
 
     def trigger_record(self, result: CheckResult, side: str) -> dict[str, Any]:
         metrics = result.metrics
@@ -615,7 +734,7 @@ class SkeletonQualityScoreCheck(BaseCheck):
         score = self.trigger_priority_score(metrics, side)
         return {
             "episode_idx": result.episode_idx,
-            "asset_id": str(result.episode_idx),
+            "asset_id": None,
             "hand_side": side,
             "frame_idx": result.frame_idx,
             "priority_score": score,
@@ -700,10 +819,23 @@ class SkeletonQualityScoreCheck(BaseCheck):
         return windows
 
     def finalize_window(self, window: dict[str, Any]) -> dict[str, Any]:
-        peak = max(window["triggers"], key=lambda item: item["priority_score"])
-        reasons = sorted({reason for trigger in window["triggers"] for reason in trigger["trigger_reason"]})
-        review_types = sorted({kind for trigger in window["triggers"] for kind in trigger["review_type"]})
+        seeds = window.get("seeds", window.get("triggers", []))
+        peak = max(seeds, key=lambda item: item["priority_score"])
+        reasons = sorted({reason for seed in seeds for reason in seed["trigger_reason"]})
+        review_types = sorted(
+            {kind for seed in seeds for kind in seed.get("review_type", ["temporal_geometry_review"])}
+        )
         priority_score = float(peak["priority_score"])
+        seed_run_frames = len({int(seed["frame_idx"]) for seed in seeds})
+        seed_run_length = int(window.get("seed_run_end", peak["frame_idx"])) - int(
+            window.get("seed_run_start", peak["frame_idx"])
+        ) + 1
+        priority = "high" if (
+            priority_score >= 80.0
+            or seed_run_frames >= max(5, self.candidate_min_seed_run_frames * 2)
+            or seed_run_length >= max(8, self.candidate_min_seed_run_frames * 3)
+            or "multi_signal_seed" in reasons
+        ) else "medium"
         return {
             "episode_idx": window["episode_idx"],
             "asset_id": window["asset_id"],
@@ -711,10 +843,14 @@ class SkeletonQualityScoreCheck(BaseCheck):
             "start_frame": int(window["start_frame"]),
             "end_frame": int(window["end_frame"]),
             "peak_frame": int(peak["frame_idx"]),
+            "seed_run_start": int(window.get("seed_run_start", peak["frame_idx"])),
+            "seed_run_end": int(window.get("seed_run_end", peak["frame_idx"])),
+            "seed_run_frames": float(seed_run_frames),
             "trigger_reason": reasons,
-            "review_type": review_types,
-            "priority": "high" if priority_score >= 80.0 else "medium" if priority_score >= 40.0 else "low",
+            "review_type": review_types or ["temporal_geometry_review"],
+            "priority": priority,
             "priority_score": priority_score,
+            "window_source": "skeleton_quality_temporal_run",
             "trigger_metrics": peak["trigger_metrics"],
         }
 

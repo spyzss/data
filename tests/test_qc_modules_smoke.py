@@ -6,6 +6,7 @@ import numpy as np
 from annotation_verify.config import AnnotationVerifyConfig
 from annotation_verify.runner import AnnotationVerifyRunner
 from precheck.adapters.supplier_hdf5 import load_supplier_hdf5_clip
+from precheck.checks.skeleton_quality_score import SkeletonQualityScoreCheck
 from precheck.config import PrecheckConfig, SkeletonQualityScoreConfig
 from precheck.registry import available_checks
 from precheck.runner import PrecheckRunner
@@ -117,6 +118,46 @@ def _displacement_jump_clip(episode_idx: int) -> ClipInputs:
         rotations=rotations,
         fps=1.0,
     )
+
+
+def _skeleton_candidate_result(
+    frame_idx: int,
+    exceeded: list[str],
+    flag: bool | None = None,
+    invalid: bool = False,
+) -> CheckResult:
+    metrics = {
+        "joint_angle_change_deg_max": 11.0 if "joint_angle_change_deg_max" in exceeded else 1.0,
+        "rotation_delta_max": 0.5 if "rotation_delta_max" in exceeded else 0.1,
+        "joint_acceleration_m_s2_max": 16.0 if "joint_acceleration_m_s2_max" in exceeded else 1.0,
+        "joint_displacement_m_max": 0.06 if "joint_displacement_m_max" in exceeded else 0.001,
+        "joint_angle_change_deg_ratio": 1.1 if "joint_angle_change_deg_max" in exceeded else 0.1,
+        "rotation_delta_ratio": 1.1 if "rotation_delta_max" in exceeded else 0.1,
+        "joint_acceleration_m_s2_ratio": 1.1 if "joint_acceleration_m_s2_max" in exceeded else 0.1,
+        "joint_displacement_m_ratio": 1.2 if "joint_displacement_m_max" in exceeded else 0.02,
+        "which_thresholds_exceeded": exceeded,
+        "keypoint_presence_invalid": 1.0 if invalid else 0.0,
+        "skeleton_verdict": "invalid" if invalid else "suspect" if flag else "review",
+    }
+    return CheckResult(
+        check="skeleton_quality_score",
+        episode_idx=12,
+        frame_idx=frame_idx,
+        metrics=metrics,
+        flag=flag,
+        reason="synthetic skeleton candidate row",
+    )
+
+
+def _candidate_check(**overrides: object) -> SkeletonQualityScoreCheck:
+    config = {
+        "candidate_gap_close_frames": 2,
+        "candidate_min_seed_run_frames": 3,
+        "candidate_pre_context_frames": 1,
+        "candidate_post_context_frames": 1,
+    }
+    config.update(overrides)
+    return SkeletonQualityScoreCheck(config)
 
 
 def _write_minimal_supplier_hdf5(path: Path, quality_hand: np.ndarray) -> None:
@@ -578,70 +619,167 @@ def test_skeleton_rotation_review_requires_projection_risk(tmp_path: Path) -> No
     assert edge_row.metrics["left_needs_rotation_mask_review"] == 1.0
     assert edge_row.metrics["needs_rotation_mask_review"] == 1.0
     assert edge_row.metrics["needs_visual_review"] == 1.0
-    assert (tmp_path / "rotation_edge_projection" / "candidate_windows.json").exists()
-    edge_windows = json.loads(
-        (tmp_path / "rotation_edge_projection" / "candidate_windows.json").read_text()
-    )
-    assert any(window["hand_side"] == "left" for window in edge_windows)
-    assert not any(window["hand_side"] == "both" for window in edge_windows)
+    assert not (tmp_path / "rotation_edge_projection" / "candidate_windows.json").exists()
 
 
-def test_skeleton_projection_candidate_windows_merge(tmp_path: Path) -> None:
+def test_skeleton_candidate_windows_use_strict_temporal_seed_runs() -> None:
+    clip = ClipInputs(episode_idx=12, frame_indices=list(range(40)))
+    check = _candidate_check()
+
+    flag_only_rows = [
+        _skeleton_candidate_result(frame_idx, [], flag=True)
+        for frame_idx in [5, 6, 7]
+    ]
+    assert check.build_candidate_windows(clip, flag_only_rows) == []
+
+    invalid_rows = [
+        _skeleton_candidate_result(
+            frame_idx,
+            ["joint_acceleration_m_s2_max"],
+            flag=True,
+            invalid=True,
+        )
+        for frame_idx in [5, 6, 7]
+    ]
+    assert check.build_candidate_windows(clip, invalid_rows) == []
+
+    rotation_only_rows = [
+        _skeleton_candidate_result(frame_idx, ["rotation_delta_max"], flag=True)
+        for frame_idx in [5, 6, 7]
+    ]
+    assert check.build_candidate_windows(clip, rotation_only_rows) == []
+
+    acceleration_rows = [
+        _skeleton_candidate_result(frame_idx, ["joint_acceleration_m_s2_max"])
+        for frame_idx in [5, 6, 7]
+    ]
+    acceleration_windows = check.build_candidate_windows(clip, acceleration_rows)
+    assert len(acceleration_windows) == 1
+    assert acceleration_windows[0]["seed_run_start"] == 5
+    assert acceleration_windows[0]["seed_run_end"] == 7
+    assert acceleration_windows[0]["seed_run_frames"] == 3.0
+    assert acceleration_windows[0]["start_frame"] == 4
+    assert acceleration_windows[0]["end_frame"] == 8
+    assert acceleration_windows[0]["window_source"] == "skeleton_quality_temporal_run"
+    assert acceleration_windows[0]["review_type"] == ["temporal_geometry_review"]
+    assert "acceleration_seed" in acceleration_windows[0]["trigger_reason"]
+
+    displacement_rows = [
+        _skeleton_candidate_result(frame_idx, ["joint_displacement_m_max"])
+        for frame_idx in [10, 11, 12]
+    ]
+    displacement_windows = check.build_candidate_windows(clip, displacement_rows)
+    assert len(displacement_windows) == 1
+    assert "displacement_seed" in displacement_windows[0]["trigger_reason"]
+
+    multi_signal_rows = [
+        _skeleton_candidate_result(
+            frame_idx,
+            ["rotation_delta_max", "joint_angle_change_deg_max"],
+        )
+        for frame_idx in [15, 16, 17]
+    ]
+    multi_signal_windows = check.build_candidate_windows(clip, multi_signal_rows)
+    assert len(multi_signal_windows) == 1
+    assert "multi_signal_seed" in multi_signal_windows[0]["trigger_reason"]
+
+
+def test_skeleton_candidate_seed_runs_before_context_expansion() -> None:
+    clip = ClipInputs(episode_idx=12, frame_indices=list(range(40)))
+    check = _candidate_check()
+
+    scattered_rows = [
+        _skeleton_candidate_result(frame_idx, ["joint_acceleration_m_s2_max"])
+        for frame_idx in [2, 8, 14]
+    ]
+    assert check.build_candidate_windows(clip, scattered_rows) == []
+
+    gap_closed_rows = [
+        _skeleton_candidate_result(frame_idx, ["joint_acceleration_m_s2_max"])
+        for frame_idx in [5, 8, 11]
+    ]
+    gap_closed_windows = check.build_candidate_windows(clip, gap_closed_rows)
+    assert len(gap_closed_windows) == 1
+    assert gap_closed_windows[0]["seed_run_start"] == 5
+    assert gap_closed_windows[0]["seed_run_end"] == 11
+    assert gap_closed_windows[0]["seed_run_frames"] == 3.0
+    assert gap_closed_windows[0]["start_frame"] == 4
+    assert gap_closed_windows[0]["end_frame"] == 12
+
+    overlapping_rows = [
+        _skeleton_candidate_result(frame_idx, ["joint_acceleration_m_s2_max"])
+        for frame_idx in [5, 6, 7, 9, 10, 11]
+    ]
+    overlapping_windows = check.build_candidate_windows(clip, overlapping_rows)
+    assert len(overlapping_windows) == 1
+    assert overlapping_windows[0]["seed_run_start"] == 5
+    assert overlapping_windows[0]["seed_run_end"] == 11
+
+    separated_rows = [
+        _skeleton_candidate_result(frame_idx, ["joint_acceleration_m_s2_max"])
+        for frame_idx in [5, 6, 7, 20, 21, 22]
+    ]
+    separated_windows = check.build_candidate_windows(clip, separated_rows)
+    assert len(separated_windows) == 2
+    assert separated_windows[0]["end_frame"] < separated_windows[1]["start_frame"]
+
+
+def test_skeleton_candidate_windows_are_written_by_runner(tmp_path: Path) -> None:
     num_frames = 30
     keypoints = _static_keypoints(num_frames)
     rotations = _synthetic_rotations(keypoints, num_frames)
-    for joint in acceptance_joint_names(["left"]):
+    for joint in keypoints:
         values = keypoints[joint]
-        values[:, 0] = 0.0
-        values[:, 1] = 0.0
-        values[:, 2] = 1.0
-        values[10, 0] = -0.63
-        values[14, 0] = -0.63
-        values[24, 0] = -0.63
-    clip = ClipInputs(
-        episode_idx=113,
-        frame_indices=list(range(num_frames)),
-        keypoints=keypoints,
-        rotations=rotations,
-        fps=1.0,
-    )
+        for frame_idx in range(5, 9):
+            values[frame_idx, 0] += 0.02 * (frame_idx - 4)
+    input_file = tmp_path / "100030_hdf5.hdf5"
+    input_file.write_bytes(b"")
+
+    def clip_loader(
+        path: Path,
+        episode_idx: int | None,
+        fps: float | None,
+    ) -> list[ClipInputs]:
+        assert path == input_file
+        return [
+            ClipInputs(
+                episode_idx=0 if episode_idx is None else episode_idx,
+                frame_indices=list(range(num_frames)),
+                keypoints=keypoints,
+                rotations=rotations,
+                fps=fps,
+            )
+        ]
+
     config = PrecheckConfig(
-        output_dir=tmp_path / "projection_windows",
+        output_dir=tmp_path / "runner_candidate_windows",
+        input_paths=[input_file],
+        fps=1.0,
         enabled_checks=["skeleton_quality_score"],
         skeleton_quality_score=SkeletonQualityScoreConfig(
             decision_mode="temporal_triage",
-            joint_angle_change_deg_max_threshold=1_000.0,
-            rotation_delta_max_threshold=1_000.0,
-            joint_acceleration_m_s2_max_threshold=1_000.0,
-            joint_displacement_m_max_threshold=1_000.0,
-            projection_image_width=1280,
-            projection_image_height=720,
-            projection_fx=1000.0,
-            projection_fy=1000.0,
-            projection_cx=640.0,
-            projection_cy=360.0,
-            projection_near_border_count_threshold=6,
+            joint_displacement_m_max_threshold=0.005,
+            candidate_gap_close_frames=2,
+            candidate_min_seed_run_frames=3,
             candidate_pre_context_frames=1,
             candidate_post_context_frames=1,
-            candidate_merge_gap_frames=5,
         ),
         overwrite=True,
     )
-    PrecheckRunner(config).run([clip])
+    PrecheckRunner(config, clip_loader=clip_loader).run()
 
+    candidate_path = tmp_path / "runner_candidate_windows" / "candidate_windows.json"
+    assert candidate_path.exists()
+    assert (tmp_path / "runner_candidate_windows" / "candidate_windows.parquet").exists()
     windows = json.loads(
-        (tmp_path / "projection_windows" / "candidate_windows.json").read_text()
+        candidate_path.read_text()
     )
-    left_windows = [window for window in windows if window["hand_side"] == "left"]
-    both_windows = [window for window in windows if window["hand_side"] == "both"]
-    assert len(left_windows) == 2
-    assert both_windows == []
-    assert left_windows[0]["start_frame"] == 9
-    assert left_windows[0]["end_frame"] == 16
-    assert left_windows[0]["peak_frame"] in {10, 14}
-    assert "projection_near_border" in left_windows[0]["trigger_reason"]
-    assert left_windows[1]["start_frame"] == 23
-    assert left_windows[1]["end_frame"] == 26
+    assert windows
+    assert windows[0]["asset_id"] == "100030"
+    assert windows[0]["hand_side"] == "both"
+    assert windows[0]["window_source"] == "skeleton_quality_temporal_run"
+    assert windows[0]["seed_run_frames"] >= 3.0
+    assert "displacement_seed" in windows[0]["trigger_reason"]
 
 
 def test_skeleton_hard_invalid_flags_missing_keypoints(tmp_path: Path) -> None:
