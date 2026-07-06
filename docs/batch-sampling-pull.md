@@ -102,7 +102,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 可选使用 YAML 覆盖阈值：
 
 ```yaml
-sample_count: 10
+sample_count: 30
 alignment_mode: warn
 thresholds:
   min_fps: 1
@@ -111,8 +111,13 @@ thresholds:
   min_sample_decode_ratio: 1.0
   max_mean_over_dark_ratio: 0.10
   max_mean_over_exposed_ratio: 0.05
+  min_laplacian_p10: 300.0
+  min_laplacian_median: 450.0
+  max_laplacian_under_100_ratio: 0.0
+  min_tenengrad_p10: 30.0
+  min_tenengrad_median: 35.0
   max_black_frame_ratio: 0.05
-  max_frozen_frame_ratio: 0.8
+  max_frozen_frame_ratio: 0.1
 ```
 
 运行后输出：
@@ -125,4 +130,4 @@ sampled/XJGT_20260616/
     <asset_id>.json
 ```
 
-`quality_archive/<asset_id>.json` 是单条数据的全流程 QC 档案，和 `hdf5/`、`video/` 同级，格式见 `docs/asset-qc-json-format.md`。上游建档模块应在拉取完成后先创建这个文件；视频质量检测后续只更新其中的 `video_quality`、`hdf5_text_info`、`reference_quality` 等 block。后续批次 summary、表格或完整报告都可以直接从这些 `<asset_id>.json` 聚合生成。该检测不使用 VMAF、CAMBI 或标准对照视频；它只计算可解码性、fps、分辨率、抽样帧亮度/过暗/过曝/模糊代理、黑屏、冻结帧，以及可选 HDF5 帧数对齐。
+`quality_archive/<asset_id>.json` 是单条数据的全流程 QC 档案，和 `hdf5/`、`video/` 同级，格式见 `docs/asset-qc-json-format.md`。上游建档模块应在拉取完成后先创建这个文件；视频质量检测后续只更新其中的 `video_quality`、`hdf5_text_info`、`reference_quality` 等 block。后续批次 summary、表格或完整报告都可以直接从这些 `<asset_id>.json` 聚合生成。该检测不使用 VMAF、CAMBI 或标准对照视频；它只计算可解码性、fps、分辨率、抽样帧亮度/过暗/过曝、清屏清晰度硬筛（`laplacian_p10 >= 300`、`laplacian_median >= 450`、`laplacian_under_100_ratio == 0`、`tenengrad_p10 >= 30`、`tenengrad_median >= 35`）、黑屏、冻结帧，以及可选 HDF5 帧数对齐。

@@ -210,9 +210,9 @@ quality_archive/408817.json  -> asset_id = 408817
     "height": 720
   },
   "sampling": {
-    "sample_count_configured": 10,
-    "sampled_frame_count": 10,
-    "decoded_sample_count": 10,
+    "sample_count_configured": 30,
+    "sampled_frame_count": 30,
+    "decoded_sample_count": 30,
     "sample_decode_ratio": 1.0
   },
   "metrics": {
@@ -228,7 +228,21 @@ quality_archive/408817.json  -> asset_id = 408817
       "over_exposed_pixel_threshold": 245
     },
     "sharpness": {
-      "mean_blur_laplacian_var": 69.71875739224541
+      "mean_blur_laplacian_var": 703.8909998044529,
+      "laplacian": {
+        "min": 491.1170638753997,
+        "p10": 587.5743396361266,
+        "median": 674.0077060111153,
+        "mean": 703.8909998044529,
+        "p90": 897.1528888694626,
+        "under_100_ratio": 0.0,
+        "under_100_threshold": 100.0
+      },
+      "tenengrad": {
+        "p10": 42.599610736089254,
+        "median": 46.17884019666276,
+        "mean": 45.84542635329141
+      }
     },
     "temporal": {
       "frozen_frame_ratio": 0.0,
@@ -242,9 +256,13 @@ quality_archive/408817.json  -> asset_id = 408817
     "min_sample_decode_ratio": 1.0,
     "max_mean_over_dark_ratio": 0.1,
     "max_mean_over_exposed_ratio": 0.05,
-    "min_mean_blur_laplacian_var": 1.0,
+    "min_laplacian_p10": 300.0,
+    "min_laplacian_median": 450.0,
+    "max_laplacian_under_100_ratio": 0.0,
+    "min_tenengrad_p10": 30.0,
+    "min_tenengrad_median": 35.0,
     "max_black_frame_ratio": 0.05,
-    "max_frozen_frame_ratio": 0.8,
+    "max_frozen_frame_ratio": 0.1,
     "fail_on_hdf5_frame_mismatch": true
   },
   "errors": []
@@ -263,7 +281,11 @@ quality_archive/408817.json  -> asset_id = 408817
 | `sample_decode_ratio_below_min` | 抽样帧解码率低于阈值。 |
 | `mean_over_dark_ratio_above_max` | 平均过暗像素占比高于阈值。 |
 | `mean_over_exposed_ratio_above_max` | 平均过曝像素占比高于阈值。 |
-| `mean_blur_laplacian_var_below_min` | 模糊代理指标低于阈值。 |
+| `laplacian_p10_below_min` | Laplacian 方差 p10 低于清晰度硬筛阈值。 |
+| `laplacian_median_below_min` | Laplacian 方差中位数低于清晰度硬筛阈值。 |
+| `laplacian_under_100_ratio_above_max` | 存在 Laplacian 方差低于 100 的抽样帧。 |
+| `tenengrad_p10_below_min` | Tenengrad p10 低于清晰度硬筛阈值。 |
+| `tenengrad_median_below_min` | Tenengrad 中位数低于清晰度硬筛阈值。 |
 | `black_frame_ratio_above_max` | 黑帧率高于阈值。 |
 | `frozen_frame_ratio_above_max` | 冻帧率高于阈值。 |
 | `hdf5_frame_count_mismatch` | HDF5 帧数与视频帧数不一致。 |

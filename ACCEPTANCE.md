@@ -111,7 +111,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 Optional config:
 
 ```yaml
-sample_count: 10
+sample_count: 30
 alignment_mode: warn
 thresholds:
   min_fps: 1
@@ -120,8 +120,13 @@ thresholds:
   min_sample_decode_ratio: 1.0
   max_mean_over_dark_ratio: 0.10
   max_mean_over_exposed_ratio: 0.05
+  min_laplacian_p10: 300.0
+  min_laplacian_median: 450.0
+  max_laplacian_under_100_ratio: 0.0
+  min_tenengrad_p10: 30.0
+  min_tenengrad_median: 35.0
   max_black_frame_ratio: 0.05
-  max_frozen_frame_ratio: 0.8
+  max_frozen_frame_ratio: 0.1
 ```
 
 The video check writes:
@@ -152,5 +157,7 @@ sampled/XJGT_20260616/
 
 It uses practical no-reference indicators: open/decode health, frame count,
 fps, duration, resolution, sampled-frame decode ratio, brightness, over-dark and
-over-exposure ratios, blur proxy, black-frame risk, frozen-frame risk, and
+over-exposure ratios, clear-screen sharpness hard filters
+(`laplacian_p10`, `laplacian_median`, `laplacian_under_100_ratio`,
+`tenengrad_p10`, `tenengrad_median`), black-frame risk, frozen-frame risk, and
 optional HDF5 frame-count alignment.

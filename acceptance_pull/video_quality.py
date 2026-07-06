@@ -14,11 +14,12 @@ import yaml
 
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi"}
-DEFAULT_SAMPLE_COUNT = 10
+DEFAULT_SAMPLE_COUNT = 30
 DARK_PIXEL_THRESHOLD = 16
 OVER_EXPOSED_PIXEL_THRESHOLD = 245
 BLACK_FRAME_BRIGHTNESS_THRESHOLD = 16
 FROZEN_FRAME_MEAN_ABS_DIFF_THRESHOLD = 1.0
+LAPLACIAN_LOW_DETAIL_THRESHOLD = 100.0
 
 
 class AlignmentMode(StrEnum):
@@ -35,9 +36,13 @@ class ThresholdConfig:
     min_sample_decode_ratio: float = 1.0
     max_mean_over_dark_ratio: float = 0.10
     max_mean_over_exposed_ratio: float = 0.05
-    min_mean_blur_laplacian_var: float = 1.0
+    min_laplacian_p10: float = 300.0
+    min_laplacian_median: float = 450.0
+    max_laplacian_under_100_ratio: float = 0.0
+    min_tenengrad_p10: float = 30.0
+    min_tenengrad_median: float = 35.0
     max_black_frame_ratio: float = 0.05
-    max_frozen_frame_ratio: float = 0.8
+    max_frozen_frame_ratio: float = 0.1
     fail_on_hdf5_frame_mismatch: bool = True
 
 
@@ -103,7 +108,15 @@ class VideoMetrics:
     mean_brightness: float
     mean_over_dark_ratio: float
     mean_over_exposed_ratio: float
+    laplacian_min: float
+    laplacian_p10: float
+    laplacian_median: float
     mean_blur_laplacian_var: float
+    laplacian_p90: float
+    laplacian_under_100_ratio: float
+    tenengrad_p10: float
+    tenengrad_median: float
+    tenengrad_mean: float
     black_frame_ratio: float
     frozen_frame_ratio: float
     errors: tuple[str, ...] = ()
@@ -145,6 +158,16 @@ def _sample_indexes(frame_count: int, sample_count: int) -> list[int]:
     return sorted({round(index * (frame_count - 1) / (count - 1)) for index in range(count)})
 
 
+def _percentile(values: list[float], percentile: float) -> float:
+    return float(np.percentile(values, percentile)) if values else 0.0
+
+
+def _tenengrad(gray: np.ndarray) -> float:
+    gradient_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    gradient_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    return float(np.mean(np.sqrt(gradient_x * gradient_x + gradient_y * gradient_y)))
+
+
 def _empty_metrics(path: Path, errors: tuple[str, ...]) -> VideoMetrics:
     return VideoMetrics(
         path=path,
@@ -161,7 +184,15 @@ def _empty_metrics(path: Path, errors: tuple[str, ...]) -> VideoMetrics:
         mean_brightness=0.0,
         mean_over_dark_ratio=1.0,
         mean_over_exposed_ratio=0.0,
+        laplacian_min=0.0,
+        laplacian_p10=0.0,
+        laplacian_median=0.0,
         mean_blur_laplacian_var=0.0,
+        laplacian_p90=0.0,
+        laplacian_under_100_ratio=1.0,
+        tenengrad_p10=0.0,
+        tenengrad_median=0.0,
+        tenengrad_mean=0.0,
         black_frame_ratio=1.0,
         frozen_frame_ratio=0.0,
         errors=errors,
@@ -185,6 +216,7 @@ def analyze_video(path: Path, config: VideoQualityConfig) -> VideoMetrics:
         dark_values: list[float] = []
         exposed_values: list[float] = []
         blur_values: list[float] = []
+        tenengrad_values: list[float] = []
         black_values: list[float] = []
         frozen_pairs = 0
         previous_gray: np.ndarray | None = None
@@ -203,6 +235,7 @@ def analyze_video(path: Path, config: VideoQualityConfig) -> VideoMetrics:
             dark_values.append(float(np.mean(gray < DARK_PIXEL_THRESHOLD)))
             exposed_values.append(float(np.mean(gray > OVER_EXPOSED_PIXEL_THRESHOLD)))
             blur_values.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
+            tenengrad_values.append(_tenengrad(gray))
             black_values.append(1.0 if brightness < BLACK_FRAME_BRIGHTNESS_THRESHOLD else 0.0)
 
             if previous_gray is not None:
@@ -215,6 +248,9 @@ def analyze_video(path: Path, config: VideoQualityConfig) -> VideoMetrics:
         sampled = len(indexes)
         if sampled and decoded == 0:
             errors.append("no_sample_frames_decoded")
+        laplacian_under_100_ratio = (
+            float(np.mean(np.array(blur_values) < LAPLACIAN_LOW_DETAIL_THRESHOLD)) if blur_values else 1.0
+        )
 
         return VideoMetrics(
             path=path,
@@ -231,7 +267,15 @@ def analyze_video(path: Path, config: VideoQualityConfig) -> VideoMetrics:
             mean_brightness=float(np.mean(brightness_values)) if brightness_values else 0.0,
             mean_over_dark_ratio=float(np.mean(dark_values)) if dark_values else 1.0,
             mean_over_exposed_ratio=float(np.mean(exposed_values)) if exposed_values else 0.0,
+            laplacian_min=float(min(blur_values)) if blur_values else 0.0,
+            laplacian_p10=_percentile(blur_values, 10),
+            laplacian_median=_percentile(blur_values, 50),
             mean_blur_laplacian_var=float(np.mean(blur_values)) if blur_values else 0.0,
+            laplacian_p90=_percentile(blur_values, 90),
+            laplacian_under_100_ratio=laplacian_under_100_ratio,
+            tenengrad_p10=_percentile(tenengrad_values, 10),
+            tenengrad_median=_percentile(tenengrad_values, 50),
+            tenengrad_mean=float(np.mean(tenengrad_values)) if tenengrad_values else 0.0,
             black_frame_ratio=float(np.mean(black_values)) if black_values else 1.0,
             frozen_frame_ratio=frozen_pairs / (decoded - 1) if decoded > 1 else 0.0,
             errors=tuple(errors),
@@ -301,8 +345,16 @@ def evaluate_video_quality(
         reasons.append("mean_over_dark_ratio_above_max")
     if metrics.mean_over_exposed_ratio > thresholds.max_mean_over_exposed_ratio:
         reasons.append("mean_over_exposed_ratio_above_max")
-    if metrics.mean_blur_laplacian_var < thresholds.min_mean_blur_laplacian_var:
-        reasons.append("mean_blur_laplacian_var_below_min")
+    if metrics.laplacian_p10 < thresholds.min_laplacian_p10:
+        reasons.append("laplacian_p10_below_min")
+    if metrics.laplacian_median < thresholds.min_laplacian_median:
+        reasons.append("laplacian_median_below_min")
+    if metrics.laplacian_under_100_ratio > thresholds.max_laplacian_under_100_ratio:
+        reasons.append("laplacian_under_100_ratio_above_max")
+    if metrics.tenengrad_p10 < thresholds.min_tenengrad_p10:
+        reasons.append("tenengrad_p10_below_min")
+    if metrics.tenengrad_median < thresholds.min_tenengrad_median:
+        reasons.append("tenengrad_median_below_min")
     if metrics.black_frame_ratio > thresholds.max_black_frame_ratio:
         reasons.append("black_frame_ratio_above_max")
     if metrics.frozen_frame_ratio > thresholds.max_frozen_frame_ratio:
@@ -458,6 +510,20 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
                 },
                 "sharpness": {
                     "mean_blur_laplacian_var": metrics.mean_blur_laplacian_var,
+                    "laplacian": {
+                        "min": metrics.laplacian_min,
+                        "p10": metrics.laplacian_p10,
+                        "median": metrics.laplacian_median,
+                        "mean": metrics.mean_blur_laplacian_var,
+                        "p90": metrics.laplacian_p90,
+                        "under_100_ratio": metrics.laplacian_under_100_ratio,
+                        "under_100_threshold": LAPLACIAN_LOW_DETAIL_THRESHOLD,
+                    },
+                    "tenengrad": {
+                        "p10": metrics.tenengrad_p10,
+                        "median": metrics.tenengrad_median,
+                        "mean": metrics.tenengrad_mean,
+                    },
                 },
                 "temporal": {
                     "frozen_frame_ratio": metrics.frozen_frame_ratio,

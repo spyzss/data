@@ -19,15 +19,17 @@ from tests.fixtures import write_quality_hdf5_with_text
 
 
 def textured_frame(offset: int, width: int = 32, height: int = 24) -> np.ndarray:
-    grid = np.indices((height, width)).sum(axis=0)
-    gray = ((grid % 2) * 120 + 60 + offset).clip(0, 255).astype(np.uint8)
+    y, x = np.indices((height, width))
+    gray = (80 + ((x * 7 + y * 5 + offset) % 140)).astype(np.uint8)
+    gray[:, width // 3 : width // 3 + 2] = 20
+    gray[:, 2 * width // 3 : 2 * width // 3 + 2] = 235
     return np.repeat(gray[:, :, None], 3, axis=2)
 
 
 def test_default_video_quality_config() -> None:
     config = load_video_quality_config(None)
 
-    assert config.sample_count == 10
+    assert config.sample_count == 30
     assert config.alignment_mode == AlignmentMode.WARN
     assert config.thresholds.min_fps == 1.0
     assert config.thresholds.min_width == 1
@@ -35,8 +37,13 @@ def test_default_video_quality_config() -> None:
     assert config.thresholds.min_sample_decode_ratio == 1.0
     assert config.thresholds.max_mean_over_dark_ratio == 0.10
     assert config.thresholds.max_mean_over_exposed_ratio == 0.05
+    assert config.thresholds.min_laplacian_p10 == 300.0
+    assert config.thresholds.min_laplacian_median == 450.0
+    assert config.thresholds.max_laplacian_under_100_ratio == 0.0
+    assert config.thresholds.min_tenengrad_p10 == 30.0
+    assert config.thresholds.min_tenengrad_median == 35.0
     assert config.thresholds.max_black_frame_ratio == 0.05
-    assert config.thresholds.max_frozen_frame_ratio == 0.8
+    assert config.thresholds.max_frozen_frame_ratio == 0.1
 
 
 def test_video_quality_config_yaml_override(tmp_path: Path) -> None:
@@ -103,6 +110,19 @@ def test_analyze_video_reports_metadata_and_sample_metrics(tmp_path: Path) -> No
     assert metrics.mean_over_exposed_ratio < 0.1
 
 
+def test_analyze_video_reports_clear_screen_sharpness_distribution(tmp_path: Path) -> None:
+    video = tmp_path / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=12.0)
+
+    metrics = analyze_video(video, load_video_quality_config(None))
+
+    assert metrics.laplacian_p10 >= 300
+    assert metrics.laplacian_median >= 450
+    assert metrics.laplacian_under_100_ratio == 0
+    assert metrics.tenengrad_p10 >= 30
+    assert metrics.tenengrad_median >= 35
+
+
 def test_analyze_video_marks_invalid_video_unopened(tmp_path: Path) -> None:
     video = tmp_path / "bad_video.mp4"
     video.write_bytes(b"not a video")
@@ -158,6 +178,21 @@ def test_evaluate_video_quality_fails_black_and_frozen_video(tmp_path: Path) -> 
     assert evaluation.passed is False
     assert "black_frame_ratio_above_max" in evaluation.reasons
     assert "frozen_frame_ratio_above_max" in evaluation.reasons
+
+
+def test_evaluate_video_quality_fails_clear_screen_thresholds(tmp_path: Path) -> None:
+    video = tmp_path / "408817_video.mp4"
+    write_test_video(video, [solid_frame(100), solid_frame(120), solid_frame(140)], fps=10.0)
+    metrics = analyze_video(video, load_video_quality_config(None))
+
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
+
+    assert evaluation.passed is False
+    assert "laplacian_p10_below_min" in evaluation.reasons
+    assert "laplacian_median_below_min" in evaluation.reasons
+    assert "laplacian_under_100_ratio_above_max" in evaluation.reasons
+    assert "tenengrad_p10_below_min" in evaluation.reasons
+    assert "tenengrad_median_below_min" in evaluation.reasons
 
 
 def test_check_hdf5_alignment_passes_matching_frame_count(tmp_path: Path) -> None:
