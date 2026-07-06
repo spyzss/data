@@ -47,16 +47,61 @@ def asset_id_from_path(path: Path) -> str:
     return match.group(1) if match else path.stem
 
 
-def hdf5_files(input_path: Path) -> list[Path]:
+def hdf5_files(
+    input_path: Path,
+    *,
+    recursive: bool = False,
+) -> list[Path]:
     if input_path.is_file():
         return [input_path]
+    globber = input_path.rglob if recursive else input_path.glob
     files = [
         path
         for suffix in ("*.hdf5", "*.h5")
-        for path in input_path.rglob(suffix)
+        for path in globber(suffix)
         if path.is_file()
     ]
     return sorted(files)
+
+
+def hdf5_files_for_asset_ids(input_path: Path, asset_ids: list[str]) -> list[Path]:
+    if input_path.is_file():
+        path_asset_id = asset_id_from_path(input_path)
+        return [input_path] if path_asset_id in set(asset_ids) else []
+
+    files: list[Path] = []
+    missing: list[str] = []
+    for asset_id in asset_ids:
+        candidates = [
+            input_path / f"{asset_id}_hdf5.hdf5",
+            input_path / f"{asset_id}.hdf5",
+            input_path / f"{asset_id}_hdf5.h5",
+            input_path / f"{asset_id}.h5",
+        ]
+        found = next((path for path in candidates if path.exists()), None)
+        if found is None:
+            # Fall back to shallow glob for naming variants without scanning
+            # the whole tree recursively.
+            matches = sorted(input_path.glob(f"*{asset_id}*.hdf5")) + sorted(
+                input_path.glob(f"*{asset_id}*.h5")
+            )
+            found = matches[0] if matches else None
+        if found is None:
+            missing.append(asset_id)
+            continue
+        files.append(found)
+
+    if missing:
+        print(f"Warning: missing asset IDs: {', '.join(missing)}")
+    return files
+
+
+def read_asset_id_file(path: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
 
 
 def run_clip(path: Path, fps: float | None) -> dict[str, Any]:
@@ -150,9 +195,24 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=29.97)
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--max-clips", type=int)
+    parser.add_argument("--recursive", action="store_true")
+    parser.add_argument("--sample-step", type=int, default=1)
+    parser.add_argument("--asset-ids", nargs="*")
+    parser.add_argument("--asset-id-file", type=Path)
     args = parser.parse_args()
 
-    files = hdf5_files(args.hdf5_dir)
+    asset_ids = list(args.asset_ids or [])
+    if args.asset_id_file is not None:
+        asset_ids.extend(read_asset_id_file(args.asset_id_file))
+
+    if asset_ids:
+        files = hdf5_files_for_asset_ids(args.hdf5_dir, asset_ids)
+    else:
+        files = hdf5_files(args.hdf5_dir, recursive=args.recursive)
+    if args.sample_step < 1:
+        raise ValueError("--sample-step must be >= 1")
+    if args.sample_step > 1:
+        files = files[:: args.sample_step]
     if args.max_clips is not None:
         files = files[: args.max_clips]
     if not files:
