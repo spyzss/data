@@ -1,0 +1,56 @@
+output_dir: outputs/precheck_100677
+overwrite: true
+fps: 29.97
+
+input_paths:
+  - /Users/nathanlou/Downloads/xingjiguitu/100677_hdf5.hdf5
+
+enabled_checks:
+  - text_integrity
+  - quality_score
+  - keypoint_missing
+  - keypoint_temporal
+  - skeleton_quality_score
+  - composite_frame_verdict
+
+text_integrity:
+  required_fields:
+    - scene
+    - task
+    - text_en
+
+quality_score:
+  pass_threshold: 0.90
+
+keypoint_missing:
+  fps: null
+  window_seconds: 10.0
+  allowed_missing_seconds: 1.0
+
+keypoint_temporal:
+  fps: null
+  project_2d: true
+
+skeleton_quality_score:
+  decision_mode: temporal_triage
+  joint_angle_change_deg_max_threshold: 10.0
+  rotation_delta_max_threshold: 0.45
+  joint_acceleration_m_s2_max_threshold: 15.0
+  joint_displacement_m_max_threshold: 0.05
+  hard_exceeded_metric_count: 3
+  strong_acceleration_ratio: 2.5
+  strong_displacement_ratio: 1.8
+  rotation_mask_review_ratio: 1.0
+  promote_sustained_review: true
+  sustained_review_min_frames: 6
+  reject_missing_keypoints: true
+  reject_low_quality_hand: false
+  allowed_missing_keypoints_per_hand: 0
+  pass_threshold: 0.90
+
+composite_frame_verdict:
+  joint_angle_change_deg_max_threshold: 10.0
+  rotation_delta_max_threshold: 0.45
+  joint_acceleration_m_s2_max_threshold: 15.0
+  joint_displacement_m_max_threshold: 0.05
+  pass_threshold: 0.90

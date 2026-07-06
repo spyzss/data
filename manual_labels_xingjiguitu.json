@@ -1,0 +1,733 @@
+{
+  "schema_version": "skeleton_qc_manual_dataset.v1",
+  "dataset": "xingjiguitu_overlay_manual_review",
+  "purpose": "Consolidated human labels and script diagnoses for skeleton QC threshold and ablation design.",
+  "precheck_outputs": [
+    "outputs/precheck_100003/check_results.json",
+    "outputs/precheck_xingjiguitu_local/check_results.json"
+  ],
+  "current_thresholds": {
+    "joint_angle_change_deg_max": 10.0,
+    "rotation_delta_max": 0.45,
+    "joint_acceleration_m_s2_max": 15.0,
+    "joint_displacement_m_max": 0.05
+  },
+  "label_taxonomy": {
+    "positive": "Human-confirmed visible skeleton/keypoint abnormality.",
+    "acceptable_flagged": "Human-reviewed segment that looks acceptable even though the temporal skeleton check flagged it.",
+    "review": "Candidate segment requiring another human pass.",
+    "algorithm_outcome_true_positive": "The temporal skeleton check broadly caught the human-confirmed abnormal segment.",
+    "algorithm_outcome_partial": "The temporal skeleton check caught only part of the human-confirmed abnormal segment.",
+    "algorithm_outcome_false_negative": "The human-confirmed abnormal segment was mostly missed by temporal geometry.",
+    "algorithm_outcome_false_positive": "The temporal skeleton check flagged a visually acceptable segment."
+  },
+  "assets": {
+    "100003": {
+      "fps": 30.07,
+      "frame_count": 915,
+      "video": "100003_video.mp4",
+      "precheck_output": "outputs/precheck_100003/check_results.json"
+    },
+    "100030": {
+      "fps": 30.07,
+      "frame_count": 916,
+      "video": "/Users/nathanlou/Downloads/xingjiguitu_overlay/100030_overlay.mp4",
+      "hdf5": "/Users/nathanlou/Downloads/xingjiguitu/100030_hdf5.hdf5",
+      "precheck_output": "outputs/precheck_xingjiguitu_local/check_results.json",
+      "episode_idx": 0
+    },
+    "100044": {
+      "fps": 30.07,
+      "frame_count": 915,
+      "video": "/Users/nathanlou/Downloads/xingjiguitu_overlay/100044_overlay.mp4",
+      "hdf5": "/Users/nathanlou/Downloads/xingjiguitu/100044_hdf5.hdf5",
+      "precheck_output": "outputs/precheck_xingjiguitu_local/check_results.json",
+      "episode_idx": 1
+    },
+    "100560": {
+      "fps": 29.937,
+      "frame_count": 906,
+      "video": "/Users/nathanlou/Downloads/xingjiguitu_overlay/100560_overlay.mp4",
+      "hdf5": "/Users/nathanlou/Downloads/xingjiguitu/100560_hdf5.hdf5",
+      "precheck_output": "outputs/precheck_xingjiguitu_local/check_results.json",
+      "episode_idx": 2
+    },
+    "100669": {
+      "fps": 29.97,
+      "frame_count": 982,
+      "video": "/Users/nathanlou/Downloads/xingjiguitu/100669_video.mp4",
+      "hdf5": "/Users/nathanlou/Downloads/xingjiguitu/100669_hdf5.hdf5",
+      "precheck_output": "outputs/precheck_100669/check_results.json",
+      "episode_idx": 0
+    }
+  },
+  "segments": [
+    {
+      "asset_id": "100003",
+      "start": 478,
+      "end": 495,
+      "label": "positive",
+      "confidence": "high",
+      "algorithm_outcome": "true_positive",
+      "failure_mode": "visible skeleton/keypoint abnormality during folding",
+      "note": "Human review found the clearest issue around frames 482-493; metrics show a broader abnormal run from 478-495."
+    },
+    {
+      "asset_id": "100030",
+      "start": 123,
+      "end": 135,
+      "label": "positive",
+      "confidence": "high",
+      "algorithm_outcome": "partial",
+      "algorithm_segments": [
+        {
+          "start": 117,
+          "end": 135
+        }
+      ],
+      "boundary_false_positive_frames": [
+        {
+          "start": 117,
+          "end": 122
+        }
+      ],
+      "failure_mode": "hand leaves frame; keypoints rotate inside image",
+      "note": "Human-visible failure starts around frame 123, while the script starts flagging at 117."
+    },
+    {
+      "asset_id": "100030",
+      "start": 480,
+      "end": 491,
+      "label": "positive",
+      "confidence": "high",
+      "algorithm_outcome": "true_positive",
+      "algorithm_segments": [
+        {
+          "start": 479,
+          "end": 492
+        }
+      ],
+      "boundary_review_frames": [
+        479,
+        492
+      ],
+      "failure_mode": "left hand occlusion during folding; keypoints misidentified and rotate",
+      "note": "Algorithm segment closely matches human-confirmed 480-491."
+    },
+    {
+      "asset_id": "100030",
+      "start": 723,
+      "end": 766,
+      "label": "positive",
+      "confidence": "medium",
+      "algorithm_outcome": "false_negative",
+      "failure_mode": "hand leaves camera view but skeleton temporal metrics stay below threshold",
+      "required_future_signal": "mask_containment",
+      "note": "Human-visible abnormal segment is mostly not detected by temporal geometry; likely needs SAM3/mask containment."
+    },
+    {
+      "asset_id": "100030",
+      "start": 841,
+      "end": 869,
+      "label": "positive",
+      "confidence": "high",
+      "algorithm_outcome": "partial",
+      "algorithm_segments": [
+        {
+          "start": 835,
+          "end": 847
+        },
+        {
+          "start": 850,
+          "end": 875
+        }
+      ],
+      "missed_frames_inside_segment": [
+        848,
+        849
+      ],
+      "boundary_review_segments": [
+        {
+          "start": 835,
+          "end": 840
+        },
+        {
+          "start": 870,
+          "end": 875
+        }
+      ],
+      "failure_mode": "hands cross; skeleton keypoints do not correctly follow",
+      "trigger_metrics": [
+        "joint_acceleration_m_s2_max",
+        "rotation_delta_max",
+        "joint_displacement_m_max",
+        "joint_angle_change_deg_max"
+      ],
+      "note": "Temporal skeleton check catches most frames, but misses 848-849 because all metrics fall just below thresholds."
+    },
+    {
+      "asset_id": "100030",
+      "start": 888,
+      "end": 916,
+      "label": "positive",
+      "confidence": "high",
+      "machine_frame_idx_range": {
+        "start": 888,
+        "end": 915
+      },
+      "algorithm_outcome": "partial",
+      "algorithm_segments": [
+        {
+          "start": 882,
+          "end": 898
+        },
+        {
+          "start": 908,
+          "end": 915
+        }
+      ],
+      "missed_frames_inside_segment": [
+        899,
+        900,
+        901,
+        902,
+        903,
+        904,
+        905,
+        906,
+        907
+      ],
+      "failure_mode": "end-of-clip hand/wrist out of view; wrong skeleton becomes temporally stable",
+      "required_future_signal": "mask_containment",
+      "note": "The check catches entry/exit jumps but misses the stable wrong-skeleton middle."
+    },
+    {
+      "asset_id": "100044",
+      "start": 37,
+      "end": 67,
+      "label": "positive",
+      "confidence": "high",
+      "algorithm_outcome": "false_negative",
+      "partially_flagged_frames": [
+        46,
+        47,
+        49,
+        50,
+        64
+      ],
+      "failure_mode": "keypoints detached from hand during fast hand motion",
+      "required_future_signal": "mask_containment",
+      "note": "Only a few local jumps are caught; the segment-level detachment is mostly missed by temporal geometry."
+    },
+    {
+      "asset_id": "100044",
+      "start": 262,
+      "end": 280,
+      "label": "positive",
+      "confidence": "high",
+      "algorithm_outcome": "true_positive",
+      "missed_frames_inside_segment": [
+        277
+      ],
+      "rotation_subsegment": {
+        "start": 266,
+        "end": 270
+      },
+      "failure_mode": "left hand detached from skeleton/keypoints",
+      "trigger_metrics": [
+        "joint_acceleration_m_s2_max",
+        "rotation_delta_max",
+        "joint_displacement_m_max",
+        "joint_angle_change_deg_max"
+      ],
+      "note": "The check catches most frames, especially the rotation-heavy 266-270 subsegment."
+    },
+    {
+      "asset_id": "100044",
+      "start": 395,
+      "end": 401,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fast or smooth motion",
+      "trigger_metrics": [
+        "joint_displacement_m_max",
+        "joint_acceleration_m_s2_max"
+      ],
+      "note": "Human review says this segment is acceptable. Frames 395-400 are mostly displacement-only flags; frame 401 is acceleration."
+    },
+    {
+      "asset_id": "100044",
+      "start": 834,
+      "end": 840,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fast motion with multi-metric threshold crossings",
+      "trigger_metrics": [
+        "rotation_delta_max",
+        "joint_angle_change_deg_max",
+        "joint_acceleration_m_s2_max",
+        "joint_displacement_m_max"
+      ],
+      "note": "Human review says this looks acceptable, but all frames were flagged. Rotation is the most consistent trigger."
+    },
+    {
+      "asset_id": "100044",
+      "start": 842,
+      "end": 846,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fast motion with moderate rotation/angle/acceleration",
+      "trigger_metrics": [
+        "rotation_delta_max",
+        "joint_angle_change_deg_max",
+        "joint_displacement_m_max",
+        "joint_acceleration_m_s2_max"
+      ],
+      "note": "Human review says this looks acceptable, but all frames were flagged by moderate multi-metric crossings."
+    },
+    {
+      "asset_id": "100560",
+      "start": 27,
+      "end": 147,
+      "label": "positive",
+      "confidence": "high",
+      "algorithm_outcome": "false_negative",
+      "partially_flagged_frames_count": 23,
+      "checked_frames": 121,
+      "flagged_ratio": 0.19,
+      "algorithm_flagged_runs": [
+        {
+          "start": 33,
+          "end": 36
+        },
+        {
+          "start": 41,
+          "end": 43
+        },
+        {
+          "start": 46,
+          "end": 46
+        },
+        {
+          "start": 50,
+          "end": 50
+        },
+        {
+          "start": 62,
+          "end": 62
+        },
+        {
+          "start": 84,
+          "end": 84
+        },
+        {
+          "start": 87,
+          "end": 87
+        },
+        {
+          "start": 97,
+          "end": 97
+        },
+        {
+          "start": 99,
+          "end": 99
+        },
+        {
+          "start": 112,
+          "end": 112
+        },
+        {
+          "start": 122,
+          "end": 123
+        },
+        {
+          "start": 127,
+          "end": 127
+        },
+        {
+          "start": 130,
+          "end": 132
+        },
+        {
+          "start": 136,
+          "end": 137
+        }
+      ],
+      "failure_mode": "dishwashing/fine hand motion with visibly poor skeleton following",
+      "required_future_signal": "mask_containment",
+      "note": "Human review says the full 27-147 segment is very poor, but temporal geometry only flags 23/121 frames. This supports the hypothesis that fine manipulation can look visually wrong while per-frame temporal deltas remain mostly moderate."
+    },
+    {
+      "asset_id": "100560",
+      "start": 150,
+      "end": 153,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fine dishwashing motion with moderate rotation",
+      "trigger_metrics": [
+        "rotation_delta_max",
+        "joint_angle_change_deg_max"
+      ],
+      "note": "Human review says this short segment is acceptable. The script flags all four frames mainly due to rotation_delta_max, with only frame 153 slightly exceeding angle threshold."
+    },
+    {
+      "asset_id": "100560",
+      "start": 171,
+      "end": 174,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fine dishwashing motion with slight keypoint lag",
+      "trigger_metrics": [
+        "rotation_delta_max"
+      ],
+      "note": "Human review says this segment is not severe. All four frames are flagged only by rotation_delta_max; angle, acceleration, and displacement remain well below thresholds."
+    },
+    {
+      "asset_id": "100560",
+      "start": 229,
+      "end": 232,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fine dishwashing motion with slight keypoint lag",
+      "trigger_metrics": [
+        "rotation_delta_max"
+      ],
+      "note": "Human review says this segment is not severe. All four frames are flagged only by rotation_delta_max, while acceleration and displacement are low."
+    },
+    {
+      "asset_id": "100560",
+      "start": 245,
+      "end": 249,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fine dishwashing motion with moderate wrist/finger rotation",
+      "trigger_metrics": [
+        "rotation_delta_max",
+        "joint_angle_change_deg_max"
+      ],
+      "note": "Human review says this segment is not very severe. Frames are flagged by rotation_delta_max and mild angle changes, but acceleration and displacement stay low, consistent with unavoidable lag during fine manipulation."
+    },
+    {
+      "asset_id": "100560",
+      "start": 558,
+      "end": 561,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fine dishwashing motion with slight keypoint lag",
+      "trigger_metrics": [
+        "rotation_delta_max"
+      ],
+      "note": "Human review did not find an obvious severe issue. All four frames are flagged only by rotation_delta_max; angle, acceleration, and displacement remain below thresholds."
+    },
+    {
+      "asset_id": "100560",
+      "start": 579,
+      "end": 582,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fine dishwashing motion with slight keypoint lag",
+      "trigger_metrics": [
+        "rotation_delta_max"
+      ],
+      "note": "Human review did not find an obvious severe issue. All four frames are flagged only by rotation_delta_max; angle is close but below threshold, while acceleration and displacement stay low."
+    },
+    {
+      "asset_id": "100560",
+      "start": 584,
+      "end": 593,
+      "label": "positive",
+      "confidence": "medium",
+      "algorithm_outcome": "false_negative",
+      "partially_flagged_frames": [
+        593
+      ],
+      "failure_mode": "visually questionable fine manipulation with low temporal metric response",
+      "required_future_signal": "mask_containment",
+      "note": "Human review says this segment has some problem, but the temporal skeleton check only flags frame 593 by a borderline rotation_delta_max crossing. Other temporal metrics remain below thresholds, so this is mostly missed by HDF5-only temporal geometry."
+    },
+    {
+      "asset_id": "100669",
+      "start": 1,
+      "end": 30,
+      "label": "positive",
+      "confidence": "medium",
+      "algorithm_outcome": "partial",
+      "partially_flagged_frames": [
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "review_frames": [
+        1,
+        8,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        22,
+        23,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30
+      ],
+      "failure_mode": "early visible skeleton/keypoint abnormality mostly downgraded to review by weighted temporal rule",
+      "required_future_signal": "mask_containment_or_side_specific_temporal",
+      "note": "Human review says frames 1-30 are abnormal. Current temporal_triage only hard-flags 9-13; many surrounding frames exceed acceleration/displacement thresholds but are downgraded to review, suggesting the fitted rule is too conservative for sustained moderate abnormal motion."
+    },
+    {
+      "asset_id": "100669",
+      "start": 111,
+      "end": 153,
+      "label": "positive",
+      "confidence": "medium",
+      "algorithm_outcome": "true_positive",
+      "failure_mode": "visible skeleton/keypoint abnormality caught by strong temporal acceleration/displacement",
+      "trigger_metrics": [
+        "joint_acceleration_m_s2_max",
+        "joint_displacement_m_max"
+      ],
+      "note": "Human review agrees this segment has problems; weighted acceleration/displacement rule catches the broad 111-153 run."
+    },
+    {
+      "asset_id": "100669",
+      "start": 163,
+      "end": 202,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fast hand motion over-flagged by acceleration/displacement",
+      "trigger_metrics": [
+        "joint_acceleration_m_s2_max",
+        "joint_displacement_m_max"
+      ],
+      "note": "Human review says this segment is basically acceptable, but temporal_triage hard-flags 38/40 frames. This is evidence that acceleration/displacement alone can still over-trigger on fast but valid motion."
+    },
+    {
+      "asset_id": "100669",
+      "start": 218,
+      "end": 316,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable fast hand motion heavily over-flagged by temporal metrics",
+      "trigger_metrics": [
+        "joint_acceleration_m_s2_max",
+        "joint_displacement_m_max",
+        "rotation_delta_max",
+        "joint_angle_change_deg_max"
+      ],
+      "note": "Human review says this segment is mostly acceptable, while current temporal_triage hard-flags 96/99 frames. This is a high-value negative sample for preventing overfit to large motion magnitude."
+    },
+    {
+      "asset_id": "100669",
+      "start": 318,
+      "end": 372,
+      "label": "acceptable_flagged",
+      "confidence": "medium",
+      "algorithm_outcome": "false_positive",
+      "failure_mode": "acceptable motion hard-flagged across the whole segment",
+      "trigger_metrics": [
+        "joint_acceleration_m_s2_max",
+        "joint_displacement_m_max",
+        "rotation_delta_max",
+        "joint_angle_change_deg_max"
+      ],
+      "note": "Human review says this segment has no major visible issue, but temporal_triage hard-flags all 55 frames. This argues for adding visual containment or side-aware context before hard rejection."
+    },
+    {
+      "asset_id": "100669",
+      "start": 410,
+      "end": 420,
+      "label": "positive",
+      "confidence": "medium",
+      "algorithm_outcome": "partial",
+      "partially_flagged_frames": [
+        411,
+        412,
+        416,
+        418,
+        419,
+        420
+      ],
+      "failure_mode": "wrist point stretches violently",
+      "trigger_metrics": [
+        "joint_displacement_m_max",
+        "joint_acceleration_m_s2_max",
+        "joint_angle_change_deg_max"
+      ],
+      "note": "Human review sees a sharp wrist-point stretch. Current temporal_triage catches only 6/11 frames as hard suspect and downgrades the rest to review."
+    },
+    {
+      "asset_id": "100669",
+      "start": 437,
+      "end": 488,
+      "label": "positive",
+      "confidence": "high",
+      "algorithm_outcome": "partial",
+      "partially_flagged_frames": [
+        443,
+        444,
+        446,
+        447,
+        448,
+        449,
+        450,
+        451,
+        452,
+        453,
+        457
+      ],
+      "failure_mode": "right hand exits camera; keypoints move incorrectly",
+      "required_future_signal": "rotation_review_and_mask_containment",
+      "trigger_metrics": [
+        "rotation_delta_max",
+        "joint_acceleration_m_s2_max",
+        "joint_displacement_m_max"
+      ],
+      "note": "Human review says right hand leaves the camera and skeleton becomes unreliable. Current temporal_triage hard-flags only 11/52 frames and marks many others as review, so rotation-driven review plus mask containment should arbitrate this kind of segment."
+    },
+    {
+      "asset_id": "100669",
+      "start": 567,
+      "end": 567,
+      "label": "positive",
+      "confidence": "medium",
+      "algorithm_outcome": "false_negative",
+      "failure_mode": "visible keypoint missing",
+      "required_future_signal": "keypoint_presence_or_quality_hand_gate",
+      "note": "Human review sees a missing keypoint. Current temporal metrics stay below thresholds and quality_score has no zero-quality supplier signal on this frame, so this requires explicit keypoint presence/validity handling when available from HDF5 or overlay extraction."
+    }
+  ],
+  "rule_development_notes": [
+    {
+      "name": "mask_containment_needed",
+      "evidence_segments": [
+        "100030:723-766",
+        "100030:888-916",
+        "100044:37-67",
+        "100560:27-147",
+        "100560:584-593",
+        "100669:437-488",
+        "100669:567-567"
+      ],
+      "description": "Temporal geometry misses cases where keypoints are visibly detached from the hand but remain temporally stable or only jump briefly."
+    },
+    {
+      "name": "temporal_gap_closing",
+      "evidence_segments": [
+        "100030:841-869",
+        "100030:888-916",
+        "100044:262-280"
+      ],
+      "description": "A short gap inside a strong abnormal segment should be bridged before segment-level reporting."
+    },
+    {
+      "name": "fast_motion_false_positive_control",
+      "evidence_segments": [
+        "100003:3-3",
+        "100044:395-401",
+        "100044:834-840",
+        "100044:842-846",
+        "100560:150-153",
+        "100560:171-174",
+        "100560:229-232",
+        "100560:245-249",
+        "100560:558-561",
+        "100560:579-582",
+        "100669:163-202",
+        "100669:218-316",
+        "100669:318-372"
+      ],
+      "description": "Borderline or acceptable fast motion can trigger current single-frame thresholds, especially rotation_delta and displacement."
+    },
+    {
+      "name": "rotation_only_false_positive_control",
+      "evidence_segments": [
+        "100560:150-153",
+        "100560:171-174",
+        "100560:229-232",
+        "100560:245-249",
+        "100560:558-561",
+        "100560:579-582"
+      ],
+      "description": "Fine dishwashing motions can trigger rotation_delta-only or rotation-plus-angle flags while acceleration and displacement remain low. These should probably be downgraded unless supported by containment or additional motion signals."
+    },
+    {
+      "name": "rotation_as_review_route",
+      "evidence_segments": [
+        "100669:437-488",
+        "100669:410-420"
+      ],
+      "description": "Large or sustained rotation changes should not always be a hard temporal failure by themselves, but they are useful as a route into SAM3/mask containment review when the hand may leave frame or keypoints rotate incorrectly."
+    },
+    {
+      "name": "keypoint_presence_gate",
+      "evidence_segments": [
+        "100669:567-567"
+      ],
+      "description": "If the supplier HDF5 exposes missing per-joint validity, NaN coordinates, or fewer than 21 usable points, that frame should be assigned zero/rejected before SAM3. If HDF5 only stores 21 numeric points without visibility, this cannot be reliably inferred from geometry alone."
+    },
+    {
+      "name": "fine_manipulation_visual_failure",
+      "evidence_segments": [
+        "100560:27-147"
+      ],
+      "description": "Dishwashing or other fine manipulation can produce visually poor keypoint following without large temporal jitter on most frames. This probably cannot be solved by simply lowering temporal thresholds without increasing false positives."
+    }
+  ],
+  "candidate_ablation_rules": [
+    {
+      "name": "baseline_current",
+      "description": "Current single-frame thresholds.",
+      "thresholds": {
+        "joint_angle_change_deg_max": 10.0,
+        "rotation_delta_max": 0.45,
+        "joint_acceleration_m_s2_max": 15.0,
+        "joint_displacement_m_max": 0.05
+      }
+    },
+    {
+      "name": "relaxed_thresholds",
+      "description": "Less sensitive thresholds for fast folding motions.",
+      "thresholds": {
+        "joint_angle_change_deg_max": 12.0,
+        "rotation_delta_max": 0.55,
+        "joint_acceleration_m_s2_max": 25.0,
+        "joint_displacement_m_max": 0.055
+      }
+    },
+    {
+      "name": "temporal_persistence",
+      "description": "Require at least 3 consecutive flagged frames before a hard suspect segment."
+    },
+    {
+      "name": "short_gap_closing",
+      "description": "Bridge 1-2 unflagged frames between two flagged runs when surrounding frames are strongly abnormal."
+    },
+    {
+      "name": "multi_signal",
+      "description": "Require at least two metrics to exceed thresholds on the same frame for high-confidence temporal flags."
+    },
+    {
+      "name": "mask_containment",
+      "description": "Add image/mask containment to catch stable wrong keypoints and hand-out-of-view cases."
+    }
+  ]
+}
