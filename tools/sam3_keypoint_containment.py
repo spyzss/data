@@ -46,6 +46,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sam3-model", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sample-fraction", type=float, default=0.10)
+    parser.add_argument(
+        "--start-clip",
+        type=int,
+        default=0,
+        help=(
+            "0-based inclusive start index after sorting hdf5 files. "
+            "Use --start-clip 1 --end-clip 2 to run only the second clip."
+        ),
+    )
+    parser.add_argument(
+        "--end-clip",
+        type=int,
+        default=None,
+        help="0-based exclusive end index after sorting hdf5 files.",
+    )
     parser.add_argument("--max-clips", type=int, default=None)
     parser.add_argument("--max-sampled-frames-per-clip", type=int, default=None)
     parser.add_argument(
@@ -112,13 +127,24 @@ def main() -> None:
         raise ValueError("--sample-fraction must be in (0, 1]")
     if not 0.0 <= args.abnormal_inside_ratio_threshold <= 1.0:
         raise ValueError("--abnormal-inside-ratio-threshold must be in [0, 1]")
+    if args.start_clip < 0:
+        raise ValueError("--start-clip must be >= 0")
+    if args.end_clip is not None and args.end_clip < args.start_clip:
+        raise ValueError("--end-clip must be >= --start-clip")
+    if args.max_clips is not None and args.max_clips < 1:
+        raise ValueError("--max-clips must be >= 1")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    hdf5_paths = sorted(args.hdf5_dir.glob("*.hdf5"))
+    all_hdf5_paths = sorted(args.hdf5_dir.glob("*.hdf5"))
+    hdf5_paths = all_hdf5_paths[args.start_clip : args.end_clip]
     if args.max_clips is not None:
         hdf5_paths = hdf5_paths[: args.max_clips]
     if not hdf5_paths:
-        raise FileNotFoundError(f"No .hdf5 files under {args.hdf5_dir}")
+        raise FileNotFoundError(
+            f"No .hdf5 files selected under {args.hdf5_dir}; "
+            f"available={len(all_hdf5_paths)}, "
+            f"start_clip={args.start_clip}, end_clip={args.end_clip}"
+        )
 
     queries = [query.strip() for query in args.queries.split(",") if query.strip()]
     segmenter = SAM3Segmenter(
@@ -179,6 +205,11 @@ def main() -> None:
             "video_dir": str(args.video_dir),
             "sam3_model": str(args.sam3_model),
             "sample_fraction": args.sample_fraction,
+            "start_clip": args.start_clip,
+            "end_clip": args.end_clip,
+            "max_clips": args.max_clips,
+            "available_hdf5_count": len(all_hdf5_paths),
+            "selected_hdf5_paths": [str(path) for path in hdf5_paths],
             "queries": queries,
             "abnormal_inside_ratio_threshold": args.abnormal_inside_ratio_threshold,
             "write_overlays": args.write_overlays,
