@@ -522,7 +522,10 @@ def _timeline_metrics(path: Path, frame_count: int, fps: float, config: Timeline
 
 
 def _keypoint_dataset_has_points(dataset: h5py.Dataset) -> bool:
-    return len(dataset.shape) >= 3 and dataset.shape[0] >= 0 and dataset.shape[-1] >= 2
+    if len(dataset.shape) < 3 or dataset.shape[-1] not in {2, 3}:
+        return False
+    point_count = int(np.prod(dataset.shape[1:-1]))
+    return point_count >= 8
 
 
 def _read_keypoint_data(path: Path) -> np.ndarray | None:
@@ -539,9 +542,16 @@ def _read_keypoint_data(path: Path) -> np.ndarray | None:
 
             found: np.ndarray | None = None
 
-            def visit(_name: str, obj: h5py.Group | h5py.Dataset) -> None:
+            def visit(name: str, obj: h5py.Group | h5py.Dataset) -> None:
                 nonlocal found
-                if found is None and isinstance(obj, h5py.Dataset) and _keypoint_dataset_has_points(obj):
+                lower_name = name.lower()
+                keypoint_like_name = any(token in lower_name for token in ("keypoint", "landmark", "quality_hand"))
+                if (
+                    found is None
+                    and keypoint_like_name
+                    and isinstance(obj, h5py.Dataset)
+                    and _keypoint_dataset_has_points(obj)
+                ):
                     found = np.asarray(obj[()])
 
             handle.visititems(visit)
@@ -1141,67 +1151,68 @@ def evaluate_video_quality(
         elif roi.available_ratio < config.hand_roi.available_ratio_pass:
             warn.append("hand_roi_available_ratio_warn")
 
-        severe = config.hand_roi.severe_fail
-        if severe.enabled:
-            lap_fail = roi.laplacian_p10 < severe.laplacian_p10_fail
-            ten_fail = roi.tenengrad_p10 < severe.tenengrad_p10_fail
-            if severe.require_both_lap_and_ten_fail and lap_fail and ten_fail:
-                fail.append("hand_roi_severe_blur")
-            elif not severe.require_both_lap_and_ten_fail and (lap_fail or ten_fail):
-                fail.append("hand_roi_severe_blur")
-            if roi.blur_bad_frame_ratio > severe.blur_bad_frame_ratio_fail:
-                fail.append("hand_roi_blur_bad_frame_ratio_above_max")
+        if roi.available_frame_count > 0:
+            severe = config.hand_roi.severe_fail
+            if severe.enabled:
+                lap_fail = roi.laplacian_p10 < severe.laplacian_p10_fail
+                ten_fail = roi.tenengrad_p10 < severe.tenengrad_p10_fail
+                if severe.require_both_lap_and_ten_fail and lap_fail and ten_fail:
+                    fail.append("hand_roi_severe_blur")
+                elif not severe.require_both_lap_and_ten_fail and (lap_fail or ten_fail):
+                    fail.append("hand_roi_severe_blur")
+                if roi.blur_bad_frame_ratio > severe.blur_bad_frame_ratio_fail:
+                    fail.append("hand_roi_blur_bad_frame_ratio_above_max")
 
-        _add_threshold_reason(
-            fail,
-            warn,
-            roi.laplacian_p10,
-            config.hand_roi.laplacian_p10_pass,
-            config.hand_roi.laplacian_p10_warn,
-            "hand_roi_laplacian_p10_below_min",
-            "hand_roi_laplacian_p10_warn",
-            higher_is_bad=False,
-        )
-        _add_threshold_reason(
-            fail,
-            warn,
-            roi.laplacian_median,
-            config.hand_roi.laplacian_median_pass,
-            config.hand_roi.laplacian_median_warn,
-            "hand_roi_laplacian_median_below_min",
-            "hand_roi_laplacian_median_warn",
-            higher_is_bad=False,
-        )
-        _add_threshold_reason(
-            fail,
-            warn,
-            roi.tenengrad_p10,
-            config.hand_roi.tenengrad_p10_pass,
-            config.hand_roi.tenengrad_p10_warn,
-            "hand_roi_tenengrad_p10_below_min",
-            "hand_roi_tenengrad_p10_warn",
-            higher_is_bad=False,
-        )
-        _add_threshold_reason(
-            fail,
-            warn,
-            roi.tenengrad_median,
-            config.hand_roi.tenengrad_median_pass,
-            config.hand_roi.tenengrad_median_warn,
-            "hand_roi_tenengrad_median_below_min",
-            "hand_roi_tenengrad_median_warn",
-            higher_is_bad=False,
-        )
-        _add_threshold_reason(
-            fail,
-            warn,
-            roi.blur_bad_frame_ratio,
-            config.hand_roi.blur_bad_frame_ratio_pass,
-            config.hand_roi.blur_bad_frame_ratio_warn,
-            "hand_roi_blur_bad_frame_ratio_above_max",
-            "hand_roi_blur_bad_frame_ratio_warn",
-            higher_is_bad=True,
-        )
+            _add_threshold_reason(
+                fail,
+                warn,
+                roi.laplacian_p10,
+                config.hand_roi.laplacian_p10_pass,
+                config.hand_roi.laplacian_p10_warn,
+                "hand_roi_laplacian_p10_below_min",
+                "hand_roi_laplacian_p10_warn",
+                higher_is_bad=False,
+            )
+            _add_threshold_reason(
+                fail,
+                warn,
+                roi.laplacian_median,
+                config.hand_roi.laplacian_median_pass,
+                config.hand_roi.laplacian_median_warn,
+                "hand_roi_laplacian_median_below_min",
+                "hand_roi_laplacian_median_warn",
+                higher_is_bad=False,
+            )
+            _add_threshold_reason(
+                fail,
+                warn,
+                roi.tenengrad_p10,
+                config.hand_roi.tenengrad_p10_pass,
+                config.hand_roi.tenengrad_p10_warn,
+                "hand_roi_tenengrad_p10_below_min",
+                "hand_roi_tenengrad_p10_warn",
+                higher_is_bad=False,
+            )
+            _add_threshold_reason(
+                fail,
+                warn,
+                roi.tenengrad_median,
+                config.hand_roi.tenengrad_median_pass,
+                config.hand_roi.tenengrad_median_warn,
+                "hand_roi_tenengrad_median_below_min",
+                "hand_roi_tenengrad_median_warn",
+                higher_is_bad=False,
+            )
+            _add_threshold_reason(
+                fail,
+                warn,
+                roi.blur_bad_frame_ratio,
+                config.hand_roi.blur_bad_frame_ratio_pass,
+                config.hand_roi.blur_bad_frame_ratio_warn,
+                "hand_roi_blur_bad_frame_ratio_above_max",
+                "hand_roi_blur_bad_frame_ratio_warn",
+                higher_is_bad=True,
+            )
 
     return _make_evaluation(fail, warn)
 

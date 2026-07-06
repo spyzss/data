@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import h5py
 
 from acceptance_pull.video_quality import (
     AlignmentMode,
@@ -329,6 +330,34 @@ def test_hand_roi_bbox_metrics_warn_without_keypoint_quality_check(tmp_path: Pat
     assert metrics.hand_roi.laplacian_p10 > 0
     assert "hand_roi_available_ratio_below_min" not in evaluation.reasons
     assert evaluation.should_run_mask_qc is True
+
+
+def test_hand_roi_unavailable_warns_without_severe_blur_fail(tmp_path: Path) -> None:
+    batch = tmp_path
+    video_dir = batch / "video"
+    video_dir.mkdir()
+    video = video_dir / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
+    hdf5_path = batch / "hdf5" / "408817_hdf5.hdf5"
+    hdf5_path.parent.mkdir()
+    with h5py.File(hdf5_path, "w") as handle:
+        label = handle.create_group("label")
+        label.create_dataset("quality_hand", data=np.ones((3, 2), dtype=np.float32))
+        transforms = handle.create_group("transforms")
+        transforms.create_dataset("leftHand", data=np.repeat(np.eye(4, dtype=np.float32)[None, :, :], 3, axis=0))
+    config = load_video_quality_config(None)
+
+    metrics = analyze_video(video, config, hdf5_path=hdf5_path)
+    evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
+
+    assert metrics.hand_roi is not None
+    assert metrics.hand_roi.available_ratio == 0.0
+    assert evaluation.passed is True
+    assert evaluation.decision == "warn"
+    assert evaluation.should_run_mask_qc is True
+    assert "hand_roi_available_ratio_below_min" in evaluation.warn_reasons
+    assert "hand_roi_severe_blur" not in evaluation.reasons
+    assert "hand_roi_blur_bad_frame_ratio_above_max" not in evaluation.reasons
 
 
 def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tmp_path: Path) -> None:
