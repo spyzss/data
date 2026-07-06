@@ -14,11 +14,11 @@ from acceptance_pull.video_quality import (
     main,
     run_video_quality_check,
 )
-from tests.fixtures import solid_frame, write_quality_hdf5, write_test_video
+from tests.fixtures import solid_frame, write_hand_keypoint_hdf5, write_quality_hdf5, write_test_video
 from tests.fixtures import write_quality_hdf5_with_text
 
 
-def textured_frame(offset: int, width: int = 32, height: int = 24) -> np.ndarray:
+def textured_frame(offset: int, width: int = 1280, height: int = 720) -> np.ndarray:
     y, x = np.indices((height, width))
     gray = (80 + ((x * 7 + y * 5 + offset) % 140)).astype(np.uint8)
     gray[:, width // 3 : width // 3 + 2] = 20
@@ -29,46 +29,62 @@ def textured_frame(offset: int, width: int = 32, height: int = 24) -> np.ndarray
 def test_default_video_quality_config() -> None:
     config = load_video_quality_config(None)
 
-    assert config.sample_count == 30
-    assert config.alignment_mode == AlignmentMode.WARN
-    assert config.thresholds.min_fps == 1.0
-    assert config.thresholds.min_width == 1
-    assert config.thresholds.min_height == 1
-    assert config.thresholds.min_sample_decode_ratio == 1.0
-    assert config.thresholds.max_mean_over_dark_ratio == 0.10
-    assert config.thresholds.max_mean_over_exposed_ratio == 0.05
-    assert config.thresholds.min_laplacian_p10 == 300.0
-    assert config.thresholds.min_laplacian_median == 450.0
-    assert config.thresholds.max_laplacian_under_100_ratio == 0.0
-    assert config.thresholds.min_tenengrad_p10 == 30.0
-    assert config.thresholds.min_tenengrad_median == 35.0
-    assert config.thresholds.max_black_frame_ratio == 0.05
-    assert config.thresholds.max_frozen_frame_ratio == 0.1
+    assert config.threshold_version == "video_prefilter_v0.2"
+    assert config.pipeline.stop_before_mask_if_fail is True
+    assert config.pipeline.run_hand_roi is True
+    assert config.pipeline.do_keypoint_quality_check is False
+    assert config.fps.expected_fps is None
+    assert config.fps.min_fps_pass == 24
+    assert config.fps.min_fps_warn == 20
+    assert config.resolution.min_short_side_fail == 720
+    assert config.resolution.min_long_side_fail == 1280
+    assert config.decode.sample_decode_ratio_pass == 0.995
+    assert config.decode.sample_decode_ratio_warn == 0.98
+    assert config.decode.max_sample_frames == 300
+    assert config.exposure.black.ratio_pass == 0.005
+    assert config.exposure.over_dark.ratio_pass == 0.05
+    assert config.exposure.over_exposed.ratio_pass == 0.05
+    assert config.sharpness_global.target_short_side == 720
+    assert config.sharpness_global.laplacian_p10_pass == 300
+    assert config.sharpness_global.laplacian_median_pass == 450
+    assert config.sharpness_global.laplacian_under_100_ratio_pass == 0.01
+    assert config.sharpness_global.tenengrad_p10_pass == 30
+    assert config.sharpness_global.tenengrad_median_pass == 35
+    assert config.freeze.frozen_frame_ratio_pass == 0.03
+    assert config.freeze.max_consecutive_frozen_sec_fail == 1.0
+    assert config.hdf5_alignment.mode == AlignmentMode.FAIL
+    assert config.hdf5_alignment.max_delta_frames_pass == 2
+    assert config.hand_roi.mode == "warn_except_severe_fail"
+    assert config.hand_roi.use_keypoints_as_bbox_only is True
 
 
 def test_video_quality_config_yaml_override(tmp_path: Path) -> None:
     path = tmp_path / "quality.yaml"
     path.write_text(
         """
-sample_count: 4
-alignment_mode: fail
-thresholds:
-  min_fps: 20
-  min_width: 640
-  min_height: 480
-  max_black_frame_ratio: 0.1
+threshold_version: video_prefilter_v0.2-custom
+decode:
+  max_sample_frames: 4
+hdf5_alignment:
+  mode: warn
+fps:
+  expected_fps: 30
+resolution:
+  min_short_side_fail: 480
+hand_roi:
+  enabled: false
 """,
         encoding="utf-8",
     )
 
     config = load_video_quality_config(path)
 
-    assert config.sample_count == 4
-    assert config.alignment_mode == AlignmentMode.FAIL
-    assert config.thresholds.min_fps == 20
-    assert config.thresholds.min_width == 640
-    assert config.thresholds.min_height == 480
-    assert config.thresholds.max_black_frame_ratio == 0.1
+    assert config.threshold_version == "video_prefilter_v0.2-custom"
+    assert config.decode.max_sample_frames == 4
+    assert config.hdf5_alignment.mode == AlignmentMode.WARN
+    assert config.fps.expected_fps == 30
+    assert config.resolution.min_short_side_fail == 480
+    assert config.hand_roi.enabled is False
 
 
 def test_discover_batch_videos_requires_video_dir(tmp_path: Path) -> None:
@@ -103,6 +119,8 @@ def test_analyze_video_reports_metadata_and_sample_metrics(tmp_path: Path) -> No
     assert metrics.fps == pytest.approx(12.0, rel=0.1)
     assert metrics.width == 32
     assert metrics.height == 24
+    assert metrics.short_side == 24
+    assert metrics.long_side == 32
     assert metrics.decoded_sample_count >= 1
     assert metrics.sample_decode_ratio > 0
     assert 70 <= metrics.mean_brightness <= 210
@@ -121,6 +139,7 @@ def test_analyze_video_reports_clear_screen_sharpness_distribution(tmp_path: Pat
     assert metrics.laplacian_under_100_ratio == 0
     assert metrics.tenengrad_p10 >= 30
     assert metrics.tenengrad_median >= 35
+    assert metrics.sharpness_scale_short_side == 720
 
 
 def test_analyze_video_marks_invalid_video_unopened(tmp_path: Path) -> None:
@@ -147,13 +166,16 @@ def test_analyze_video_detects_black_and_frozen_samples(tmp_path: Path) -> None:
 
 def test_evaluate_video_quality_passes_good_metrics(tmp_path: Path) -> None:
     video = tmp_path / "408817_video.mp4"
-    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=10.0)
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     metrics = analyze_video(video, load_video_quality_config(None))
 
     evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
 
     assert evaluation.passed is True
+    assert evaluation.decision == "pass"
+    assert evaluation.should_run_mask_qc is True
     assert evaluation.reasons == ()
+    assert evaluation.warn_reasons == ()
 
 
 def test_evaluate_video_quality_fails_decode_and_threshold_reasons(tmp_path: Path) -> None:
@@ -164,20 +186,24 @@ def test_evaluate_video_quality_fails_decode_and_threshold_reasons(tmp_path: Pat
     evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
 
     assert evaluation.passed is False
+    assert evaluation.decision == "fail"
+    assert evaluation.should_run_mask_qc is False
     assert "cannot_open_video" in evaluation.reasons
     assert "sample_decode_ratio_below_min" in evaluation.reasons
 
 
 def test_evaluate_video_quality_fails_black_and_frozen_video(tmp_path: Path) -> None:
     video = tmp_path / "408817_video.mp4"
-    write_test_video(video, [solid_frame(0) for _ in range(6)], fps=10.0)
+    write_test_video(video, [solid_frame(0) for _ in range(16)], fps=10.0)
     metrics = analyze_video(video, load_video_quality_config(None))
 
     evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
 
     assert evaluation.passed is False
     assert "black_frame_ratio_above_max" in evaluation.reasons
+    assert "mean_over_dark_ratio_above_max" in evaluation.reasons
     assert "frozen_frame_ratio_above_max" in evaluation.reasons
+    assert "max_consecutive_frozen_sec_above_max" in evaluation.reasons
 
 
 def test_evaluate_video_quality_fails_clear_screen_thresholds(tmp_path: Path) -> None:
@@ -193,6 +219,18 @@ def test_evaluate_video_quality_fails_clear_screen_thresholds(tmp_path: Path) ->
     assert "laplacian_under_100_ratio_above_max" in evaluation.reasons
     assert "tenengrad_p10_below_min" in evaluation.reasons
     assert "tenengrad_median_below_min" in evaluation.reasons
+
+
+def test_evaluate_video_quality_fails_low_resolution(tmp_path: Path) -> None:
+    video = tmp_path / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0, width=640, height=360), textured_frame(10, width=640, height=360)])
+    metrics = analyze_video(video, load_video_quality_config(None))
+
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
+
+    assert evaluation.passed is False
+    assert "short_side_below_min" in evaluation.reasons
+    assert "long_side_below_min" in evaluation.reasons
 
 
 def test_check_hdf5_alignment_passes_matching_frame_count(tmp_path: Path) -> None:
@@ -211,14 +249,16 @@ def test_check_hdf5_alignment_passes_matching_frame_count(tmp_path: Path) -> Non
     assert alignment.frame_count_match is True
 
 
-def test_hdf5_alignment_mismatch_fails_evaluation(tmp_path: Path) -> None:
+def test_hdf5_alignment_small_delta_warns_without_stopping_mask_qc(tmp_path: Path) -> None:
     batch = tmp_path
     video_dir = batch / "video"
     video_dir.mkdir()
     video = video_dir / "408817_video.mp4"
-    write_test_video(video, [solid_frame(100) for _ in range(4)], fps=10.0)
-    write_quality_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", 5)
-    config = load_video_quality_config(None)
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20), textured_frame(30)], fps=30.0)
+    write_quality_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", 8)
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text("hdf5_alignment:\n  max_delta_ratio_warn: 1.0\n", encoding="utf-8")
+    config = load_video_quality_config(config_path)
     metrics = analyze_video(video, config)
     alignment = check_hdf5_alignment(video, batch, metrics, config)
 
@@ -226,17 +266,23 @@ def test_hdf5_alignment_mismatch_fails_evaluation(tmp_path: Path) -> None:
 
     assert alignment.status == "mismatch"
     assert alignment.frame_count_match is False
-    assert evaluation.passed is False
-    assert "hdf5_frame_count_mismatch" in evaluation.reasons
+    assert alignment.frame_count_delta == 4
+    assert alignment.frame_count_delta_ratio == pytest.approx(0.5)
+    assert evaluation.passed is True
+    assert evaluation.decision == "warn"
+    assert evaluation.should_run_mask_qc is True
+    assert "hdf5_frame_count_mismatch_warn" in evaluation.warn_reasons
 
 
-def test_hdf5_alignment_missing_warn_does_not_fail(tmp_path: Path) -> None:
+def test_hdf5_alignment_missing_warn_mode_does_not_fail(tmp_path: Path) -> None:
     batch = tmp_path
     video_dir = batch / "video"
     video_dir.mkdir()
     video = video_dir / "408817_video.mp4"
     write_test_video(video, [solid_frame(100) for _ in range(4)], fps=10.0)
-    config = load_video_quality_config(None)
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text("hdf5_alignment:\n  mode: warn\n", encoding="utf-8")
+    config = load_video_quality_config(config_path)
     metrics = analyze_video(video, config)
 
     alignment = check_hdf5_alignment(video, batch, metrics, config)
@@ -244,6 +290,45 @@ def test_hdf5_alignment_missing_warn_does_not_fail(tmp_path: Path) -> None:
 
     assert alignment.status == "missing"
     assert "hdf5_missing" not in evaluation.reasons
+    assert "hdf5_missing" in evaluation.warn_reasons
+
+
+def test_hdf5_alignment_large_delta_fails_by_default(tmp_path: Path) -> None:
+    batch = tmp_path
+    video_dir = batch / "video"
+    video_dir.mkdir()
+    video = video_dir / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
+    write_quality_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", 20)
+    config = load_video_quality_config(None)
+    metrics = analyze_video(video, config)
+
+    alignment = check_hdf5_alignment(video, batch, metrics, config)
+    evaluation = evaluate_video_quality(metrics, config, alignment)
+
+    assert alignment.frame_count_delta == 17
+    assert evaluation.passed is False
+    assert "hdf5_frame_count_mismatch" in evaluation.reasons
+
+
+def test_hand_roi_bbox_metrics_warn_without_keypoint_quality_check(tmp_path: Path) -> None:
+    batch = tmp_path
+    video_dir = batch / "video"
+    video_dir.mkdir()
+    video = video_dir / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
+    write_hand_keypoint_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", frame_count=3, normalized=True)
+    config = load_video_quality_config(None)
+
+    metrics = analyze_video(video, config, hdf5_path=batch / "hdf5" / "408817_hdf5.hdf5")
+    evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
+
+    assert metrics.hand_roi is not None
+    assert metrics.hand_roi.source == "hdf5_keypoints_bbox"
+    assert metrics.hand_roi.available_ratio == 1.0
+    assert metrics.hand_roi.laplacian_p10 > 0
+    assert "hand_roi_available_ratio_below_min" not in evaluation.reasons
+    assert evaluation.should_run_mask_qc is True
 
 
 def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tmp_path: Path) -> None:
@@ -251,7 +336,7 @@ def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tm
     video_dir = batch / "video"
     video_dir.mkdir()
     video = video_dir / "408817_video.mp4"
-    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=10.0)
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     write_quality_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", 3)
 
     exit_code = run_video_quality_check(batch)
@@ -260,8 +345,9 @@ def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tm
     assert not (batch / "reports").exists()
     report = json.loads((batch / "quality_archive" / "408817.json").read_text(encoding="utf-8"))
     assert report["asset_id"] == "408817"
-    assert report["qc_summary"]["status"] == "passed"
-    assert report["video_quality"]["thresholds"]["min_sample_decode_ratio"] == 1.0
+    assert report["qc_summary"]["status"] == "pass"
+    assert report["qc_summary"]["should_run_mask_qc"] is True
+    assert report["video_quality"]["thresholds"]["decode"]["sample_decode_ratio_pass"] == 0.995
 
 
 def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path: Path) -> None:
@@ -269,7 +355,7 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     video_dir = batch / "video"
     video_dir.mkdir()
     video = video_dir / "408817_video.mp4"
-    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=10.0)
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     write_quality_hdf5_with_text(batch / "hdf5" / "408817_hdf5.hdf5", 3)
 
     exit_code = run_video_quality_check(batch)
@@ -282,14 +368,16 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     assert report["schema_version"] == "asset_qc_report.v1"
     assert report["asset_id"] == "408817"
     assert report["qc_summary"] == {
-        "status": "passed",
+        "status": "pass",
         "passed": True,
         "completed_modules": ["video_quality"],
         "failed_modules": [],
         "reasons": [],
+        "warn_reasons": [],
+        "should_run_mask_qc": True,
     }
-    assert report["source_files"]["video"]["path"] == str(video)
-    assert report["source_files"]["hdf5"]["path"] == str(batch / "hdf5" / "408817_hdf5.hdf5")
+    assert report["source_files"]["video"]["path"] == "video/408817_video.mp4"
+    assert report["source_files"]["hdf5"]["path"] == "hdf5/408817_hdf5.hdf5"
     assert report["hdf5_text_info"]["alignment"]["status"] == "matched"
     assert report["hdf5_text_info"]["text_fields"]["attributes"]["/"]["task"] == "pick up red cup"
     assert report["hdf5_text_info"]["text_fields"]["attributes"]["/meta"]["scene"] == "kitchen"
@@ -299,9 +387,18 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
         "task": "整理桌面",
     }
     assert report["video_quality"]["metadata"]["frame_count"] == 3
-    assert report["video_quality"]["evaluation"] == {"passed": True, "reasons": []}
+    assert report["video_quality"]["evaluation"] == {
+        "decision": "pass",
+        "passed": True,
+        "reasons": [],
+        "warn_reasons": [],
+        "should_run_mask_qc": True,
+    }
     assert report["video_quality"]["sampling"]["decoded_sample_count"] >= 1
+    assert report["video_quality"]["metrics"]["video_basic"]["short_side"] == 720
     assert report["video_quality"]["metrics"]["exposure"]["mean_over_dark_ratio"] < 0.1
+    assert "timeline_metrics" in report["video_quality"]["metrics"]
+    assert "hand_roi_metrics" in report["video_quality"]["metrics"]
     assert report["reference_quality"]["mode"] == "none"
 
 
@@ -316,7 +413,7 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     assert exit_code == 2
     assert not (batch / "reports").exists()
     report = json.loads((batch / "quality_archive" / "bad.json").read_text(encoding="utf-8"))
-    assert report["qc_summary"]["status"] == "failed"
+    assert report["qc_summary"]["status"] == "fail"
     assert report["qc_summary"]["failed_modules"] == ["video_quality"]
     assert "cannot_open_video" in report["video_quality"]["evaluation"]["reasons"]
 
@@ -325,9 +422,9 @@ def test_video_quality_main_accepts_config_and_writes_quality_archive(tmp_path: 
     batch = tmp_path / "batch"
     video_dir = batch / "video"
     video_dir.mkdir(parents=True)
-    write_test_video(video_dir / "408817_video.mp4", [textured_frame(0), textured_frame(10)], fps=10.0)
+    write_test_video(video_dir / "408817_video.mp4", [textured_frame(0), textured_frame(10)], fps=30.0)
     config = tmp_path / "quality.yaml"
-    config.write_text("sample_count: 2\nalignment_mode: ignore\n", encoding="utf-8")
+    config.write_text("decode:\n  max_sample_frames: 2\nhdf5_alignment:\n  mode: warn\n", encoding="utf-8")
 
     exit_code = main(["--batch", str(batch), "--config", str(config)])
 

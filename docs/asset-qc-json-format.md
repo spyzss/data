@@ -45,7 +45,9 @@ quality_archive/408817.json  -> asset_id = 408817
     "passed": null,
     "completed_modules": [],
     "failed_modules": [],
-    "reasons": []
+    "reasons": [],
+    "warn_reasons": [],
+    "should_run_mask_qc": null
   },
   "source_files": {
     "video": {
@@ -79,6 +81,7 @@ quality_archive/408817.json  -> asset_id = 408817
 - 尚未执行的模块写 `null`，不要写空对象伪装完成。
 - `qc_summary.status` 初始为 `pending`。
 - `qc_summary.passed` 初始为 `null`，等至少一个 QC 模块完成后再改为 boolean。
+- `qc_summary.should_run_mask_qc` 初始为 `null`；视频预筛完成后必须写 boolean，供后续 pipeline 判断是否继续跑 mask / 骨骼点比对 / 语义一致性。
 
 ## 顶层字段
 
@@ -102,7 +105,9 @@ quality_archive/408817.json  -> asset_id = 408817
   "passed": null,
   "completed_modules": [],
   "failed_modules": [],
-  "reasons": []
+  "reasons": [],
+  "warn_reasons": [],
+  "should_run_mask_qc": null
 }
 ```
 
@@ -110,11 +115,13 @@ quality_archive/408817.json  -> asset_id = 408817
 
 ```json
 {
-  "status": "passed",
+  "status": "pass",
   "passed": true,
   "completed_modules": ["video_quality"],
   "failed_modules": [],
-  "reasons": []
+  "reasons": [],
+  "warn_reasons": [],
+  "should_run_mask_qc": true
 }
 ```
 
@@ -122,11 +129,13 @@ quality_archive/408817.json  -> asset_id = 408817
 
 | 字段 | 类型 | 规则 |
 |---|---|---|
-| `status` | string | `pending`、`passed`、`failed` 三选一。 |
-| `passed` | boolean/null | `pending` 时为 `null`；有 QC 结论后为 boolean。 |
+| `status` | string | `pending`、`pass`、`warn`、`fail` 四选一。 |
+| `passed` | boolean/null | `pending` 时为 `null`；`pass/warn` 为 `true`；`fail` 为 `false`。 |
 | `completed_modules` | string[] | 已完成并写入结果的模块名。 |
 | `failed_modules` | string[] | 有失败结论的模块名。 |
-| `reasons` | string[] | 全局失败原因，格式建议为 `<module>.<reason>`。 |
+| `reasons` | string[] | 全局 hard fail 原因，格式建议为稳定机器可读枚举。 |
+| `warn_reasons` | string[] | 全局 warning 原因，不阻断后续高成本 QC。 |
+| `should_run_mask_qc` | boolean/null | 视频预筛完成后必须写入；规则是 `status != "fail"`。 |
 
 ## source_files
 
@@ -161,8 +170,11 @@ quality_archive/408817.json  -> asset_id = 408817
 {
   "alignment": {
     "status": "matched",
-    "frame_count_source": "label/quality_hand",
-    "frame_count": 913,
+    "mode": "fail",
+    "video_frame_count": 913,
+    "hdf5_frame_count": 913,
+    "frame_count_delta": 0,
+    "frame_count_delta_ratio": 0.0,
     "frame_count_match": true,
     "reason": null
   },
@@ -193,13 +205,18 @@ quality_archive/408817.json  -> asset_id = 408817
 
 ## video_quality
 
-该 block 由视频质量模块写入。未执行前为 `null`。
+该 block 由视频预筛模块写入。未执行前为 `null`。本阶段定位是低成本视频预筛，只判断这条视频是否值得继续跑 mask、骨骼点比对、语义一致性等高成本 QC；不做 21 点精度验收、手物 mask IoU、轨迹跳变或 subtask 验收。
 
 ```json
 {
+  "stage": "video_prefilter",
+  "threshold_version": "video_prefilter_v0.2",
   "evaluation": {
+    "decision": "pass",
     "passed": true,
-    "reasons": []
+    "reasons": [],
+    "warn_reasons": [],
+    "should_run_mask_qc": true
   },
   "metadata": {
     "opened": true,
@@ -207,7 +224,9 @@ quality_archive/408817.json  -> asset_id = 408817
     "fps": 29.987814371159146,
     "duration_seconds": 30.4457,
     "width": 1280,
-    "height": 720
+    "height": 720,
+    "short_side": 720,
+    "long_side": 1280
   },
   "sampling": {
     "sample_count_configured": 30,
@@ -216,81 +235,110 @@ quality_archive/408817.json  -> asset_id = 408817
     "sample_decode_ratio": 1.0
   },
   "metrics": {
-    "brightness": {
-      "mean": 141.94834483506946,
+    "video_basic": {
+      "video_open_ok": true,
+      "video_stream_present": true,
+      "codec_readable": true,
+      "metadata_read_ok": true,
+      "fps": 29.97,
+      "short_side": 720,
+      "long_side": 1280
+    },
+    "timeline_metrics": {
+      "pts_monotonic_valid": true,
+      "drop_frame_ratio": 0.0,
+      "frame_interval_p99_ms": 35.1,
+      "max_frame_gap_ms": 38.4
+    },
+    "decode_metrics": {
+      "sample_decode_ratio": 1.0
+    },
+    "exposure_metrics": {
       "black_frame_ratio": 0.0,
-      "black_frame_brightness_threshold": 16
+      "mean_over_dark_ratio": 0.0,
+      "mean_over_exposed_ratio": 0.0
     },
-    "exposure": {
-      "mean_over_dark_ratio": 0.00017957899305555555,
-      "mean_over_exposed_ratio": 0.00016731770833333328,
-      "dark_pixel_threshold": 16,
-      "over_exposed_pixel_threshold": 245
+    "sharpness_global": {
+      "sharpness_scale_short_side": 720,
+      "laplacian_p10": 420.5,
+      "laplacian_median": 650.2,
+      "laplacian_under_100_ratio": 0.0,
+      "tenengrad_p10": 34.1,
+      "tenengrad_median": 42.7
     },
-    "sharpness": {
-      "mean_blur_laplacian_var": 703.8909998044529,
-      "laplacian": {
-        "min": 491.1170638753997,
-        "p10": 587.5743396361266,
-        "median": 674.0077060111153,
-        "mean": 703.8909998044529,
-        "p90": 897.1528888694626,
-        "under_100_ratio": 0.0,
-        "under_100_threshold": 100.0
-      },
-      "tenengrad": {
-        "p10": 42.599610736089254,
-        "median": 46.17884019666276,
-        "mean": 45.84542635329141
-      }
-    },
-    "temporal": {
+    "freeze_metrics": {
       "frozen_frame_ratio": 0.0,
-      "frozen_frame_mean_abs_diff_threshold": 1.0
+      "max_consecutive_frozen_sec": 0.0
+    },
+    "hdf5_alignment": {
+      "enabled": true,
+      "mode": "fail",
+      "video_frame_count": 913,
+      "hdf5_frame_count": 913,
+      "frame_count_delta": 0,
+      "frame_count_delta_ratio": 0.0
+    },
+    "hand_roi_metrics": {
+      "enabled": true,
+      "source": "hdf5_keypoints_bbox",
+      "hand_roi_available_ratio": 0.86,
+      "hand_roi_laplacian_p10": 185.3,
+      "hand_roi_laplacian_median": 280.4,
+      "hand_roi_tenengrad_p10": 20.2,
+      "hand_roi_tenengrad_median": 26.8,
+      "hand_roi_blur_bad_frame_ratio": 0.08
     }
   },
   "thresholds": {
-    "min_fps": 1.0,
-    "min_width": 1,
-    "min_height": 1,
-    "min_sample_decode_ratio": 1.0,
-    "max_mean_over_dark_ratio": 0.1,
-    "max_mean_over_exposed_ratio": 0.05,
-    "min_laplacian_p10": 300.0,
-    "min_laplacian_median": 450.0,
-    "max_laplacian_under_100_ratio": 0.0,
-    "min_tenengrad_p10": 30.0,
-    "min_tenengrad_median": 35.0,
-    "max_black_frame_ratio": 0.05,
-    "max_frozen_frame_ratio": 0.1,
-    "fail_on_hdf5_frame_mismatch": true
+    "threshold_version": "video_prefilter_v0.2",
+    "fps": {
+      "expected_fps": null,
+      "min_fps_pass": 24,
+      "min_fps_warn": 20,
+      "min_fps_fail": 20
+    },
+    "resolution": {
+      "min_short_side_fail": 720,
+      "min_long_side_fail": 1280
+    }
   },
   "errors": []
 }
 ```
 
-`video_quality.evaluation.reasons` 使用稳定机器可读枚举，例如：
+`video_quality.evaluation.decision` 与 `qc_summary.status` 同步，取值为 `pass | warn | fail`。`should_run_mask_qc` 是 pipeline 调度 flag，规则固定为：
+
+```text
+should_run_mask_qc = decision != "fail"
+```
+
+`video_quality.evaluation.reasons` 和 `warn_reasons` 使用稳定机器可读枚举，例如：
 
 | reason | 含义 |
 |---|---|
 | `cannot_open_video` | 视频文件无法打开。 |
 | `video_not_opened` | OpenCV 未能打开视频流。 |
 | `fps_below_min` | FPS 低于阈值。 |
-| `width_below_min` | 宽度低于阈值。 |
-| `height_below_min` | 高度低于阈值。 |
+| `short_side_below_min` | 短边分辨率低于阈值。 |
+| `long_side_below_min` | 长边分辨率低于阈值。 |
+| `drop_frame_ratio_above_max` | 时间轴疑似丢帧比例超过 hard fail 阈值。 |
+| `max_frame_gap_ms_above_max` | 最大帧间隔超过 hard fail 阈值。 |
 | `sample_decode_ratio_below_min` | 抽样帧解码率低于阈值。 |
-| `mean_over_dark_ratio_above_max` | 平均过暗像素占比高于阈值。 |
-| `mean_over_exposed_ratio_above_max` | 平均过曝像素占比高于阈值。 |
+| `mean_over_dark_ratio_above_max` | 过暗帧比例高于阈值。 |
+| `mean_over_exposed_ratio_above_max` | 过曝帧比例高于阈值。 |
 | `laplacian_p10_below_min` | Laplacian 方差 p10 低于清晰度硬筛阈值。 |
 | `laplacian_median_below_min` | Laplacian 方差中位数低于清晰度硬筛阈值。 |
-| `laplacian_under_100_ratio_above_max` | 存在 Laplacian 方差低于 100 的抽样帧。 |
+| `laplacian_under_100_ratio_above_max` | Laplacian 方差低于 100 的帧比例高于阈值。 |
 | `tenengrad_p10_below_min` | Tenengrad p10 低于清晰度硬筛阈值。 |
 | `tenengrad_median_below_min` | Tenengrad 中位数低于清晰度硬筛阈值。 |
 | `black_frame_ratio_above_max` | 黑帧率高于阈值。 |
 | `frozen_frame_ratio_above_max` | 冻帧率高于阈值。 |
+| `max_consecutive_frozen_sec_above_max` | 连续冻结时长超过阈值。 |
 | `hdf5_frame_count_mismatch` | HDF5 帧数与视频帧数不一致。 |
 | `hdf5_missing` | HDF5 缺失，且配置要求失败。 |
 | `hdf5_unreadable` | HDF5 不可读，且配置要求失败。 |
+| `hand_roi_severe_blur` | HDF5 21 点粗 bbox ROI 严重模糊。 |
+| `hand_roi_blur_bad_frame_ratio_above_max` | hand ROI 模糊坏帧比例超过 hard fail 阈值。 |
 
 ## reference_quality
 

@@ -65,8 +65,9 @@ The workflow intentionally keeps several choices as human-owned inputs:
   `video.root`.
 - OSS source mode: provide `batch_uri` and `region`; do not put access keys,
   tokens, or browser login state in YAML.
-- Video quality mode: confirm `alignment_mode` and threshold overrides before
-  using the pass/fail result as an acceptance gate.
+- Video quality mode: confirm `hdf5_alignment.mode`, threshold overrides, and
+  the `decision` / `should_run_mask_qc` pipeline flags before using the result
+  as an acceptance gate.
 
 After each run, a reviewer should check:
 
@@ -111,22 +112,22 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 Optional config:
 
 ```yaml
-sample_count: 30
-alignment_mode: warn
-thresholds:
-  min_fps: 1
-  min_width: 1
-  min_height: 1
-  min_sample_decode_ratio: 1.0
-  max_mean_over_dark_ratio: 0.10
-  max_mean_over_exposed_ratio: 0.05
-  min_laplacian_p10: 300.0
-  min_laplacian_median: 450.0
-  max_laplacian_under_100_ratio: 0.0
-  min_tenengrad_p10: 30.0
-  min_tenengrad_median: 35.0
-  max_black_frame_ratio: 0.05
-  max_frozen_frame_ratio: 0.1
+threshold_version: video_prefilter_v0.2
+decode:
+  max_sample_frames: 300
+hdf5_alignment:
+  mode: fail
+resolution:
+  min_short_side_fail: 720
+  min_long_side_fail: 1280
+sharpness_global:
+  target_short_side: 720
+  laplacian_p10_pass: 300
+  laplacian_median_pass: 450
+  laplacian_under_100_ratio_pass: 0.01
+hand_roi:
+  enabled: true
+  mode: warn_except_severe_fail
 ```
 
 The video check writes:
@@ -142,7 +143,9 @@ sampled/XJGT_20260616/
 The video quality command writes each asset's QC result into
 `quality_archive/<asset_id>.json`, alongside `hdf5/` and `video/`. The schema is
 documented in `docs/asset-qc-json-format.md`; future batch-level summaries or
-tables can be generated from these archive files.
+tables can be generated from these archive files. The video block stores
+`decision: pass|warn|fail` and `should_run_mask_qc`; downstream high-cost QC
+should run only when `should_run_mask_qc` is `true`.
 
 The batch pull workflow still writes pull/sampling reports under:
 
@@ -155,9 +158,11 @@ sampled/XJGT_20260616/
     summary.json
 ```
 
-It uses practical no-reference indicators: open/decode health, frame count,
-fps, duration, resolution, sampled-frame decode ratio, brightness, over-dark and
-over-exposure ratios, clear-screen sharpness hard filters
-(`laplacian_p10`, `laplacian_median`, `laplacian_under_100_ratio`,
-`tenengrad_p10`, `tenengrad_median`), black-frame risk, frozen-frame risk, and
-optional HDF5 frame-count alignment.
+It is a `video_prefilter_v0.2` low-cost prefilter. It uses practical
+no-reference indicators: open/decode health, fps, resolution, timeline
+continuity, sampled-frame decode ratio, black/over-dark/over-exposure ratios,
+global sharpness at a normalized short side, frozen-frame risk, HDF5 frame-count
+alignment, and a coarse hand ROI sharpness check from HDF5 21-point bbox. It
+does not perform 21-point accuracy validation, keypoint-mask matching,
+hand-object mask IoU, trajectory jump checks, semantic consistency, or subtask
+acceptance.
