@@ -67,6 +67,21 @@ class SkeletonQualityScoreConfig:
     reject_missing_keypoints: bool = True
     reject_low_quality_hand: bool = False
     allowed_missing_keypoints_per_hand: int = 0
+    projection_enabled: bool = True
+    projection_image_width: int | None = None
+    projection_image_height: int | None = None
+    projection_fx: float | None = None
+    projection_fy: float | None = None
+    projection_cx: float | None = None
+    projection_cy: float | None = None
+    projection_border_margin_px: float = 20.0
+    projection_near_border_count_threshold: int = 6
+    projection_outside_count_threshold: int = 1
+    projection_center_jump_px_threshold: float = 120.0
+    projection_bbox_area_change_ratio_threshold: float = 3.0
+    candidate_pre_context_frames: int = 10
+    candidate_post_context_frames: int = 10
+    candidate_merge_gap_frames: int = 5
     pass_threshold: float = 0.90
 
 

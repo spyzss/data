@@ -11,8 +11,14 @@ from precheck.registry import available_checks
 from precheck.runner import PrecheckRunner
 from qc_common.keypoints import (
     ACCEPTANCE_FINGER_CHAINS,
+    acceptance_joint_names,
     derive_finger_bones,
     select_hand_joints,
+)
+from qc_common.projection import (
+    ProjectionConfig,
+    hand_projection_metrics,
+    project_points_with_validity,
 )
 from qc_common.types import CheckResult, ClipInputs
 
@@ -440,6 +446,228 @@ def test_text_integrity_check(tmp_path: Path) -> None:
     assert rows[54].metrics["missing_field_count"] == 3.0
     assert rows[54].metrics["empty_field_count"] == 0.0
     assert rows[54].reason == "text_label not valid JSON"
+
+
+def test_projection_helper_metrics() -> None:
+    intrinsics = np.asarray(
+        [[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    points = np.asarray(
+        [
+            [0.0, 0.0, 1.0],
+            [-0.45, 0.0, 1.0],
+            [0.60, 0.0, 1.0],
+            [0.0, -0.35, 1.0],
+            [0.0, 0.50, 1.0],
+            [0.0, 0.0, -1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    projected = project_points_with_validity(points, intrinsics)
+    assert np.allclose(projected["u"][:2], [50.0, 5.0])
+    assert np.allclose(projected["v"][:2], [40.0, 40.0])
+    assert projected["projection_valid"].tolist() == [
+        True,
+        True,
+        True,
+        True,
+        True,
+        False,
+    ]
+
+    metrics = hand_projection_metrics(
+        points,
+        intrinsics,
+        ProjectionConfig(image_width=100, image_height=80, border_margin_px=10.0),
+        previous_center=(40.0, 40.0),
+    )
+
+    assert metrics["num_projected_keypoints"] == 6.0
+    assert metrics["num_projection_valid"] == 5.0
+    assert metrics["num_projection_invalid"] == 1.0
+    assert metrics["num_points_outside_image"] == 2.0
+    assert metrics["num_points_near_border"] == 2.0
+    assert metrics["u_min"] == 5.0
+    assert metrics["u_max"] == 110.0
+    assert metrics["v_min"] == 5.0
+    assert metrics["v_max"] == 90.0
+    assert metrics["hand_bbox_area_2d"] == 105.0 * 85.0
+    assert metrics["keypoint_bbox_touches_border"] == 1.0
+    assert metrics["hand_bbox_center_jump_px"] > 10.0
+
+
+def test_skeleton_projection_config_missing_skips_cleanly(tmp_path: Path) -> None:
+    clip = _rotation_jump_clip(episode_idx=110)
+    precheck_config = PrecheckConfig(
+        output_dir=tmp_path / "skeleton_projection_skip",
+        enabled_checks=["skeleton_quality_score"],
+        skeleton_quality_score=SkeletonQualityScoreConfig(
+            decision_mode="temporal_triage",
+            projection_enabled=True,
+        ),
+        overwrite=True,
+    )
+    results = PrecheckRunner(precheck_config).run([clip])
+
+    frame_rows = [
+        result
+        for result in results
+        if result.check == "skeleton_quality_score" and result.frame_idx != -1
+    ]
+    assert frame_rows
+    assert all(row.metrics["projection_enabled"] == 0.0 for row in frame_rows)
+    assert all(row.flag is None for row in frame_rows)
+
+
+def test_skeleton_rotation_review_requires_projection_risk(tmp_path: Path) -> None:
+    safe_clip = _rotation_jump_clip(episode_idx=111)
+    projection_config = SkeletonQualityScoreConfig(
+        decision_mode="temporal_triage",
+        projection_image_width=1280,
+        projection_image_height=720,
+        projection_fx=1000.0,
+        projection_fy=1000.0,
+        projection_cx=640.0,
+        projection_cy=360.0,
+        projection_border_margin_px=20.0,
+        projection_near_border_count_threshold=6,
+    )
+    safe_config = PrecheckConfig(
+        output_dir=tmp_path / "rotation_safe_projection",
+        enabled_checks=["skeleton_quality_score"],
+        skeleton_quality_score=projection_config,
+        overwrite=True,
+    )
+    safe_results = PrecheckRunner(safe_config).run([safe_clip])
+    safe_row = next(
+        result
+        for result in safe_results
+        if result.check == "skeleton_quality_score" and result.frame_idx == 22
+    )
+    assert safe_row.flag is None
+    assert safe_row.metrics["skeleton_verdict"] == "review"
+    assert safe_row.metrics["which_thresholds_exceeded"] == ["rotation_delta_max"]
+    assert safe_row.metrics["needs_rotation_mask_review"] == 0.0
+    assert safe_row.metrics["needs_visual_review"] == 0.0
+    assert not (tmp_path / "rotation_safe_projection" / "candidate_windows.json").exists()
+
+    edge_clip = _rotation_jump_clip(episode_idx=112)
+    for joint in acceptance_joint_names(["left"]):
+        values = edge_clip.keypoints[joint]
+        values[:, 0] = -0.63
+        values[:, 1] = 0.0
+        values[:, 2] = 1.0
+    edge_config = PrecheckConfig(
+        output_dir=tmp_path / "rotation_edge_projection",
+        enabled_checks=["skeleton_quality_score"],
+        skeleton_quality_score=projection_config,
+        overwrite=True,
+    )
+    edge_results = PrecheckRunner(edge_config).run([edge_clip])
+    edge_row = next(
+        result
+        for result in edge_results
+        if result.check == "skeleton_quality_score" and result.frame_idx == 22
+    )
+    assert edge_row.flag is None
+    assert edge_row.metrics["skeleton_verdict"] == "review"
+    assert edge_row.metrics["left_num_points_near_border"] == 21.0
+    assert edge_row.metrics["left_needs_projection_review"] == 1.0
+    assert edge_row.metrics["left_needs_rotation_mask_review"] == 1.0
+    assert edge_row.metrics["needs_rotation_mask_review"] == 1.0
+    assert edge_row.metrics["needs_visual_review"] == 1.0
+    assert (tmp_path / "rotation_edge_projection" / "candidate_windows.json").exists()
+    edge_windows = json.loads(
+        (tmp_path / "rotation_edge_projection" / "candidate_windows.json").read_text()
+    )
+    assert any(window["hand_side"] == "left" for window in edge_windows)
+    assert not any(window["hand_side"] == "both" for window in edge_windows)
+
+
+def test_skeleton_projection_candidate_windows_merge(tmp_path: Path) -> None:
+    num_frames = 30
+    keypoints = _static_keypoints(num_frames)
+    rotations = _synthetic_rotations(keypoints, num_frames)
+    for joint in acceptance_joint_names(["left"]):
+        values = keypoints[joint]
+        values[:, 0] = 0.0
+        values[:, 1] = 0.0
+        values[:, 2] = 1.0
+        values[10, 0] = -0.63
+        values[14, 0] = -0.63
+        values[24, 0] = -0.63
+    clip = ClipInputs(
+        episode_idx=113,
+        frame_indices=list(range(num_frames)),
+        keypoints=keypoints,
+        rotations=rotations,
+        fps=1.0,
+    )
+    config = PrecheckConfig(
+        output_dir=tmp_path / "projection_windows",
+        enabled_checks=["skeleton_quality_score"],
+        skeleton_quality_score=SkeletonQualityScoreConfig(
+            decision_mode="temporal_triage",
+            joint_angle_change_deg_max_threshold=1_000.0,
+            rotation_delta_max_threshold=1_000.0,
+            joint_acceleration_m_s2_max_threshold=1_000.0,
+            joint_displacement_m_max_threshold=1_000.0,
+            projection_image_width=1280,
+            projection_image_height=720,
+            projection_fx=1000.0,
+            projection_fy=1000.0,
+            projection_cx=640.0,
+            projection_cy=360.0,
+            projection_near_border_count_threshold=6,
+            candidate_pre_context_frames=1,
+            candidate_post_context_frames=1,
+            candidate_merge_gap_frames=5,
+        ),
+        overwrite=True,
+    )
+    PrecheckRunner(config).run([clip])
+
+    windows = json.loads(
+        (tmp_path / "projection_windows" / "candidate_windows.json").read_text()
+    )
+    left_windows = [window for window in windows if window["hand_side"] == "left"]
+    both_windows = [window for window in windows if window["hand_side"] == "both"]
+    assert len(left_windows) == 2
+    assert both_windows == []
+    assert left_windows[0]["start_frame"] == 9
+    assert left_windows[0]["end_frame"] == 16
+    assert left_windows[0]["peak_frame"] in {10, 14}
+    assert "projection_near_border" in left_windows[0]["trigger_reason"]
+    assert left_windows[1]["start_frame"] == 23
+    assert left_windows[1]["end_frame"] == 26
+
+
+def test_skeleton_hard_invalid_flags_missing_keypoints(tmp_path: Path) -> None:
+    clip = _rotation_jump_clip(episode_idx=114)
+    clip.keypoints["leftHand"][1, 0] = np.nan
+    precheck_config = PrecheckConfig(
+        output_dir=tmp_path / "skeleton_hard_invalid",
+        enabled_checks=["skeleton_quality_score"],
+        skeleton_quality_score=SkeletonQualityScoreConfig(
+            decision_mode="temporal_triage",
+        ),
+        overwrite=True,
+    )
+    results = PrecheckRunner(precheck_config).run([clip])
+
+    invalid_row = next(
+        result
+        for result in results
+        if result.check == "skeleton_quality_score" and result.frame_idx == 21
+    )
+    assert invalid_row.flag is True
+    assert invalid_row.metrics["skeleton_verdict"] == "invalid"
+    assert invalid_row.metrics["skeleton_score"] == 0.0
+    assert invalid_row.metrics["missing_keypoint_count_left"] == 1.0
+    assert invalid_row.metrics["keypoint_presence_invalid"] == 1.0
+    assert not (tmp_path / "skeleton_hard_invalid" / "candidate_windows.json").exists()
 
 
 def test_skeleton_quality_score_without_quality_hand(tmp_path: Path) -> None:

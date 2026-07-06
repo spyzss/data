@@ -44,6 +44,7 @@ class PrecheckRunner:
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.repair_records: list[dict] = []
+        self.candidate_window_records: list[dict] = []
 
     def run(self, clips: Iterable[ClipInputs] | None = None) -> list[CheckResult]:
         if clips is None:
@@ -71,6 +72,9 @@ class PrecheckRunner:
                 )
                 results.extend(check_results)
                 self.repair_records.extend(getattr(check, "repair_records", []))
+                self.candidate_window_records.extend(
+                    getattr(check, "candidate_windows", [])
+                )
             except Exception as exc:
                 logger.error(
                     "Episode %s: %s failed: %s",
@@ -156,6 +160,20 @@ class PrecheckRunner:
             repair_path.write_text(
                 json.dumps(self.repair_records, indent=2, sort_keys=True),
                 encoding="utf-8",
+            )
+        if self.candidate_window_records:
+            candidate_path = self.output_dir / "candidate_windows.json"
+            candidate_path.write_text(
+                json.dumps(
+                    self.candidate_window_records,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            write_dataframe(
+                pd.DataFrame(self.candidate_window_records),
+                self.output_dir / "candidate_windows.parquet",
             )
         logger.info(
             "Wrote precheck results to %s, %s, %s and %s",

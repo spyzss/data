@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import numpy as np
 
 from precheck.base import BaseCheck
 from precheck.registry import register
 from qc_common.keypoints import acceptance_joint_names
+from qc_common.projection import (
+    ProjectionConfig,
+    hand_projection_metrics,
+    intrinsics_from_values,
+)
 from qc_common.types import CheckResult, ClipInputs
 
 from .keypoint_temporal import KeypointTemporalCheck
@@ -78,8 +84,42 @@ class SkeletonQualityScoreCheck(BaseCheck):
         self.allowed_missing_keypoints_per_hand = int(
             config.get("allowed_missing_keypoints_per_hand", 0)
         )
+        self.projection_enabled = bool(config.get("projection_enabled", True))
+        self.projection_image_width = config.get("projection_image_width")
+        self.projection_image_height = config.get("projection_image_height")
+        self.projection_intrinsics_override = intrinsics_from_values(
+            config.get("projection_fx"),
+            config.get("projection_fy"),
+            config.get("projection_cx"),
+            config.get("projection_cy"),
+        )
+        self.projection_border_margin_px = float(
+            config.get("projection_border_margin_px", 20.0)
+        )
+        self.projection_near_border_count_threshold = int(
+            config.get("projection_near_border_count_threshold", 6)
+        )
+        self.projection_outside_count_threshold = int(
+            config.get("projection_outside_count_threshold", 1)
+        )
+        self.projection_center_jump_px_threshold = float(
+            config.get("projection_center_jump_px_threshold", 120.0)
+        )
+        self.projection_bbox_area_change_ratio_threshold = float(
+            config.get("projection_bbox_area_change_ratio_threshold", 3.0)
+        )
+        self.candidate_pre_context_frames = int(
+            config.get("candidate_pre_context_frames", 10)
+        )
+        self.candidate_post_context_frames = int(
+            config.get("candidate_post_context_frames", 10)
+        )
+        self.candidate_merge_gap_frames = int(
+            config.get("candidate_merge_gap_frames", 5)
+        )
         self.pass_threshold = float(config.get("pass_threshold", 0.90))
         self.temporal_check = KeypointTemporalCheck({})
+        self.candidate_windows: list[dict[str, Any]] = []
 
     def run(self, clip: ClipInputs) -> list[CheckResult]:
         temporal_results = [
@@ -91,6 +131,7 @@ class SkeletonQualityScoreCheck(BaseCheck):
             return []
 
         results: list[CheckResult] = []
+        projection_state = self.projection_state(clip)
         for frame_offset, temporal_result in enumerate(temporal_results):
             metric_values = self.geometry_metric_values(temporal_result.metrics)
             missing_metrics = [
@@ -98,11 +139,22 @@ class SkeletonQualityScoreCheck(BaseCheck):
             ]
             exceeded = self.exceeded_thresholds(metric_values)
             presence_metrics = self.presence_metrics(clip, frame_offset)
+            projection_metrics = self.projection_metrics(
+                clip,
+                frame_offset,
+                projection_state,
+            )
+            combined_review_metrics = self.combined_review_metrics(
+                metric_values,
+                exceeded,
+                projection_metrics,
+            )
             ratios = self.metric_ratios(metric_values)
             verdict, needs_mask_review, needs_rotation_review, source = self.classify_frame(
                 metric_values,
                 exceeded,
                 presence_metrics,
+                combined_review_metrics,
             )
             penalties = self.penalties(exceeded)
             skeleton_score = (
@@ -154,17 +206,32 @@ class SkeletonQualityScoreCheck(BaseCheck):
                         "skeleton_verdict_code": SKELETON_VERDICT_CODES[verdict],
                         "needs_mask_containment_review": float(needs_mask_review),
                         "needs_rotation_mask_review": float(needs_rotation_review),
+                        "needs_projection_review": combined_review_metrics[
+                            "needs_projection_review"
+                        ],
+                        "needs_out_of_frame_review": combined_review_metrics[
+                            "needs_out_of_frame_review"
+                        ],
+                        "needs_visual_review": combined_review_metrics[
+                            "needs_visual_review"
+                        ],
                         "skeleton_decision_source": source,
                         "sustained_review_promoted": 0.0,
                         "skeleton_decision_mode": self.decision_mode,
                         **presence_metrics,
+                        **projection_metrics,
                     },
-                    flag=True if verdict == "suspect" else None,
+                    flag=True if verdict in {"invalid", "suspect"} else None,
                     reason=self.reason(verdict, missing_metrics),
                 )
             )
 
         self.promote_sustained_review_runs(results)
+        self.refresh_visual_review_after_promotion(results)
+        self.candidate_windows = self.build_candidate_windows(
+            clip,
+            results,
+        )
         counts = self.count_verdicts(results)
         scores = [
             float(result.metrics.get("skeleton_score", 0.0))
@@ -209,6 +276,7 @@ class SkeletonQualityScoreCheck(BaseCheck):
         metric_values: dict[str, float],
         exceeded: list[str],
         presence_metrics: dict[str, float],
+        review_metrics: dict[str, float],
     ) -> tuple[str, bool, bool, str]:
         if bool(presence_metrics.get("keypoint_presence_invalid", 0.0)):
             return "invalid", False, False, "keypoint_presence"
@@ -225,11 +293,7 @@ class SkeletonQualityScoreCheck(BaseCheck):
             return "good", False, False, "within_thresholds"
 
         ratios = self.metric_ratios(metric_values)
-        rotation_review = (
-            ratios["rotation_delta_max"] >= self.rotation_mask_review_ratio
-            if math.isfinite(ratios["rotation_delta_max"])
-            else False
-        )
+        rotation_review = bool(review_metrics["needs_rotation_mask_review"])
         strong_motion = (
             ratios["joint_acceleration_m_s2_max"] >= self.strong_acceleration_ratio
             or ratios["joint_displacement_m_max"] >= self.strong_displacement_ratio
@@ -237,7 +301,14 @@ class SkeletonQualityScoreCheck(BaseCheck):
         multi_signal = len(exceeded) >= self.hard_exceeded_metric_count
         if strong_motion or multi_signal:
             return "suspect", False, bool(rotation_review), "strong_temporal_geometry"
-        return "review", True, bool(rotation_review), "moderate_temporal_geometry"
+        projection_review = bool(review_metrics["needs_projection_review"])
+        out_of_frame_review = bool(review_metrics["needs_out_of_frame_review"])
+        return (
+            "review",
+            projection_review or out_of_frame_review or bool(rotation_review),
+            bool(rotation_review),
+            "projection_visual_review" if projection_review else "moderate_temporal_geometry",
+        )
 
     def presence_metrics(
         self,
@@ -285,6 +356,151 @@ class SkeletonQualityScoreCheck(BaseCheck):
         metrics["keypoint_presence_invalid"] = float(invalid)
         return metrics
 
+    def projection_state(self, clip: ClipInputs) -> dict[str, Any]:
+        image_size = self.projection_image_size(clip)
+        intrinsics = self.projection_intrinsics_override
+        if intrinsics is None:
+            intrinsics = clip.intrinsics
+        enabled = (
+            self.projection_enabled
+            and intrinsics is not None
+            and image_size is not None
+        )
+        return {
+            "enabled": bool(enabled),
+            "intrinsics": intrinsics,
+            "image_size": image_size,
+            "previous_center": {},
+            "previous_area": {},
+        }
+
+    def projection_image_size(self, clip: ClipInputs) -> tuple[int, int] | None:
+        if self.projection_image_width is not None and self.projection_image_height is not None:
+            return int(self.projection_image_width), int(self.projection_image_height)
+        frames = clip.frames
+        if frames is None or len(frames) == 0:
+            return None
+        first = np.asarray(frames[0])
+        if first.ndim < 2:
+            return None
+        height, width = first.shape[:2]
+        return int(width), int(height)
+
+    def projection_metrics(
+        self,
+        clip: ClipInputs,
+        frame_offset: int,
+        state: dict[str, Any],
+    ) -> dict[str, float]:
+        width_height = state.get("image_size")
+        metrics: dict[str, float] = {
+            "projection_enabled": float(bool(state.get("enabled"))),
+        }
+        if width_height is not None:
+            metrics["projection_image_width"] = float(width_height[0])
+            metrics["projection_image_height"] = float(width_height[1])
+        if not state.get("enabled"):
+            return metrics
+
+        config = ProjectionConfig(
+            image_width=int(width_height[0]),
+            image_height=int(width_height[1]),
+            border_margin_px=self.projection_border_margin_px,
+        )
+        keypoints = clip.keypoints or {}
+        intrinsics = state["intrinsics"]
+        for side in ("left", "right"):
+            expected = acceptance_joint_names([side])
+            if not all(name in keypoints and keypoints[name].shape[0] > frame_offset for name in expected):
+                continue
+            points = np.asarray([keypoints[name][frame_offset] for name in expected], dtype=np.float64)
+            side_metrics = hand_projection_metrics(
+                points,
+                intrinsics,
+                config,
+                previous_center=state["previous_center"].get(side),
+            )
+            area = float(side_metrics.get("hand_bbox_area_2d", math.nan))
+            previous_area = state["previous_area"].get(side)
+            if previous_area is None or previous_area <= 1e-8 or not math.isfinite(area):
+                area_change_ratio = math.nan
+            else:
+                area_change_ratio = max(area / previous_area, previous_area / max(area, 1e-8))
+            center_u = side_metrics.get("hand_bbox_center_u")
+            center_v = side_metrics.get("hand_bbox_center_v")
+            if isinstance(center_u, float) and isinstance(center_v, float) and math.isfinite(center_u) and math.isfinite(center_v):
+                state["previous_center"][side] = (center_u, center_v)
+            if math.isfinite(area):
+                state["previous_area"][side] = area
+            side_metrics["hand_bbox_area_change_ratio"] = area_change_ratio
+            for name, value in side_metrics.items():
+                metrics[f"{side}_{name}"] = float(value) if isinstance(value, (int, float, np.floating)) else value
+        return metrics
+
+    def combined_review_metrics(
+        self,
+        metric_values: dict[str, float],
+        exceeded: list[str],
+        projection_metrics: dict[str, float],
+    ) -> dict[str, float]:
+        ratios = self.metric_ratios(metric_values)
+        any_projection_review = False
+        any_out_of_frame_review = False
+        any_rotation_projection_review = False
+        for side in ("left", "right"):
+            outside = projection_metrics.get(f"{side}_num_points_outside_image", 0.0)
+            invalid = projection_metrics.get(f"{side}_num_projection_invalid", 0.0)
+            near_border = projection_metrics.get(f"{side}_num_points_near_border", 0.0)
+            touches_border = projection_metrics.get(f"{side}_keypoint_bbox_touches_border", 0.0)
+            center_jump = projection_metrics.get(f"{side}_hand_bbox_center_jump_px", math.nan)
+            area_ratio = projection_metrics.get(f"{side}_hand_bbox_area_change_ratio", math.nan)
+            out_of_frame = (
+                outside >= self.projection_outside_count_threshold
+                or near_border >= self.projection_near_border_count_threshold
+                or bool(touches_border)
+            )
+            projection_review = (
+                out_of_frame
+                or invalid >= self.projection_outside_count_threshold
+                or (
+                    math.isfinite(center_jump)
+                    and center_jump >= self.projection_center_jump_px_threshold
+                )
+                or (
+                    math.isfinite(area_ratio)
+                    and area_ratio >= self.projection_bbox_area_change_ratio_threshold
+                )
+            )
+            rotation_projection = (
+                ratios["rotation_delta_max"] >= self.rotation_mask_review_ratio
+                and out_of_frame
+            ) if math.isfinite(ratios["rotation_delta_max"]) else False
+            projection_metrics[f"{side}_needs_out_of_frame_review"] = float(out_of_frame)
+            projection_metrics[f"{side}_needs_projection_review"] = float(projection_review)
+            projection_metrics[f"{side}_needs_rotation_mask_review"] = float(rotation_projection)
+            any_out_of_frame_review = any_out_of_frame_review or out_of_frame
+            any_projection_review = any_projection_review or projection_review
+            any_rotation_projection_review = (
+                any_rotation_projection_review or rotation_projection
+            )
+
+        strong_temporal = (
+            ratios["joint_acceleration_m_s2_max"] >= self.strong_acceleration_ratio
+            or ratios["joint_displacement_m_max"] >= self.strong_displacement_ratio
+            or len(exceeded) >= self.hard_exceeded_metric_count
+        )
+        return {
+            "needs_projection_review": float(any_projection_review),
+            "needs_out_of_frame_review": float(any_out_of_frame_review),
+            "needs_rotation_mask_review": float(any_rotation_projection_review),
+            "needs_visual_review": float(
+                any_projection_review
+                or any_out_of_frame_review
+                or any_rotation_projection_review
+                or strong_temporal
+            ),
+        }
+
     def promote_sustained_review_runs(self, results: list[CheckResult]) -> None:
         if (
             self.decision_mode != "temporal_triage"
@@ -310,8 +526,14 @@ class SkeletonQualityScoreCheck(BaseCheck):
             result.metrics["sustained_review_promoted"] = 1.0
             result.metrics["needs_mask_containment_review"] = 1.0
             result.metrics["skeleton_decision_source"] = "sustained_review_run"
+            result.metrics["needs_visual_review"] = 1.0
             result.flag = True
             result.reason = "sustained temporal review run needs mask containment"
+
+    def refresh_visual_review_after_promotion(self, results: list[CheckResult]) -> None:
+        for result in results:
+            if result.flag is True:
+                result.metrics["needs_visual_review"] = 1.0
 
     def count_verdicts(self, results: list[CheckResult]) -> dict[str, int]:
         counts = {"invalid": 0, "good": 0, "review": 0, "suspect": 0}
@@ -320,6 +542,181 @@ class SkeletonQualityScoreCheck(BaseCheck):
             if verdict in counts:
                 counts[verdict] += 1
         return counts
+
+    def build_candidate_windows(
+        self,
+        clip: ClipInputs,
+        results: list[CheckResult],
+    ) -> list[dict[str, Any]]:
+        triggers_by_hand: dict[str, list[dict[str, Any]]] = {"left": [], "right": [], "both": []}
+        for result in results:
+            metrics = result.metrics
+            if result.frame_idx < 0:
+                continue
+            if bool(metrics.get("keypoint_presence_invalid", 0.0)):
+                continue
+            temporal_trigger = (
+                result.flag is True
+                and metrics.get("skeleton_verdict") == "suspect"
+            )
+            has_side_trigger = False
+            for side in ("left", "right"):
+                side_trigger = bool(metrics.get(f"{side}_needs_projection_review", 0.0)) or bool(
+                    metrics.get(f"{side}_needs_out_of_frame_review", 0.0)
+                ) or bool(metrics.get(f"{side}_needs_rotation_mask_review", 0.0))
+                if side_trigger:
+                    has_side_trigger = True
+                    triggers_by_hand[side].append(
+                        self.trigger_record(result, side)
+                    )
+            fallback_visual_trigger = (
+                bool(metrics.get("needs_visual_review", 0.0))
+                and not has_side_trigger
+            )
+            if temporal_trigger or fallback_visual_trigger:
+                triggers_by_hand["both"].append(self.trigger_record(result, "both"))
+
+        windows: list[dict[str, Any]] = []
+        for side, triggers in triggers_by_hand.items():
+            windows.extend(self.merge_trigger_windows(clip, side, triggers))
+        return windows
+
+    def trigger_record(self, result: CheckResult, side: str) -> dict[str, Any]:
+        metrics = result.metrics
+        reasons: list[str] = []
+        review_types: list[str] = []
+        side_prefix = "" if side == "both" else f"{side}_"
+        if result.flag is True:
+            reasons.append("temporal_jump")
+            review_types.append("temporal_skeleton_review")
+        if side != "both":
+            if metrics.get(f"{side_prefix}num_points_outside_image", 0.0) >= self.projection_outside_count_threshold:
+                reasons.append("projection_outside")
+                review_types.append("out_of_frame_review")
+            if metrics.get(f"{side_prefix}num_projection_invalid", 0.0) >= self.projection_outside_count_threshold:
+                reasons.append("projection_invalid")
+                review_types.append("projection_review")
+            if metrics.get(f"{side_prefix}num_points_near_border", 0.0) >= self.projection_near_border_count_threshold:
+                reasons.append("projection_near_border")
+                review_types.append("out_of_frame_review")
+            if metrics.get(f"{side_prefix}keypoint_bbox_touches_border", 0.0):
+                reasons.append("bbox_touches_border")
+                review_types.append("out_of_frame_review")
+            center_jump = metrics.get(f"{side_prefix}hand_bbox_center_jump_px", math.nan)
+            if math.isfinite(center_jump) and center_jump >= self.projection_center_jump_px_threshold:
+                reasons.append("bbox_center_jump")
+                review_types.append("projection_review")
+            if metrics.get(f"{side_prefix}needs_rotation_mask_review", 0.0):
+                reasons.append("rotation_edge_risk")
+                review_types.append("rotation_visual_review")
+        if not reasons and metrics.get("needs_visual_review", 0.0):
+            reasons.append("visual_review")
+            review_types.append("projection_review")
+        score = self.trigger_priority_score(metrics, side)
+        return {
+            "episode_idx": result.episode_idx,
+            "asset_id": str(result.episode_idx),
+            "hand_side": side,
+            "frame_idx": result.frame_idx,
+            "priority_score": score,
+            "priority": "high" if score >= 80.0 else "medium" if score >= 40.0 else "low",
+            "trigger_reason": sorted(set(reasons)),
+            "review_type": sorted(set(review_types)),
+            "trigger_metrics": self.window_trigger_metrics(metrics, side),
+        }
+
+    def trigger_priority_score(self, metrics: dict[str, Any], side: str) -> float:
+        score = 0.0
+        if metrics.get("skeleton_verdict") == "invalid":
+            score += 120.0
+        if metrics.get("skeleton_verdict") == "suspect":
+            score += 60.0
+        if side != "both":
+            prefix = f"{side}_"
+            score += 20.0 * float(metrics.get(f"{prefix}num_points_outside_image", 0.0))
+            score += 15.0 * float(metrics.get(f"{prefix}num_projection_invalid", 0.0))
+            score += 4.0 * float(metrics.get(f"{prefix}num_points_near_border", 0.0))
+            if metrics.get(f"{prefix}keypoint_bbox_touches_border", 0.0):
+                score += 35.0
+            if metrics.get(f"{prefix}needs_rotation_mask_review", 0.0):
+                score += 45.0
+            center_jump = metrics.get(f"{prefix}hand_bbox_center_jump_px", math.nan)
+            if math.isfinite(center_jump):
+                score += min(40.0, center_jump / max(1.0, self.projection_center_jump_px_threshold) * 30.0)
+        return score
+
+    def window_trigger_metrics(self, metrics: dict[str, Any], side: str) -> dict[str, Any]:
+        names = [
+            "rotation_delta_max",
+            "joint_displacement_m_max",
+            "joint_acceleration_m_s2_max",
+            "joint_angle_change_deg_max",
+        ]
+        if side != "both":
+            prefix = f"{side}_"
+            names.extend(
+                [
+                    f"{prefix}num_points_outside_image",
+                    f"{prefix}num_points_near_border",
+                    f"{prefix}num_projection_invalid",
+                    f"{prefix}hand_bbox_center_jump_px",
+                    f"{prefix}hand_bbox_area_2d",
+                    f"{prefix}hand_bbox_area_change_ratio",
+                ]
+            )
+        return {name: metrics.get(name) for name in names if name in metrics}
+
+    def merge_trigger_windows(
+        self,
+        clip: ClipInputs,
+        hand_side: str,
+        triggers: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not triggers:
+            return []
+        max_frame = clip.frame_idx_at(clip.num_frames - 1) if clip.num_frames else 0
+        sorted_triggers = sorted(triggers, key=lambda item: item["frame_idx"])
+        windows: list[dict[str, Any]] = []
+        active: dict[str, Any] | None = None
+        for trigger in sorted_triggers:
+            start = max(0, int(trigger["frame_idx"]) - self.candidate_pre_context_frames)
+            end = min(max_frame, int(trigger["frame_idx"]) + self.candidate_post_context_frames)
+            if active is None or start > active["end_frame"] + self.candidate_merge_gap_frames:
+                if active is not None:
+                    windows.append(self.finalize_window(active))
+                active = {
+                    "episode_idx": trigger["episode_idx"],
+                    "asset_id": trigger["asset_id"],
+                    "hand_side": hand_side,
+                    "start_frame": start,
+                    "end_frame": end,
+                    "triggers": [trigger],
+                }
+            else:
+                active["end_frame"] = max(active["end_frame"], end)
+                active["triggers"].append(trigger)
+        if active is not None:
+            windows.append(self.finalize_window(active))
+        return windows
+
+    def finalize_window(self, window: dict[str, Any]) -> dict[str, Any]:
+        peak = max(window["triggers"], key=lambda item: item["priority_score"])
+        reasons = sorted({reason for trigger in window["triggers"] for reason in trigger["trigger_reason"]})
+        review_types = sorted({kind for trigger in window["triggers"] for kind in trigger["review_type"]})
+        priority_score = float(peak["priority_score"])
+        return {
+            "episode_idx": window["episode_idx"],
+            "asset_id": window["asset_id"],
+            "hand_side": window["hand_side"],
+            "start_frame": int(window["start_frame"]),
+            "end_frame": int(window["end_frame"]),
+            "peak_frame": int(peak["frame_idx"]),
+            "trigger_reason": reasons,
+            "review_type": review_types,
+            "priority": "high" if priority_score >= 80.0 else "medium" if priority_score >= 40.0 else "low",
+            "priority_score": priority_score,
+            "trigger_metrics": peak["trigger_metrics"],
+        }
 
     def penalties(self, exceeded: list[str]) -> dict[str, float]:
         penalty = 1.0 / len(GEOMETRY_METRIC_NAMES)

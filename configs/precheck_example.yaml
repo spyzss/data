@@ -62,6 +62,23 @@ skeleton_quality_score:
   reject_missing_keypoints: true
   reject_low_quality_hand: false
   allowed_missing_keypoints_per_hand: 0
+  # Projection review is skipped unless image size and intrinsics are available
+  # from ClipInputs or these projection_* fields.
+  projection_enabled: true
+  projection_image_width: null
+  projection_image_height: null
+  projection_fx: null
+  projection_fy: null
+  projection_cx: null
+  projection_cy: null
+  projection_border_margin_px: 20.0
+  projection_near_border_count_threshold: 6
+  projection_outside_count_threshold: 1
+  projection_center_jump_px_threshold: 120.0
+  projection_bbox_area_change_ratio_threshold: 3.0
+  candidate_pre_context_frames: 10
+  candidate_post_context_frames: 10
+  candidate_merge_gap_frames: 5
   pass_threshold: 0.90
 
 composite_frame_verdict:
