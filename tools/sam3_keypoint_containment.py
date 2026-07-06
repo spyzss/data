@@ -68,6 +68,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-threshold", type=float, default=0.5)
     parser.add_argument("--max-instances-per-query", type=int, default=10)
     parser.add_argument(
+        "--write-overlays",
+        action="store_true",
+        help="Write per-frame RGB + SAM3 mask + projected keypoint overlay PNGs.",
+    )
+    parser.add_argument(
+        "--overlay-dir",
+        type=Path,
+        default=None,
+        help="Overlay output directory. Defaults to <output-dir>/overlays.",
+    )
+    parser.add_argument(
         "--abnormal-inside-ratio-threshold",
         type=float,
         default=1.0,
@@ -144,6 +155,9 @@ def main() -> None:
                 max_sampled_frames=args.max_sampled_frames_per_clip,
                 projection_mode=args.projection_mode,
                 abnormal_inside_ratio_threshold=args.abnormal_inside_ratio_threshold,
+                overlay_dir=(args.overlay_dir or args.output_dir / "overlays")
+                if args.write_overlays
+                else None,
                 sam3_config={
                     "confidence_threshold": args.confidence_threshold,
                     "mask_threshold": args.mask_threshold,
@@ -167,6 +181,10 @@ def main() -> None:
             "sample_fraction": args.sample_fraction,
             "queries": queries,
             "abnormal_inside_ratio_threshold": args.abnormal_inside_ratio_threshold,
+            "write_overlays": args.write_overlays,
+            "overlay_dir": str(args.overlay_dir or args.output_dir / "overlays")
+            if args.write_overlays
+            else None,
             "num_clips": len(clip_rows),
         },
         args.output_dir / "run_manifest.json",
@@ -183,6 +201,7 @@ def process_clip(
     max_sampled_frames: int | None,
     projection_mode: str,
     abnormal_inside_ratio_threshold: float,
+    overlay_dir: Path | None,
     sam3_config: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import h5py
@@ -252,6 +271,10 @@ def process_clip(
             )
             inside[in_bounds] = union_mask[rounded[in_bounds, 1], rounded[in_bounds, 0]]
 
+        inside_indices = np.flatnonzero(inside).tolist()
+        missing_indices = np.flatnonzero(~inside).tolist()
+        valid_missing_indices = np.flatnonzero(valid & ~inside).tolist()
+        invalid_indices = np.flatnonzero(~valid).tolist()
         inside_count = int(np.sum(inside))
         missing_from_mask_count = int(valid_count - inside_count)
         expected_missing_from_mask_count = int(total_expected - inside_count)
@@ -277,6 +300,16 @@ def process_clip(
             "inside_keypoints": inside_count,
             "missing_from_mask_keypoints": missing_from_mask_count,
             "expected_missing_from_mask_keypoints": expected_missing_from_mask_count,
+            "inside_joint_names": [joint_names[index] for index in inside_indices],
+            "missing_from_mask_joint_names": [
+                joint_names[index] for index in valid_missing_indices
+            ],
+            "expected_missing_from_mask_joint_names": [
+                joint_names[index] for index in missing_indices
+            ],
+            "invalid_projected_joint_names": [
+                joint_names[index] for index in invalid_indices
+            ],
             "keypoint_inside_ratio": keypoint_inside_ratio,
             "keypoint_missing_ratio": keypoint_missing_ratio,
             "valid_projected_inside_ratio": valid_projected_inside_ratio,
@@ -288,6 +321,19 @@ def process_clip(
             "mask_area_ratio": safe_ratio(mask_area, frame.shape[0] * frame.shape[1]),
             "sam3_categories": sorted({mask.category for mask in masks}),
         }
+        if overlay_dir is not None:
+            overlay_path = write_overlay_image(
+                frame=frame,
+                mask=union_mask,
+                pixels=pixels,
+                valid=valid,
+                inside=inside,
+                joint_names=joint_names,
+                clip_id=clip_id_from_path(hdf5_path),
+                frame_idx=frame_idx,
+                output_dir=overlay_dir,
+            )
+            row["overlay_path"] = str(overlay_path)
         frame_rows.append(row)
         totals["sampled_frames"] += 1
         totals["total_expected_keypoints"] += total_expected
@@ -311,6 +357,13 @@ def process_clip(
         "hdf5_path": str(hdf5_path),
         "video_path": str(video_path),
         "sample_fraction": sample_fraction,
+        "sampled_frame_indices": [row["frame_idx"] for row in frame_rows],
+        "abnormal_frame_indices": [
+            row["frame_idx"] for row in frame_rows if row["abnormal_frame"]
+        ],
+        "overlay_paths": [
+            row["overlay_path"] for row in frame_rows if "overlay_path" in row
+        ],
         "sampled_frames": int(totals["sampled_frames"]),
         "joint_count_per_frame": len(joint_names),
         "joint_names": joint_names,
@@ -482,6 +535,104 @@ def union_instance_masks(masks: list[Any], image_shape: tuple[int, int]) -> np.n
             continue
         union |= mask
     return union
+
+
+def write_overlay_image(
+    frame: np.ndarray,
+    mask: np.ndarray | None,
+    pixels: np.ndarray,
+    valid: np.ndarray,
+    inside: np.ndarray,
+    joint_names: list[str],
+    clip_id: str,
+    frame_idx: int,
+    output_dir: Path,
+) -> Path:
+    from PIL import Image, ImageDraw, ImageFont
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image = Image.fromarray(np.asarray(frame, dtype=np.uint8)).convert("RGBA")
+    width, height = image.size
+
+    if mask is not None:
+        mask_bool = np.asarray(mask, dtype=bool)
+        if mask_bool.shape == (height, width):
+            overlay = np.zeros((height, width, 4), dtype=np.uint8)
+            overlay[mask_bool] = np.array([0, 220, 160, 90], dtype=np.uint8)
+            image = Image.alpha_composite(image, Image.fromarray(overlay, mode="RGBA"))
+
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    valid_count = int(np.sum(valid))
+    inside_count = int(np.sum(inside))
+    invalid_count = int(len(joint_names) - valid_count)
+    outside_count = int(valid_count - inside_count)
+
+    header = (
+        f"{clip_id} frame={int(frame_idx)} "
+        f"inside={inside_count}/{len(joint_names)} "
+        f"outside={outside_count} invalid={invalid_count}"
+    )
+    draw.rectangle((0, 0, min(width, 760), 26), fill=(0, 0, 0, 175))
+    draw.text((6, 6), header, fill=(255, 255, 255, 255), font=font)
+
+    for index, (x_raw, y_raw) in enumerate(pixels):
+        if not bool(valid[index]) or not np.isfinite([x_raw, y_raw]).all():
+            continue
+        x = int(round(float(x_raw)))
+        y = int(round(float(y_raw)))
+        if x < 0 or x >= width or y < 0 or y >= height:
+            continue
+
+        is_inside = bool(inside[index])
+        fill = (0, 255, 90, 255) if is_inside else (255, 45, 45, 255)
+        radius = 4 if is_inside else 5
+        draw.ellipse(
+            (x - radius, y - radius, x + radius, y + radius),
+            fill=fill,
+            outline=(0, 0, 0, 230),
+            width=1,
+        )
+        if not is_inside:
+            draw.text(
+                (x + 7, y - 7),
+                compact_joint_label(joint_names[index]),
+                fill=(255, 255, 255, 255),
+                font=font,
+                stroke_width=2,
+                stroke_fill=(0, 0, 0, 220),
+            )
+
+    output_path = output_dir / f"{clip_id}_frame_{int(frame_idx):06d}.png"
+    image.convert("RGB").save(output_path)
+    return output_path
+
+
+def compact_joint_label(joint_name: str) -> str:
+    label = joint_name
+    side = ""
+    if label.startswith("left"):
+        side = "L:"
+        label = label.removeprefix("left")
+    elif label.startswith("right"):
+        side = "R:"
+        label = label.removeprefix("right")
+
+    replacements = {
+        "Thumb": "Th",
+        "Index": "Idx",
+        "Middle": "Mid",
+        "Ring": "Ring",
+        "Little": "Lit",
+        "Finger": "F",
+        "Intermediate": "Int",
+        "Knuckle": "Kn",
+        "Base": "Base",
+        "Tip": "Tip",
+    }
+    for old, new in replacements.items():
+        label = label.replace(old, new)
+    return f"{side}{label}"
 
 
 def clip_id_from_path(path: Path) -> str:
