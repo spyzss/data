@@ -112,7 +112,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 Optional config:
 
 ```yaml
-threshold_version: video_prefilter_v0.2.4
+threshold_version: video_prefilter_v0.2.5
 decode:
   max_sample_frames: 300
 hdf5_alignment:
@@ -122,18 +122,18 @@ resolution:
   min_long_side_fail: 1280
 sharpness_global:
   target_short_side: 720
-  laplacian_p10_pass: 150
+  laplacian_p10_pass: 100
   laplacian_p10_warn: 35
-  laplacian_median_pass: 220
+  laplacian_median_pass: 120
   laplacian_median_warn: 50
-  laplacian_under_100_ratio_pass: 0.05
+  laplacian_under_100_ratio_pass: 0.15
   laplacian_under_100_ratio_warn: 1.00
-  tenengrad_p10_pass: 25
+  tenengrad_p10_pass: 18
   tenengrad_p10_warn: 12
-  tenengrad_median_pass: 30
+  tenengrad_median_pass: 19
   tenengrad_median_warn: 13
 freeze:
-  frozen_frame_ratio_pass: 0.03
+  frozen_frame_ratio_pass: 0.09
   frozen_frame_ratio_warn: 0.15
 hand_roi:
   enabled: true
@@ -168,7 +168,7 @@ sampled/XJGT_20260616/
     summary.json
 ```
 
-It is a `video_prefilter_v0.2.4` low-cost prefilter. It uses practical
+It is a `video_prefilter_v0.2.5` low-cost prefilter. It uses practical
 no-reference indicators: open/decode health, fps, resolution, timeline
 continuity, sampled-frame decode ratio, black/over-dark/over-exposure ratios,
 global sharpness at a normalized short side, frozen-frame risk, HDF5 frame-count
