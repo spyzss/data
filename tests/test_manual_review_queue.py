@@ -12,6 +12,7 @@ from tools.build_manual_review_queue import (
     assign_review_ids,
     build_review_index_html,
     manual_template_row,
+    queue_row,
     rows_from_candidate_windows,
     rows_from_sam3_summary,
     select_review_rows,
@@ -111,7 +112,13 @@ def test_manual_review_queue_uses_fixed_fields_and_enums(tmp_path: Path) -> None
     assert set(template_df["failure_mode"]).issubset(set(FAILURE_MODE_ENUM))
     assert "manual_outcome" in html
     assert "true_positive" in html
-    assert "Fill <code>manual_labels_template.csv</code>" in html
+    assert "keypoint_raw_invalid" in html
+    assert "keypoint_low_quality_window" in html
+    assert "visual_skeleton_presence_mismatch" in html
+    assert "Export manual_labels.csv" in html
+    assert "function exportManualLabelsCsv" in html
+    assert "localStorage" in html
+    assert "manual_labels_template.csv" in html
     assert "100044_100_120.png" in html
 
 
@@ -139,6 +146,114 @@ def test_convert_completed_manual_csv_to_patch_records(tmp_path: Path) -> None:
     assert record["algorithm_outcome"] == "true_positive"
     assert record["manual_outcome"] in MANUAL_OUTCOME_ENUM
     assert record["failure_mode"] == "side_view_mask_undersegmentation"
+
+
+def test_review_queue_selection_caps_side_view_and_keeps_other_issue_types() -> None:
+    assets = {
+        "asset_side": {"supplier_id": "supplier_a", "asset_id": "asset_side"},
+        "asset_strong": {"supplier_id": "supplier_a", "asset_id": "asset_strong"},
+        "asset_mixed": {"supplier_id": "supplier_a", "asset_id": "asset_mixed"},
+        "asset_quality": {"supplier_id": "supplier_a", "asset_id": "asset_quality"},
+    }
+    rows = []
+    for index in range(20):
+        rows.append(
+            queue_row(
+                supplier_id="supplier_a",
+                asset_id=f"asset_side_{index}",
+                start=index,
+                end=index + 1,
+                representative=index,
+                source_level="window",
+                module="precheck",
+                auto_verdict="review",
+                suggested_issue_type="side_view_mask_undersegmentation",
+                severity_suggestion="medium",
+                priority="medium",
+                key_metrics={},
+                reason="side view",
+                evidence_path=None,
+                overlay_path=None,
+                needs_manual_review=True,
+                sam3_containment_eligible=False,
+            )
+        )
+    rows.extend(
+        [
+            queue_row(
+                supplier_id="supplier_a",
+                asset_id="asset_mixed",
+                start=100,
+                end=110,
+                representative=105,
+                source_level="window",
+                module="sam3_containment",
+                auto_verdict="mixed_review",
+                suggested_issue_type="strong_containment_mismatch",
+                severity_suggestion="high",
+                priority="high",
+                key_metrics={"strong_fail_frame_count": 2},
+                reason="mixed strong",
+                evidence_path=None,
+                overlay_path=None,
+                needs_manual_review=True,
+                sam3_containment_eligible=True,
+            ),
+            queue_row(
+                supplier_id="supplier_a",
+                asset_id="asset_strong",
+                start=120,
+                end=130,
+                representative=125,
+                source_level="window",
+                module="sam3_containment",
+                auto_verdict="containment_fail",
+                suggested_issue_type="strong_containment_mismatch",
+                severity_suggestion="high",
+                priority="high",
+                key_metrics={"strong_fail_frame_count": 5},
+                reason="strong containment",
+                evidence_path=None,
+                overlay_path=None,
+                needs_manual_review=True,
+                sam3_containment_eligible=True,
+            ),
+            queue_row(
+                supplier_id="supplier_a",
+                asset_id="asset_quality",
+                start=None,
+                end=None,
+                representative=None,
+                source_level="asset",
+                module="precheck",
+                auto_verdict="review",
+                suggested_issue_type="keypoint_low_quality_window",
+                severity_suggestion="medium",
+                priority="medium",
+                key_metrics={"flagged_frames": 3},
+                reason="low quality window",
+                evidence_path=None,
+                overlay_path=None,
+                needs_manual_review=True,
+                sam3_containment_eligible=None,
+            ),
+        ]
+    )
+
+    selected = select_review_rows(
+        rows,
+        assets,
+        max_items_per_supplier=30,
+        max_side_view_per_supplier=10,
+        max_pass_samples_per_supplier=2,
+        overlay_dir=None,
+    )
+
+    issue_counts = pd.Series([row["suggested_issue_type"] for row in selected]).value_counts()
+    assert issue_counts["side_view_mask_undersegmentation"] == 10
+    assert "keypoint_low_quality_window" in issue_counts
+    assert any(row["auto_verdict"] == "mixed_review" for row in selected)
+    assert any(row["auto_verdict"] == "containment_fail" for row in selected)
 
 
 def test_convert_manual_csv_rejects_invalid_enum(tmp_path: Path) -> None:
