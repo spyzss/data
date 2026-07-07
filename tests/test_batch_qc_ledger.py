@@ -140,9 +140,9 @@ def test_build_batch_qc_ledger_combines_modules(tmp_path: Path) -> None:
 
     ledger = {row["asset_id"]: row for row in build_ledger_rows(assets, module_status, events)}
 
-    assert ledger["100030"]["final_verdict"] == "fail"
-    assert ledger["100030"]["risk_level"] == "high"
-    assert ledger["100030"]["keypoint_missing_status"] == "fail"
+    assert ledger["100030"]["final_verdict"] == "review"
+    assert ledger["100030"]["risk_level"] == "medium"
+    assert ledger["100030"]["keypoint_missing_status"] == "review"
     assert ledger["100044"]["final_verdict"] == "review"
     assert ledger["100044"]["risk_level"] == "medium"
     assert ledger["100044"]["side_view_status"] == "review"
@@ -151,8 +151,152 @@ def test_build_batch_qc_ledger_combines_modules(tmp_path: Path) -> None:
     assert ledger["100560"]["manual_review_status"] == "fail"
 
     frequency = build_supplier_issue_frequency(assets, events)
+    low_quality = next(row for row in frequency if row["issue_type"] == "keypoint_low_quality_window")
+    assert low_quality["supplier_id"] == "supplier_a"
     side_view = next(row for row in frequency if row["issue_type"] == "side_view_manual_review")
     assert side_view["supplier_id"] == "supplier_a"
     assert side_view["affected_assets"] == 1
     assert side_view["total_assets"] == 2
     assert side_view["asset_rate"] == 0.5
+
+
+def test_keypoint_missing_aggregate_only_is_review_not_fail(tmp_path: Path) -> None:
+    manifest = tmp_path / "supplier_sample_manifest.csv"
+    _write_csv(
+        manifest,
+        "supplier_id,asset_id,episode_idx\n"
+        "supplier_a,100030,0\n"
+        "supplier_a,100044,1\n",
+    )
+    assets, episode_to_asset = load_manifest(manifest)
+    module_status = {asset_id: default_module_statuses() for asset_id in assets}
+    events = []
+
+    precheck_path = tmp_path / "clip_aggregates.json"
+    rows = [
+        {
+            "episode_idx": 0,
+            "check": "keypoint_missing",
+            "checked_frames": 100,
+            "flagged_frames": 10,
+            "clip_flag": True,
+            "quality_hand": 0.4,
+            "missing_frames_in_10s_window": 8,
+        },
+        {
+            "episode_idx": 1,
+            "check": "keypoint_missing",
+            "checked_frames": 100,
+            "flagged_frames": 25,
+            "clip_flag": True,
+            "low_quality_hands": 25,
+        },
+    ]
+    add_precheck_aggregates(
+        rows,
+        precheck_path,
+        assets,
+        episode_to_asset,
+        module_status,
+        events,
+    )
+
+    ledger = {row["asset_id"]: row for row in build_ledger_rows(assets, module_status, events)}
+    event_by_asset = {event["asset_id"]: event for event in events}
+
+    assert ledger["100030"]["final_verdict"] == "review"
+    assert ledger["100030"]["risk_level"] == "medium"
+    assert event_by_asset["100030"]["issue_type"] == "keypoint_low_quality_window"
+    assert event_by_asset["100030"]["severity"] == "medium"
+    assert event_by_asset["100030"]["auto_verdict"] == "review"
+
+    assert ledger["100044"]["final_verdict"] == "review"
+    assert ledger["100044"]["risk_level"] == "high"
+    assert event_by_asset["100044"]["issue_type"] == "keypoint_low_quality_window"
+    assert event_by_asset["100044"]["severity"] == "high"
+    assert event_by_asset["100044"]["auto_verdict"] == "review"
+
+
+def test_keypoint_raw_invalid_evidence_is_fail(tmp_path: Path) -> None:
+    manifest = tmp_path / "supplier_sample_manifest.csv"
+    _write_csv(
+        manifest,
+        "supplier_id,asset_id,episode_idx\n"
+        "supplier_a,100030,0\n"
+        "supplier_a,100044,1\n"
+        "supplier_a,100560,2\n"
+        "supplier_a,100669,3\n"
+        "supplier_a,100677,4\n",
+    )
+    assets, episode_to_asset = load_manifest(manifest)
+    module_status = {asset_id: default_module_statuses() for asset_id in assets}
+    events = []
+
+    rows = [
+        {
+            "episode_idx": 0,
+            "check": "keypoint_missing",
+            "checked_frames": 100,
+            "flagged_frames": 1,
+            "clip_flag": True,
+            "nan_count": 1,
+        },
+        {
+            "episode_idx": 1,
+            "check": "keypoint_missing",
+            "checked_frames": 100,
+            "flagged_frames": 1,
+            "clip_flag": True,
+            "valid_points": 20,
+        },
+        {
+            "episode_idx": 2,
+            "check": "keypoint_missing",
+            "checked_frames": 100,
+            "flagged_frames": 1,
+            "clip_flag": True,
+            "metrics": {"reason": "raw_invalid valid point count below threshold"},
+        },
+        {
+            "episode_idx": 3,
+            "check": "keypoint_missing",
+            "checked_frames": 100,
+            "flagged_frames": 1,
+            "clip_flag": True,
+            "keypoint_presence_invalid": 1,
+        },
+        {
+            "episode_idx": 4,
+            "check": "keypoint_missing",
+            "checked_frames": 100,
+            "flagged_frames": 1,
+            "clip_flag": True,
+            "metrics": {"metric_name": "confidence"},
+        },
+    ]
+    add_precheck_aggregates(
+        rows,
+        tmp_path / "clip_aggregates.json",
+        assets,
+        episode_to_asset,
+        module_status,
+        events,
+    )
+
+    ledger = {row["asset_id"]: row for row in build_ledger_rows(assets, module_status, events)}
+
+    raw_events = [event for event in events if event["issue_type"] == "keypoint_raw_invalid"]
+    low_quality_events = [
+        event for event in events if event["issue_type"] == "keypoint_low_quality_window"
+    ]
+    assert len(raw_events) == 4
+    assert len(low_quality_events) == 1
+    assert all(event["severity"] == "high" for event in raw_events)
+    assert all(event["auto_verdict"] == "fail" for event in raw_events)
+    assert low_quality_events[0]["asset_id"] == "100677"
+    assert low_quality_events[0]["auto_verdict"] == "review"
+    assert ledger["100030"]["final_verdict"] == "fail"
+    assert ledger["100044"]["keypoint_missing_status"] == "fail"
+    assert ledger["100560"]["risk_level"] == "high"
+    assert ledger["100669"]["final_verdict"] == "fail"
+    assert ledger["100677"]["final_verdict"] == "review"

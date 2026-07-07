@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import math
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -389,20 +390,30 @@ def add_precheck_aggregates(
                     evidence_path=path,
                 )
         elif check == "keypoint_missing":
-            status = "fail" if flagged_frames > 0 or boolish_or_none(clip_flag) is True else "pass"
+            has_issue = flagged_frames > 0 or boolish_or_none(clip_flag) is True
+            raw_invalid = has_raw_keypoint_invalid_evidence(row)
+            status = "fail" if raw_invalid else ("review" if has_issue else "pass")
             module_status[asset_id]["keypoint_missing_status"] = status
-            if status == "fail":
+            if has_issue:
+                issue_type = "keypoint_raw_invalid" if raw_invalid else "keypoint_low_quality_window"
+                flagged_ratio = flagged_frames / checked_frames if checked_frames else 0.0
+                severity = "high" if raw_invalid or flagged_ratio >= 0.2 else "medium"
+                auto_verdict = "fail" if raw_invalid else "review"
                 add_event(
                     events,
                     assets,
                     asset_id,
                     module="precheck",
-                    issue_type="keypoint_missing",
-                    severity="high",
-                    auto_verdict="fail",
+                    issue_type=issue_type,
+                    severity=severity,
+                    auto_verdict=auto_verdict,
                     metric_name="flagged_frames",
                     metric_value=flagged_frames,
-                    reason="keypoint missing or low-quality window exceeded",
+                    reason=(
+                        raw_keypoint_invalid_reason(row)
+                        if raw_invalid
+                        else "keypoint low-quality window exceeded aggregate threshold"
+                    ),
                     evidence_path=path,
                 )
         elif check == "skeleton_quality_score":
@@ -431,6 +442,112 @@ def pass_flag_status(value: Any) -> str:
     if bool_value is False:
         return "fail"
     return "not_run"
+
+
+def has_raw_keypoint_invalid_evidence(row: dict[str, Any]) -> bool:
+    keypoint_presence_invalid = numeric_or_none(row.get("keypoint_presence_invalid"))
+    if keypoint_presence_invalid is not None and keypoint_presence_invalid >= 1:
+        return True
+
+    for key in ("nan_count", "inf_count", "missing_points", "raw_missing_points"):
+        value = numeric_or_none(row.get(key))
+        if value is not None and value > 0:
+            return True
+
+    valid_points = numeric_or_none(row.get("valid_points"))
+    expected_points = first_numeric_present(
+        row,
+        (
+            "expected_points",
+            "expected_keypoints",
+            "expected_valid_points",
+            "expected_count",
+            "valid_points_expected",
+        ),
+    )
+    expected_valid_points = expected_points if expected_points is not None else 21.0
+    if valid_points is not None and valid_points < expected_valid_points:
+        return True
+
+    diagnostic_text = raw_invalid_diagnostic_text(row)
+    return has_raw_invalid_text_evidence(diagnostic_text)
+
+
+def raw_keypoint_invalid_reason(row: dict[str, Any]) -> str:
+    keypoint_presence_invalid = numeric_or_none(row.get("keypoint_presence_invalid"))
+    if keypoint_presence_invalid is not None and keypoint_presence_invalid >= 1:
+        return (
+            "raw keypoint invalid evidence: "
+            f"keypoint_presence_invalid={scalar(keypoint_presence_invalid)}"
+        )
+    for key in ("nan_count", "inf_count", "missing_points", "raw_missing_points"):
+        value = numeric_or_none(row.get(key))
+        if value is not None and value > 0:
+            return f"raw keypoint invalid evidence: {key}={scalar(value)}"
+    valid_points = numeric_or_none(row.get("valid_points"))
+    expected_points = first_numeric_present(
+        row,
+        (
+            "expected_points",
+            "expected_keypoints",
+            "expected_valid_points",
+            "expected_count",
+            "valid_points_expected",
+        ),
+    )
+    expected_valid_points = expected_points if expected_points is not None else 21.0
+    if valid_points is not None and valid_points < expected_valid_points:
+        return (
+            "raw keypoint invalid evidence: "
+            f"valid_points={scalar(valid_points)} < expected={scalar(expected_valid_points)}"
+        )
+    return "raw keypoint invalid evidence in reason or metrics"
+
+
+def raw_invalid_diagnostic_text(row: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("reason", "metrics", "metric_name", "issue_type", "notes"):
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            parts.append(value)
+        else:
+            parts.append(json.dumps(value, ensure_ascii=False, default=str))
+    return " ".join(parts).lower()
+
+
+def has_raw_invalid_text_evidence(text: str) -> bool:
+    patterns = (
+        r"\braw_invalid\b",
+        r"\bnan\b",
+        r"\binf\b",
+        r"\bkeypoint_presence_invalid\b",
+        r"\braw[_ ]missing[_ ]points?\b",
+        r"\bvalid[_ ]points?\b",
+        r"\bvalid point count\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def first_numeric_present(
+    row: dict[str, Any],
+    keys: tuple[str, ...],
+) -> float | None:
+    for key in keys:
+        value = numeric_or_none(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def numeric_or_none(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def add_candidate_windows(
