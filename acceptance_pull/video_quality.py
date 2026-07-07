@@ -111,15 +111,15 @@ class SharpnessGlobalConfig:
     target_short_side: int = 720
     no_upscale: bool = True
     laplacian_p10_pass: float = 150.0
-    laplacian_p10_warn: float = 30.0
+    laplacian_p10_warn: float = 35.0
     laplacian_median_pass: float = 220.0
-    laplacian_median_warn: float = 45.0
+    laplacian_median_warn: float = 50.0
     laplacian_under_100_ratio_pass: float = 0.05
     laplacian_under_100_ratio_warn: float = 1.00
     tenengrad_p10_pass: float = 25.0
-    tenengrad_p10_warn: float = 11.0
+    tenengrad_p10_warn: float = 12.0
     tenengrad_median_pass: float = 30.0
-    tenengrad_median_warn: float = 12.0
+    tenengrad_median_warn: float = 13.0
 
 
 @dataclass(frozen=True)
@@ -182,7 +182,7 @@ class HandRoiConfig:
 
 @dataclass(frozen=True)
 class VideoQualityConfig:
-    threshold_version: str = "video_prefilter_v0.2.3"
+    threshold_version: str = "video_prefilter_v0.2.4"
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     fps: FpsConfig = field(default_factory=FpsConfig)
     resolution: ResolutionConfig = field(default_factory=ResolutionConfig)

@@ -31,7 +31,7 @@ def textured_frame(offset: int, width: int = 1280, height: int = 720) -> np.ndar
 def test_default_video_quality_config() -> None:
     config = load_video_quality_config(None)
 
-    assert config.threshold_version == "video_prefilter_v0.2.3"
+    assert config.threshold_version == "video_prefilter_v0.2.4"
     assert config.pipeline.stop_before_mask_if_fail is True
     assert config.pipeline.run_hand_roi is True
     assert config.pipeline.do_keypoint_quality_check is False
@@ -48,15 +48,15 @@ def test_default_video_quality_config() -> None:
     assert config.exposure.over_exposed.ratio_pass == 0.05
     assert config.sharpness_global.target_short_side == 720
     assert config.sharpness_global.laplacian_p10_pass == 150
-    assert config.sharpness_global.laplacian_p10_warn == 30
+    assert config.sharpness_global.laplacian_p10_warn == 35
     assert config.sharpness_global.laplacian_median_pass == 220
-    assert config.sharpness_global.laplacian_median_warn == 45
+    assert config.sharpness_global.laplacian_median_warn == 50
     assert config.sharpness_global.laplacian_under_100_ratio_pass == 0.05
     assert config.sharpness_global.laplacian_under_100_ratio_warn == 1.00
     assert config.sharpness_global.tenengrad_p10_pass == 25
-    assert config.sharpness_global.tenengrad_p10_warn == 11
+    assert config.sharpness_global.tenengrad_p10_warn == 12
     assert config.sharpness_global.tenengrad_median_pass == 30
-    assert config.sharpness_global.tenengrad_median_warn == 12
+    assert config.sharpness_global.tenengrad_median_warn == 13
     assert config.freeze.frozen_frame_ratio_pass == 0.03
     assert config.freeze.frozen_frame_ratio_warn == 0.15
     assert config.freeze.max_consecutive_frozen_sec_fail == 1.0
@@ -211,7 +211,37 @@ def test_evaluate_video_quality_warns_moderate_global_blur_without_stopping_mask
     assert "laplacian_median_below_min" not in evaluation.reasons
 
 
-def test_evaluate_video_quality_warns_low_but_usable_global_blur_without_stopping_mask_qc(tmp_path: Path) -> None:
+def test_evaluate_video_quality_warns_borderline_but_usable_global_blur_without_stopping_mask_qc(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
+    metrics = analyze_video(video, load_video_quality_config(None))
+    metrics = replace(
+        metrics,
+        laplacian_p10=44.9,
+        laplacian_median=64.0,
+        laplacian_under_100_ratio=1.0,
+        tenengrad_p10=12.6,
+        tenengrad_median=13.7,
+        frozen_frame_ratio=0.01834862385321101,
+        max_consecutive_frozen_sec=0.06669376218323587,
+    )
+
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
+
+    assert evaluation.passed is True
+    assert evaluation.decision == "warn"
+    assert evaluation.should_run_mask_qc is True
+    assert "laplacian_p10_warn" in evaluation.warn_reasons
+    assert "laplacian_median_warn" in evaluation.warn_reasons
+    assert "laplacian_under_100_ratio_warn" in evaluation.warn_reasons
+    assert "tenengrad_p10_warn" in evaluation.warn_reasons
+    assert "tenengrad_median_warn" in evaluation.warn_reasons
+    assert evaluation.reasons == ()
+
+
+def test_evaluate_video_quality_fails_low_edge_quality_after_provider_calibration(tmp_path: Path) -> None:
     video = tmp_path / "408817_video.mp4"
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     metrics = analyze_video(video, load_video_quality_config(None))
@@ -228,16 +258,15 @@ def test_evaluate_video_quality_warns_low_but_usable_global_blur_without_stoppin
 
     evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
 
-    assert evaluation.passed is True
-    assert evaluation.decision == "warn"
-    assert evaluation.should_run_mask_qc is True
+    assert evaluation.passed is False
+    assert evaluation.decision == "fail"
+    assert evaluation.should_run_mask_qc is False
     assert "laplacian_p10_warn" in evaluation.warn_reasons
     assert "laplacian_median_warn" in evaluation.warn_reasons
     assert "laplacian_under_100_ratio_warn" in evaluation.warn_reasons
-    assert "tenengrad_p10_warn" in evaluation.warn_reasons
-    assert "tenengrad_median_warn" in evaluation.warn_reasons
+    assert "tenengrad_p10_below_min" in evaluation.reasons
+    assert "tenengrad_median_below_min" in evaluation.reasons
     assert "frozen_frame_ratio_warn" in evaluation.warn_reasons
-    assert evaluation.reasons == ()
 
 
 def test_evaluate_video_quality_fails_cross_provider_extreme_blur_tail(tmp_path: Path) -> None:
@@ -259,8 +288,8 @@ def test_evaluate_video_quality_fails_cross_provider_extreme_blur_tail(tmp_path:
     assert evaluation.decision == "fail"
     assert evaluation.should_run_mask_qc is False
     assert "laplacian_p10_below_min" in evaluation.reasons
-    assert "laplacian_median_below_min" not in evaluation.reasons
-    assert "tenengrad_p10_below_min" not in evaluation.reasons
+    assert "laplacian_median_below_min" in evaluation.reasons
+    assert "tenengrad_p10_below_min" in evaluation.reasons
     assert "tenengrad_median_below_min" not in evaluation.reasons
 
 

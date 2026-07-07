@@ -210,7 +210,7 @@ quality_archive/408817.json  -> asset_id = 408817
 ```json
 {
   "stage": "video_prefilter",
-  "threshold_version": "video_prefilter_v0.2.3",
+  "threshold_version": "video_prefilter_v0.2.4",
   "evaluation": {
     "decision": "pass",
     "passed": true,
@@ -290,7 +290,7 @@ quality_archive/408817.json  -> asset_id = 408817
     }
   },
   "thresholds": {
-    "threshold_version": "video_prefilter_v0.2.3",
+    "threshold_version": "video_prefilter_v0.2.4",
     "fps": {
       "expected_fps": null,
       "min_fps_pass": 24,
@@ -304,15 +304,15 @@ quality_archive/408817.json  -> asset_id = 408817
     "sharpness_global": {
       "target_short_side": 720,
       "laplacian_p10_pass": 150,
-      "laplacian_p10_warn": 30,
+      "laplacian_p10_warn": 35,
       "laplacian_median_pass": 220,
-      "laplacian_median_warn": 45,
+      "laplacian_median_warn": 50,
       "laplacian_under_100_ratio_pass": 0.05,
       "laplacian_under_100_ratio_warn": 1.00,
       "tenengrad_p10_pass": 25,
-      "tenengrad_p10_warn": 11,
+      "tenengrad_p10_warn": 12,
       "tenengrad_median_pass": 30,
-      "tenengrad_median_warn": 12
+      "tenengrad_median_warn": 13
     },
     "freeze": {
       "frozen_frame_ratio_pass": 0.03,
