@@ -148,8 +148,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--acceptable-inside-ratio-threshold", type=float, default=0.6)
     parser.add_argument("--mask-tiny-area-ratio-threshold", type=float, default=0.0)
-    parser.add_argument("--containment-fail-min-strong-frames", type=int, default=2)
-    parser.add_argument("--containment-fail-strong-frame-ratio", type=float, default=0.4)
+    parser.add_argument("--containment-fail-min-strong-frames", type=int, default=3)
+    parser.add_argument("--containment-fail-strong-frame-ratio", type=float, default=0.6)
     parser.add_argument(
         "--video-patterns",
         default="{episode_id}.mp4,{stem}.mp4,{stem_no_hdf5}.mp4",
@@ -953,8 +953,8 @@ def classify_containment_rows(
 
 def aggregate_window_containment_summaries(
     rows: list[dict[str, Any]],
-    fail_min_strong_frames: int = 2,
-    fail_strong_frame_ratio: float = 0.4,
+    fail_min_strong_frames: int = 3,
+    fail_strong_frame_ratio: float = 0.6,
 ) -> list[dict[str, Any]]:
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for row in rows:
@@ -1002,17 +1002,6 @@ def summarize_window_containment(
     acceptable_count = int(verdict_counts["likely_visible_ok"])
     mask_missing_count = int(verdict_counts["mask_missing_or_tiny_review"])
     strong_ratio = safe_ratio(strong_count, sampled_count) or 0.0
-    window_verdict, reason = window_containment_verdict(
-        sampled_count=sampled_count,
-        strong_fail_frame_count=strong_count,
-        strong_fail_frame_ratio=strong_ratio,
-        review_frame_count=containment_review_count,
-        projection_review_frame_count=projection_review_count,
-        acceptable_frame_count=acceptable_count,
-        mask_missing_or_tiny_frame_count=mask_missing_count,
-        fail_min_strong_frames=fail_min_strong_frames,
-        fail_strong_frame_ratio=fail_strong_frame_ratio,
-    )
     inside_values = [
         value
         for value in (
@@ -1033,6 +1022,21 @@ def summarize_window_containment(
         )
         if value is not None
     ]
+    inside_ratio_mean = float(np.mean(inside_values)) if inside_values else None
+    projected_ratio_mean = float(np.mean(projected_values)) if projected_values else None
+    window_verdict, reason = window_containment_verdict(
+        sampled_count=sampled_count,
+        strong_fail_frame_count=strong_count,
+        strong_fail_frame_ratio=strong_ratio,
+        review_frame_count=containment_review_count,
+        projection_review_frame_count=projection_review_count,
+        acceptable_frame_count=acceptable_count,
+        mask_missing_or_tiny_frame_count=mask_missing_count,
+        inside_ratio_mean=inside_ratio_mean,
+        projected_in_image_ratio_mean=projected_ratio_mean,
+        fail_min_strong_frames=fail_min_strong_frames,
+        fail_strong_frame_ratio=fail_strong_frame_ratio,
+    )
     start_frame = first.get("window_start_frame")
     end_frame = first.get("window_end_frame")
     if start_frame is None:
@@ -1063,14 +1067,12 @@ def summarize_window_containment(
         "acceptable_frame_count": acceptable_count,
         "mask_missing_or_tiny_frame_count": mask_missing_count,
         "inside_ratio_min": min(inside_values) if inside_values else None,
-        "inside_ratio_mean": float(np.mean(inside_values)) if inside_values else None,
+        "inside_ratio_mean": inside_ratio_mean,
         "inside_ratio_max": max(inside_values) if inside_values else None,
         "projected_in_image_ratio_min": min(projected_values)
         if projected_values
         else None,
-        "projected_in_image_ratio_mean": float(np.mean(projected_values))
-        if projected_values
-        else None,
+        "projected_in_image_ratio_mean": projected_ratio_mean,
         "projected_in_image_ratio_max": max(projected_values)
         if projected_values
         else None,
@@ -1087,18 +1089,30 @@ def window_containment_verdict(
     projection_review_frame_count: int,
     acceptable_frame_count: int,
     mask_missing_or_tiny_frame_count: int,
-    fail_min_strong_frames: int = 2,
-    fail_strong_frame_ratio: float = 0.4,
+    inside_ratio_mean: float | None = None,
+    projected_in_image_ratio_mean: float | None = None,
+    fail_min_strong_frames: int = 3,
+    fail_strong_frame_ratio: float = 0.6,
 ) -> tuple[str, str]:
-    if (
-        strong_fail_frame_count >= fail_min_strong_frames
-        or strong_fail_frame_ratio >= fail_strong_frame_ratio
-    ):
+    mean_clean_fail = (
+        projected_in_image_ratio_mean is not None
+        and inside_ratio_mean is not None
+        and projected_in_image_ratio_mean >= 0.8
+        and inside_ratio_mean <= 0.2
+        and projection_review_frame_count == 0
+    )
+    if strong_fail_frame_count >= fail_min_strong_frames:
         return "containment_fail", "sustained strong keypoint-mask mismatch"
-    if projection_review_frame_count == sampled_count and sampled_count > 0:
+    if strong_fail_frame_ratio >= fail_strong_frame_ratio:
+        return "containment_fail", "sustained strong keypoint-mask mismatch"
+    if mean_clean_fail:
+        return "containment_fail", "clean window-level containment mismatch"
+    if projection_review_frame_count > 0 and strong_fail_frame_count == 0:
         return "projection_review", "only insufficient projection evidence"
     if acceptable_frame_count > sampled_count / 2 and strong_fail_frame_count == 0:
         return "acceptable_flagged", "majority frames are visually acceptable"
+    if strong_fail_frame_count > 0:
+        return "mixed_review", "mixed containment evidence with strong outliers"
     nonzero_classes = sum(
         count > 0
         for count in (

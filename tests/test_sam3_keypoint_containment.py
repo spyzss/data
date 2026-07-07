@@ -260,19 +260,95 @@ def test_classify_containment_rows_updates_verdicts() -> None:
     ]
 
 
-def test_window_aggregation_two_strong_frames_fail() -> None:
+def test_window_aggregation_all_strong_frames_fail() -> None:
     rows = classify_containment_rows(
         [
             _frame_row(0.0, frame_idx=1),
             _frame_row(0.1, frame_idx=2),
-            _frame_row(0.8, frame_idx=3),
+            _frame_row(0.0, frame_idx=3),
+            _frame_row(0.1, frame_idx=4),
+            _frame_row(0.0, frame_idx=5),
+        ]
+    )
+
+    summary = aggregate_window_containment_summaries(rows)[0]
+
+    assert summary["strong_fail_frame_count"] == 5
+    assert summary["window_containment_verdict"] == "containment_fail"
+
+
+def test_window_aggregation_three_strong_frames_fail() -> None:
+    rows = classify_containment_rows(
+        [
+            _frame_row(0.0, frame_idx=1),
+            _frame_row(0.1, frame_idx=2),
+            _frame_row(0.0, frame_idx=3),
+            _frame_row(0.35, frame_idx=4),
+            _frame_row(0.45, frame_idx=5),
+        ]
+    )
+
+    summary = aggregate_window_containment_summaries(rows)[0]
+
+    assert summary["strong_fail_frame_count"] == 3
+    assert summary["review_frame_count"] == 2
+    assert summary["window_containment_verdict"] == "containment_fail"
+
+
+def test_window_aggregation_two_strong_with_acceptable_majority_is_mixed() -> None:
+    rows = classify_containment_rows(
+        [
+            _frame_row(0.0, frame_idx=1),
+            _frame_row(0.1, frame_idx=2),
+            _frame_row(0.75, frame_idx=3),
+            _frame_row(0.80, frame_idx=4),
+            _frame_row(0.90, frame_idx=5),
         ]
     )
 
     summary = aggregate_window_containment_summaries(rows)[0]
 
     assert summary["strong_fail_frame_count"] == 2
-    assert summary["window_containment_verdict"] == "containment_fail"
+    assert summary["acceptable_frame_count"] == 3
+    assert summary["window_containment_verdict"] == "mixed_review"
+
+
+def test_window_aggregation_two_strong_with_projection_is_mixed() -> None:
+    rows = classify_containment_rows(
+        [
+            _frame_row(0.0, frame_idx=1),
+            _frame_row(0.1, frame_idx=2),
+            _frame_row(0.35, frame_idx=3),
+            _frame_row(0.0, projected_ratio=0.0, frame_idx=4),
+            _frame_row(0.1, projected_ratio=0.2, frame_idx=5),
+        ]
+    )
+
+    summary = aggregate_window_containment_summaries(rows)[0]
+
+    assert summary["strong_fail_frame_count"] == 2
+    assert summary["review_frame_count"] == 1
+    assert summary["projection_review_frame_count"] == 2
+    assert summary["window_containment_verdict"] == "mixed_review"
+
+
+def test_window_aggregation_majority_acceptable_without_strong_is_acceptable() -> None:
+    rows = classify_containment_rows(
+        [
+            _frame_row(0.75, frame_idx=1),
+            _frame_row(0.80, frame_idx=2),
+            _frame_row(0.90, frame_idx=3),
+            _frame_row(0.85, frame_idx=4),
+            _frame_row(0.45, frame_idx=5),
+        ]
+    )
+
+    summary = aggregate_window_containment_summaries(rows)[0]
+
+    assert summary["acceptable_frame_count"] == 4
+    assert summary["review_frame_count"] == 1
+    assert summary["strong_fail_frame_count"] == 0
+    assert summary["window_containment_verdict"] == "acceptable_flagged"
 
 
 def test_window_aggregation_only_projection_review() -> None:
@@ -280,43 +356,14 @@ def test_window_aggregation_only_projection_review() -> None:
         [
             _frame_row(0.0, projected_ratio=0.0, frame_idx=1),
             _frame_row(0.1, projected_ratio=0.2, frame_idx=2),
+            _frame_row(0.3, projected_ratio=0.3, frame_idx=3),
+            _frame_row(0.8, projected_ratio=0.1, frame_idx=4),
+            _frame_row(0.9, projected_ratio=0.0, frame_idx=5),
         ]
     )
 
     summary = aggregate_window_containment_summaries(rows)[0]
 
-    assert summary["projection_review_frame_count"] == 2
+    assert summary["projection_review_frame_count"] == 5
     assert summary["strong_fail_frame_count"] == 0
     assert summary["window_containment_verdict"] == "projection_review"
-
-
-def test_window_aggregation_majority_acceptable() -> None:
-    rows = classify_containment_rows(
-        [
-            _frame_row(0.75, frame_idx=1),
-            _frame_row(0.80, frame_idx=2),
-            _frame_row(0.45, frame_idx=3),
-        ]
-    )
-
-    summary = aggregate_window_containment_summaries(rows)[0]
-
-    assert summary["acceptable_frame_count"] == 2
-    assert summary["window_containment_verdict"] == "acceptable_flagged"
-
-
-def test_window_aggregation_mixed_review() -> None:
-    rows = classify_containment_rows(
-        [
-            _frame_row(0.35, frame_idx=1),
-            _frame_row(0.0, projected_ratio=0.0, frame_idx=2),
-            _frame_row(0.0, projected_ratio=1.0, mask_present=False, frame_idx=3),
-        ]
-    )
-
-    summary = aggregate_window_containment_summaries(rows)[0]
-
-    assert summary["review_frame_count"] == 1
-    assert summary["projection_review_frame_count"] == 1
-    assert summary["mask_missing_or_tiny_frame_count"] == 1
-    assert summary["window_containment_verdict"] == "mixed_review"
