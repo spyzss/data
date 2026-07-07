@@ -41,10 +41,19 @@ def parse_args() -> argparse.Namespace:
             "acceptance keypoints fall inside the generated hand mask."
         )
     )
-    parser.add_argument("--hdf5-dir", type=Path, required=True)
-    parser.add_argument("--video-dir", type=Path, required=True)
-    parser.add_argument("--sam3-model", type=Path, required=True)
+    parser.add_argument("--hdf5-dir", type=Path, default=None)
+    parser.add_argument("--video-dir", type=Path, default=None)
+    parser.add_argument("--sam3-model", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--aggregate-frame-results",
+        type=Path,
+        default=None,
+        help=(
+            "Read an existing frame_keypoint_containment.json and write "
+            "window_keypoint_containment_summary outputs without running SAM3."
+        ),
+    )
     parser.add_argument("--sample-fraction", type=float, default=0.10)
     parser.add_argument(
         "--candidate-windows",
@@ -131,6 +140,16 @@ def parse_args() -> argparse.Namespace:
             "unprojectable keypoints, marks the frame abnormal."
         ),
     )
+    parser.add_argument("--projected-in-image-ratio-threshold", type=float, default=0.8)
+    parser.add_argument(
+        "--strong-containment-inside-ratio-threshold",
+        type=float,
+        default=0.2,
+    )
+    parser.add_argument("--acceptable-inside-ratio-threshold", type=float, default=0.6)
+    parser.add_argument("--mask-tiny-area-ratio-threshold", type=float, default=0.0)
+    parser.add_argument("--containment-fail-min-strong-frames", type=int, default=2)
+    parser.add_argument("--containment-fail-strong-frame-ratio", type=float, default=0.4)
     parser.add_argument(
         "--video-patterns",
         default="{episode_id}.mp4,{stem}.mp4,{stem_no_hdf5}.mp4",
@@ -154,6 +173,17 @@ def main() -> None:
         raise ValueError("--sample-fraction must be in (0, 1]")
     if not 0.0 <= args.abnormal_inside_ratio_threshold <= 1.0:
         raise ValueError("--abnormal-inside-ratio-threshold must be in [0, 1]")
+    if not 0.0 <= args.projected_in_image_ratio_threshold <= 1.0:
+        raise ValueError("--projected-in-image-ratio-threshold must be in [0, 1]")
+    if not 0.0 <= args.strong_containment_inside_ratio_threshold <= 1.0:
+        raise ValueError("--strong-containment-inside-ratio-threshold must be in [0, 1]")
+    if not 0.0 <= args.acceptable_inside_ratio_threshold <= 1.0:
+        raise ValueError("--acceptable-inside-ratio-threshold must be in [0, 1]")
+    if args.strong_containment_inside_ratio_threshold >= args.acceptable_inside_ratio_threshold:
+        raise ValueError(
+            "--strong-containment-inside-ratio-threshold must be less than "
+            "--acceptable-inside-ratio-threshold"
+        )
     if args.start_clip < 0:
         raise ValueError("--start-clip must be >= 0")
     if args.end_clip is not None and args.end_clip < args.start_clip:
@@ -162,8 +192,49 @@ def main() -> None:
         raise ValueError("--max-clips must be >= 1")
     if args.frames_per_window < 1:
         raise ValueError("--frames-per-window must be >= 1")
+    if args.containment_fail_min_strong_frames < 1:
+        raise ValueError("--containment-fail-min-strong-frames must be >= 1")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.aggregate_frame_results is not None:
+        frame_rows = json.loads(args.aggregate_frame_results.read_text(encoding="utf-8"))
+        if not isinstance(frame_rows, list):
+            raise ValueError("--aggregate-frame-results must point to a JSON list")
+        frame_rows = classify_containment_rows(
+            frame_rows,
+            projected_in_image_ratio_threshold=args.projected_in_image_ratio_threshold,
+            strong_inside_ratio_threshold=args.strong_containment_inside_ratio_threshold,
+            acceptable_inside_ratio_threshold=args.acceptable_inside_ratio_threshold,
+            mask_tiny_area_ratio_threshold=args.mask_tiny_area_ratio_threshold,
+        )
+        summaries = aggregate_window_containment_summaries(
+            frame_rows,
+            fail_min_strong_frames=args.containment_fail_min_strong_frames,
+            fail_strong_frame_ratio=args.containment_fail_strong_frame_ratio,
+        )
+        write_window_summary_outputs(summaries, args.output_dir)
+        write_json(
+            {
+                "aggregate_frame_results": str(args.aggregate_frame_results),
+                "projected_in_image_ratio_threshold": args.projected_in_image_ratio_threshold,
+                "strong_containment_inside_ratio_threshold": (
+                    args.strong_containment_inside_ratio_threshold
+                ),
+                "acceptable_inside_ratio_threshold": args.acceptable_inside_ratio_threshold,
+                "mask_tiny_area_ratio_threshold": args.mask_tiny_area_ratio_threshold,
+                "num_windows": len(summaries),
+            },
+            args.output_dir / "run_manifest.json",
+        )
+        LOGGER.info("Wrote aggregate-only results under %s", args.output_dir)
+        return
+
+    if args.hdf5_dir is None or args.video_dir is None or args.sam3_model is None:
+        raise ValueError(
+            "--hdf5-dir, --video-dir, and --sam3-model are required unless "
+            "--aggregate-frame-results is used"
+        )
+
     all_hdf5_paths = sorted(
         path
         for suffix in ("*.hdf5", "*.h5")
@@ -234,6 +305,10 @@ def main() -> None:
                     max_sampled_frames=args.max_sampled_frames_per_clip,
                     projection_mode=args.projection_mode,
                     abnormal_inside_ratio_threshold=args.abnormal_inside_ratio_threshold,
+                    projected_in_image_ratio_threshold=args.projected_in_image_ratio_threshold,
+                    strong_inside_ratio_threshold=args.strong_containment_inside_ratio_threshold,
+                    acceptable_inside_ratio_threshold=args.acceptable_inside_ratio_threshold,
+                    mask_tiny_area_ratio_threshold=args.mask_tiny_area_ratio_threshold,
                     overlay_dir=(args.overlay_dir or args.output_dir / "overlays")
                     if args.write_overlays
                     else None,
@@ -288,6 +363,10 @@ def main() -> None:
                     max_sampled_frames=args.max_sampled_frames_per_clip,
                     projection_mode=args.projection_mode,
                     abnormal_inside_ratio_threshold=args.abnormal_inside_ratio_threshold,
+                    projected_in_image_ratio_threshold=args.projected_in_image_ratio_threshold,
+                    strong_inside_ratio_threshold=args.strong_containment_inside_ratio_threshold,
+                    acceptable_inside_ratio_threshold=args.acceptable_inside_ratio_threshold,
+                    mask_tiny_area_ratio_threshold=args.mask_tiny_area_ratio_threshold,
                     overlay_dir=(args.overlay_dir or args.output_dir / "overlays")
                     if args.write_overlays
                     else None,
@@ -306,6 +385,12 @@ def main() -> None:
 
     write_json(frame_rows, args.output_dir / "frame_keypoint_containment.json")
     write_json(clip_rows, args.output_dir / "clip_keypoint_containment.json")
+    window_summaries = aggregate_window_containment_summaries(
+        frame_rows,
+        fail_min_strong_frames=args.containment_fail_min_strong_frames,
+        fail_strong_frame_ratio=args.containment_fail_strong_frame_ratio,
+    )
+    write_window_summary_outputs(window_summaries, args.output_dir)
     write_json(
         {
             "hdf5_dir": str(args.hdf5_dir),
@@ -326,11 +411,18 @@ def main() -> None:
             "selected_hdf5_paths": [str(path) for path in selected_hdf5_paths],
             "queries": queries,
             "abnormal_inside_ratio_threshold": args.abnormal_inside_ratio_threshold,
+            "projected_in_image_ratio_threshold": args.projected_in_image_ratio_threshold,
+            "strong_containment_inside_ratio_threshold": (
+                args.strong_containment_inside_ratio_threshold
+            ),
+            "acceptable_inside_ratio_threshold": args.acceptable_inside_ratio_threshold,
+            "mask_tiny_area_ratio_threshold": args.mask_tiny_area_ratio_threshold,
             "write_overlays": args.write_overlays,
             "overlay_dir": str(args.overlay_dir or args.output_dir / "overlays")
             if args.write_overlays
             else None,
             "num_clips": len(clip_rows),
+            "num_window_summaries": len(window_summaries),
         },
         args.output_dir / "run_manifest.json",
     )
@@ -346,6 +438,10 @@ def process_clip(
     max_sampled_frames: int | None,
     projection_mode: str,
     abnormal_inside_ratio_threshold: float,
+    projected_in_image_ratio_threshold: float,
+    strong_inside_ratio_threshold: float,
+    acceptable_inside_ratio_threshold: float,
+    mask_tiny_area_ratio_threshold: float,
     overlay_dir: Path | None,
     sam3_config: dict[str, Any],
     candidate_window: dict[str, Any] | None = None,
@@ -461,11 +557,19 @@ def process_clip(
         mask_area = int(np.sum(union_mask)) if union_mask is not None else 0
         mask_area_ratio = safe_ratio(mask_area, frame.shape[0] * frame.shape[1])
         hand_mask_present = bool(union_mask is not None and mask_area > 0)
-        containment_verdict, reason = containment_verdict_for_frame(
-            hand_mask_present=hand_mask_present,
-            valid_count=valid_count,
+        hand_mask_tiny = bool(
+            hand_mask_present
+            and mask_area_ratio is not None
+            and mask_area_ratio <= mask_tiny_area_ratio_threshold
+        )
+        containment_verdict, reason = classify_containment_frame(
+            projected_in_image_ratio=projected_keypoints_in_image_ratio,
             inside_ratio=keypoint_inside_ratio,
-            threshold=abnormal_inside_ratio_threshold,
+            hand_mask_present=hand_mask_present,
+            hand_mask_tiny=hand_mask_tiny,
+            projected_in_image_ratio_threshold=projected_in_image_ratio_threshold,
+            strong_inside_ratio_threshold=strong_inside_ratio_threshold,
+            acceptable_inside_ratio_threshold=acceptable_inside_ratio_threshold,
         )
         row = {
             "clip_id": clip_id_from_path(hdf5_path),
@@ -502,6 +606,10 @@ def process_clip(
             "valid_projected_missing_ratio": valid_projected_missing_ratio,
             "abnormal_inside_ratio_threshold": abnormal_inside_ratio_threshold,
             "abnormal_frame": abnormal_frame,
+            "projected_in_image_ratio_threshold": projected_in_image_ratio_threshold,
+            "strong_containment_inside_ratio_threshold": strong_inside_ratio_threshold,
+            "acceptable_inside_ratio_threshold": acceptable_inside_ratio_threshold,
+            "mask_tiny_area_ratio_threshold": mask_tiny_area_ratio_threshold,
             "keypoints_inside_hand_mask_ratio": keypoint_inside_ratio,
             "containment_verdict": containment_verdict,
             "reason": reason,
@@ -510,6 +618,7 @@ def process_clip(
             "mask_area_ratio": mask_area_ratio,
             "hand_mask_present": hand_mask_present,
             "hand_mask_area_ratio": mask_area_ratio,
+            "hand_mask_tiny": hand_mask_tiny,
             "hand_mask_touches_border": bool(mask_touches_border(union_mask)),
             "sam3_categories": sorted({mask.category for mask in masks}),
         }
@@ -761,19 +870,258 @@ def candidate_window_metadata(window: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def containment_verdict_for_frame(
-    hand_mask_present: bool,
-    valid_count: int,
+def classify_containment_frame(
+    projected_in_image_ratio: float | None,
     inside_ratio: float | None,
-    threshold: float,
+    hand_mask_present: bool,
+    hand_mask_tiny: bool,
+    projected_in_image_ratio_threshold: float = 0.8,
+    strong_inside_ratio_threshold: float = 0.2,
+    acceptable_inside_ratio_threshold: float = 0.6,
 ) -> tuple[str, str]:
-    if not hand_mask_present:
-        return "review", "hand mask missing"
-    if valid_count == 0 or inside_ratio is None:
-        return "review", "projection failed"
-    if inside_ratio < threshold:
-        return "abnormal", "keypoints outside hand mask"
-    return "pass", "keypoints inside hand mask"
+    if (
+        projected_in_image_ratio is None
+        or projected_in_image_ratio < projected_in_image_ratio_threshold
+    ):
+        return "projection_review", "insufficient_projection_evidence"
+    if not hand_mask_present or hand_mask_tiny:
+        return "mask_missing_or_tiny_review", "hand mask missing or tiny"
+    if inside_ratio is None:
+        return "projection_review", "insufficient_projection_evidence"
+    if inside_ratio <= strong_inside_ratio_threshold:
+        return (
+            "strong_containment_mismatch",
+            "projected keypoints are in image but mostly outside hand mask",
+        )
+    if inside_ratio < acceptable_inside_ratio_threshold:
+        return "containment_review", "partial keypoint-mask mismatch"
+    return "likely_visible_ok", "keypoints mostly consistent with hand mask"
+
+
+def classify_containment_rows(
+    rows: list[dict[str, Any]],
+    projected_in_image_ratio_threshold: float = 0.8,
+    strong_inside_ratio_threshold: float = 0.2,
+    acceptable_inside_ratio_threshold: float = 0.6,
+    mask_tiny_area_ratio_threshold: float = 0.0,
+) -> list[dict[str, Any]]:
+    classified = []
+    for row in rows:
+        next_row = dict(row)
+        hand_mask_present = bool(next_row.get("hand_mask_present", False))
+        mask_area_ratio = next_row.get("hand_mask_area_ratio")
+        if mask_area_ratio is None:
+            mask_area_ratio = next_row.get("mask_area_ratio")
+        hand_mask_tiny = bool(
+            hand_mask_present
+            and mask_area_ratio is not None
+            and float(mask_area_ratio) <= mask_tiny_area_ratio_threshold
+        )
+        projected_ratio = ratio_value(
+            next_row.get("projected_keypoints_in_image_ratio")
+        )
+        inside_ratio = ratio_value(
+            next_row.get("keypoints_inside_hand_mask_ratio")
+            if "keypoints_inside_hand_mask_ratio" in next_row
+            else next_row.get("keypoint_inside_ratio")
+        )
+        verdict, reason = classify_containment_frame(
+            projected_in_image_ratio=projected_ratio,
+            inside_ratio=inside_ratio,
+            hand_mask_present=hand_mask_present,
+            hand_mask_tiny=hand_mask_tiny,
+            projected_in_image_ratio_threshold=projected_in_image_ratio_threshold,
+            strong_inside_ratio_threshold=strong_inside_ratio_threshold,
+            acceptable_inside_ratio_threshold=acceptable_inside_ratio_threshold,
+        )
+        next_row["containment_verdict"] = verdict
+        next_row["reason"] = reason
+        next_row["hand_mask_tiny"] = hand_mask_tiny
+        next_row["projected_in_image_ratio_threshold"] = (
+            projected_in_image_ratio_threshold
+        )
+        next_row["strong_containment_inside_ratio_threshold"] = (
+            strong_inside_ratio_threshold
+        )
+        next_row["acceptable_inside_ratio_threshold"] = (
+            acceptable_inside_ratio_threshold
+        )
+        next_row["mask_tiny_area_ratio_threshold"] = mask_tiny_area_ratio_threshold
+        classified.append(next_row)
+    return classified
+
+
+def aggregate_window_containment_summaries(
+    rows: list[dict[str, Any]],
+    fail_min_strong_frames: int = 2,
+    fail_strong_frame_ratio: float = 0.4,
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (
+            row.get("asset_id") or row.get("clip_id"),
+            row.get("episode_idx"),
+            row.get("window_start_frame"),
+            row.get("window_end_frame"),
+            row.get("hand_side"),
+        )
+        groups.setdefault(key, []).append(row)
+
+    summaries = []
+    for group_rows in groups.values():
+        summaries.append(
+            summarize_window_containment(
+                group_rows,
+                fail_min_strong_frames=fail_min_strong_frames,
+                fail_strong_frame_ratio=fail_strong_frame_ratio,
+            )
+        )
+    return sorted(
+        summaries,
+        key=lambda item: (
+            str(item.get("asset_id") or ""),
+            item.get("window_start_frame")
+            if item.get("window_start_frame") is not None
+            else -1,
+            str(item.get("hand_side") or ""),
+        ),
+    )
+
+
+def summarize_window_containment(
+    rows: list[dict[str, Any]],
+    fail_min_strong_frames: int,
+    fail_strong_frame_ratio: float,
+) -> dict[str, Any]:
+    first = rows[0]
+    verdict_counts = Counter(row.get("containment_verdict") for row in rows)
+    sampled_count = len(rows)
+    strong_count = int(verdict_counts["strong_containment_mismatch"])
+    containment_review_count = int(verdict_counts["containment_review"])
+    projection_review_count = int(verdict_counts["projection_review"])
+    acceptable_count = int(verdict_counts["likely_visible_ok"])
+    mask_missing_count = int(verdict_counts["mask_missing_or_tiny_review"])
+    strong_ratio = safe_ratio(strong_count, sampled_count) or 0.0
+    window_verdict, reason = window_containment_verdict(
+        sampled_count=sampled_count,
+        strong_fail_frame_count=strong_count,
+        strong_fail_frame_ratio=strong_ratio,
+        review_frame_count=containment_review_count,
+        projection_review_frame_count=projection_review_count,
+        acceptable_frame_count=acceptable_count,
+        mask_missing_or_tiny_frame_count=mask_missing_count,
+        fail_min_strong_frames=fail_min_strong_frames,
+        fail_strong_frame_ratio=fail_strong_frame_ratio,
+    )
+    inside_values = [
+        value
+        for value in (
+            ratio_value(
+                row.get("keypoints_inside_hand_mask_ratio")
+                if "keypoints_inside_hand_mask_ratio" in row
+                else row.get("keypoint_inside_ratio")
+            )
+            for row in rows
+        )
+        if value is not None
+    ]
+    projected_values = [
+        value
+        for value in (
+            ratio_value(row.get("projected_keypoints_in_image_ratio"))
+            for row in rows
+        )
+        if value is not None
+    ]
+    start_frame = first.get("window_start_frame")
+    end_frame = first.get("window_end_frame")
+    if start_frame is None:
+        start_frame = min(int(row.get("frame_idx", 0)) for row in rows)
+    if end_frame is None:
+        end_frame = max(int(row.get("frame_idx", 0)) for row in rows)
+    return {
+        "asset_id": first.get("asset_id") or first.get("clip_id"),
+        "episode_idx": first.get("episode_idx"),
+        "hand_side": first.get("hand_side"),
+        "window_start_frame": start_frame,
+        "window_end_frame": end_frame,
+        "seed_run_start": first.get("seed_run_start"),
+        "seed_run_end": first.get("seed_run_end"),
+        "seed_run_frames": first.get("seed_run_frames"),
+        "source_window_source": first.get("source_window_source"),
+        "source_review_type": first.get("source_review_type"),
+        "source_trigger_reason": first.get("source_trigger_reason"),
+        "source_priority": first.get("source_priority"),
+        "sampled_frame_count": sampled_count,
+        "sampled_frame_indices": sorted(
+            int(row["frame_idx"]) for row in rows if row.get("frame_idx") is not None
+        ),
+        "strong_fail_frame_count": strong_count,
+        "strong_fail_frame_ratio": strong_ratio,
+        "review_frame_count": containment_review_count,
+        "projection_review_frame_count": projection_review_count,
+        "acceptable_frame_count": acceptable_count,
+        "mask_missing_or_tiny_frame_count": mask_missing_count,
+        "inside_ratio_min": min(inside_values) if inside_values else None,
+        "inside_ratio_mean": float(np.mean(inside_values)) if inside_values else None,
+        "inside_ratio_max": max(inside_values) if inside_values else None,
+        "projected_in_image_ratio_min": min(projected_values)
+        if projected_values
+        else None,
+        "projected_in_image_ratio_mean": float(np.mean(projected_values))
+        if projected_values
+        else None,
+        "projected_in_image_ratio_max": max(projected_values)
+        if projected_values
+        else None,
+        "window_containment_verdict": window_verdict,
+        "reason": reason,
+    }
+
+
+def window_containment_verdict(
+    sampled_count: int,
+    strong_fail_frame_count: int,
+    strong_fail_frame_ratio: float,
+    review_frame_count: int,
+    projection_review_frame_count: int,
+    acceptable_frame_count: int,
+    mask_missing_or_tiny_frame_count: int,
+    fail_min_strong_frames: int = 2,
+    fail_strong_frame_ratio: float = 0.4,
+) -> tuple[str, str]:
+    if (
+        strong_fail_frame_count >= fail_min_strong_frames
+        or strong_fail_frame_ratio >= fail_strong_frame_ratio
+    ):
+        return "containment_fail", "sustained strong keypoint-mask mismatch"
+    if projection_review_frame_count == sampled_count and sampled_count > 0:
+        return "projection_review", "only insufficient projection evidence"
+    if acceptable_frame_count > sampled_count / 2 and strong_fail_frame_count == 0:
+        return "acceptable_flagged", "majority frames are visually acceptable"
+    nonzero_classes = sum(
+        count > 0
+        for count in (
+            strong_fail_frame_count,
+            review_frame_count,
+            projection_review_frame_count,
+            acceptable_frame_count,
+            mask_missing_or_tiny_frame_count,
+        )
+    )
+    if nonzero_classes > 1:
+        return "mixed_review", "mixed containment evidence"
+    return "review", "uncertain containment evidence"
+
+
+def ratio_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    return ratio if math.isfinite(ratio) else None
 
 
 def mask_touches_border(mask: np.ndarray | None) -> bool:
@@ -1049,6 +1397,47 @@ def error_clip_row(hdf5_path: Path, error: str, video_path: Path | None = None) 
         "abnormal_frame_ratio": None,
         "error": error,
     }
+
+
+def error_candidate_row(
+    window: dict[str, Any],
+    error: str,
+    hdf5_path: Path | None = None,
+    video_path: Path | None = None,
+) -> dict[str, Any]:
+    row = {
+        "asset_id": window.get("asset_id"),
+        "episode_idx": window.get("episode_idx"),
+        "hdf5_path": str(hdf5_path) if hdf5_path is not None else None,
+        "video_path": str(video_path) if video_path is not None else None,
+        "frame_idx": None,
+        "hand_side": normalize_hand_side(window.get("hand_side")),
+        "hand_mask_present": False,
+        "hand_mask_area_ratio": None,
+        "hand_mask_touches_border": False,
+        "projected_keypoints_in_image_ratio": None,
+        "keypoints_inside_hand_mask_ratio": None,
+        "containment_verdict": "projection_review",
+        "reason": f"candidate window failed: {error}",
+        "error": error,
+    }
+    row.update(candidate_window_metadata(window))
+    return row
+
+
+def write_window_summary_outputs(
+    summaries: list[dict[str, Any]],
+    output_dir: Path,
+) -> None:
+    json_path = output_dir / "window_keypoint_containment_summary.json"
+    write_json(summaries, json_path)
+    parquet_path = output_dir / "window_keypoint_containment_summary.parquet"
+    try:
+        import pandas as pd
+
+        pd.DataFrame(summaries).to_parquet(parquet_path, index=False)
+    except Exception as exc:
+        LOGGER.warning("Could not write %s: %s", parquet_path, exc)
 
 
 def write_json(value: Any, path: Path) -> None:
