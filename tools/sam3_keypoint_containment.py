@@ -47,6 +47,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sample-fraction", type=float, default=0.10)
     parser.add_argument(
+        "--candidate-windows",
+        type=Path,
+        default=None,
+        help=(
+            "Optional precheck candidate_windows.json. When provided, frame "
+            "selection is window-based and --sample-fraction is ignored."
+        ),
+    )
+    parser.add_argument(
+        "--asset-ids",
+        default=None,
+        help="Optional comma-separated asset ids to keep, e.g. 100030,100044.",
+    )
+    parser.add_argument(
+        "--frames-per-window",
+        type=int,
+        default=3,
+        help="Number of evenly spaced interior frames sampled per candidate window.",
+    )
+    parser.add_argument(
+        "--no-window-boundaries",
+        dest="include_window_boundaries",
+        action="store_false",
+        help="Do not force include candidate window start_frame and end_frame.",
+    )
+    parser.set_defaults(include_window_boundaries=True)
+    parser.add_argument(
         "--start-clip",
         type=int,
         default=0,
@@ -133,17 +160,18 @@ def main() -> None:
         raise ValueError("--end-clip must be >= --start-clip")
     if args.max_clips is not None and args.max_clips < 1:
         raise ValueError("--max-clips must be >= 1")
+    if args.frames_per_window < 1:
+        raise ValueError("--frames-per-window must be >= 1")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    all_hdf5_paths = sorted(args.hdf5_dir.glob("*.hdf5"))
-    hdf5_paths = all_hdf5_paths[args.start_clip : args.end_clip]
-    if args.max_clips is not None:
-        hdf5_paths = hdf5_paths[: args.max_clips]
-    if not hdf5_paths:
+    all_hdf5_paths = sorted(
+        path
+        for suffix in ("*.hdf5", "*.h5")
+        for path in args.hdf5_dir.glob(suffix)
+    )
+    if not all_hdf5_paths:
         raise FileNotFoundError(
-            f"No .hdf5 files selected under {args.hdf5_dir}; "
-            f"available={len(all_hdf5_paths)}, "
-            f"start_clip={args.start_clip}, end_clip={args.end_clip}"
+            f"No .hdf5 files found under {args.hdf5_dir}"
         )
 
     queries = [query.strip() for query in args.queries.split(",") if query.strip()]
@@ -158,44 +186,123 @@ def main() -> None:
 
     frame_rows: list[dict[str, Any]] = []
     clip_rows: list[dict[str, Any]] = []
-    for offset, hdf5_path in enumerate(hdf5_paths):
-        LOGGER.info("Clip %d/%d: %s", offset + 1, len(hdf5_paths), hdf5_path.name)
-        video_path = find_video_path(
-            hdf5_path,
-            args.video_dir,
-            args.video_patterns.split(","),
-            recursive=args.recursive_videos,
+    selected_hdf5_paths: list[Path] = []
+    candidate_windows: list[dict[str, Any]] | None = None
+    asset_id_filter = parse_asset_ids(args.asset_ids)
+    if args.candidate_windows is not None:
+        candidate_windows = filter_candidate_windows(
+            load_candidate_windows(args.candidate_windows),
+            asset_id_filter,
         )
-        if video_path is None:
-            LOGGER.warning("No matching video for %s", hdf5_path.name)
-            clip_rows.append(error_clip_row(hdf5_path, "matching video not found"))
-            continue
-
-        try:
-            clip_frame_rows, clip_summary = process_clip(
-                hdf5_path=hdf5_path,
-                video_path=video_path,
-                segmenter=segmenter,
-                queries=queries,
-                sample_fraction=args.sample_fraction,
-                max_sampled_frames=args.max_sampled_frames_per_clip,
-                projection_mode=args.projection_mode,
-                abnormal_inside_ratio_threshold=args.abnormal_inside_ratio_threshold,
-                overlay_dir=(args.overlay_dir or args.output_dir / "overlays")
-                if args.write_overlays
-                else None,
-                sam3_config={
-                    "confidence_threshold": args.confidence_threshold,
-                    "mask_threshold": args.mask_threshold,
-                    "max_instances_per_query": args.max_instances_per_query,
-                },
+        LOGGER.info(
+            "Candidate-window mode: %d windows selected from %s",
+            len(candidate_windows),
+            args.candidate_windows,
+        )
+        for offset, window in enumerate(candidate_windows):
+            asset_label = window.get("asset_id") or f"episode:{window.get('episode_idx')}"
+            LOGGER.info(
+                "Window %d/%d: asset=%s frames=%s-%s",
+                offset + 1,
+                len(candidate_windows),
+                asset_label,
+                window.get("start_frame"),
+                window.get("end_frame"),
             )
-        except Exception as exc:
-            LOGGER.exception("Clip failed: %s", hdf5_path.name)
-            clip_rows.append(error_clip_row(hdf5_path, str(exc), video_path))
-            continue
-        frame_rows.extend(clip_frame_rows)
-        clip_rows.append(clip_summary)
+            resolved = resolve_candidate_asset_paths(
+                window=window,
+                hdf5_dir=args.hdf5_dir,
+                video_dir=args.video_dir,
+                all_hdf5_paths=all_hdf5_paths,
+                video_patterns=args.video_patterns.split(","),
+                recursive_videos=args.recursive_videos,
+            )
+            if resolved.get("error"):
+                LOGGER.warning("Skipping candidate window: %s", resolved["error"])
+                frame_rows.append(error_candidate_row(window, resolved["error"]))
+                continue
+            hdf5_path = resolved["hdf5_path"]
+            video_path = resolved["video_path"]
+            selected_hdf5_paths.append(hdf5_path)
+            try:
+                clip_frame_rows, clip_summary = process_clip(
+                    hdf5_path=hdf5_path,
+                    video_path=video_path,
+                    segmenter=segmenter,
+                    queries=queries,
+                    sample_fraction=args.sample_fraction,
+                    max_sampled_frames=args.max_sampled_frames_per_clip,
+                    projection_mode=args.projection_mode,
+                    abnormal_inside_ratio_threshold=args.abnormal_inside_ratio_threshold,
+                    overlay_dir=(args.overlay_dir or args.output_dir / "overlays")
+                    if args.write_overlays
+                    else None,
+                    sam3_config={
+                        "confidence_threshold": args.confidence_threshold,
+                        "mask_threshold": args.mask_threshold,
+                        "max_instances_per_query": args.max_instances_per_query,
+                    },
+                    candidate_window=window,
+                    frames_per_window=args.frames_per_window,
+                    include_window_boundaries=args.include_window_boundaries,
+                )
+            except Exception as exc:
+                LOGGER.exception("Candidate window failed: %s", asset_label)
+                frame_rows.append(
+                    error_candidate_row(window, str(exc), hdf5_path, video_path)
+                )
+                continue
+            frame_rows.extend(clip_frame_rows)
+            clip_rows.append(clip_summary)
+    else:
+        hdf5_paths = all_hdf5_paths[args.start_clip : args.end_clip]
+        if args.max_clips is not None:
+            hdf5_paths = hdf5_paths[: args.max_clips]
+        if not hdf5_paths:
+            raise FileNotFoundError(
+                f"No .hdf5 files selected under {args.hdf5_dir}; "
+                f"available={len(all_hdf5_paths)}, "
+                f"start_clip={args.start_clip}, end_clip={args.end_clip}"
+            )
+        selected_hdf5_paths = hdf5_paths
+        for offset, hdf5_path in enumerate(hdf5_paths):
+            LOGGER.info("Clip %d/%d: %s", offset + 1, len(hdf5_paths), hdf5_path.name)
+            video_path = find_video_path(
+                hdf5_path,
+                args.video_dir,
+                args.video_patterns.split(","),
+                recursive=args.recursive_videos,
+            )
+            if video_path is None:
+                LOGGER.warning("No matching video for %s", hdf5_path.name)
+                clip_rows.append(error_clip_row(hdf5_path, "matching video not found"))
+                continue
+
+            try:
+                clip_frame_rows, clip_summary = process_clip(
+                    hdf5_path=hdf5_path,
+                    video_path=video_path,
+                    segmenter=segmenter,
+                    queries=queries,
+                    sample_fraction=args.sample_fraction,
+                    max_sampled_frames=args.max_sampled_frames_per_clip,
+                    projection_mode=args.projection_mode,
+                    abnormal_inside_ratio_threshold=args.abnormal_inside_ratio_threshold,
+                    overlay_dir=(args.overlay_dir or args.output_dir / "overlays")
+                    if args.write_overlays
+                    else None,
+                    sam3_config={
+                        "confidence_threshold": args.confidence_threshold,
+                        "mask_threshold": args.mask_threshold,
+                        "max_instances_per_query": args.max_instances_per_query,
+                    },
+                )
+            except Exception as exc:
+                LOGGER.exception("Clip failed: %s", hdf5_path.name)
+                clip_rows.append(error_clip_row(hdf5_path, str(exc), video_path))
+                continue
+            frame_rows.extend(clip_frame_rows)
+            clip_rows.append(clip_summary)
 
     write_json(frame_rows, args.output_dir / "frame_keypoint_containment.json")
     write_json(clip_rows, args.output_dir / "clip_keypoint_containment.json")
@@ -205,11 +312,18 @@ def main() -> None:
             "video_dir": str(args.video_dir),
             "sam3_model": str(args.sam3_model),
             "sample_fraction": args.sample_fraction,
+            "candidate_windows": str(args.candidate_windows)
+            if args.candidate_windows is not None
+            else None,
+            "candidate_window_mode": args.candidate_windows is not None,
+            "asset_ids": sorted(asset_id_filter) if asset_id_filter else None,
+            "frames_per_window": args.frames_per_window,
+            "include_window_boundaries": args.include_window_boundaries,
             "start_clip": args.start_clip,
             "end_clip": args.end_clip,
             "max_clips": args.max_clips,
             "available_hdf5_count": len(all_hdf5_paths),
-            "selected_hdf5_paths": [str(path) for path in hdf5_paths],
+            "selected_hdf5_paths": [str(path) for path in selected_hdf5_paths],
             "queries": queries,
             "abnormal_inside_ratio_threshold": args.abnormal_inside_ratio_threshold,
             "write_overlays": args.write_overlays,
@@ -234,6 +348,9 @@ def process_clip(
     abnormal_inside_ratio_threshold: float,
     overlay_dir: Path | None,
     sam3_config: dict[str, Any],
+    candidate_window: dict[str, Any] | None = None,
+    frames_per_window: int = 3,
+    include_window_boundaries: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import h5py
 
@@ -254,9 +371,23 @@ def process_clip(
         )
         num_frames = int(points.shape[0])
 
-    sampled_frames = sample_frame_indices(num_frames, sample_fraction)
-    if max_sampled_frames is not None:
-        sampled_frames = sampled_frames[:max_sampled_frames]
+    asset_id = str(candidate_window.get("asset_id")) if candidate_window and candidate_window.get("asset_id") else clip_id_from_path(hdf5_path)
+    hand_side = normalize_hand_side(candidate_window.get("hand_side") if candidate_window else None)
+    if hand_side in {"left", "right"}:
+        indices = [idx for idx, name in enumerate(joint_names) if name.startswith(hand_side)]
+        joint_names = [joint_names[idx] for idx in indices]
+        points = points[:, indices, :]
+    if candidate_window is not None:
+        sampled_frames = sample_candidate_window_frames(
+            candidate_window,
+            num_frames=num_frames,
+            frames_per_window=frames_per_window,
+            include_boundaries=include_window_boundaries,
+        )
+    else:
+        sampled_frames = sample_frame_indices(num_frames, sample_fraction)
+        if max_sampled_frames is not None:
+            sampled_frames = sampled_frames[:max_sampled_frames]
     if not sampled_frames:
         raise ValueError("no sampled frames selected")
 
@@ -301,33 +432,57 @@ def process_clip(
                 & (rounded[:, 1] < frame.shape[0])
             )
             inside[in_bounds] = union_mask[rounded[in_bounds, 1], rounded[in_bounds, 0]]
+        else:
+            in_bounds = (
+                valid
+                & (pixels[:, 0] >= 0)
+                & (pixels[:, 0] < frame.shape[1])
+                & (pixels[:, 1] >= 0)
+                & (pixels[:, 1] < frame.shape[0])
+            )
 
         inside_indices = np.flatnonzero(inside).tolist()
         missing_indices = np.flatnonzero(~inside).tolist()
         valid_missing_indices = np.flatnonzero(valid & ~inside).tolist()
         invalid_indices = np.flatnonzero(~valid).tolist()
         inside_count = int(np.sum(inside))
+        in_image_count = int(np.sum(in_bounds))
         missing_from_mask_count = int(valid_count - inside_count)
         expected_missing_from_mask_count = int(total_expected - inside_count)
         valid_projected_inside_ratio = safe_ratio(inside_count, valid_count)
         valid_projected_missing_ratio = safe_ratio(missing_from_mask_count, valid_count)
         keypoint_inside_ratio = safe_ratio(inside_count, total_expected)
         keypoint_missing_ratio = safe_ratio(expected_missing_from_mask_count, total_expected)
+        projected_keypoints_in_image_ratio = safe_ratio(in_image_count, total_expected)
         abnormal_frame = (
             keypoint_inside_ratio is not None
             and keypoint_inside_ratio < abnormal_inside_ratio_threshold
         )
         mask_area = int(np.sum(union_mask)) if union_mask is not None else 0
+        mask_area_ratio = safe_ratio(mask_area, frame.shape[0] * frame.shape[1])
+        hand_mask_present = bool(union_mask is not None and mask_area > 0)
+        containment_verdict, reason = containment_verdict_for_frame(
+            hand_mask_present=hand_mask_present,
+            valid_count=valid_count,
+            inside_ratio=keypoint_inside_ratio,
+            threshold=abnormal_inside_ratio_threshold,
+        )
         row = {
             "clip_id": clip_id_from_path(hdf5_path),
+            "asset_id": asset_id,
+            "episode_idx": candidate_window.get("episode_idx") if candidate_window else None,
             "hdf5_path": str(hdf5_path),
             "video_path": str(video_path),
             "frame_idx": int(frame_idx),
             "projection_mode": resolved_projection_mode,
+            "projection_mode_used": resolved_projection_mode,
             "image_width": int(frame.shape[1]),
             "image_height": int(frame.shape[0]),
+            "hand_side": hand_side,
             "sampled_keypoints": int(total_expected),
             "valid_projected_keypoints": valid_count,
+            "projected_keypoints_in_image": in_image_count,
+            "projected_keypoints_in_image_ratio": projected_keypoints_in_image_ratio,
             "inside_keypoints": inside_count,
             "missing_from_mask_keypoints": missing_from_mask_count,
             "expected_missing_from_mask_keypoints": expected_missing_from_mask_count,
@@ -347,12 +502,26 @@ def process_clip(
             "valid_projected_missing_ratio": valid_projected_missing_ratio,
             "abnormal_inside_ratio_threshold": abnormal_inside_ratio_threshold,
             "abnormal_frame": abnormal_frame,
+            "keypoints_inside_hand_mask_ratio": keypoint_inside_ratio,
+            "containment_verdict": containment_verdict,
+            "reason": reason,
             "mask_instance_count": len(masks),
             "mask_area": mask_area,
-            "mask_area_ratio": safe_ratio(mask_area, frame.shape[0] * frame.shape[1]),
+            "mask_area_ratio": mask_area_ratio,
+            "hand_mask_present": hand_mask_present,
+            "hand_mask_area_ratio": mask_area_ratio,
+            "hand_mask_touches_border": bool(mask_touches_border(union_mask)),
             "sam3_categories": sorted({mask.category for mask in masks}),
         }
+        if candidate_window is not None:
+            row.update(candidate_window_metadata(candidate_window))
         if overlay_dir is not None:
+            overlay_clip_id = (
+                f"{asset_id}_window_"
+                f"{candidate_window.get('start_frame')}_{candidate_window.get('end_frame')}"
+                if candidate_window is not None
+                else clip_id_from_path(hdf5_path)
+            )
             overlay_path = write_overlay_image(
                 frame=frame,
                 mask=union_mask,
@@ -360,7 +529,7 @@ def process_clip(
                 valid=valid,
                 inside=inside,
                 joint_names=joint_names,
-                clip_id=clip_id_from_path(hdf5_path),
+                clip_id=overlay_clip_id,
                 frame_idx=frame_idx,
                 output_dir=overlay_dir,
             )
@@ -385,9 +554,12 @@ def process_clip(
     ]
     clip_summary = {
         "clip_id": clip_id_from_path(hdf5_path),
+        "asset_id": asset_id,
+        "episode_idx": candidate_window.get("episode_idx") if candidate_window else None,
         "hdf5_path": str(hdf5_path),
         "video_path": str(video_path),
         "sample_fraction": sample_fraction,
+        "candidate_window_mode": candidate_window is not None,
         "sampled_frame_indices": [row["frame_idx"] for row in frame_rows],
         "abnormal_frame_indices": [
             row["frame_idx"] for row in frame_rows if row["abnormal_frame"]
@@ -433,7 +605,189 @@ def process_clip(
         "frames_without_mask": int(totals["frames_without_mask"]),
         "error": None,
     }
+    if candidate_window is not None:
+        clip_summary.update(candidate_window_metadata(candidate_window))
     return frame_rows, clip_summary
+
+
+def parse_asset_ids(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def load_candidate_windows(path: Path) -> list[dict[str, Any]]:
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise ValueError(f"candidate windows must be a JSON list: {path}")
+    windows: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"candidate window {index} is not an object")
+        windows.append(row)
+    return windows
+
+
+def filter_candidate_windows(
+    windows: list[dict[str, Any]],
+    asset_ids: set[str],
+) -> list[dict[str, Any]]:
+    if not asset_ids:
+        return windows
+    return [
+        window
+        for window in windows
+        if window.get("asset_id") is not None
+        and str(window.get("asset_id")) in asset_ids
+    ]
+
+
+def sample_candidate_window_frames(
+    window: dict[str, Any],
+    num_frames: int,
+    frames_per_window: int,
+    include_boundaries: bool,
+) -> list[int]:
+    start = int(window["start_frame"])
+    end = int(window["end_frame"])
+    if num_frames <= 0:
+        return []
+    start = max(0, min(start, num_frames - 1))
+    end = max(0, min(end, num_frames - 1))
+    if end < start:
+        start, end = end, start
+    if include_boundaries:
+        frame_indices = {start, end}
+        if end - start > 1 and frames_per_window > 0:
+            interior = np.linspace(
+                start + 1,
+                end - 1,
+                min(frames_per_window, end - start - 1),
+                dtype=int,
+            ).tolist()
+            frame_indices.update(interior)
+        return sorted(frame_indices)
+    count = min(max(1, frames_per_window), end - start + 1)
+    return sorted(set(np.linspace(start, end, count, dtype=int).tolist()))
+
+
+def resolve_candidate_asset_paths(
+    window: dict[str, Any],
+    hdf5_dir: Path,
+    video_dir: Path,
+    all_hdf5_paths: list[Path],
+    video_patterns: list[str],
+    recursive_videos: bool,
+) -> dict[str, Any]:
+    asset_id = window.get("asset_id")
+    hdf5_path: Path | None = None
+    if asset_id is not None:
+        hdf5_path = find_hdf5_path_for_asset(str(asset_id), hdf5_dir)
+        if hdf5_path is None:
+            return {"error": f"HDF5 not found for asset_id={asset_id}"}
+    else:
+        episode_idx = window.get("episode_idx")
+        if episode_idx is None:
+            return {"error": "candidate window has neither asset_id nor episode_idx"}
+        try:
+            hdf5_path = all_hdf5_paths[int(episode_idx)]
+        except (IndexError, TypeError, ValueError):
+            return {
+                "error": (
+                    "candidate window has missing asset_id and episode_idx "
+                    f"cannot map safely: {episode_idx}"
+                )
+            }
+
+    video_path = find_video_path_for_asset(
+        asset_id=clip_id_from_path(hdf5_path),
+        hdf5_path=hdf5_path,
+        video_dir=video_dir,
+        patterns=video_patterns,
+        recursive=recursive_videos,
+    )
+    if video_path is None:
+        return {"error": f"matching video not found for {hdf5_path.name}"}
+    return {"hdf5_path": hdf5_path, "video_path": video_path, "error": None}
+
+
+def find_hdf5_path_for_asset(asset_id: str, hdf5_dir: Path) -> Path | None:
+    for filename in (
+        f"{asset_id}_hdf5.hdf5",
+        f"{asset_id}_hdf5.h5",
+        f"{asset_id}.hdf5",
+        f"{asset_id}.h5",
+    ):
+        candidate = hdf5_dir / filename
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def find_video_path_for_asset(
+    asset_id: str,
+    hdf5_path: Path,
+    video_dir: Path,
+    patterns: list[str],
+    recursive: bool,
+) -> Path | None:
+    for filename in (f"{asset_id}_video.mp4", f"{asset_id}.mp4"):
+        candidate = video_dir / filename
+        if candidate.exists():
+            return candidate
+        if recursive:
+            matches = sorted(video_dir.rglob(filename))
+            if matches:
+                return matches[0]
+    return find_video_path(hdf5_path, video_dir, patterns, recursive=recursive)
+
+
+def normalize_hand_side(value: Any) -> str:
+    side = str(value or "both").lower()
+    return side if side in {"left", "right", "both"} else "both"
+
+
+def candidate_window_metadata(window: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "window_start_frame": window.get("start_frame"),
+        "window_end_frame": window.get("end_frame"),
+        "seed_run_start": window.get("seed_run_start"),
+        "seed_run_end": window.get("seed_run_end"),
+        "seed_run_frames": window.get("seed_run_frames"),
+        "source_window_source": window.get("window_source"),
+        "source_review_type": window.get("review_type"),
+        "source_trigger_reason": window.get("trigger_reason"),
+        "source_priority": window.get("priority"),
+    }
+
+
+def containment_verdict_for_frame(
+    hand_mask_present: bool,
+    valid_count: int,
+    inside_ratio: float | None,
+    threshold: float,
+) -> tuple[str, str]:
+    if not hand_mask_present:
+        return "review", "hand mask missing"
+    if valid_count == 0 or inside_ratio is None:
+        return "review", "projection failed"
+    if inside_ratio < threshold:
+        return "abnormal", "keypoints outside hand mask"
+    return "pass", "keypoints inside hand mask"
+
+
+def mask_touches_border(mask: np.ndarray | None) -> bool:
+    if mask is None:
+        return False
+    mask_bool = np.asarray(mask, dtype=bool)
+    if mask_bool.size == 0 or not bool(np.any(mask_bool)):
+        return False
+    return bool(
+        np.any(mask_bool[0, :])
+        or np.any(mask_bool[-1, :])
+        or np.any(mask_bool[:, 0])
+        or np.any(mask_bool[:, -1])
+    )
 
 
 def sample_frame_indices(num_frames: int, fraction: float) -> list[int]:
