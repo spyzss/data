@@ -112,7 +112,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 Optional config:
 
 ```yaml
-threshold_version: video_prefilter_v0.2.6
+threshold_version: video_prefilter_v0.2.8
 decode:
   max_sample_frames: 300
 hdf5_alignment:
@@ -120,23 +120,37 @@ hdf5_alignment:
 resolution:
   min_short_side_fail: 720
   min_long_side_fail: 1280
+exposure:
+  black:
+    max_frame_count_fail: 10
+    ratio_pass: 0.01
+    ratio_warn: 0.90
+  over_dark:
+    ratio_pass: 0.05
+    ratio_warn: 0.90
+  over_exposed:
+    ratio_pass: 0.05
+    ratio_warn: 0.90
 sharpness_global:
   target_short_side: 720
-  laplacian_p10_pass: 100
-  laplacian_p10_warn: 35
-  laplacian_median_pass: 120
-  laplacian_median_warn: 50
-  laplacian_under_100_ratio_pass: 0.15
+  laplacian_p10_pass: 35
+  laplacian_p10_warn: 0
+  laplacian_median_pass: 50
+  laplacian_median_warn: 0
+  laplacian_under_100_ratio_pass: 0.50
   laplacian_under_100_ratio_warn: 1.00
-  tenengrad_p10_pass: 18
-  tenengrad_p10_warn: 12
-  tenengrad_median_pass: 19
-  tenengrad_median_warn: 13
+  tenengrad_p10_pass: 12
+  tenengrad_p10_warn: 6
+  tenengrad_median_pass: 13
+  tenengrad_median_warn: 8
 freeze:
-  frozen_frame_ratio_pass: 0.09
-  frozen_frame_ratio_warn: 0.15
+  frozen_frame_ratio_pass: 0.05
+  frozen_frame_ratio_warn: 0.10
+defects:
+  max_duration_ratio_fail: 0.10
+  duration_ratio_warn: 0.05
 hand_roi:
-  enabled: true
+  enabled: false
   mode: warn_except_severe_fail
 ```
 
@@ -168,12 +182,14 @@ sampled/XJGT_20260616/
     summary.json
 ```
 
-It is a `video_prefilter_v0.2.6` low-cost prefilter. It uses practical
+It is a `video_prefilter_v0.2.8` low-cost prefilter. It uses practical
 no-reference indicators: open/decode health, fps, resolution, timeline
 continuity, sampled-frame decode ratio, black/over-dark/over-exposure ratios,
-global sharpness at a normalized short side, frozen-frame risk, HDF5 frame-count
-alignment, and a coarse hand ROI sharpness check from HDF5 keypoint arrays or
-4x4 hand/finger transform matrices projected with `camera/intrinsic`. It
-does not perform keypoint accuracy validation, keypoint-mask matching,
+global sharpness at a normalized short side, frozen-frame risk, drop-frame risk,
+total defect-duration ratio, and HDF5 frame-count alignment. Hand ROI is disabled
+by default in this prefilter because the rough bbox is too noisy for gating. It
+is calibrated for robot pretraining videos that may be downsampled to low
+resolution, so sharpness mostly produces warnings unless edges are nearly
+unreadable. It does not perform keypoint accuracy validation, keypoint-mask matching,
 hand-object mask IoU, trajectory jump checks, semantic consistency, or subtask
 acceptance.

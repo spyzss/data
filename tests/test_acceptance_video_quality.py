@@ -32,9 +32,9 @@ def textured_frame(offset: int, width: int = 1280, height: int = 720) -> np.ndar
 def test_default_video_quality_config() -> None:
     config = load_video_quality_config(None)
 
-    assert config.threshold_version == "video_prefilter_v0.2.6"
+    assert config.threshold_version == "video_prefilter_v0.2.8"
     assert config.pipeline.stop_before_mask_if_fail is True
-    assert config.pipeline.run_hand_roi is True
+    assert config.pipeline.run_hand_roi is False
     assert config.pipeline.do_keypoint_quality_check is False
     assert config.fps.expected_fps is None
     assert config.fps.min_fps_pass == 24
@@ -44,27 +44,38 @@ def test_default_video_quality_config() -> None:
     assert config.decode.sample_decode_ratio_pass == 0.995
     assert config.decode.sample_decode_ratio_warn == 0.98
     assert config.decode.max_sample_frames == 300
-    assert config.exposure.black.ratio_pass == 0.005
+    assert config.exposure.black.ratio_pass == 0.01
+    assert config.exposure.black.ratio_warn == 0.90
+    assert config.exposure.black.max_frame_count_fail == 10
     assert config.exposure.over_dark.ratio_pass == 0.05
+    assert config.exposure.over_dark.ratio_warn == 0.90
     assert config.exposure.over_exposed.ratio_pass == 0.05
+    assert config.exposure.over_exposed.ratio_warn == 0.90
     assert config.sharpness_global.target_short_side == 720
-    assert config.sharpness_global.laplacian_p10_pass == 100
-    assert config.sharpness_global.laplacian_p10_warn == 35
-    assert config.sharpness_global.laplacian_median_pass == 120
-    assert config.sharpness_global.laplacian_median_warn == 50
-    assert config.sharpness_global.laplacian_under_100_ratio_pass == 0.15
+    assert config.sharpness_global.laplacian_p10_pass == 35
+    assert config.sharpness_global.laplacian_p10_warn == 0
+    assert config.sharpness_global.laplacian_median_pass == 50
+    assert config.sharpness_global.laplacian_median_warn == 0
+    assert config.sharpness_global.laplacian_under_100_ratio_pass == 0.50
     assert config.sharpness_global.laplacian_under_100_ratio_warn == 1.00
-    assert config.sharpness_global.tenengrad_p10_pass == 18
-    assert config.sharpness_global.tenengrad_p10_warn == 12
-    assert config.sharpness_global.tenengrad_median_pass == 19
-    assert config.sharpness_global.tenengrad_median_warn == 13
-    assert config.freeze.frozen_frame_ratio_pass == 0.09
-    assert config.freeze.frozen_frame_ratio_warn == 0.15
+    assert config.sharpness_global.tenengrad_p10_pass == 12
+    assert config.sharpness_global.tenengrad_p10_warn == 6
+    assert config.sharpness_global.tenengrad_median_pass == 13
+    assert config.sharpness_global.tenengrad_median_warn == 8
+    assert config.timeline.drop_frame_ratio_pass == 0.05
+    assert config.timeline.drop_frame_ratio_warn == 0.10
+    assert config.freeze.frozen_frame_ratio_pass == 0.05
+    assert config.freeze.frozen_frame_ratio_warn == 0.10
     assert config.freeze.max_consecutive_frozen_sec_fail == 1.0
+    assert config.defects.max_duration_ratio_fail == 0.10
+    assert config.defects.duration_ratio_warn == 0.05
     assert config.hdf5_alignment.mode == AlignmentMode.FAIL
     assert config.hdf5_alignment.max_delta_frames_pass == 2
+    assert config.hand_roi.enabled is False
     assert config.hand_roi.mode == "warn_except_severe_fail"
     assert config.hand_roi.use_keypoints_as_bbox_only is True
+    assert config.hand_roi.blur_bad_frame_ratio_pass == 0.50
+    assert config.hand_roi.blur_bad_frame_ratio_warn == 0.90
 
 
 def test_video_quality_config_yaml_override(tmp_path: Path) -> None:
@@ -178,7 +189,9 @@ def test_evaluate_video_quality_passes_good_metrics(tmp_path: Path) -> None:
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     metrics = analyze_video(video, load_video_quality_config(None))
 
-    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(config_path))
 
     assert evaluation.passed is True
     assert evaluation.decision == "pass"
@@ -202,7 +215,9 @@ def test_evaluate_video_quality_passes_calibrated_provider_quality_metrics(tmp_p
         max_consecutive_frozen_sec=0.0,
     )
 
-    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(config_path))
 
     assert evaluation.passed is True
     assert evaluation.decision == "pass"
@@ -211,7 +226,7 @@ def test_evaluate_video_quality_passes_calibrated_provider_quality_metrics(tmp_p
     assert evaluation.warn_reasons == ()
 
 
-def test_evaluate_video_quality_warns_moderate_global_blur_without_stopping_mask_qc(tmp_path: Path) -> None:
+def test_evaluate_video_quality_passes_moderate_global_blur_for_pretraining(tmp_path: Path) -> None:
     video = tmp_path / "408817_video.mp4"
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     metrics = analyze_video(video, load_video_quality_config(None))
@@ -227,11 +242,9 @@ def test_evaluate_video_quality_warns_moderate_global_blur_without_stopping_mask
     evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
 
     assert evaluation.passed is True
-    assert evaluation.decision == "warn"
+    assert evaluation.decision == "pass"
     assert evaluation.should_run_mask_qc is True
-    assert "laplacian_p10_warn" in evaluation.warn_reasons
-    assert "laplacian_median_warn" not in evaluation.warn_reasons
-    assert "laplacian_under_100_ratio_warn" not in evaluation.warn_reasons
+    assert evaluation.warn_reasons == ()
     assert "laplacian_p10_below_min" not in evaluation.reasons
     assert "laplacian_median_below_min" not in evaluation.reasons
 
@@ -258,15 +271,15 @@ def test_evaluate_video_quality_warns_borderline_but_usable_global_blur_without_
     assert evaluation.passed is True
     assert evaluation.decision == "warn"
     assert evaluation.should_run_mask_qc is True
-    assert "laplacian_p10_warn" in evaluation.warn_reasons
-    assert "laplacian_median_warn" in evaluation.warn_reasons
     assert "laplacian_under_100_ratio_warn" in evaluation.warn_reasons
-    assert "tenengrad_p10_warn" in evaluation.warn_reasons
-    assert "tenengrad_median_warn" in evaluation.warn_reasons
+    assert "laplacian_p10_warn" not in evaluation.warn_reasons
+    assert "laplacian_median_warn" not in evaluation.warn_reasons
+    assert "tenengrad_p10_warn" not in evaluation.warn_reasons
+    assert "tenengrad_median_warn" not in evaluation.warn_reasons
     assert evaluation.reasons == ()
 
 
-def test_evaluate_video_quality_fails_low_edge_quality_after_provider_calibration(tmp_path: Path) -> None:
+def test_evaluate_video_quality_warns_low_edge_quality_after_pretraining_calibration(tmp_path: Path) -> None:
     video = tmp_path / "408817_video.mp4"
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     metrics = analyze_video(video, load_video_quality_config(None))
@@ -283,18 +296,19 @@ def test_evaluate_video_quality_fails_low_edge_quality_after_provider_calibratio
 
     evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
 
-    assert evaluation.passed is False
-    assert evaluation.decision == "fail"
-    assert evaluation.should_run_mask_qc is False
-    assert "laplacian_p10_warn" in evaluation.warn_reasons
-    assert "laplacian_median_warn" in evaluation.warn_reasons
+    assert evaluation.passed is True
+    assert evaluation.decision == "warn"
+    assert evaluation.should_run_mask_qc is True
     assert "laplacian_under_100_ratio_warn" in evaluation.warn_reasons
-    assert "tenengrad_p10_below_min" in evaluation.reasons
-    assert "tenengrad_median_below_min" in evaluation.reasons
-    assert "frozen_frame_ratio_warn" not in evaluation.warn_reasons
+    assert "laplacian_p10_warn" not in evaluation.warn_reasons
+    assert "laplacian_median_warn" not in evaluation.warn_reasons
+    assert "tenengrad_p10_warn" in evaluation.warn_reasons
+    assert "tenengrad_median_warn" in evaluation.warn_reasons
+    assert evaluation.reasons == ()
+    assert "frozen_frame_ratio_warn" in evaluation.warn_reasons
 
 
-def test_evaluate_video_quality_fails_cross_provider_extreme_blur_tail(tmp_path: Path) -> None:
+def test_evaluate_video_quality_warns_cross_provider_low_detail_tail(tmp_path: Path) -> None:
     video = tmp_path / "408817_video.mp4"
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     metrics = analyze_video(video, load_video_quality_config(None))
@@ -307,15 +321,18 @@ def test_evaluate_video_quality_fails_cross_provider_extreme_blur_tail(tmp_path:
         tenengrad_median=14.5,
     )
 
-    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(config_path))
 
-    assert evaluation.passed is False
-    assert evaluation.decision == "fail"
-    assert evaluation.should_run_mask_qc is False
-    assert "laplacian_p10_below_min" in evaluation.reasons
-    assert "laplacian_median_below_min" in evaluation.reasons
-    assert "tenengrad_p10_below_min" in evaluation.reasons
-    assert "tenengrad_median_below_min" not in evaluation.reasons
+    assert evaluation.passed is True
+    assert evaluation.decision == "warn"
+    assert evaluation.should_run_mask_qc is True
+    assert "laplacian_p10_warn" in evaluation.warn_reasons
+    assert "laplacian_median_warn" in evaluation.warn_reasons
+    assert "laplacian_under_100_ratio_warn" in evaluation.warn_reasons
+    assert "tenengrad_p10_warn" in evaluation.warn_reasons
+    assert evaluation.reasons == ()
 
 
 def test_evaluate_video_quality_still_fails_severe_global_blur(tmp_path: Path) -> None:
@@ -336,11 +353,11 @@ def test_evaluate_video_quality_still_fails_severe_global_blur(tmp_path: Path) -
     assert evaluation.passed is False
     assert evaluation.decision == "fail"
     assert evaluation.should_run_mask_qc is False
-    assert "laplacian_p10_below_min" in evaluation.reasons
-    assert "laplacian_median_below_min" in evaluation.reasons
+    assert "laplacian_p10_warn" in evaluation.warn_reasons
+    assert "laplacian_median_warn" in evaluation.warn_reasons
     assert "laplacian_under_100_ratio_above_max" not in evaluation.reasons
     assert "tenengrad_p10_below_min" in evaluation.reasons
-    assert "tenengrad_median_below_min" in evaluation.reasons
+    assert "tenengrad_median_below_min" not in evaluation.reasons
 
 
 def test_evaluate_video_quality_fails_decode_and_threshold_reasons(tmp_path: Path) -> None:
@@ -371,6 +388,72 @@ def test_evaluate_video_quality_fails_black_and_frozen_video(tmp_path: Path) -> 
     assert "max_consecutive_frozen_sec_above_max" in evaluation.reasons
 
 
+def test_evaluate_video_quality_fails_when_black_frame_count_exceeds_ten(tmp_path: Path) -> None:
+    video = tmp_path / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
+    metrics = analyze_video(video, load_video_quality_config(None))
+    metrics = replace(
+        metrics,
+        frame_count=2000,
+        black_frame_ratio=11 / 2000,
+        black_frame_count_estimate=11,
+        mean_over_dark_ratio=0.0,
+        exposure_defect_frame_ratio=11 / 2000,
+        defect_duration_ratio=11 / 2000,
+        frozen_frame_ratio=0.0,
+        max_consecutive_frozen_sec=0.0,
+    )
+
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
+
+    assert evaluation.passed is False
+    assert evaluation.decision == "fail"
+    assert "black_frame_count_above_max" in evaluation.reasons
+    assert "black_frame_ratio_above_max" not in evaluation.reasons
+
+
+def test_evaluate_video_quality_fails_when_total_defect_duration_exceeds_ten_percent(tmp_path: Path) -> None:
+    video = tmp_path / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
+    metrics = analyze_video(video, load_video_quality_config(None))
+
+    borderline = replace(
+        metrics,
+        mean_over_exposed_ratio=0.04,
+        exposure_defect_frame_ratio=0.04,
+        frozen_frame_ratio=0.03,
+        drop_frame_ratio=0.02,
+        defect_duration_ratio=0.09,
+    )
+    borderline_evaluation = evaluate_video_quality(borderline, load_video_quality_config(None))
+
+    assert borderline_evaluation.passed is True
+    assert borderline_evaluation.decision == "warn"
+    assert "defect_duration_ratio_warn" in borderline_evaluation.warn_reasons
+    assert "defect_duration_ratio_above_max" not in borderline_evaluation.reasons
+
+    too_many_defects = replace(
+        metrics,
+        mean_over_exposed_ratio=0.04,
+        exposure_defect_frame_ratio=0.04,
+        frozen_frame_ratio=0.04,
+        drop_frame_ratio=0.03,
+        defect_duration_ratio=0.11,
+    )
+    too_many_evaluation = evaluate_video_quality(too_many_defects, load_video_quality_config(None))
+
+    assert too_many_evaluation.passed is False
+    assert too_many_evaluation.decision == "fail"
+    assert "defect_duration_ratio_above_max" in too_many_evaluation.reasons
+
+    mostly_exposed = replace(metrics, mean_over_exposed_ratio=0.91, exposure_defect_frame_ratio=0.91, defect_duration_ratio=0.91)
+    mostly_evaluation = evaluate_video_quality(mostly_exposed, load_video_quality_config(None))
+
+    assert mostly_evaluation.passed is False
+    assert "mean_over_exposed_ratio_above_max" in mostly_evaluation.reasons
+    assert "defect_duration_ratio_above_max" in mostly_evaluation.reasons
+
+
 def test_evaluate_video_quality_fails_clear_screen_thresholds(tmp_path: Path) -> None:
     video = tmp_path / "408817_video.mp4"
     write_test_video(video, [solid_frame(100), solid_frame(120), solid_frame(140)], fps=10.0)
@@ -379,8 +462,8 @@ def test_evaluate_video_quality_fails_clear_screen_thresholds(tmp_path: Path) ->
     evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
 
     assert evaluation.passed is False
-    assert "laplacian_p10_below_min" in evaluation.reasons
-    assert "laplacian_median_below_min" in evaluation.reasons
+    assert "laplacian_p10_warn" in evaluation.warn_reasons
+    assert "laplacian_median_warn" in evaluation.warn_reasons
     assert "laplacian_under_100_ratio_above_max" not in evaluation.reasons
     assert "laplacian_under_100_ratio_warn" in evaluation.warn_reasons
     assert "tenengrad_p10_below_min" in evaluation.reasons
@@ -477,7 +560,7 @@ def test_hdf5_alignment_large_delta_fails_by_default(tmp_path: Path) -> None:
     assert "hdf5_frame_count_mismatch" in evaluation.reasons
 
 
-def test_hand_roi_bbox_metrics_warn_without_keypoint_quality_check(tmp_path: Path) -> None:
+def test_hand_roi_is_disabled_by_default_for_video_prefilter(tmp_path: Path) -> None:
     batch = tmp_path
     video_dir = batch / "video"
     video_dir.mkdir()
@@ -485,6 +568,25 @@ def test_hand_roi_bbox_metrics_warn_without_keypoint_quality_check(tmp_path: Pat
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     write_hand_keypoint_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", frame_count=3, normalized=True)
     config = load_video_quality_config(None)
+
+    metrics = analyze_video(video, config, hdf5_path=batch / "hdf5" / "408817_hdf5.hdf5")
+    evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
+
+    assert metrics.hand_roi is None
+    assert evaluation.reasons == ()
+    assert not any(reason.startswith("hand_roi_") for reason in evaluation.warn_reasons)
+
+
+def test_hand_roi_bbox_metrics_warn_without_keypoint_quality_check(tmp_path: Path) -> None:
+    batch = tmp_path
+    video_dir = batch / "video"
+    video_dir.mkdir()
+    video = video_dir / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
+    write_hand_keypoint_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", frame_count=3, normalized=True)
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
+    config = load_video_quality_config(config_path)
 
     metrics = analyze_video(video, config, hdf5_path=batch / "hdf5" / "408817_hdf5.hdf5")
     evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
@@ -532,7 +634,9 @@ def test_hand_roi_uses_transform_matrices_as_keypoints(tmp_path: Path) -> None:
                     dtype=np.float32,
                 )
             transforms.create_dataset(name, data=matrices)
-    config = load_video_quality_config(None)
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
+    config = load_video_quality_config(config_path)
 
     metrics = analyze_video(video, config, hdf5_path=hdf5_path)
     evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
@@ -556,15 +660,17 @@ def test_hand_roi_soft_blur_warns_under_warn_except_severe_fail(tmp_path: Path) 
             sampled_frame_count=10,
             available_frame_count=10,
             available_ratio=1.0,
-            laplacian_p10=80.0,
-            laplacian_median=150.0,
-            tenengrad_p10=14.0,
-            tenengrad_median=20.0,
-            blur_bad_frame_ratio=0.20,
+            laplacian_p10=70.0,
+            laplacian_median=100.0,
+            tenengrad_p10=10.0,
+            tenengrad_median=13.0,
+            blur_bad_frame_ratio=0.60,
         ),
     )
 
-    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(config_path))
 
     assert evaluation.passed is True
     assert evaluation.decision == "warn"
@@ -590,7 +696,9 @@ def test_hand_roi_unavailable_warns_without_severe_blur_fail(tmp_path: Path) -> 
         label.create_dataset("quality_hand", data=np.ones((3, 2), dtype=np.float32))
         transforms = handle.create_group("transforms")
         transforms.create_dataset("leftHand", data=np.repeat(np.eye(4, dtype=np.float32)[None, :, :], 3, axis=0))
-    config = load_video_quality_config(None)
+    config_path = tmp_path / "quality.yaml"
+    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
+    config = load_video_quality_config(config_path)
 
     metrics = analyze_video(video, config, hdf5_path=hdf5_path)
     evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
@@ -671,8 +779,15 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     assert report["video_quality"]["sampling"]["decoded_sample_count"] >= 1
     assert report["video_quality"]["metrics"]["video_basic"]["short_side"] == 720
     assert report["video_quality"]["metrics"]["exposure"]["mean_over_dark_ratio"] < 0.1
+    assert report["video_quality"]["metrics"]["defect_metrics"] == {
+        "defect_duration_ratio": 0.0,
+        "exposure_defect_frame_ratio": 0.0,
+        "frozen_frame_ratio": 0.0,
+        "drop_frame_ratio": 0.0,
+    }
     assert "timeline_metrics" in report["video_quality"]["metrics"]
     assert "hand_roi_metrics" in report["video_quality"]["metrics"]
+    assert report["video_quality"]["metrics"]["hand_roi_metrics"] is None
     assert report["reference_quality"]["mode"] == "none"
 
 

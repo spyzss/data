@@ -210,7 +210,7 @@ quality_archive/408817.json  -> asset_id = 408817
 ```json
 {
   "stage": "video_prefilter",
-  "threshold_version": "video_prefilter_v0.2.6",
+  "threshold_version": "video_prefilter_v0.2.8",
   "evaluation": {
     "decision": "pass",
     "passed": true,
@@ -255,6 +255,8 @@ quality_archive/408817.json  -> asset_id = 408817
     },
     "exposure_metrics": {
       "black_frame_ratio": 0.0,
+      "black_frame_count_estimate": 0,
+      "exposure_defect_frame_ratio": 0.0,
       "mean_over_dark_ratio": 0.0,
       "mean_over_exposed_ratio": 0.0
     },
@@ -270,6 +272,12 @@ quality_archive/408817.json  -> asset_id = 408817
       "frozen_frame_ratio": 0.0,
       "max_consecutive_frozen_sec": 0.0
     },
+    "defect_metrics": {
+      "defect_duration_ratio": 0.0,
+      "exposure_defect_frame_ratio": 0.0,
+      "frozen_frame_ratio": 0.0,
+      "drop_frame_ratio": 0.0
+    },
     "hdf5_alignment": {
       "enabled": true,
       "mode": "fail",
@@ -278,19 +286,10 @@ quality_archive/408817.json  -> asset_id = 408817
       "frame_count_delta": 0,
       "frame_count_delta_ratio": 0.0
     },
-    "hand_roi_metrics": {
-      "enabled": true,
-      "source": "hdf5_keypoints_bbox",
-      "hand_roi_available_ratio": 0.86,
-      "hand_roi_laplacian_p10": 185.3,
-      "hand_roi_laplacian_median": 280.4,
-      "hand_roi_tenengrad_p10": 20.2,
-      "hand_roi_tenengrad_median": 26.8,
-      "hand_roi_blur_bad_frame_ratio": 0.08
-    }
+    "hand_roi_metrics": null
   },
   "thresholds": {
-    "threshold_version": "video_prefilter_v0.2.6",
+    "threshold_version": "video_prefilter_v0.2.8",
     "fps": {
       "expected_fps": null,
       "min_fps_pass": 24,
@@ -301,36 +300,58 @@ quality_archive/408817.json  -> asset_id = 408817
       "min_short_side_fail": 720,
       "min_long_side_fail": 1280
     },
+    "exposure": {
+      "black": {
+        "max_frame_count_fail": 10,
+        "ratio_pass": 0.01,
+        "ratio_warn": 0.90
+      },
+      "over_dark": {
+        "ratio_pass": 0.05,
+        "ratio_warn": 0.90
+      },
+      "over_exposed": {
+        "ratio_pass": 0.05,
+        "ratio_warn": 0.90
+      }
+    },
     "sharpness_global": {
       "target_short_side": 720,
-      "laplacian_p10_pass": 100,
-      "laplacian_p10_warn": 35,
-      "laplacian_median_pass": 120,
-      "laplacian_median_warn": 50,
-      "laplacian_under_100_ratio_pass": 0.15,
+      "laplacian_p10_pass": 35,
+      "laplacian_p10_warn": 0,
+      "laplacian_median_pass": 50,
+      "laplacian_median_warn": 0,
+      "laplacian_under_100_ratio_pass": 0.50,
       "laplacian_under_100_ratio_warn": 1.00,
-      "tenengrad_p10_pass": 18,
-      "tenengrad_p10_warn": 12,
-      "tenengrad_median_pass": 19,
-      "tenengrad_median_warn": 13
+      "tenengrad_p10_pass": 12,
+      "tenengrad_p10_warn": 6,
+      "tenengrad_median_pass": 13,
+      "tenengrad_median_warn": 8
     },
     "freeze": {
-      "frozen_frame_ratio_pass": 0.09,
-      "frozen_frame_ratio_warn": 0.15
+      "frozen_frame_ratio_pass": 0.05,
+      "frozen_frame_ratio_warn": 0.10
+    },
+    "defects": {
+      "max_duration_ratio_fail": 0.10,
+      "duration_ratio_warn": 0.05
+    },
+    "hand_roi": {
+      "enabled": false
     }
   },
   "errors": []
 }
 ```
 
-`hand_roi_metrics.source` 当前可为：
+默认视频预筛不再运行 hand ROI，因此 `hand_roi_metrics` 为 `null`。如果通过 YAML 显式启用 `hand_roi.enabled: true`，`hand_roi_metrics.source` 可为：
 
 | source | 含义 |
 |---|---|
 | `hdf5_keypoints_bbox` | 从 HDF5 关键点数组生成粗 hand ROI bbox。 |
 | `hdf5_transform_keypoints_bbox` | 从 `transforms/*` 下手部、手指、拇指相关 4x4 矩阵取平移点，并使用 `camera/intrinsic` 投影后生成粗 hand ROI bbox。 |
 
-当 `hand_roi.mode` 为 `warn_except_severe_fail` 时，ROI Laplacian / Tenengrad 低于 pass 线只写入 `warn_reasons`；只有 `hand_roi_severe_blur` 或 `hand_roi_blur_bad_frame_ratio_above_max` 才会把视频预筛判成 `fail`。
+`video_prefilter_v0.2.8` 面向机器人预训练预筛，默认认为后续视频可能下采样到 448x256 一类低分辨率，因此清晰度指标主要用于发现风险，不追求高清画质硬筛。hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近整段过暗/过曝、冻帧/丢帧，以及所有瑕疵时长合计超过 10%。如果启用 `hand_roi.mode: warn_except_severe_fail`，ROI Laplacian / Tenengrad 低于 pass 线只写入 `warn_reasons`；只有 `hand_roi_severe_blur` 或 `hand_roi_blur_bad_frame_ratio_above_max` 才会把视频预筛判成 `fail`。
 
 `video_quality.evaluation.decision` 与 `qc_summary.status` 同步，取值为 `pass | warn | fail`。`should_run_mask_qc` 是 pipeline 调度 flag，规则固定为：
 
@@ -347,19 +368,21 @@ should_run_mask_qc = decision != "fail"
 | `fps_below_min` | FPS 低于阈值。 |
 | `short_side_below_min` | 短边分辨率低于阈值。 |
 | `long_side_below_min` | 长边分辨率低于阈值。 |
-| `drop_frame_ratio_above_max` | 时间轴疑似丢帧比例超过 hard fail 阈值。 |
+| `drop_frame_ratio_above_max` | 时间轴疑似丢帧比例超过 hard fail 阈值，默认 10%。 |
 | `max_frame_gap_ms_above_max` | 最大帧间隔超过 hard fail 阈值。 |
 | `sample_decode_ratio_below_min` | 抽样帧解码率低于阈值。 |
-| `mean_over_dark_ratio_above_max` | 过暗帧比例高于阈值。 |
-| `mean_over_exposed_ratio_above_max` | 过曝帧比例高于阈值。 |
-| `laplacian_p10_below_min` | Laplacian 方差 p10 低于清晰度硬筛阈值。 |
-| `laplacian_median_below_min` | Laplacian 方差中位数低于清晰度硬筛阈值。 |
-| `laplacian_under_100_ratio_above_max` | Laplacian 方差低于 100 的帧比例高于阈值。 |
-| `tenengrad_p10_below_min` | Tenengrad p10 低于清晰度硬筛阈值。 |
-| `tenengrad_median_below_min` | Tenengrad 中位数低于清晰度硬筛阈值。 |
-| `black_frame_ratio_above_max` | 黑帧率高于阈值。 |
-| `frozen_frame_ratio_above_max` | 冻帧率高于阈值。 |
+| `mean_over_dark_ratio_above_max` | 过暗帧比例接近整段视频，超过 hard fail 阈值。 |
+| `mean_over_exposed_ratio_above_max` | 过曝帧比例接近整段视频，超过 hard fail 阈值。 |
+| `laplacian_p10_below_min` | Laplacian 方差 p10 极低；默认阈值已放宽，通常只作为 warn。 |
+| `laplacian_median_below_min` | Laplacian 方差中位数极低；默认阈值已放宽，通常只作为 warn。 |
+| `laplacian_under_100_ratio_above_max` | Laplacian 方差低于 100 的帧比例高于阈值；默认不单独 hard fail。 |
+| `tenengrad_p10_below_min` | Tenengrad p10 极低，边缘几乎不可读。 |
+| `tenengrad_median_below_min` | Tenengrad 中位数极低，边缘几乎不可读。 |
+| `black_frame_ratio_above_max` | 黑帧率接近整段视频，超过 hard fail 阈值。 |
+| `black_frame_count_above_max` | 估算黑帧数超过 10 帧。 |
+| `frozen_frame_ratio_above_max` | 冻帧率高于 hard fail 阈值，默认 10%。 |
 | `max_consecutive_frozen_sec_above_max` | 连续冻结时长超过阈值。 |
+| `defect_duration_ratio_above_max` | 曝光/黑帧类、冻帧、丢帧合计瑕疵时长比例超过 10%。 |
 | `hdf5_frame_count_mismatch` | HDF5 帧数与视频帧数不一致。 |
 | `hdf5_missing` | HDF5 缺失，且配置要求失败。 |
 | `hdf5_unreadable` | HDF5 不可读，且配置要求失败。 |

@@ -28,7 +28,7 @@ class AlignmentMode(StrEnum):
 @dataclass(frozen=True)
 class PipelineConfig:
     stop_before_mask_if_fail: bool = True
-    run_hand_roi: bool = True
+    run_hand_roi: bool = False
     hand_roi_source: str = "hdf5_keypoints"
     do_keypoint_quality_check: bool = False
     do_keypoint_mask_matching: bool = False
@@ -58,8 +58,8 @@ class TimelineConfig:
     use_actual_fps: bool = True
     drop_interval_factor: float = 1.35
     drop_interval_extra_ms: float = 10.0
-    drop_frame_ratio_pass: float = 0.01
-    drop_frame_ratio_warn: float = 0.02
+    drop_frame_ratio_pass: float = 0.05
+    drop_frame_ratio_warn: float = 0.10
     max_gap_factor: float = 3.0
     max_gap_floor_ms: float = 100.0
     pts_monotonic_required: bool = True
@@ -78,8 +78,9 @@ class DecodeConfig:
 class BlackFrameConfig:
     mean_y_max: float = 10.0
     dark_pixel_ratio_min: float = 0.98
-    ratio_pass: float = 0.005
-    ratio_warn: float = 0.01
+    ratio_pass: float = 0.01
+    ratio_warn: float = 0.90
+    max_frame_count_fail: int = 10
 
 
 @dataclass(frozen=True)
@@ -87,7 +88,7 @@ class OverDarkConfig:
     mean_y_max: float = 35.0
     dark_pixel_ratio_min: float = 0.75
     ratio_pass: float = 0.05
-    ratio_warn: float = 0.10
+    ratio_warn: float = 0.90
 
 
 @dataclass(frozen=True)
@@ -95,7 +96,7 @@ class OverExposedConfig:
     mean_y_min: float = 235.0
     over_exposed_pixel_ratio_min: float = 0.35
     ratio_pass: float = 0.05
-    ratio_warn: float = 0.10
+    ratio_warn: float = 0.90
 
 
 @dataclass(frozen=True)
@@ -110,16 +111,16 @@ class SharpnessGlobalConfig:
     normalize_before_compute: bool = True
     target_short_side: int = 720
     no_upscale: bool = True
-    laplacian_p10_pass: float = 100.0
-    laplacian_p10_warn: float = 35.0
-    laplacian_median_pass: float = 120.0
-    laplacian_median_warn: float = 50.0
-    laplacian_under_100_ratio_pass: float = 0.15
+    laplacian_p10_pass: float = 35.0
+    laplacian_p10_warn: float = 0.0
+    laplacian_median_pass: float = 50.0
+    laplacian_median_warn: float = 0.0
+    laplacian_under_100_ratio_pass: float = 0.50
     laplacian_under_100_ratio_warn: float = 1.00
-    tenengrad_p10_pass: float = 18.0
-    tenengrad_p10_warn: float = 12.0
-    tenengrad_median_pass: float = 19.0
-    tenengrad_median_warn: float = 13.0
+    tenengrad_p10_pass: float = 12.0
+    tenengrad_p10_warn: float = 6.0
+    tenengrad_median_pass: float = 13.0
+    tenengrad_median_warn: float = 8.0
 
 
 @dataclass(frozen=True)
@@ -128,10 +129,16 @@ class FreezeConfig:
     downscale_short_side: int = 360
     frame_diff_mean_abs_max: float = 1.0
     hist_diff_max: float = 0.01
-    frozen_frame_ratio_pass: float = 0.09
-    frozen_frame_ratio_warn: float = 0.15
+    frozen_frame_ratio_pass: float = 0.05
+    frozen_frame_ratio_warn: float = 0.10
     max_consecutive_frozen_sec_pass: float = 0.5
     max_consecutive_frozen_sec_fail: float = 1.0
+
+
+@dataclass(frozen=True)
+class DefectDurationConfig:
+    max_duration_ratio_fail: float = 0.10
+    duration_ratio_warn: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -148,14 +155,14 @@ class Hdf5AlignmentConfig:
 class HandRoiSevereFailConfig:
     enabled: bool = True
     require_both_lap_and_ten_fail: bool = True
-    laplacian_p10_fail: float = 100.0
-    tenengrad_p10_fail: float = 12.0
-    blur_bad_frame_ratio_fail: float = 0.25
+    laplacian_p10_fail: float = 20.0
+    tenengrad_p10_fail: float = 6.0
+    blur_bad_frame_ratio_fail: float = 0.90
 
 
 @dataclass(frozen=True)
 class HandRoiConfig:
-    enabled: bool = True
+    enabled: bool = False
     mode: str = "warn_except_severe_fail"
     use_keypoints_as_bbox_only: bool = True
     min_valid_points_for_bbox: int = 8
@@ -167,22 +174,22 @@ class HandRoiConfig:
     no_upscale_if_roi_too_small: bool = True
     available_ratio_pass: float = 0.70
     available_ratio_warn: float = 0.40
-    laplacian_p10_pass: float = 160.0
-    laplacian_p10_warn: float = 100.0
-    laplacian_median_pass: float = 240.0
-    laplacian_median_warn: float = 160.0
-    tenengrad_p10_pass: float = 18.0
-    tenengrad_p10_warn: float = 12.0
-    tenengrad_median_pass: float = 24.0
-    tenengrad_median_warn: float = 16.0
-    blur_bad_frame_ratio_pass: float = 0.12
-    blur_bad_frame_ratio_warn: float = 0.25
+    laplacian_p10_pass: float = 80.0
+    laplacian_p10_warn: float = 20.0
+    laplacian_median_pass: float = 120.0
+    laplacian_median_warn: float = 40.0
+    tenengrad_p10_pass: float = 12.0
+    tenengrad_p10_warn: float = 6.0
+    tenengrad_median_pass: float = 14.0
+    tenengrad_median_warn: float = 8.0
+    blur_bad_frame_ratio_pass: float = 0.50
+    blur_bad_frame_ratio_warn: float = 0.90
     severe_fail: HandRoiSevereFailConfig = field(default_factory=HandRoiSevereFailConfig)
 
 
 @dataclass(frozen=True)
 class VideoQualityConfig:
-    threshold_version: str = "video_prefilter_v0.2.6"
+    threshold_version: str = "video_prefilter_v0.2.8"
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     fps: FpsConfig = field(default_factory=FpsConfig)
     resolution: ResolutionConfig = field(default_factory=ResolutionConfig)
@@ -191,6 +198,7 @@ class VideoQualityConfig:
     exposure: ExposureConfig = field(default_factory=ExposureConfig)
     sharpness_global: SharpnessGlobalConfig = field(default_factory=SharpnessGlobalConfig)
     freeze: FreezeConfig = field(default_factory=FreezeConfig)
+    defects: DefectDurationConfig = field(default_factory=DefectDurationConfig)
     hdf5_alignment: Hdf5AlignmentConfig = field(default_factory=Hdf5AlignmentConfig)
     hand_roi: HandRoiConfig = field(default_factory=HandRoiConfig)
 
@@ -239,6 +247,9 @@ class VideoMetrics:
     sample_decode_ratio: float
     mean_brightness: float
     black_frame_ratio: float
+    black_frame_count_estimate: int
+    exposure_defect_frame_ratio: float
+    defect_duration_ratio: float
     mean_over_dark_ratio: float
     mean_over_exposed_ratio: float
     laplacian_min: float
@@ -771,6 +782,9 @@ def _empty_metrics(path: Path, errors: tuple[str, ...]) -> VideoMetrics:
         sample_decode_ratio=0.0,
         mean_brightness=0.0,
         black_frame_ratio=1.0,
+        black_frame_count_estimate=0,
+        exposure_defect_frame_ratio=1.0,
+        defect_duration_ratio=1.0,
         mean_over_dark_ratio=1.0,
         mean_over_exposed_ratio=0.0,
         laplacian_min=0.0,
@@ -818,6 +832,7 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
         black_values: list[float] = []
         dark_values: list[float] = []
         exposed_values: list[float] = []
+        exposure_defect_values: list[float] = []
         blur_values: list[float] = []
         tenengrad_values: list[float] = []
         scale_values: list[int] = []
@@ -839,24 +854,22 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
             dark_pixel_ratio = float(np.mean(gray < DARK_PIXEL_Y_THRESHOLD))
             over_exposed_pixel_ratio = float(np.mean(gray > OVER_EXPOSED_PIXEL_Y_THRESHOLD))
             brightness_values.append(brightness)
-            black_values.append(
-                1.0
-                if brightness < config.exposure.black.mean_y_max
+            black_frame = (
+                brightness < config.exposure.black.mean_y_max
                 or dark_pixel_ratio > config.exposure.black.dark_pixel_ratio_min
-                else 0.0
             )
-            dark_values.append(
-                1.0
-                if brightness < config.exposure.over_dark.mean_y_max
+            over_dark_frame = (
+                brightness < config.exposure.over_dark.mean_y_max
                 or dark_pixel_ratio > config.exposure.over_dark.dark_pixel_ratio_min
-                else 0.0
             )
-            exposed_values.append(
-                1.0
-                if brightness > config.exposure.over_exposed.mean_y_min
+            over_exposed_frame = (
+                brightness > config.exposure.over_exposed.mean_y_min
                 or over_exposed_pixel_ratio > config.exposure.over_exposed.over_exposed_pixel_ratio_min
-                else 0.0
             )
+            black_values.append(1.0 if black_frame else 0.0)
+            dark_values.append(1.0 if over_dark_frame else 0.0)
+            exposed_values.append(1.0 if over_exposed_frame else 0.0)
+            exposure_defect_values.append(1.0 if black_frame or over_dark_frame or over_exposed_frame else 0.0)
 
             laplacian, tenengrad, scale_short_side = _sharpness_for_frame(
                 frame,
@@ -885,6 +898,14 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
         sampled = len(indexes)
         if sampled and decoded == 0:
             errors.append("no_sample_frames_decoded")
+        black_frame_ratio = float(np.mean(black_values)) if black_values else 1.0
+        black_frame_count_estimate = int(round(black_frame_ratio * frame_count)) if frame_count > 0 else 0
+        exposure_defect_frame_ratio = float(np.mean(exposure_defect_values)) if exposure_defect_values else 1.0
+        frozen_frame_ratio = frozen_pairs / (decoded - 1) if decoded > 1 and config.freeze.enabled else 0.0
+        defect_duration_ratio = min(
+            1.0,
+            exposure_defect_frame_ratio + frozen_frame_ratio + float(timeline["drop_frame_ratio"]),
+        )
         laplacian_under_100_ratio = (
             float(np.mean(np.array(blur_values) < LAPLACIAN_LOW_DETAIL_THRESHOLD)) if blur_values else 1.0
         )
@@ -911,7 +932,10 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
             decoded_sample_count=decoded,
             sample_decode_ratio=decoded / sampled if sampled else 0.0,
             mean_brightness=float(np.mean(brightness_values)) if brightness_values else 0.0,
-            black_frame_ratio=float(np.mean(black_values)) if black_values else 1.0,
+            black_frame_ratio=black_frame_ratio,
+            black_frame_count_estimate=black_frame_count_estimate,
+            exposure_defect_frame_ratio=exposure_defect_frame_ratio,
+            defect_duration_ratio=defect_duration_ratio,
             mean_over_dark_ratio=float(np.mean(dark_values)) if dark_values else 1.0,
             mean_over_exposed_ratio=float(np.mean(exposed_values)) if exposed_values else 0.0,
             laplacian_min=float(min(blur_values)) if blur_values else 0.0,
@@ -924,7 +948,7 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
             tenengrad_median=_percentile(tenengrad_values, 50),
             tenengrad_mean=float(np.mean(tenengrad_values)) if tenengrad_values else 0.0,
             sharpness_scale_short_side=max(scale_values) if scale_values else short_side,
-            frozen_frame_ratio=frozen_pairs / (decoded - 1) if decoded > 1 and config.freeze.enabled else 0.0,
+            frozen_frame_ratio=frozen_frame_ratio,
             max_consecutive_frozen_sec=max_frozen_run / fps if fps > 0 else 0.0,
             pts_monotonic_valid=bool(timeline["pts_monotonic_valid"]),
             drop_frame_ratio=float(timeline["drop_frame_ratio"]),
@@ -1098,6 +1122,18 @@ def evaluate_video_quality(
         config.exposure.black.ratio_warn,
         "black_frame_ratio_above_max",
         "black_frame_ratio_warn",
+        higher_is_bad=True,
+    )
+    if metrics.black_frame_count_estimate > config.exposure.black.max_frame_count_fail:
+        fail.append("black_frame_count_above_max")
+    _add_threshold_reason(
+        fail,
+        warn,
+        metrics.defect_duration_ratio,
+        config.defects.duration_ratio_warn,
+        config.defects.max_duration_ratio_fail,
+        "defect_duration_ratio_above_max",
+        "defect_duration_ratio_warn",
         higher_is_bad=True,
     )
     _add_threshold_reason(
@@ -1454,6 +1490,8 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
     exposure_metrics = {
         "mean_brightness": metrics.mean_brightness,
         "black_frame_ratio": metrics.black_frame_ratio,
+        "black_frame_count_estimate": metrics.black_frame_count_estimate,
+        "exposure_defect_frame_ratio": metrics.exposure_defect_frame_ratio,
         "mean_over_dark_ratio": metrics.mean_over_dark_ratio,
         "mean_over_exposed_ratio": metrics.mean_over_exposed_ratio,
     }
@@ -1472,6 +1510,12 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
     freeze_metrics = {
         "frozen_frame_ratio": metrics.frozen_frame_ratio,
         "max_consecutive_frozen_sec": metrics.max_consecutive_frozen_sec,
+    }
+    defect_metrics = {
+        "defect_duration_ratio": metrics.defect_duration_ratio,
+        "exposure_defect_frame_ratio": metrics.exposure_defect_frame_ratio,
+        "frozen_frame_ratio": metrics.frozen_frame_ratio,
+        "drop_frame_ratio": metrics.drop_frame_ratio,
     }
     hdf5_alignment = {
         "enabled": config.hdf5_alignment.enabled,
@@ -1541,6 +1585,7 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
                 "exposure": exposure_metrics,
                 "sharpness_global": sharpness_global,
                 "freeze_metrics": freeze_metrics,
+                "defect_metrics": defect_metrics,
                 "hdf5_alignment": hdf5_alignment,
                 "hand_roi_metrics": hand_roi_metrics,
             },
