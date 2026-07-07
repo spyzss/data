@@ -112,7 +112,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 Optional config:
 
 ```yaml
-threshold_version: video_prefilter_v0.2.8
+threshold_version: video_prefilter_v0.2.9
 decode:
   max_sample_frames: 300
 hdf5_alignment:
@@ -146,6 +146,7 @@ sharpness_global:
 freeze:
   frozen_frame_ratio_pass: 0.05
   frozen_frame_ratio_warn: 0.10
+  min_interval_frames: 6
 defects:
   max_duration_ratio_fail: 0.10
   duration_ratio_warn: 0.05
@@ -182,14 +183,15 @@ sampled/XJGT_20260616/
     summary.json
 ```
 
-It is a `video_prefilter_v0.2.8` low-cost prefilter. It uses practical
+It is a `video_prefilter_v0.2.9` low-cost prefilter. It uses practical
 no-reference indicators: open/decode health, fps, resolution, timeline
 continuity, sampled-frame decode ratio, black/over-dark/over-exposure ratios,
 global sharpness at a normalized short side, frozen-frame risk, drop-frame risk,
-total defect-duration ratio, and HDF5 frame-count alignment. Hand ROI is disabled
-by default in this prefilter because the rough bbox is too noisy for gating. It
-is calibrated for robot pretraining videos that may be downsampled to low
-resolution, so sharpness mostly produces warnings unless edges are nearly
-unreadable. It does not perform keypoint accuracy validation, keypoint-mask matching,
+total defect-duration ratio, HDF5 frame-count alignment, and continuous frozen
+intervals with at least 6 frames for downstream trimming. Hand ROI is disabled by
+default in this prefilter because the rough bbox is too noisy for gating. It is
+calibrated for robot pretraining videos that may be downsampled to low resolution,
+so sharpness mostly produces warnings unless edges are nearly unreadable. It does
+not perform keypoint accuracy validation, keypoint-mask matching,
 hand-object mask IoU, trajectory jump checks, semantic consistency, or subtask
 acceptance.

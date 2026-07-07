@@ -131,6 +131,7 @@ class FreezeConfig:
     hist_diff_max: float = 0.01
     frozen_frame_ratio_pass: float = 0.05
     frozen_frame_ratio_warn: float = 0.10
+    min_interval_frames: int = 6
     max_consecutive_frozen_sec_pass: float = 0.5
     max_consecutive_frozen_sec_fail: float = 1.0
 
@@ -189,7 +190,7 @@ class HandRoiConfig:
 
 @dataclass(frozen=True)
 class VideoQualityConfig:
-    threshold_version: str = "video_prefilter_v0.2.8"
+    threshold_version: str = "video_prefilter_v0.2.9"
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     fps: FpsConfig = field(default_factory=FpsConfig)
     resolution: ResolutionConfig = field(default_factory=ResolutionConfig)
@@ -208,6 +209,16 @@ class VideoQualityConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return _to_plain(self)
+
+
+@dataclass(frozen=True)
+class FrozenInterval:
+    start_frame: int
+    end_frame: int
+    frame_count: int
+    start_time_sec: float
+    end_time_sec: float
+    duration_sec: float
 
 
 @dataclass(frozen=True)
@@ -264,6 +275,7 @@ class VideoMetrics:
     sharpness_scale_short_side: int
     frozen_frame_ratio: float
     max_consecutive_frozen_sec: float
+    frozen_intervals: tuple[FrozenInterval, ...]
     pts_monotonic_valid: bool
     drop_frame_ratio: float
     frame_interval_p99_ms: float
@@ -760,6 +772,84 @@ def _compute_hand_roi_metrics(
     )
 
 
+def _make_frozen_interval(start_frame: int, end_frame: int, fps: float) -> FrozenInterval:
+    frame_count = end_frame - start_frame + 1
+    if fps > 0:
+        start_time_sec = start_frame / fps
+        end_time_sec = (end_frame + 1) / fps
+        duration_sec = frame_count / fps
+    else:
+        start_time_sec = 0.0
+        end_time_sec = 0.0
+        duration_sec = 0.0
+    return FrozenInterval(
+        start_frame=start_frame,
+        end_frame=end_frame,
+        frame_count=frame_count,
+        start_time_sec=start_time_sec,
+        end_time_sec=end_time_sec,
+        duration_sec=duration_sec,
+    )
+
+
+def _scan_frozen_intervals(
+    path: Path,
+    fps: float,
+    config: FreezeConfig,
+) -> tuple[tuple[FrozenInterval, ...], int, int]:
+    if not config.enabled:
+        return (), 0, 0
+
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        return (), 0, 0
+
+    intervals: list[FrozenInterval] = []
+    frozen_pairs = 0
+    max_run_frames = 0
+    previous_gray: np.ndarray | None = None
+    current_run_start: int | None = None
+    current_run_end: int | None = None
+    frame_index = 0
+
+    def finish_run() -> None:
+        nonlocal current_run_start, current_run_end, max_run_frames
+        if current_run_start is None or current_run_end is None:
+            return
+        run_frame_count = current_run_end - current_run_start + 1
+        max_run_frames = max(max_run_frames, run_frame_count)
+        if run_frame_count >= config.min_interval_frames:
+            intervals.append(_make_frozen_interval(current_run_start, current_run_end, fps))
+        current_run_start = None
+        current_run_end = None
+
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+
+            freeze_frame, _freeze_scale = _resize_keep_aspect(frame, config.downscale_short_side, no_upscale=True)
+            freeze_gray = cv2.cvtColor(freeze_frame, cv2.COLOR_BGR2GRAY)
+            if previous_gray is not None:
+                diff = float(np.mean(cv2.absdiff(previous_gray, freeze_gray)))
+                hist_diff = _chi_square_hist_diff(previous_gray, freeze_gray)
+                if diff < config.frame_diff_mean_abs_max and hist_diff < config.hist_diff_max:
+                    frozen_pairs += 1
+                    if current_run_start is None:
+                        current_run_start = frame_index - 1
+                    current_run_end = frame_index
+                else:
+                    finish_run()
+            previous_gray = freeze_gray
+            frame_index += 1
+        finish_run()
+    finally:
+        capture.release()
+
+    return tuple(intervals), frozen_pairs, max_run_frames
+
+
 def _empty_metrics(path: Path, errors: tuple[str, ...]) -> VideoMetrics:
     return VideoMetrics(
         path=path,
@@ -799,6 +889,7 @@ def _empty_metrics(path: Path, errors: tuple[str, ...]) -> VideoMetrics:
         sharpness_scale_short_side=0,
         frozen_frame_ratio=0.0,
         max_consecutive_frozen_sec=0.0,
+        frozen_intervals=(),
         pts_monotonic_valid=False,
         drop_frame_ratio=1.0,
         frame_interval_p99_ms=0.0,
@@ -836,10 +927,6 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
         blur_values: list[float] = []
         tenengrad_values: list[float] = []
         scale_values: list[int] = []
-        frozen_pairs = 0
-        max_frozen_run = 0
-        current_frozen_run = 0
-        previous_gray: np.ndarray | None = None
         errors: list[str] = []
 
         for index in indexes:
@@ -880,20 +967,6 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
             tenengrad_values.append(tenengrad)
             scale_values.append(scale_short_side)
 
-            if config.freeze.enabled:
-                freeze_frame, _freeze_scale = _resize_keep_aspect(frame, config.freeze.downscale_short_side, no_upscale=True)
-                freeze_gray = cv2.cvtColor(freeze_frame, cv2.COLOR_BGR2GRAY)
-                if previous_gray is not None:
-                    diff = float(np.mean(cv2.absdiff(previous_gray, freeze_gray)))
-                    hist_diff = _chi_square_hist_diff(previous_gray, freeze_gray)
-                    if diff < config.freeze.frame_diff_mean_abs_max and hist_diff < config.freeze.hist_diff_max:
-                        frozen_pairs += 1
-                        current_frozen_run += 1
-                        max_frozen_run = max(max_frozen_run, current_frozen_run)
-                    else:
-                        current_frozen_run = 0
-                previous_gray = freeze_gray
-
         decoded = len(brightness_values)
         sampled = len(indexes)
         if sampled and decoded == 0:
@@ -901,7 +974,8 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
         black_frame_ratio = float(np.mean(black_values)) if black_values else 1.0
         black_frame_count_estimate = int(round(black_frame_ratio * frame_count)) if frame_count > 0 else 0
         exposure_defect_frame_ratio = float(np.mean(exposure_defect_values)) if exposure_defect_values else 1.0
-        frozen_frame_ratio = frozen_pairs / (decoded - 1) if decoded > 1 and config.freeze.enabled else 0.0
+        frozen_intervals, frozen_pairs, max_frozen_run_frames = _scan_frozen_intervals(path, fps, config.freeze)
+        frozen_frame_ratio = frozen_pairs / (frame_count - 1) if frame_count > 1 and config.freeze.enabled else 0.0
         defect_duration_ratio = min(
             1.0,
             exposure_defect_frame_ratio + frozen_frame_ratio + float(timeline["drop_frame_ratio"]),
@@ -949,7 +1023,8 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
             tenengrad_mean=float(np.mean(tenengrad_values)) if tenengrad_values else 0.0,
             sharpness_scale_short_side=max(scale_values) if scale_values else short_side,
             frozen_frame_ratio=frozen_frame_ratio,
-            max_consecutive_frozen_sec=max_frozen_run / fps if fps > 0 else 0.0,
+            max_consecutive_frozen_sec=max_frozen_run_frames / fps if fps > 0 else 0.0,
+            frozen_intervals=frozen_intervals,
             pts_monotonic_valid=bool(timeline["pts_monotonic_valid"]),
             drop_frame_ratio=float(timeline["drop_frame_ratio"]),
             frame_interval_p99_ms=float(timeline["frame_interval_p99_ms"]),
@@ -1431,6 +1506,17 @@ def _hand_roi_json(metrics: HandRoiMetrics | None) -> dict[str, Any] | None:
     }
 
 
+def _frozen_interval_json(interval: FrozenInterval) -> dict[str, Any]:
+    return {
+        "start_frame": interval.start_frame,
+        "end_frame": interval.end_frame,
+        "frame_count": interval.frame_count,
+        "start_time_sec": interval.start_time_sec,
+        "end_time_sec": interval.end_time_sec,
+        "duration_sec": interval.duration_sec,
+    }
+
+
 def _infer_batch_dir(metrics: VideoMetrics, alignment: Hdf5Alignment) -> Path | None:
     if alignment.hdf5_path is not None and alignment.hdf5_path.parent.name == "hdf5":
         return alignment.hdf5_path.parent.parent
@@ -1510,6 +1596,11 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
     freeze_metrics = {
         "frozen_frame_ratio": metrics.frozen_frame_ratio,
         "max_consecutive_frozen_sec": metrics.max_consecutive_frozen_sec,
+        "frozen_interval_min_frames": config.freeze.min_interval_frames,
+        "frozen_interval_count": len(metrics.frozen_intervals),
+        "frozen_interval_frame_count": sum(interval.frame_count for interval in metrics.frozen_intervals),
+        "frozen_interval_duration_sec": sum(interval.duration_sec for interval in metrics.frozen_intervals),
+        "frozen_intervals": [_frozen_interval_json(interval) for interval in metrics.frozen_intervals],
     }
     defect_metrics = {
         "defect_duration_ratio": metrics.defect_duration_ratio,

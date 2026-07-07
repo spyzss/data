@@ -210,7 +210,7 @@ quality_archive/408817.json  -> asset_id = 408817
 ```json
 {
   "stage": "video_prefilter",
-  "threshold_version": "video_prefilter_v0.2.8",
+  "threshold_version": "video_prefilter_v0.2.9",
   "evaluation": {
     "decision": "pass",
     "passed": true,
@@ -270,7 +270,12 @@ quality_archive/408817.json  -> asset_id = 408817
     },
     "freeze_metrics": {
       "frozen_frame_ratio": 0.0,
-      "max_consecutive_frozen_sec": 0.0
+      "max_consecutive_frozen_sec": 0.0,
+      "frozen_interval_min_frames": 6,
+      "frozen_interval_count": 0,
+      "frozen_interval_frame_count": 0,
+      "frozen_interval_duration_sec": 0.0,
+      "frozen_intervals": []
     },
     "defect_metrics": {
       "defect_duration_ratio": 0.0,
@@ -289,7 +294,7 @@ quality_archive/408817.json  -> asset_id = 408817
     "hand_roi_metrics": null
   },
   "thresholds": {
-    "threshold_version": "video_prefilter_v0.2.8",
+    "threshold_version": "video_prefilter_v0.2.9",
     "fps": {
       "expected_fps": null,
       "min_fps_pass": 24,
@@ -330,7 +335,8 @@ quality_archive/408817.json  -> asset_id = 408817
     },
     "freeze": {
       "frozen_frame_ratio_pass": 0.05,
-      "frozen_frame_ratio_warn": 0.10
+      "frozen_frame_ratio_warn": 0.10,
+      "min_interval_frames": 6
     },
     "defects": {
       "max_duration_ratio_fail": 0.10,
@@ -351,7 +357,18 @@ quality_archive/408817.json  -> asset_id = 408817
 | `hdf5_keypoints_bbox` | 从 HDF5 关键点数组生成粗 hand ROI bbox。 |
 | `hdf5_transform_keypoints_bbox` | 从 `transforms/*` 下手部、手指、拇指相关 4x4 矩阵取平移点，并使用 `camera/intrinsic` 投影后生成粗 hand ROI bbox。 |
 
-`video_prefilter_v0.2.8` 面向机器人预训练预筛，默认认为后续视频可能下采样到 448x256 一类低分辨率，因此清晰度指标主要用于发现风险，不追求高清画质硬筛。hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近整段过暗/过曝、冻帧/丢帧，以及所有瑕疵时长合计超过 10%。如果启用 `hand_roi.mode: warn_except_severe_fail`，ROI Laplacian / Tenengrad 低于 pass 线只写入 `warn_reasons`；只有 `hand_roi_severe_blur` 或 `hand_roi_blur_bad_frame_ratio_above_max` 才会把视频预筛判成 `fail`。
+`video_prefilter_v0.2.9` 面向机器人预训练预筛，默认认为后续视频可能下采样到 448x256 一类低分辨率，因此清晰度指标主要用于发现风险，不追求高清画质硬筛。hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近整段过暗/过曝、冻帧/丢帧，以及所有瑕疵时长合计超过 10%。如果启用 `hand_roi.mode: warn_except_severe_fail`，ROI Laplacian / Tenengrad 低于 pass 线只写入 `warn_reasons`；只有 `hand_roi_severe_blur` 或 `hand_roi_blur_bad_frame_ratio_above_max` 才会把视频预筛判成 `fail`。
+
+`freeze_metrics.frozen_intervals` 记录连续冻帧区间，默认只记录 `frame_count >= 6` 的片段，即超过 5 帧。每个区间字段如下：
+
+| field | 含义 |
+|---|---|
+| `start_frame` | 冻帧区间起始帧，闭区间。 |
+| `end_frame` | 冻帧区间结束帧，闭区间。 |
+| `frame_count` | 区间包含的帧数。 |
+| `start_time_sec` | 起始秒数，等于 `start_frame / fps`。 |
+| `end_time_sec` | 右开结束秒数，等于 `(end_frame + 1) / fps`，适合后续裁切。 |
+| `duration_sec` | 区间时长，等于 `frame_count / fps`。 |
 
 `video_quality.evaluation.decision` 与 `qc_summary.status` 同步，取值为 `pass | warn | fail`。`should_run_mask_qc` 是 pipeline 调度 flag，规则固定为：
 

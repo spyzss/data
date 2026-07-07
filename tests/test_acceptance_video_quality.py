@@ -32,7 +32,7 @@ def textured_frame(offset: int, width: int = 1280, height: int = 720) -> np.ndar
 def test_default_video_quality_config() -> None:
     config = load_video_quality_config(None)
 
-    assert config.threshold_version == "video_prefilter_v0.2.8"
+    assert config.threshold_version == "video_prefilter_v0.2.9"
     assert config.pipeline.stop_before_mask_if_fail is True
     assert config.pipeline.run_hand_roi is False
     assert config.pipeline.do_keypoint_quality_check is False
@@ -66,6 +66,7 @@ def test_default_video_quality_config() -> None:
     assert config.timeline.drop_frame_ratio_warn == 0.10
     assert config.freeze.frozen_frame_ratio_pass == 0.05
     assert config.freeze.frozen_frame_ratio_warn == 0.10
+    assert config.freeze.min_interval_frames == 6
     assert config.freeze.max_consecutive_frozen_sec_fail == 1.0
     assert config.defects.max_duration_ratio_fail == 0.10
     assert config.defects.duration_ratio_warn == 0.05
@@ -182,6 +183,25 @@ def test_analyze_video_detects_black_and_frozen_samples(tmp_path: Path) -> None:
 
     assert metrics.black_frame_ratio >= 0.9
     assert metrics.frozen_frame_ratio >= 0.8
+
+
+def test_analyze_video_records_frozen_intervals_over_five_frames(tmp_path: Path) -> None:
+    video = tmp_path / "408817_video.mp4"
+    frames = [solid_frame(80) for _ in range(7)]
+    frames.extend(solid_frame(140) for _ in range(5))
+    frames.extend(solid_frame(200) for _ in range(6))
+    write_test_video(video, frames, fps=10.0)
+
+    metrics = analyze_video(video, load_video_quality_config(None))
+
+    assert [interval.frame_count for interval in metrics.frozen_intervals] == [7, 6]
+    assert metrics.frozen_intervals[0].start_frame == 0
+    assert metrics.frozen_intervals[0].end_frame == 6
+    assert metrics.frozen_intervals[0].start_time_sec == 0.0
+    assert metrics.frozen_intervals[0].end_time_sec == 0.7
+    assert metrics.frozen_intervals[0].duration_sec == 0.7
+    assert metrics.frozen_intervals[1].start_frame == 12
+    assert metrics.frozen_intervals[1].end_frame == 17
 
 
 def test_evaluate_video_quality_passes_good_metrics(tmp_path: Path) -> None:
@@ -785,6 +805,9 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
         "frozen_frame_ratio": 0.0,
         "drop_frame_ratio": 0.0,
     }
+    assert report["video_quality"]["metrics"]["freeze_metrics"]["frozen_intervals"] == []
+    assert report["video_quality"]["metrics"]["freeze_metrics"]["frozen_interval_count"] == 0
+    assert report["video_quality"]["metrics"]["freeze_metrics"]["frozen_interval_frame_count"] == 0
     assert "timeline_metrics" in report["video_quality"]["metrics"]
     assert "hand_roi_metrics" in report["video_quality"]["metrics"]
     assert report["video_quality"]["metrics"]["hand_roi_metrics"] is None
