@@ -102,7 +102,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 可选使用 YAML 覆盖阈值：
 
 ```yaml
-threshold_version: video_prefilter_v0.2.5
+threshold_version: video_prefilter_v0.2.6
 decode:
   max_sample_frames: 300
 hdf5_alignment:
@@ -142,4 +142,4 @@ sampled/XJGT_20260616/
 
 `quality_archive/<asset_id>.json` 是单条数据的全流程 QC 档案，和 `hdf5/`、`video/` 同级，格式见 `docs/asset-qc-json-format.md`。上游建档模块应在拉取完成后先创建这个文件；视频质量检测后续只更新其中的 `video_quality`、`hdf5_text_info`、`reference_quality` 等 block。后续批次 summary、表格或完整报告都可以直接从这些 `<asset_id>.json` 聚合生成。
 
-当前视频模块是 `video_prefilter_v0.2.5` 低成本预筛，不使用 VMAF、CAMBI 或标准对照视频；它只计算基础可用性、fps、分辨率、时间轴连续性、抽样解码、黑帧/过暗/过曝、全帧清晰度、冻结帧、HDF5 帧数对齐，以及基于 HDF5 21 点粗 bbox 的 hand ROI 清晰度。输出 JSON 里必须保存 `decision: pass|warn|fail` 和 `should_run_mask_qc`：只有 `decision == "fail"` 时后续 mask / 骨骼点比对 / 语义一致性等高成本 QC 才应跳过。
+当前视频模块是 `video_prefilter_v0.2.6` 低成本预筛，不使用 VMAF、CAMBI 或标准对照视频；它只计算基础可用性、fps、分辨率、时间轴连续性、抽样解码、黑帧/过暗/过曝、全帧清晰度、冻结帧、HDF5 帧数对齐，以及基于 HDF5 关键点数组或 `transforms/*` 4x4 手部/手指矩阵投影 bbox 的 hand ROI 清晰度。输出 JSON 里必须保存 `decision: pass|warn|fail` 和 `should_run_mask_qc`：只有 `decision == "fail"` 时后续 mask / 骨骼点比对 / 语义一致性等高成本 QC 才应跳过。

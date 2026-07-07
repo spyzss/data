@@ -182,7 +182,7 @@ class HandRoiConfig:
 
 @dataclass(frozen=True)
 class VideoQualityConfig:
-    threshold_version: str = "video_prefilter_v0.2.5"
+    threshold_version: str = "video_prefilter_v0.2.6"
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     fps: FpsConfig = field(default_factory=FpsConfig)
     resolution: ResolutionConfig = field(default_factory=ResolutionConfig)
@@ -282,6 +282,12 @@ class Hdf5Alignment:
     frame_count_delta: int | None = None
     frame_count_delta_ratio: float | None = None
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class Hdf5KeypointData:
+    points: np.ndarray
+    source: str
 
 
 @dataclass(frozen=True)
@@ -528,7 +534,67 @@ def _keypoint_dataset_has_points(dataset: h5py.Dataset) -> bool:
     return point_count >= 8
 
 
-def _read_keypoint_data(path: Path) -> np.ndarray | None:
+def _is_hand_transform_name(name: str) -> bool:
+    lower_name = name.lower()
+    return any(token in lower_name for token in ("hand", "finger", "thumb"))
+
+
+def _read_camera_intrinsic(handle: h5py.File) -> np.ndarray | None:
+    for candidate in ("camera/intrinsic", "camera_intrinsic", "intrinsic"):
+        if candidate in handle and isinstance(handle[candidate], h5py.Dataset):
+            intrinsic = np.asarray(handle[candidate][()], dtype=np.float64)
+            if intrinsic.shape == (3, 3) and np.all(np.isfinite(intrinsic)):
+                return intrinsic
+    return None
+
+
+def _project_camera_points(points_3d: np.ndarray, intrinsic: np.ndarray) -> np.ndarray:
+    projected = np.full(points_3d.shape[:2] + (2,), np.nan, dtype=np.float64)
+    finite = np.all(np.isfinite(points_3d), axis=-1)
+    homogeneous = points_3d @ intrinsic.T
+    depth = homogeneous[..., 2]
+    valid = finite & np.isfinite(depth) & (np.abs(depth) > 1e-9) & (points_3d[..., 2] > 1e-9)
+    projected[..., 0][valid] = homogeneous[..., 0][valid] / depth[valid]
+    projected[..., 1][valid] = homogeneous[..., 1][valid] / depth[valid]
+    return projected
+
+
+def _read_transform_keypoint_data(handle: h5py.File) -> Hdf5KeypointData | None:
+    if "transforms" not in handle or not isinstance(handle["transforms"], h5py.Group):
+        return None
+    intrinsic = _read_camera_intrinsic(handle)
+    if intrinsic is None:
+        return None
+
+    datasets: list[tuple[str, h5py.Dataset]] = []
+
+    def visit(name: str, obj: h5py.Group | h5py.Dataset) -> None:
+        if isinstance(obj, h5py.Dataset) and len(obj.shape) == 3 and obj.shape[1:] == (4, 4):
+            if _is_hand_transform_name(name):
+                datasets.append((name, obj))
+
+    handle["transforms"].visititems(visit)
+    if not datasets:
+        return None
+
+    ordered = sorted(datasets, key=lambda item: item[0])
+    frame_count = min(int(dataset.shape[0]) for _name, dataset in ordered)
+    if frame_count <= 0:
+        return None
+
+    translations = np.stack(
+        [np.asarray(dataset[:frame_count, :3, 3], dtype=np.float64) for _name, dataset in ordered],
+        axis=1,
+    )
+    if translations.shape[1] < 8:
+        return None
+    return Hdf5KeypointData(
+        points=_project_camera_points(translations, intrinsic),
+        source="hdf5_transform_keypoints_bbox",
+    )
+
+
+def _read_keypoint_data(path: Path) -> Hdf5KeypointData | None:
     if not path.is_file():
         return None
 
@@ -538,9 +604,9 @@ def _read_keypoint_data(path: Path) -> np.ndarray | None:
                 if candidate in handle and isinstance(handle[candidate], h5py.Dataset):
                     dataset = handle[candidate]
                     if _keypoint_dataset_has_points(dataset):
-                        return np.asarray(dataset[()])
+                        return Hdf5KeypointData(np.asarray(dataset[()]), "hdf5_keypoints_bbox")
 
-            found: np.ndarray | None = None
+            found: Hdf5KeypointData | None = None
 
             def visit(name: str, obj: h5py.Group | h5py.Dataset) -> None:
                 nonlocal found
@@ -552,10 +618,10 @@ def _read_keypoint_data(path: Path) -> np.ndarray | None:
                     and isinstance(obj, h5py.Dataset)
                     and _keypoint_dataset_has_points(obj)
                 ):
-                    found = np.asarray(obj[()])
+                    found = Hdf5KeypointData(np.asarray(obj[()]), "hdf5_keypoints_bbox")
 
             handle.visititems(visit)
-            return found
+            return found or _read_transform_keypoint_data(handle)
     except OSError:
         return None
 
@@ -601,8 +667,8 @@ def _compute_hand_roi_metrics(
     if not config.enabled or hdf5_path is None or not hdf5_path.is_file() or not indexes:
         return None
 
-    keypoints = _read_keypoint_data(hdf5_path)
-    if keypoints is None:
+    keypoint_data = _read_keypoint_data(hdf5_path)
+    if keypoint_data is None:
         return HandRoiMetrics(
             enabled=True,
             source="hdf5_keypoints_bbox",
@@ -625,7 +691,7 @@ def _compute_hand_roi_metrics(
     available = 0
     try:
         for index in indexes:
-            points = _points_for_frame(keypoints, index, width, height)
+            points = _points_for_frame(keypoint_data.points, index, width, height)
             if points is None or len(points) < config.min_valid_points_for_bbox:
                 unavailable_reasons.append("not_enough_keypoints")
                 continue
@@ -670,7 +736,7 @@ def _compute_hand_roi_metrics(
     sampled = len(indexes)
     return HandRoiMetrics(
         enabled=True,
-        source="hdf5_keypoints_bbox",
+        source=keypoint_data.source,
         sampled_frame_count=sampled,
         available_frame_count=available,
         available_ratio=available / sampled if sampled else 0.0,
@@ -1146,6 +1212,32 @@ def evaluate_video_quality(
 
     roi = metrics.hand_roi
     if roi is not None and config.hand_roi.enabled:
+        hand_roi_warn_only = config.hand_roi.mode == "warn_except_severe_fail"
+
+        def add_hand_roi_quality_reason(
+            value: float,
+            pass_limit: float,
+            warn_limit: float,
+            fail_reason: str,
+            warn_reason: str,
+            higher_is_bad: bool,
+        ) -> None:
+            if hand_roi_warn_only:
+                warn_triggered = value > pass_limit if higher_is_bad else value < pass_limit
+                if warn_triggered:
+                    warn.append(warn_reason)
+                return
+            _add_threshold_reason(
+                fail,
+                warn,
+                value,
+                pass_limit,
+                warn_limit,
+                fail_reason,
+                warn_reason,
+                higher_is_bad=higher_is_bad,
+            )
+
         if roi.available_ratio < config.hand_roi.available_ratio_warn:
             warn.append("hand_roi_available_ratio_below_min")
         elif roi.available_ratio < config.hand_roi.available_ratio_pass:
@@ -1163,9 +1255,7 @@ def evaluate_video_quality(
                 if roi.blur_bad_frame_ratio > severe.blur_bad_frame_ratio_fail:
                     fail.append("hand_roi_blur_bad_frame_ratio_above_max")
 
-            _add_threshold_reason(
-                fail,
-                warn,
+            add_hand_roi_quality_reason(
                 roi.laplacian_p10,
                 config.hand_roi.laplacian_p10_pass,
                 config.hand_roi.laplacian_p10_warn,
@@ -1173,9 +1263,7 @@ def evaluate_video_quality(
                 "hand_roi_laplacian_p10_warn",
                 higher_is_bad=False,
             )
-            _add_threshold_reason(
-                fail,
-                warn,
+            add_hand_roi_quality_reason(
                 roi.laplacian_median,
                 config.hand_roi.laplacian_median_pass,
                 config.hand_roi.laplacian_median_warn,
@@ -1183,9 +1271,7 @@ def evaluate_video_quality(
                 "hand_roi_laplacian_median_warn",
                 higher_is_bad=False,
             )
-            _add_threshold_reason(
-                fail,
-                warn,
+            add_hand_roi_quality_reason(
                 roi.tenengrad_p10,
                 config.hand_roi.tenengrad_p10_pass,
                 config.hand_roi.tenengrad_p10_warn,
@@ -1193,9 +1279,7 @@ def evaluate_video_quality(
                 "hand_roi_tenengrad_p10_warn",
                 higher_is_bad=False,
             )
-            _add_threshold_reason(
-                fail,
-                warn,
+            add_hand_roi_quality_reason(
                 roi.tenengrad_median,
                 config.hand_roi.tenengrad_median_pass,
                 config.hand_roi.tenengrad_median_warn,
@@ -1203,9 +1287,7 @@ def evaluate_video_quality(
                 "hand_roi_tenengrad_median_warn",
                 higher_is_bad=False,
             )
-            _add_threshold_reason(
-                fail,
-                warn,
+            add_hand_roi_quality_reason(
                 roi.blur_bad_frame_ratio,
                 config.hand_roi.blur_bad_frame_ratio_pass,
                 config.hand_roi.blur_bad_frame_ratio_warn,

@@ -210,7 +210,7 @@ quality_archive/408817.json  -> asset_id = 408817
 ```json
 {
   "stage": "video_prefilter",
-  "threshold_version": "video_prefilter_v0.2.5",
+  "threshold_version": "video_prefilter_v0.2.6",
   "evaluation": {
     "decision": "pass",
     "passed": true,
@@ -290,7 +290,7 @@ quality_archive/408817.json  -> asset_id = 408817
     }
   },
   "thresholds": {
-    "threshold_version": "video_prefilter_v0.2.5",
+    "threshold_version": "video_prefilter_v0.2.6",
     "fps": {
       "expected_fps": null,
       "min_fps_pass": 24,
@@ -323,6 +323,15 @@ quality_archive/408817.json  -> asset_id = 408817
 }
 ```
 
+`hand_roi_metrics.source` 当前可为：
+
+| source | 含义 |
+|---|---|
+| `hdf5_keypoints_bbox` | 从 HDF5 关键点数组生成粗 hand ROI bbox。 |
+| `hdf5_transform_keypoints_bbox` | 从 `transforms/*` 下手部、手指、拇指相关 4x4 矩阵取平移点，并使用 `camera/intrinsic` 投影后生成粗 hand ROI bbox。 |
+
+当 `hand_roi.mode` 为 `warn_except_severe_fail` 时，ROI Laplacian / Tenengrad 低于 pass 线只写入 `warn_reasons`；只有 `hand_roi_severe_blur` 或 `hand_roi_blur_bad_frame_ratio_above_max` 才会把视频预筛判成 `fail`。
+
 `video_quality.evaluation.decision` 与 `qc_summary.status` 同步，取值为 `pass | warn | fail`。`should_run_mask_qc` 是 pipeline 调度 flag，规则固定为：
 
 ```text
@@ -354,7 +363,7 @@ should_run_mask_qc = decision != "fail"
 | `hdf5_frame_count_mismatch` | HDF5 帧数与视频帧数不一致。 |
 | `hdf5_missing` | HDF5 缺失，且配置要求失败。 |
 | `hdf5_unreadable` | HDF5 不可读，且配置要求失败。 |
-| `hand_roi_severe_blur` | HDF5 21 点粗 bbox ROI 严重模糊。 |
+| `hand_roi_severe_blur` | HDF5 粗 bbox ROI 严重模糊；bbox 可来自关键点数组或 `transforms/*` 4x4 手部/手指矩阵投影点。 |
 | `hand_roi_blur_bad_frame_ratio_above_max` | hand ROI 模糊坏帧比例超过 hard fail 阈值。 |
 
 ## reference_quality

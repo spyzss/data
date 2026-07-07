@@ -112,7 +112,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 Optional config:
 
 ```yaml
-threshold_version: video_prefilter_v0.2.5
+threshold_version: video_prefilter_v0.2.6
 decode:
   max_sample_frames: 300
 hdf5_alignment:
@@ -168,11 +168,12 @@ sampled/XJGT_20260616/
     summary.json
 ```
 
-It is a `video_prefilter_v0.2.5` low-cost prefilter. It uses practical
+It is a `video_prefilter_v0.2.6` low-cost prefilter. It uses practical
 no-reference indicators: open/decode health, fps, resolution, timeline
 continuity, sampled-frame decode ratio, black/over-dark/over-exposure ratios,
 global sharpness at a normalized short side, frozen-frame risk, HDF5 frame-count
-alignment, and a coarse hand ROI sharpness check from HDF5 21-point bbox. It
-does not perform 21-point accuracy validation, keypoint-mask matching,
+alignment, and a coarse hand ROI sharpness check from HDF5 keypoint arrays or
+4x4 hand/finger transform matrices projected with `camera/intrinsic`. It
+does not perform keypoint accuracy validation, keypoint-mask matching,
 hand-object mask IoU, trajectory jump checks, semantic consistency, or subtask
 acceptance.
