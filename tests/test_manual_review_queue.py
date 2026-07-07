@@ -1,9 +1,11 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
 
-from tools.build_batch_qc_ledger import load_manifest
+from tools.build_batch_qc_ledger import load_manifest, read_records
 from tools.build_manual_review_queue import (
     FAILURE_MODE_ENUM,
     MANUAL_OUTCOME_ENUM,
@@ -11,9 +13,11 @@ from tools.build_manual_review_queue import (
     REVIEW_QUEUE_COLUMNS,
     assign_review_ids,
     build_review_index_html,
+    copy_selected_overlays,
     manual_template_row,
     queue_row,
     rows_from_candidate_windows,
+    rows_from_issue_events,
     rows_from_sam3_summary,
     select_review_rows,
 )
@@ -23,6 +27,19 @@ from tools.convert_manual_labels_csv_to_json import convert_csv_to_patch_records
 def _write_csv(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def test_help_includes_issue_events_argument() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "tools/build_manual_review_queue.py", "--help"],
+        cwd=repo_root,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    assert "--issue-events" in result.stdout
 
 
 def test_manual_review_queue_uses_fixed_fields_and_enums(tmp_path: Path) -> None:
@@ -96,6 +113,13 @@ def test_manual_review_queue_uses_fixed_fields_and_enums(tmp_path: Path) -> None
             overlay_dir=overlay_dir,
         )
     )
+    original_overlay = next(
+        row["overlay_path"]
+        for row in selected
+        if row["asset_id"] == "100044"
+    )
+    output_dir = tmp_path / "review"
+    copy_selected_overlays(selected, output_dir)
 
     queue_df = pd.DataFrame(selected, columns=REVIEW_QUEUE_COLUMNS)
     template_df = pd.DataFrame(
@@ -111,6 +135,13 @@ def test_manual_review_queue_uses_fixed_fields_and_enums(tmp_path: Path) -> None
     assert "pass_sample" in queue_df["auto_verdict"].tolist()
     assert set(template_df["failure_mode"]).issubset(set(FAILURE_MODE_ENUM))
     assert "manual_outcome" in html
+    assert "Auto result" in html
+    assert "Human label" in html
+    assert "manual_outcome</b> = whether the script flag is correct" in html
+    assert "failure_mode</b> = human-confirmed issue type" in html
+    assert "severity</b> = impact on sample quality" in html
+    assert "confidence</b> = confidence in the human label" in html
+    assert "comment optional" in html
     assert "true_positive" in html
     assert "keypoint_raw_invalid" in html
     assert "keypoint_low_quality_window" in html
@@ -119,19 +150,117 @@ def test_manual_review_queue_uses_fixed_fields_and_enums(tmp_path: Path) -> None
     assert "function exportManualLabelsCsv" in html
     assert "localStorage" in html
     assert "manual_labels_template.csv" in html
-    assert "100044_100_120.png" in html
+    assert "assets/overlays/100044_100_120.png" in html
+    for column in (
+        "auto_verdict",
+        "suggested_issue_type",
+        "severity_suggestion",
+        "key_metrics_json",
+        "reason",
+        "manual_outcome",
+        "failure_mode",
+        "severity",
+        "confidence",
+        "comment",
+        "reviewer",
+    ):
+        assert column in MANUAL_TEMPLATE_COLUMNS
+        assert column in html
+    assert (output_dir / "assets" / "overlays" / "100044_100_120.png").exists()
+    assert next(row for row in selected if row["asset_id"] == "100044")[
+        "overlay_path"
+    ] == original_overlay
+    assert next(row for row in selected if row["asset_id"] == "100044")[
+        "display_overlay_path"
+    ] == "assets/overlays/100044_100_120.png"
+
+
+def test_issue_events_add_asset_level_keypoint_low_quality_item(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.csv"
+    _write_csv(
+        manifest,
+        "supplier_id,asset_id,episode_idx\n"
+        "supplier_a,100030,0\n",
+    )
+    assets, episode_to_asset = load_manifest(manifest)
+    issue_events_path = tmp_path / "issue_events.csv"
+    pd.DataFrame(
+        [
+            {
+                "supplier_id": "supplier_a",
+                "asset_id": "100030",
+                "module": "precheck",
+                "issue_type": "keypoint_low_quality_window",
+                "severity": "medium",
+                "auto_verdict": "review",
+                "manual_outcome": "",
+                "window_start_frame": "",
+                "window_end_frame": "",
+                "metric_name": "flagged_frames",
+                "metric_value": 4,
+                "reason": "keypoint low-quality window exceeded aggregate threshold",
+                "evidence_path": str(tmp_path / "clip_aggregates.csv"),
+                "needs_manual_review": True,
+                "sam3_containment_eligible": "",
+            }
+        ]
+    ).to_csv(issue_events_path, index=False)
+
+    rows = rows_from_issue_events(
+        read_records(issue_events_path),
+        issue_events_path,
+        assets,
+        episode_to_asset,
+        overlay_dir=None,
+    )
+    selected = assign_review_ids(
+        select_review_rows(
+            rows,
+            assets,
+            max_items_per_supplier=10,
+            max_side_view_per_supplier=10,
+            max_pass_samples_per_supplier=0,
+            overlay_dir=None,
+        )
+    )
+    item = next(
+        row
+        for row in selected
+        if row["suggested_issue_type"] == "keypoint_low_quality_window"
+    )
+
+    assert item["source_level"] == "asset"
+    assert item["overlay_path"] == ""
+    assert item["display_overlay_path"] == ""
+    assert "flagged_frames" in item["key_metrics_json"]
+    assert "No overlay" in build_review_index_html(selected)
 
 
 def test_convert_completed_manual_csv_to_patch_records(tmp_path: Path) -> None:
     csv_path = tmp_path / "manual_labels_template.csv"
-    _write_csv(
-        csv_path,
-        ",".join(MANUAL_TEMPLATE_COLUMNS) + "\n"
-        "supplier_a_100044_100_120_0001,supplier_a,100044,100,120,111,"
-        "review,side_view_mask_undersegmentation,true_positive,"
-        "side_view_mask_undersegmentation,medium,high,"
-        "side view mask undersegmentation,nathan\n",
+    row = {column: "" for column in MANUAL_TEMPLATE_COLUMNS}
+    row.update(
+        {
+            "review_id": "supplier_a_100044_100_120_0001",
+            "supplier_id": "supplier_a",
+            "asset_id": "100044",
+            "window_start_frame": 100,
+            "window_end_frame": 120,
+            "representative_frame": 111,
+            "auto_verdict": "review",
+            "suggested_issue_type": "side_view_mask_undersegmentation",
+            "severity_suggestion": "medium",
+            "key_metrics_json": "{\"inside_ratio_mean\": 0.1}",
+            "reason": "side-view hand orientation makes SAM3 containment unreliable",
+            "manual_outcome": "true_positive",
+            "failure_mode": "side_view_mask_undersegmentation",
+            "severity": "medium",
+            "confidence": "high",
+            "comment": "side view mask undersegmentation",
+            "reviewer": "nathan",
+        }
     )
+    pd.DataFrame([row], columns=MANUAL_TEMPLATE_COLUMNS).to_csv(csv_path, index=False)
 
     records = convert_csv_to_patch_records(csv_path)
 
@@ -146,6 +275,9 @@ def test_convert_completed_manual_csv_to_patch_records(tmp_path: Path) -> None:
     assert record["algorithm_outcome"] == "true_positive"
     assert record["manual_outcome"] in MANUAL_OUTCOME_ENUM
     assert record["failure_mode"] == "side_view_mask_undersegmentation"
+    assert record["severity_suggestion"] == "medium"
+    assert record["key_metrics_json"] == "{\"inside_ratio_mean\": 0.1}"
+    assert record["reason"] == "side-view hand orientation makes SAM3 containment unreliable"
 
 
 def test_review_queue_selection_caps_side_view_and_keeps_other_issue_types() -> None:
@@ -258,12 +390,28 @@ def test_review_queue_selection_caps_side_view_and_keeps_other_issue_types() -> 
 
 def test_convert_manual_csv_rejects_invalid_enum(tmp_path: Path) -> None:
     csv_path = tmp_path / "manual_labels_template.csv"
-    _write_csv(
-        csv_path,
-        ",".join(MANUAL_TEMPLATE_COLUMNS) + "\n"
-        "r1,supplier_a,100044,100,120,111,review,unknown,not_an_enum,"
-        "unknown,medium,high,,nathan\n",
+    row = {column: "" for column in MANUAL_TEMPLATE_COLUMNS}
+    row.update(
+        {
+            "review_id": "r1",
+            "supplier_id": "supplier_a",
+            "asset_id": "100044",
+            "window_start_frame": 100,
+            "window_end_frame": 120,
+            "representative_frame": 111,
+            "auto_verdict": "review",
+            "suggested_issue_type": "unknown",
+            "severity_suggestion": "medium",
+            "key_metrics_json": "{}",
+            "reason": "test row",
+            "manual_outcome": "not_an_enum",
+            "failure_mode": "unknown",
+            "severity": "medium",
+            "confidence": "high",
+            "reviewer": "nathan",
+        }
     )
+    pd.DataFrame([row], columns=MANUAL_TEMPLATE_COLUMNS).to_csv(csv_path, index=False)
 
     try:
         convert_csv_to_patch_records(csv_path)

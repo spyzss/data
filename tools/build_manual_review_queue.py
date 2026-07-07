@@ -7,6 +7,7 @@ import argparse
 import html
 import json
 import logging
+import shutil
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -83,6 +84,7 @@ REVIEW_QUEUE_COLUMNS = [
     "reason",
     "evidence_path",
     "overlay_path",
+    "display_overlay_path",
     "needs_manual_review",
     "sam3_containment_eligible",
 ]
@@ -96,6 +98,9 @@ MANUAL_TEMPLATE_COLUMNS = [
     "representative_frame",
     "auto_verdict",
     "suggested_issue_type",
+    "severity_suggestion",
+    "key_metrics_json",
+    "reason",
     "manual_outcome",
     "failure_mode",
     "severity",
@@ -123,6 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--candidate-windows", required=True, type=Path)
     parser.add_argument("--sam3-window-summary", type=Path)
+    parser.add_argument("--issue-events", type=Path)
     parser.add_argument("--video-quality", type=Path)
     parser.add_argument("--overlay-dir", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -163,6 +169,16 @@ def main() -> int:
                 args.overlay_dir,
             )
         )
+    if args.issue_events:
+        rows.extend(
+            rows_from_issue_events(
+                read_records(args.issue_events),
+                args.issue_events,
+                assets,
+                episode_to_asset,
+                args.overlay_dir,
+            )
+        )
     if args.video_quality:
         rows.extend(
             rows_from_video_quality(
@@ -183,6 +199,7 @@ def main() -> int:
         overlay_dir=args.overlay_dir,
     )
     selected_rows = assign_review_ids(selected_rows)
+    copy_selected_overlays(selected_rows, args.output_dir)
 
     queue_df = pd.DataFrame(selected_rows, columns=REVIEW_QUEUE_COLUMNS)
     template_df = pd.DataFrame(
@@ -300,6 +317,61 @@ def rows_from_sam3_summary(
     return output
 
 
+def rows_from_issue_events(
+    rows: list[dict[str, Any]],
+    evidence_path: Path,
+    assets: dict[str, dict[str, Any]],
+    episode_to_asset: dict[int, str],
+    overlay_dir: Path | None,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        asset_id = asset_from_row(row, episode_to_asset)
+        if asset_id is None:
+            continue
+        supplier_id = supplier_for_asset(assets, asset_id)
+        if supplier_id == "unknown" and row.get("supplier_id") is not None:
+            supplier_id = str(row.get("supplier_id"))
+        start = frame_value(first_present(row, ("window_start_frame", "start_frame"), default=None))
+        end = frame_value(first_present(row, ("window_end_frame", "end_frame"), default=start))
+        representative = frame_value(row.get("representative_frame"), default=midpoint(start, end))
+        source_level = "window" if start is not None or end is not None else "asset"
+        issue_type = issue_from_issue_event(row)
+        severity = normalize_enum_value(row.get("severity"), SEVERITY_ENUM, "medium")
+        auto_verdict = str(row.get("auto_verdict") or "review")
+        overlay_path = (
+            find_overlay_path(overlay_dir, asset_id, start, end, representative)
+            if source_level == "window"
+            else ""
+        )
+        output.append(
+            queue_row(
+                supplier_id=supplier_id,
+                asset_id=asset_id,
+                start=start,
+                end=end,
+                representative=representative,
+                source_level=source_level,
+                module=str(row.get("module") or "ledger"),
+                auto_verdict=auto_verdict,
+                suggested_issue_type=issue_type,
+                severity_suggestion=severity,
+                priority=(
+                    "high"
+                    if issue_type == "keypoint_raw_invalid"
+                    else priority_from_issue(issue_type, severity, auto_verdict)
+                ),
+                key_metrics=collect_issue_event_metrics(row),
+                reason=str(first_present(row, ("reason",), default=str(row.get("issue_type") or "issue event"))),
+                evidence_path=Path(str(row.get("evidence_path"))) if row.get("evidence_path") else evidence_path,
+                overlay_path=overlay_path,
+                needs_manual_review=first_present(row, ("needs_manual_review",), default=True),
+                sam3_containment_eligible=row.get("sam3_containment_eligible"),
+            )
+        )
+    return output
+
+
 def rows_from_video_quality(
     rows: list[dict[str, Any]],
     evidence_path: Path,
@@ -398,11 +470,13 @@ def select_review_rows(
                 if counts_as_pass_sample:
                     pass_counts[supplier_id] += 1
 
+        append_bucket(is_keypoint_raw_invalid, max_items_per_supplier)
         append_bucket(is_mixed_containment_with_strong, 15)
         append_bucket(is_strong_containment, 15)
         append_bucket(is_side_view_review, max_side_view_per_supplier)
         append_bucket(lambda row: row.get("suggested_issue_type") == "keypoint_low_quality_window", 5)
-        append_bucket(lambda row: row.get("suggested_issue_type") == "quality_hand_failed", 5)
+        append_bucket(is_quality_hand_failed, 5)
+        append_bucket(is_high_severity_video_quality, 10)
         append_bucket(
             is_acceptable_or_pass_review,
             max(0, max_pass_samples_per_supplier - pass_counts[supplier_id]),
@@ -479,6 +553,21 @@ def is_side_view_review(row: dict[str, Any]) -> bool:
     return row.get("suggested_issue_type") == "side_view_mask_undersegmentation"
 
 
+def is_keypoint_raw_invalid(row: dict[str, Any]) -> bool:
+    return row.get("suggested_issue_type") == "keypoint_raw_invalid"
+
+
+def is_quality_hand_failed(row: dict[str, Any]) -> bool:
+    return row.get("suggested_issue_type") in {"quality_hand_low", "quality_hand_failed"}
+
+
+def is_high_severity_video_quality(row: dict[str, Any]) -> bool:
+    return str(row.get("module")) == "video_quality" and str(row.get("severity_suggestion")) in {
+        "high",
+        "critical",
+    }
+
+
 def is_acceptable_or_pass_review(row: dict[str, Any]) -> bool:
     return row.get("auto_verdict") in {"acceptable_flagged", "pass_sample"} or row.get(
         "suggested_issue_type"
@@ -490,9 +579,12 @@ def is_capped_review_type(row: dict[str, Any]) -> bool:
         is_mixed_containment_with_strong(row)
         or is_strong_containment(row)
         or is_side_view_review(row)
+        or is_keypoint_raw_invalid(row)
+        or is_quality_hand_failed(row)
+        or is_high_severity_video_quality(row)
         or is_acceptable_or_pass_review(row)
         or row.get("suggested_issue_type")
-        in {"keypoint_low_quality_window", "quality_hand_failed"}
+        == "keypoint_low_quality_window"
     )
 
 
@@ -516,6 +608,32 @@ def assign_review_ids(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output
 
 
+def copy_selected_overlays(rows: list[dict[str, Any]], output_dir: Path) -> None:
+    overlay_output_dir = output_dir / "assets" / "overlays"
+    used_names: Counter[str] = Counter()
+    for row in rows:
+        row["display_overlay_path"] = ""
+        overlay_path = row.get("overlay_path")
+        if not overlay_path:
+            continue
+        source = Path(str(overlay_path))
+        if not source.exists() or not source.is_file():
+            continue
+        overlay_output_dir.mkdir(parents=True, exist_ok=True)
+        target_name = unique_overlay_filename(source.name, used_names)
+        target = overlay_output_dir / target_name
+        shutil.copy2(source, target)
+        row["display_overlay_path"] = f"assets/overlays/{target_name}"
+
+
+def unique_overlay_filename(filename: str, used_names: Counter[str]) -> str:
+    used_names[filename] += 1
+    if used_names[filename] == 1:
+        return filename
+    path = Path(filename)
+    return f"{path.stem}_{used_names[filename]}{path.suffix}"
+
+
 def manual_template_row(row: dict[str, Any], default_reviewer: str = "") -> dict[str, Any]:
     failure_mode = row.get("suggested_issue_type")
     if failure_mode not in FAILURE_MODE_ENUM:
@@ -529,6 +647,9 @@ def manual_template_row(row: dict[str, Any], default_reviewer: str = "") -> dict
         "representative_frame": row["representative_frame"],
         "auto_verdict": row["auto_verdict"],
         "suggested_issue_type": row["suggested_issue_type"],
+        "severity_suggestion": row["severity_suggestion"],
+        "key_metrics_json": row["key_metrics_json"],
+        "reason": row["reason"],
         "manual_outcome": "",
         "failure_mode": failure_mode,
         "severity": row["severity_suggestion"],
@@ -575,6 +696,7 @@ def queue_row(
         "reason": reason,
         "evidence_path": "" if evidence_path is None else str(evidence_path),
         "overlay_path": overlay_path or "",
+        "display_overlay_path": "",
         "needs_manual_review": boolish_or_none(needs_manual_review),
         "sam3_containment_eligible": boolish_or_none(sam3_containment_eligible),
     }
@@ -636,6 +758,29 @@ def issue_from_video_quality(row: dict[str, Any]) -> str:
     if "stutter" in text or "freeze" in text:
         return "video_stutter"
     return "video_blur"
+
+
+def issue_from_issue_event(row: dict[str, Any]) -> str:
+    issue_type = str(row.get("issue_type") or "").strip()
+    issue_lower = issue_type.lower()
+    module = str(row.get("module") or "").lower()
+    if issue_lower == "keypoint_low_quality_window":
+        return "keypoint_low_quality_window"
+    if issue_lower == "quality_hand_failed":
+        return "quality_hand_low"
+    if issue_lower == "keypoint_raw_invalid":
+        return "keypoint_raw_invalid"
+    if issue_lower in {"side_view_manual_review", "rotation_manual_review"}:
+        return "side_view_mask_undersegmentation"
+    if issue_lower == "strong_containment_mismatch":
+        return "strong_containment_mismatch"
+    if issue_lower == "hdf5_text_integrity_failed":
+        return "hdf5_text_invalid"
+    if module == "video_quality" or issue_lower == "video_quality_failed":
+        return issue_from_video_quality(row)
+    if issue_type in FAILURE_MODE_ENUM:
+        return issue_type
+    return issue_type or "unknown"
 
 
 def severity_from_priority(priority: Any) -> str:
@@ -709,6 +854,28 @@ def collect_video_metrics(row: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
+def collect_issue_event_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    output = {}
+    issue_type = row.get("issue_type")
+    if issue_type is not None:
+        output["ledger_issue_type"] = issue_type
+    metric_name = row.get("metric_name")
+    metric_value = row.get("metric_value")
+    if metric_name not in (None, ""):
+        output[str(metric_name)] = metric_value
+    for key in (
+        "manual_outcome",
+        "strong_fail_frame_count",
+        "strong_fail_frame_ratio",
+        "inside_ratio_mean",
+        "flagged_frames",
+        "checked_frames",
+    ):
+        if row.get(key) is not None:
+            output[key] = row.get(key)
+    return output
+
+
 def build_review_index_html(
     rows: list[dict[str, Any]],
     default_reviewer: str = "",
@@ -738,8 +905,12 @@ def build_review_index_html(
         ".item-grid{display:grid;grid-template-columns:minmax(180px,260px) 1fr;gap:14px}.thumb{max-width:240px;max-height:170px;display:block;border:1px solid #dadce0}\n"
         ".no-overlay{height:80px;border:1px dashed #c7cdd4;color:#6b7280;display:flex;align-items:center;justify-content:center;font-size:13px}\n"
         ".meta{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:6px 12px;font-size:13px}.meta b{display:block;color:#5f6368;font-size:12px}\n"
+        ".auto-section,.human-section{border:1px solid #eceff1;border-radius:6px;padding:10px;margin-top:10px;background:#fff}\n"
+        ".auto-section{background:#fbfcfe}.human-section{background:#fffdf8}.section-title{font-weight:700;margin-bottom:8px;color:#202124}\n"
+        ".help{font-size:12px;color:#5f6368;margin:0 0 8px}.help b{color:#3c4043}\n"
         ".metrics,.reason{white-space:pre-wrap;background:#f8f9fa;border:1px solid #eceff1;padding:8px;margin-top:8px;font-size:12px;overflow:auto}\n"
         ".controls{display:grid;grid-template-columns:repeat(3,minmax(140px,1fr));gap:8px;margin-top:12px}.controls label{font-size:12px;color:#5f6368}.controls select,.controls input,.controls textarea{width:100%;box-sizing:border-box;margin-top:3px;padding:6px;border:1px solid #c7cdd4;border-radius:4px;font:inherit}.controls textarea{min-height:58px;grid-column:span 2}\n"
+        ".controls label.optional{color:#7a8087}.controls label.optional textarea{background:#fbfbfb}\n"
         "code{white-space:pre-wrap}.status{margin-left:8px;color:#188038;font-size:13px}\n"
         "</style></head><body>\n"
         "<h1>Manual Review Queue</h1>\n"
@@ -777,23 +948,24 @@ def build_review_index_html(
         "  let html = '';\n"
         "  for (const [group, items] of groups.entries()) {\n"
         "    html += `<section class=\"group\"><h2>${escapeHtml(group)}</h2>`;\n"
-        "    for (const item of items) { const row = item.row; const index = item.index; const overlay = row.overlay_path ? `<a href=\"${escapeHtml(row.overlay_path)}\"><img class=\"thumb\" src=\"${escapeHtml(row.overlay_path)}\"></a>` : '<div class=\"no-overlay\">No overlay</div>';\n"
+        "    for (const item of items) { const row = item.row; const index = item.index; const overlaySrc = row.display_overlay_path || row.overlay_path || ''; const overlay = overlaySrc ? `<a href=\"${escapeHtml(overlaySrc)}\"><img class=\"thumb\" src=\"${escapeHtml(overlaySrc)}\"></a>` : '<div class=\"no-overlay\">No overlay</div>';\n"
         "      html += `<article class=\"item\"><div class=\"item-grid\"><div>${overlay}</div><div>`;\n"
-        "      html += `<div class=\"meta\"><div><b>review_id</b>${escapeHtml(row.review_id)}</div><div><b>supplier_id</b>${escapeHtml(row.supplier_id)}</div><div><b>asset_id</b>${escapeHtml(row.asset_id)}</div><div><b>source_level</b>${escapeHtml(row.source_level)}</div><div><b>window</b>${escapeHtml(row.window_start_frame)}-${escapeHtml(row.window_end_frame)}</div><div><b>representative_frame</b>${escapeHtml(row.representative_frame)}</div><div><b>module</b>${escapeHtml(row.module)}</div><div><b>auto_verdict</b>${escapeHtml(row.auto_verdict)}</div><div><b>suggested_issue_type</b>${escapeHtml(row.suggested_issue_type)}</div><div><b>severity_suggestion</b>${escapeHtml(row.severity_suggestion)}</div><div><b>priority</b>${escapeHtml(row.priority)}</div></div>`;\n"
-        "      html += `<div class=\"metrics\"><b>key metrics</b>\\n${escapeHtml(row.key_metrics_json)}</div><div class=\"reason\"><b>reason</b>\\n${escapeHtml(row.reason)}</div>`;\n"
+        "      html += `<div class=\"meta\"><div><b>review_id</b>${escapeHtml(row.review_id)}</div><div><b>supplier_id</b>${escapeHtml(row.supplier_id)}</div><div><b>asset_id</b>${escapeHtml(row.asset_id)}</div><div><b>source_level</b>${escapeHtml(row.source_level)}</div><div><b>window</b>${escapeHtml(row.window_start_frame)}-${escapeHtml(row.window_end_frame)}</div><div><b>representative_frame</b>${escapeHtml(row.representative_frame)}</div><div><b>module</b>${escapeHtml(row.module)}</div><div><b>priority</b>${escapeHtml(row.priority)}</div></div>`;\n"
+        "      html += `<section class=\"auto-section\"><div class=\"section-title\">Auto result</div><div class=\"meta\"><div><b>auto_verdict</b>${escapeHtml(row.auto_verdict)}</div><div><b>suggested_issue_type</b>${escapeHtml(row.suggested_issue_type)}</div><div><b>severity_suggestion</b>${escapeHtml(row.severity_suggestion)}</div></div><div class=\"metrics\"><b>key_metrics_json</b>\\n${escapeHtml(row.key_metrics_json)}</div><div class=\"reason\"><b>reason</b>\\n${escapeHtml(row.reason)}</div></section>`;\n"
+        "      html += `<section class=\"human-section\"><div class=\"section-title\">Human label</div><p class=\"help\"><b>manual_outcome</b> = whether the script flag is correct<br><b>failure_mode</b> = human-confirmed issue type<br><b>severity</b> = impact on sample quality<br><b>confidence</b> = confidence in the human label</p>`;\n"
         "      html += `<div class=\"controls\"><label>manual_outcome<select id=\"${fieldId(index,'manual_outcome')}\" data-index=\"${index}\" data-field=\"manual_outcome\">${optionHtml(ENUMS.manual_outcome, 'review')}</select></label>`;\n"
         "      html += `<label>failure_mode<select id=\"${fieldId(index,'failure_mode')}\" data-index=\"${index}\" data-field=\"failure_mode\">${optionHtml(ENUMS.failure_mode, defaultFailureMode(row))}</select></label>`;\n"
         "      html += `<label>severity<select id=\"${fieldId(index,'severity')}\" data-index=\"${index}\" data-field=\"severity\">${optionHtml(ENUMS.severity, defaultSeverity(row))}</select></label>`;\n"
         "      html += `<label>confidence<select id=\"${fieldId(index,'confidence')}\" data-index=\"${index}\" data-field=\"confidence\">${optionHtml(ENUMS.confidence, 'medium')}</select></label>`;\n"
         "      html += `<label>reviewer<input id=\"${fieldId(index,'reviewer')}\" data-index=\"${index}\" data-field=\"reviewer\" value=\"${escapeHtml(DEFAULT_REVIEWER)}\"></label>`;\n"
-        "      html += `<label>comment<textarea id=\"${fieldId(index,'comment')}\" data-index=\"${index}\" data-field=\"comment\"></textarea></label></div>`;\n"
+        "      html += `<label class=\"optional\">comment optional<textarea id=\"${fieldId(index,'comment')}\" data-index=\"${index}\" data-field=\"comment\"></textarea></label></div></section>`;\n"
         "      html += '</div></div></article>';\n"
         "    }\n"
         "    html += '</section>';\n"
         "  }\n"
         "  root.innerHTML = html;\n"
         "}\n"
-        "function collectManualRows(){return REVIEW_ROWS.map((row,index)=>({review_id:row.review_id,supplier_id:row.supplier_id,asset_id:row.asset_id,window_start_frame:row.window_start_frame,window_end_frame:row.window_end_frame,representative_frame:row.representative_frame,auto_verdict:row.auto_verdict,suggested_issue_type:row.suggested_issue_type,manual_outcome:getField(index,'manual_outcome'),failure_mode:getField(index,'failure_mode'),severity:getField(index,'severity'),confidence:getField(index,'confidence'),comment:getField(index,'comment'),reviewer:getField(index,'reviewer')}));}\n"
+        "function collectManualRows(){return REVIEW_ROWS.map((row,index)=>({review_id:row.review_id,supplier_id:row.supplier_id,asset_id:row.asset_id,window_start_frame:row.window_start_frame,window_end_frame:row.window_end_frame,representative_frame:row.representative_frame,auto_verdict:row.auto_verdict,suggested_issue_type:row.suggested_issue_type,severity_suggestion:row.severity_suggestion,key_metrics_json:row.key_metrics_json,reason:row.reason,manual_outcome:getField(index,'manual_outcome'),failure_mode:getField(index,'failure_mode'),severity:getField(index,'severity'),confidence:getField(index,'confidence'),comment:getField(index,'comment'),reviewer:getField(index,'reviewer')}));}\n"
         "function getField(index, field){const el=document.getElementById(fieldId(index,field)); return el ? el.value : '';}\n"
         "function setField(index, field, value){const el=document.getElementById(fieldId(index,field)); if(el && value !== undefined && value !== null){el.value = value;}}\n"
         "function csvEscape(value){const text=String(value ?? ''); return /[\",\\n\\r]/.test(text) ? '\"' + text.replace(/\"/g,'\"\"') + '\"' : text;}\n"

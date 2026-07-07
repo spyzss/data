@@ -24,6 +24,9 @@ from tools.build_manual_review_queue import (  # noqa: E402
 )
 
 
+OPTIONAL_AUTO_EVIDENCE_COLUMNS = {"severity_suggestion", "key_metrics_json", "reason"}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -63,9 +66,15 @@ def convert_csv_to_patch_records(
 ) -> list[dict[str, Any]]:
     df = pd.read_csv(path)
     df = df.where(pd.notna(df), "")
-    missing = [column for column in MANUAL_TEMPLATE_COLUMNS if column not in df.columns]
+    required_columns = [
+        column for column in MANUAL_TEMPLATE_COLUMNS if column not in OPTIONAL_AUTO_EVIDENCE_COLUMNS
+    ]
+    missing = [column for column in required_columns if column not in df.columns]
     if missing:
         raise ValueError(f"manual labels CSV missing required columns: {missing}")
+    for column in OPTIONAL_AUTO_EVIDENCE_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
 
     records: list[dict[str, Any]] = []
     for row_index, row in enumerate(df.to_dict(orient="records"), start=2):
@@ -95,6 +104,9 @@ def convert_csv_to_patch_records(
             "algorithm_outcome": manual_outcome,
             "auto_verdict": clean(row.get("auto_verdict")),
             "suggested_issue_type": clean(row.get("suggested_issue_type")),
+            "severity_suggestion": clean(row.get("severity_suggestion")),
+            "key_metrics_json": clean(row.get("key_metrics_json")),
+            "reason": clean(row.get("reason")),
             "manual_outcome": manual_outcome,
             "failure_mode": failure_mode,
             "severity": severity,
