@@ -1039,6 +1039,7 @@ def summarize_window_containment(
         fail_min_strong_frames=fail_min_strong_frames,
         fail_strong_frame_ratio=fail_strong_frame_ratio,
         source_review_type=first.get("source_review_type"),
+        source_trigger_reason=first.get("source_trigger_reason"),
         source_sam3_containment_eligible=first.get(
             "source_sam3_containment_eligible"
         ),
@@ -1105,9 +1106,28 @@ def window_containment_verdict(
     fail_min_strong_frames: int = 3,
     fail_strong_frame_ratio: float = 0.6,
     source_review_type: Any = None,
+    source_trigger_reason: Any = None,
     source_sam3_containment_eligible: Any = None,
     source_needs_manual_review: Any = None,
 ) -> tuple[str, str]:
+    if contains_metadata_value(source_review_type, "side_view_manual_review"):
+        if contains_any_metadata_value(
+            source_trigger_reason,
+            {
+                "acceleration_seed",
+                "displacement_seed",
+                "multi_signal_seed",
+                "extreme_rotation_delta",
+            },
+        ):
+            return (
+                "mixed_review",
+                "side-view hand orientation makes SAM3 containment unreliable; requires manual review",
+            )
+        return (
+            "side_view_manual_review",
+            "side-view hand orientation makes SAM3 containment unreliable; requires manual review",
+        )
     if (
         contains_metadata_value(source_review_type, "rotation_manual_review")
         or is_false_value(source_sam3_containment_eligible)
@@ -1159,6 +1179,10 @@ def contains_metadata_value(value: Any, expected: str) -> bool:
     if isinstance(value, (list, tuple, set)):
         return any(contains_metadata_value(item, expected) for item in value)
     return False
+
+
+def contains_any_metadata_value(value: Any, expected: set[str]) -> bool:
+    return any(contains_metadata_value(value, item) for item in expected)
 
 
 def is_false_value(value: Any) -> bool:

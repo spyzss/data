@@ -63,6 +63,9 @@ class SkeletonQualityScoreConfig:
     strong_displacement_ratio: float = 1.8
     rotation_mask_review_ratio: float = 1.0
     rotation_delta_extreme_review_threshold: float | None = None
+    palm_camera_angle_review_threshold_deg: float | None = None
+    palm_camera_axis: list[float] = field(default_factory=lambda: [0.0, 0.0, 1.0])
+    palm_camera_angle_min_valid_hands: int = 1
     promote_sustained_review: bool = False
     sustained_review_min_frames: int = 6
     reject_missing_keypoints: bool = True

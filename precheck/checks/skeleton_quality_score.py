@@ -77,6 +77,21 @@ class SkeletonQualityScoreCheck(BaseCheck):
             if rotation_extreme_threshold is None
             else float(rotation_extreme_threshold)
         )
+        palm_angle_threshold = config.get("palm_camera_angle_review_threshold_deg")
+        self.palm_camera_angle_review_threshold_deg = (
+            None if palm_angle_threshold is None else float(palm_angle_threshold)
+        )
+        palm_camera_axis = np.asarray(
+            config.get("palm_camera_axis", [0.0, 0.0, 1.0]),
+            dtype=np.float64,
+        )
+        axis_norm = float(np.linalg.norm(palm_camera_axis))
+        if palm_camera_axis.shape != (3,) or axis_norm <= 1e-8:
+            raise ValueError("palm_camera_axis must be a nonzero 3-vector")
+        self.palm_camera_axis = palm_camera_axis / axis_norm
+        self.palm_camera_angle_min_valid_hands = int(
+            config.get("palm_camera_angle_min_valid_hands", 1)
+        )
         self.promote_sustained_review = bool(
             config.get("promote_sustained_review", False)
         )
@@ -151,6 +166,10 @@ class SkeletonQualityScoreCheck(BaseCheck):
             ]
             exceeded = self.exceeded_thresholds(metric_values)
             presence_metrics = self.presence_metrics(clip, frame_offset)
+            palm_orientation_metrics = self.palm_orientation_metrics(
+                clip,
+                frame_offset,
+            )
             projection_metrics = self.projection_metrics(
                 clip,
                 frame_offset,
@@ -231,6 +250,7 @@ class SkeletonQualityScoreCheck(BaseCheck):
                         "sustained_review_promoted": 0.0,
                         "skeleton_decision_mode": self.decision_mode,
                         **presence_metrics,
+                        **palm_orientation_metrics,
                         **projection_metrics,
                     },
                     flag=True if verdict in {"invalid", "suspect"} else None,
@@ -367,6 +387,68 @@ class SkeletonQualityScoreCheck(BaseCheck):
 
         metrics["keypoint_presence_invalid"] = float(invalid)
         return metrics
+
+    def palm_orientation_metrics(
+        self,
+        clip: ClipInputs,
+        frame_offset: int,
+    ) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        angles: list[float] = []
+        side_view_hand_count = 0
+        for side in ("left", "right"):
+            angle = self.palm_camera_angle_for_side(clip, frame_offset, side)
+            metrics[f"{side}_palm_camera_angle_deg"] = angle
+            valid = math.isfinite(angle)
+            metrics[f"{side}_palm_camera_angle_valid"] = float(valid)
+            if valid:
+                angles.append(angle)
+                if (
+                    self.palm_camera_angle_review_threshold_deg is not None
+                    and angle >= self.palm_camera_angle_review_threshold_deg
+                ):
+                    side_view_hand_count += 1
+
+        metrics["palm_camera_angle_deg_max"] = (
+            float(max(angles)) if angles else math.nan
+        )
+        metrics["palm_camera_angle_valid_hand_count"] = float(len(angles))
+        metrics["side_view_hand_count"] = float(side_view_hand_count)
+        return metrics
+
+    def palm_camera_angle_for_side(
+        self,
+        clip: ClipInputs,
+        frame_offset: int,
+        side: str,
+    ) -> float:
+        keypoints = clip.keypoints or {}
+        names = {
+            "wrist": f"{side}Hand",
+            "index": f"{side}IndexFingerKnuckle",
+            "little": f"{side}LittleFingerKnuckle",
+        }
+        points: dict[str, np.ndarray] = {}
+        for label, name in names.items():
+            values = keypoints.get(name)
+            if values is None or values.shape[0] <= frame_offset:
+                return math.nan
+            point = np.asarray(values[frame_offset], dtype=np.float64)
+            if point.shape[0] < 3 or not np.all(np.isfinite(point[:3])):
+                return math.nan
+            points[label] = point[:3]
+
+        v_index = points["index"] - points["wrist"]
+        v_little = points["little"] - points["wrist"]
+        palm_normal = np.cross(v_index, v_little)
+        normal_norm = float(np.linalg.norm(palm_normal))
+        if normal_norm <= 1e-8:
+            return math.nan
+        palm_normal = palm_normal / normal_norm
+        cos_angle = float(
+            np.clip(abs(np.dot(palm_normal, self.palm_camera_axis)), -1.0, 1.0)
+        )
+        return float(np.degrees(np.arccos(cos_angle)))
 
     def projection_state(self, clip: ClipInputs) -> dict[str, Any]:
         image_size = self.projection_image_size(clip)
@@ -606,11 +688,20 @@ class SkeletonQualityScoreCheck(BaseCheck):
             and math.isfinite(rotation_delta)
             and rotation_delta >= self.rotation_delta_extreme_review_threshold
         )
+        palm_camera_angle = float(metrics.get("palm_camera_angle_deg_max", math.nan))
+        side_view_seed = (
+            self.palm_camera_angle_review_threshold_deg is not None
+            and math.isfinite(palm_camera_angle)
+            and palm_camera_angle >= self.palm_camera_angle_review_threshold_deg
+            and float(metrics.get("side_view_hand_count", 0.0))
+            >= self.palm_camera_angle_min_valid_hands
+        )
         if not (
             acceleration_seed
             or displacement_seed
             or multi_signal_seed
             or extreme_rotation_seed
+            or side_view_seed
         ):
             return None
 
@@ -623,20 +714,31 @@ class SkeletonQualityScoreCheck(BaseCheck):
             reasons.append("multi_signal_seed")
         if extreme_rotation_seed:
             reasons.append("extreme_rotation_delta")
+        if side_view_seed:
+            reasons.append("side_view_hand_orientation")
+        review_types: list[str] = []
+        if side_view_seed:
+            review_types.append("side_view_manual_review")
+        if extreme_rotation_seed:
+            review_types.append("rotation_manual_review")
+        if not review_types:
+            review_types.append("temporal_geometry_review")
+        window_source = "skeleton_quality_temporal_run"
+        if extreme_rotation_seed:
+            window_source = "skeleton_rotation_extreme"
+        if side_view_seed:
+            window_source = "hand_absolute_orientation"
+        needs_manual_review = bool(side_view_seed or extreme_rotation_seed)
         return {
             "episode_idx": result.episode_idx,
             "asset_id": asset_id,
             "hand_side": "both",
             "frame_idx": result.frame_idx,
             "trigger_reason": reasons,
-            "review_type": ["rotation_manual_review"]
-            if extreme_rotation_seed
-            else ["temporal_geometry_review"],
-            "window_source": "skeleton_rotation_extreme"
-            if extreme_rotation_seed
-            else "skeleton_quality_temporal_run",
-            "needs_manual_review": bool(extreme_rotation_seed),
-            "sam3_containment_eligible": False if extreme_rotation_seed else True,
+            "review_type": review_types,
+            "window_source": window_source,
+            "needs_manual_review": needs_manual_review,
+            "sam3_containment_eligible": False if needs_manual_review else True,
             "trigger_metrics": self.window_trigger_metrics(metrics, "both"),
             "priority_score": self.temporal_seed_priority_score(metrics, reasons),
         }
@@ -662,6 +764,9 @@ class SkeletonQualityScoreCheck(BaseCheck):
         if "extreme_rotation_delta" in reasons:
             rotation_ratio = float(metrics.get("rotation_delta_ratio", 0.0) or 0.0)
             score += 30.0 + min(35.0, rotation_ratio * 10.0)
+        if "side_view_hand_orientation" in reasons:
+            angle = float(metrics.get("palm_camera_angle_deg_max", 0.0) or 0.0)
+            score += 30.0 + min(35.0, angle / 90.0 * 35.0)
         return score
 
     def build_seed_runs(self, seeds: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -802,6 +907,10 @@ class SkeletonQualityScoreCheck(BaseCheck):
             "joint_displacement_m_max",
             "joint_acceleration_m_s2_max",
             "joint_angle_change_deg_max",
+            "palm_camera_angle_deg_max",
+            "left_palm_camera_angle_deg",
+            "right_palm_camera_angle_deg",
+            "side_view_hand_count",
         ]
         if side != "both":
             prefix = f"{side}_"
@@ -890,7 +999,9 @@ class SkeletonQualityScoreCheck(BaseCheck):
             "review_type": review_types or ["temporal_geometry_review"],
             "priority": priority,
             "priority_score": priority_score,
-            "window_source": "skeleton_rotation_extreme"
+            "window_source": "hand_absolute_orientation"
+            if "hand_absolute_orientation" in window_sources
+            else "skeleton_rotation_extreme"
             if "skeleton_rotation_extreme" in window_sources
             else "skeleton_quality_temporal_run",
             "needs_manual_review": manual_review,

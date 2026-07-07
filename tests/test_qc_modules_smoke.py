@@ -160,6 +160,31 @@ def _candidate_check(**overrides: object) -> SkeletonQualityScoreCheck:
     return SkeletonQualityScoreCheck(config)
 
 
+def _palm_orientation_keypoints(num_frames: int, side_view: bool) -> dict[str, np.ndarray]:
+    keypoints = _static_keypoints(num_frames)
+    if side_view:
+        wrist = np.asarray([0.0, 0.0, 1.0])
+        index = np.asarray([0.0, 1.0, 1.0])
+        little = np.asarray([0.0, 0.0, 2.0])
+    else:
+        wrist = np.asarray([0.0, 0.0, 1.0])
+        index = np.asarray([1.0, 0.0, 1.0])
+        little = np.asarray([0.0, 1.0, 1.0])
+    for side in ("left", "right"):
+        keypoints[f"{side}Hand"] = np.repeat(wrist[None, :], num_frames, axis=0)
+        keypoints[f"{side}IndexFingerKnuckle"] = np.repeat(
+            index[None, :],
+            num_frames,
+            axis=0,
+        )
+        keypoints[f"{side}LittleFingerKnuckle"] = np.repeat(
+            little[None, :],
+            num_frames,
+            axis=0,
+        )
+    return keypoints
+
+
 def _write_minimal_supplier_hdf5(path: Path, quality_hand: np.ndarray) -> None:
     import h5py
 
@@ -704,6 +729,82 @@ def test_skeleton_extreme_rotation_candidate_routes_to_manual_review() -> None:
     assert window["sam3_containment_eligible"] is False
     assert "extreme_rotation_delta" in window["trigger_reason"]
     assert window["trigger_metrics"]["rotation_delta_max"] == 0.5
+
+
+def test_palm_orientation_front_view_does_not_trigger_side_view() -> None:
+    num_frames = 4
+    clip = ClipInputs(
+        episode_idx=12,
+        frame_indices=list(range(num_frames)),
+        keypoints=_palm_orientation_keypoints(num_frames, side_view=False),
+        fps=1.0,
+    )
+    check = _candidate_check(palm_camera_angle_review_threshold_deg=60.0)
+
+    results = check.run(clip)
+    frame_rows = [
+        result
+        for result in results
+        if result.check == "skeleton_quality_score" and result.frame_idx >= 0
+    ]
+
+    assert frame_rows
+    assert all(row.metrics["palm_camera_angle_deg_max"] < 1.0 for row in frame_rows)
+    assert all(row.metrics["side_view_hand_count"] == 0.0 for row in frame_rows)
+    assert check.candidate_windows == []
+
+
+def test_palm_orientation_side_view_routes_to_manual_review() -> None:
+    num_frames = 4
+    clip = ClipInputs(
+        episode_idx=12,
+        frame_indices=list(range(num_frames)),
+        keypoints=_palm_orientation_keypoints(num_frames, side_view=True),
+        fps=1.0,
+    )
+    check = _candidate_check(palm_camera_angle_review_threshold_deg=60.0)
+
+    results = check.run(clip)
+    frame_rows = [
+        result
+        for result in results
+        if result.check == "skeleton_quality_score" and result.frame_idx >= 0
+    ]
+
+    assert frame_rows
+    assert all(row.metrics["palm_camera_angle_deg_max"] > 89.0 for row in frame_rows)
+    assert all(row.metrics["side_view_hand_count"] == 2.0 for row in frame_rows)
+    assert len(check.candidate_windows) == 1
+    window = check.candidate_windows[0]
+    assert window["review_type"] == ["side_view_manual_review"]
+    assert window["window_source"] == "hand_absolute_orientation"
+    assert window["needs_manual_review"] is True
+    assert window["sam3_containment_eligible"] is False
+    assert "side_view_hand_orientation" in window["trigger_reason"]
+    assert window["trigger_metrics"]["palm_camera_angle_deg_max"] > 89.0
+
+
+def test_palm_orientation_threshold_none_keeps_existing_behavior() -> None:
+    num_frames = 4
+    clip = ClipInputs(
+        episode_idx=12,
+        frame_indices=list(range(num_frames)),
+        keypoints=_palm_orientation_keypoints(num_frames, side_view=True),
+        fps=1.0,
+    )
+    check = _candidate_check()
+
+    results = check.run(clip)
+    frame_rows = [
+        result
+        for result in results
+        if result.check == "skeleton_quality_score" and result.frame_idx >= 0
+    ]
+
+    assert frame_rows
+    assert all(row.metrics["palm_camera_angle_deg_max"] > 89.0 for row in frame_rows)
+    assert all(row.metrics["side_view_hand_count"] == 0.0 for row in frame_rows)
+    assert check.candidate_windows == []
 
 
 def test_skeleton_candidate_seed_runs_before_context_expansion() -> None:
