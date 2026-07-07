@@ -62,6 +62,7 @@ class SkeletonQualityScoreConfig:
     strong_acceleration_ratio: float = 2.5
     strong_displacement_ratio: float = 1.8
     rotation_mask_review_ratio: float = 1.0
+    rotation_delta_extreme_review_threshold: float | None = None
     promote_sustained_review: bool = False
     sustained_review_min_frames: int = 6
     reject_missing_keypoints: bool = True

@@ -867,6 +867,8 @@ def candidate_window_metadata(window: dict[str, Any]) -> dict[str, Any]:
         "source_review_type": window.get("review_type"),
         "source_trigger_reason": window.get("trigger_reason"),
         "source_priority": window.get("priority"),
+        "source_needs_manual_review": window.get("needs_manual_review"),
+        "source_sam3_containment_eligible": window.get("sam3_containment_eligible"),
     }
 
 
@@ -1036,6 +1038,11 @@ def summarize_window_containment(
         projected_in_image_ratio_mean=projected_ratio_mean,
         fail_min_strong_frames=fail_min_strong_frames,
         fail_strong_frame_ratio=fail_strong_frame_ratio,
+        source_review_type=first.get("source_review_type"),
+        source_sam3_containment_eligible=first.get(
+            "source_sam3_containment_eligible"
+        ),
+        source_needs_manual_review=first.get("source_needs_manual_review"),
     )
     start_frame = first.get("window_start_frame")
     end_frame = first.get("window_end_frame")
@@ -1056,6 +1063,10 @@ def summarize_window_containment(
         "source_review_type": first.get("source_review_type"),
         "source_trigger_reason": first.get("source_trigger_reason"),
         "source_priority": first.get("source_priority"),
+        "source_needs_manual_review": first.get("source_needs_manual_review"),
+        "source_sam3_containment_eligible": first.get(
+            "source_sam3_containment_eligible"
+        ),
         "sampled_frame_count": sampled_count,
         "sampled_frame_indices": sorted(
             int(row["frame_idx"]) for row in rows if row.get("frame_idx") is not None
@@ -1093,7 +1104,19 @@ def window_containment_verdict(
     projected_in_image_ratio_mean: float | None = None,
     fail_min_strong_frames: int = 3,
     fail_strong_frame_ratio: float = 0.6,
+    source_review_type: Any = None,
+    source_sam3_containment_eligible: Any = None,
+    source_needs_manual_review: Any = None,
 ) -> tuple[str, str]:
+    if (
+        contains_metadata_value(source_review_type, "rotation_manual_review")
+        or is_false_value(source_sam3_containment_eligible)
+        or is_true_value(source_needs_manual_review)
+    ):
+        return (
+            "rotation_manual_review",
+            "extreme rotation makes SAM3 containment unreliable; requires manual review",
+        )
     mean_clean_fail = (
         projected_in_image_ratio_mean is not None
         and inside_ratio_mean is not None
@@ -1126,6 +1149,32 @@ def window_containment_verdict(
     if nonzero_classes > 1:
         return "mixed_review", "mixed containment evidence"
     return "review", "uncertain containment evidence"
+
+
+def contains_metadata_value(value: Any, expected: str) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value == expected
+    if isinstance(value, (list, tuple, set)):
+        return any(contains_metadata_value(item, expected) for item in value)
+    return False
+
+
+def is_false_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, str):
+        return value.strip().lower() in {"false", "0", "no"}
+    return False
+
+
+def is_true_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return False
 
 
 def ratio_value(value: Any) -> float | None:

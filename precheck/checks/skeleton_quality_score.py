@@ -69,6 +69,14 @@ class SkeletonQualityScoreCheck(BaseCheck):
         self.rotation_mask_review_ratio = float(
             config.get("rotation_mask_review_ratio", 1.0)
         )
+        rotation_extreme_threshold = config.get(
+            "rotation_delta_extreme_review_threshold"
+        )
+        self.rotation_delta_extreme_review_threshold = (
+            None
+            if rotation_extreme_threshold is None
+            else float(rotation_extreme_threshold)
+        )
         self.promote_sustained_review = bool(
             config.get("promote_sustained_review", False)
         )
@@ -592,7 +600,18 @@ class SkeletonQualityScoreCheck(BaseCheck):
             > self.joint_displacement_m_max_threshold
         )
         multi_signal_seed = len(exceeded.intersection(GEOMETRY_METRIC_NAMES)) >= 2
-        if not (acceleration_seed or displacement_seed or multi_signal_seed):
+        rotation_delta = float(metrics.get("rotation_delta_max", 0.0) or 0.0)
+        extreme_rotation_seed = (
+            self.rotation_delta_extreme_review_threshold is not None
+            and math.isfinite(rotation_delta)
+            and rotation_delta >= self.rotation_delta_extreme_review_threshold
+        )
+        if not (
+            acceleration_seed
+            or displacement_seed
+            or multi_signal_seed
+            or extreme_rotation_seed
+        ):
             return None
 
         reasons: list[str] = []
@@ -602,12 +621,22 @@ class SkeletonQualityScoreCheck(BaseCheck):
             reasons.append("displacement_seed")
         if multi_signal_seed:
             reasons.append("multi_signal_seed")
+        if extreme_rotation_seed:
+            reasons.append("extreme_rotation_delta")
         return {
             "episode_idx": result.episode_idx,
             "asset_id": asset_id,
             "hand_side": "both",
             "frame_idx": result.frame_idx,
             "trigger_reason": reasons,
+            "review_type": ["rotation_manual_review"]
+            if extreme_rotation_seed
+            else ["temporal_geometry_review"],
+            "window_source": "skeleton_rotation_extreme"
+            if extreme_rotation_seed
+            else "skeleton_quality_temporal_run",
+            "needs_manual_review": bool(extreme_rotation_seed),
+            "sam3_containment_eligible": False if extreme_rotation_seed else True,
             "trigger_metrics": self.window_trigger_metrics(metrics, "both"),
             "priority_score": self.temporal_seed_priority_score(metrics, reasons),
         }
@@ -630,6 +659,9 @@ class SkeletonQualityScoreCheck(BaseCheck):
             score += 25.0 + min(30.0, acceleration_ratio * 10.0)
         if "displacement_seed" in reasons:
             score += 25.0 + min(30.0, displacement_ratio * 10.0)
+        if "extreme_rotation_delta" in reasons:
+            rotation_ratio = float(metrics.get("rotation_delta_ratio", 0.0) or 0.0)
+            score += 30.0 + min(35.0, rotation_ratio * 10.0)
         return score
 
     def build_seed_runs(self, seeds: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -825,6 +857,14 @@ class SkeletonQualityScoreCheck(BaseCheck):
         review_types = sorted(
             {kind for seed in seeds for kind in seed.get("review_type", ["temporal_geometry_review"])}
         )
+        window_sources = {
+            seed.get("window_source", "skeleton_quality_temporal_run")
+            for seed in seeds
+        }
+        manual_review = any(bool(seed.get("needs_manual_review")) for seed in seeds)
+        sam3_eligible = not any(
+            seed.get("sam3_containment_eligible") is False for seed in seeds
+        )
         priority_score = float(peak["priority_score"])
         seed_run_frames = len({int(seed["frame_idx"]) for seed in seeds})
         seed_run_length = int(window.get("seed_run_end", peak["frame_idx"])) - int(
@@ -850,7 +890,11 @@ class SkeletonQualityScoreCheck(BaseCheck):
             "review_type": review_types or ["temporal_geometry_review"],
             "priority": priority,
             "priority_score": priority_score,
-            "window_source": "skeleton_quality_temporal_run",
+            "window_source": "skeleton_rotation_extreme"
+            if "skeleton_rotation_extreme" in window_sources
+            else "skeleton_quality_temporal_run",
+            "needs_manual_review": manual_review,
+            "sam3_containment_eligible": sam3_eligible,
             "trigger_metrics": peak["trigger_metrics"],
         }
 

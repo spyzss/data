@@ -684,6 +684,28 @@ def test_skeleton_candidate_windows_use_strict_temporal_seed_runs() -> None:
     assert "multi_signal_seed" in multi_signal_windows[0]["trigger_reason"]
 
 
+def test_skeleton_extreme_rotation_candidate_routes_to_manual_review() -> None:
+    clip = ClipInputs(episode_idx=12, frame_indices=list(range(40)))
+    check = _candidate_check(rotation_delta_extreme_review_threshold=0.49)
+
+    rotation_rows = [
+        _skeleton_candidate_result(frame_idx, ["rotation_delta_max"], flag=True)
+        for frame_idx in [5, 6, 7]
+    ]
+    windows = check.build_candidate_windows(clip, rotation_rows)
+
+    assert len(windows) == 1
+    window = windows[0]
+    assert window["seed_run_start"] == 5
+    assert window["seed_run_end"] == 7
+    assert window["review_type"] == ["rotation_manual_review"]
+    assert window["window_source"] == "skeleton_rotation_extreme"
+    assert window["needs_manual_review"] is True
+    assert window["sam3_containment_eligible"] is False
+    assert "extreme_rotation_delta" in window["trigger_reason"]
+    assert window["trigger_metrics"]["rotation_delta_max"] == 0.5
+
+
 def test_skeleton_candidate_seed_runs_before_context_expansion() -> None:
     clip = ClipInputs(episode_idx=12, frame_indices=list(range(40)))
     check = _candidate_check()

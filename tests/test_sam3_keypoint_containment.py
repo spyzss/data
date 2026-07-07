@@ -277,6 +277,51 @@ def test_window_aggregation_all_strong_frames_fail() -> None:
     assert summary["window_containment_verdict"] == "containment_fail"
 
 
+def test_rotation_manual_review_window_does_not_hard_fail() -> None:
+    rows = classify_containment_rows(
+        [
+            {
+                **_frame_row(0.0, frame_idx=1),
+                "source_review_type": ["rotation_manual_review"],
+                "source_needs_manual_review": True,
+                "source_sam3_containment_eligible": False,
+            },
+            {
+                **_frame_row(0.1, frame_idx=2),
+                "source_review_type": ["rotation_manual_review"],
+                "source_needs_manual_review": True,
+                "source_sam3_containment_eligible": False,
+            },
+            {
+                **_frame_row(0.0, frame_idx=3),
+                "source_review_type": ["rotation_manual_review"],
+                "source_needs_manual_review": True,
+                "source_sam3_containment_eligible": False,
+            },
+            {
+                **_frame_row(0.1, frame_idx=4),
+                "source_review_type": ["rotation_manual_review"],
+                "source_needs_manual_review": True,
+                "source_sam3_containment_eligible": False,
+            },
+            {
+                **_frame_row(0.0, frame_idx=5),
+                "source_review_type": ["rotation_manual_review"],
+                "source_needs_manual_review": True,
+                "source_sam3_containment_eligible": False,
+            },
+        ]
+    )
+
+    summary = aggregate_window_containment_summaries(rows)[0]
+
+    assert summary["strong_fail_frame_count"] == 5
+    assert summary["source_review_type"] == ["rotation_manual_review"]
+    assert summary["source_sam3_containment_eligible"] is False
+    assert summary["window_containment_verdict"] == "rotation_manual_review"
+    assert "extreme rotation makes SAM3 containment unreliable" in summary["reason"]
+
+
 def test_window_aggregation_three_strong_frames_fail() -> None:
     rows = classify_containment_rows(
         [
