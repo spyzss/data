@@ -249,15 +249,14 @@ def test_video_review_html_supports_multi_segment_labeling() -> None:
 
     html = build_review_index_video_html(rows)
 
-    assert "Add affected segment" in html
-    assert "Confirm whole candidate window affected" in html
-    assert "Mark whole candidate window false positive" in html
-    assert "Mark whole candidate window acceptable" in html
-    assert "Defer / needs SAM3 or second review" in html
+    assert "Accept whole window" in html
+    assert "Add rejected segment" in html
+    assert "Defer / needs second check" in html
+    assert "accept_reason" in html
+    assert "defer_reason" in html
     assert "Delete segment" in html
     assert "affected_start_frame" in html
     assert "affected_end_frame" in html
-    assert "acceptance_status" in html
     assert "Set start = current overlay frame" in html
     assert "Set end = current overlay frame" in html
     assert "currentOverlayFrame" in html
@@ -323,19 +322,32 @@ def test_video_review_html_wraps_carousel_and_supports_frame_jump() -> None:
 def test_video_review_html_action_semantics_clear_or_fill_affected_frames() -> None:
     html = build_review_index_video_html([])
 
-    assert "markWholeWindowFalsePositive" in html
+    assert "function acceptWholeWindow" in html
     assert "manual_outcome:'false_positive'" in html
-    assert "affected_start_frame:'',affected_end_frame:''" in html
-    assert "markWholeWindowAcceptable" in html
     assert "manual_outcome:'acceptable_flagged'" in html
-    assert "failure_mode:'acceptable_minor_misalignment'" in html
-    assert "confirmWholeWindowAffected" in html
-    assert "affected_start_frame:row.window_start_frame,affected_end_frame:row.window_end_frame" in html
+    assert "affected_start_frame:'',affected_end_frame:''" in html
+    assert "acceptance_status:'accepted'" in html
+    assert "severity:'low'" in html
+    assert "confidence:'medium'" in html
+    assert "function addRejectedSegment" in html
     assert "manual_outcome:'true_positive'" in html
     assert "acceptance_status:'rejected'" in html
-    assert "markWholeWindowNeedsReview" in html
+    assert "severity:'high'" in html
+    assert "function deferWholeWindow" in html
     assert "manual_outcome:'review'" in html
     assert "acceptance_status:'review'" in html
+    assert "severity:'medium'" in html
+    assert "confidence:'low'" in html
+
+
+def test_video_review_normal_ui_hides_derived_schema_dropdowns() -> None:
+    html = build_review_index_video_html([])
+
+    assert "manual_outcome<select" not in html
+    assert "acceptance_status<select" not in html
+    assert "severity<select" not in html
+    assert "confidence<select" not in html
+    assert '"partial"' not in html
 
 
 def test_video_review_html_contains_labeling_help_and_sam3_clarification() -> None:
@@ -470,11 +482,9 @@ def test_video_review_default_dropdowns_hide_unrelated_failure_modes() -> None:
     for visible in [
         '"severe_keypoint_offset"',
         '"visual_skeleton_presence_mismatch"',
-        '"skeleton_pose_hallucination"',
+        '"implausible_skeleton_pose"',
         '"hand_out_of_frame"',
-        '"side_view_mask_undersegmentation"',
-        '"projection_review"',
-        '"acceptable_minor_misalignment"',
+        '"projection_ambiguous"',
         '"unknown"',
     ]:
         assert visible in html
@@ -488,13 +498,12 @@ def test_video_review_default_manual_outcomes_hide_false_negative_and_show_help(
         '"true_positive"',
         '"false_positive"',
         '"acceptable_flagged"',
-        '"partial"',
         '"review"',
     ]:
         assert visible in html
 
-    assert "true_positive = script flag is correct; real issue confirmed." in html
-    assert "partial = only some frames inside candidate window are affected." in html
+    assert "Add rejected segment = true_positive, rejected, high severity, medium confidence." in html
+    assert "Partial bad windows are represented by adding one rejected segment per affected range." in html
     assert "failure_mode options are limited to HDF5 skeleton projection review." in html
     assert "severe_keypoint_offset = projected skeleton/keypoints are clearly far from the hand." in html
 
