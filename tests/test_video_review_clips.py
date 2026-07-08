@@ -253,13 +253,14 @@ def test_video_review_html_supports_multi_segment_labeling() -> None:
     assert "Confirm whole candidate window affected" in html
     assert "Mark whole candidate window false positive" in html
     assert "Mark whole candidate window acceptable" in html
-    assert "Mark whole candidate window needs review" in html
+    assert "Defer / needs SAM3 or second review" in html
     assert "Delete segment" in html
     assert "affected_start_frame" in html
     assert "affected_end_frame" in html
     assert "acceptance_status" in html
-    assert "Set segment start from current video frame" in html
-    assert "Set segment end from current video frame" in html
+    assert "Set start = current overlay frame" in html
+    assert "Set end = current overlay frame" in html
+    assert "currentOverlayFrame" in html
     assert "currentVideoFrame" in html
     assert "segmentsByReviewId" in html
     assert "flatMap" in html
@@ -271,6 +272,59 @@ def test_video_review_html_supports_multi_segment_labeling() -> None:
     assert "candidate window start/end" in html
     assert "ArrowLeft" in html
     assert "event.shiftKey ? 10 : 1" in html
+
+
+def test_video_review_html_validates_segment_ranges_and_blocks_invalid_export() -> None:
+    html = build_review_index_video_html(
+        [
+            {
+                "review_id": "rq_001",
+                "supplier_id": "supplier_a",
+                "asset_id": "100030",
+                "window_start_frame": 10,
+                "window_end_frame": 20,
+                "frame_count": 50,
+                "display_clip_path": "",
+                "clip_error": "missing",
+            }
+        ]
+    )
+
+    assert "function validateSegment" in html
+    assert "startFrame < windowStart" in html
+    assert "endFrame > windowEnd" in html
+    assert "startFrame > endFrame" in html
+    assert "segment-invalid" in html
+    assert "validateAllSegments()" in html
+    assert "Cannot export manual_labels.csv" in html
+
+
+def test_video_review_html_action_semantics_clear_or_fill_affected_frames() -> None:
+    html = build_review_index_video_html([])
+
+    assert "markWholeWindowFalsePositive" in html
+    assert "manual_outcome:'false_positive'" in html
+    assert "affected_start_frame:'',affected_end_frame:''" in html
+    assert "markWholeWindowAcceptable" in html
+    assert "manual_outcome:'acceptable_flagged'" in html
+    assert "failure_mode:'acceptable_minor_misalignment'" in html
+    assert "confirmWholeWindowAffected" in html
+    assert "affected_start_frame:row.window_start_frame,affected_end_frame:row.window_end_frame" in html
+    assert "manual_outcome:'true_positive'" in html
+    assert "acceptance_status:'rejected'" in html
+    assert "markWholeWindowNeedsReview" in html
+    assert "manual_outcome:'review'" in html
+    assert "acceptance_status:'review'" in html
+
+
+def test_video_review_html_contains_labeling_help_and_sam3_clarification() -> None:
+    html = build_review_index_video_html([])
+
+    assert "False positive = script flagged this window but human confirms there is no real issue." in html
+    assert "Acceptable = flagged phenomenon exists but should not reduce usable duration." in html
+    assert "Defer = cannot decide from current overlay; needs SAM3, stride=1, video_quality, or second reviewer." in html
+    assert "This page shows HDF5 skeleton projection overlay only." in html
+    assert "SAM3 mask containment has not been run unless a SAM3 containment input was provided upstream." in html
 
 
 def test_video_review_html_autosaves_and_loads_saved_progress() -> None:
