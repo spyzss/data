@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import h5py
 
+import acceptance_pull.video_quality as video_quality
 from acceptance_pull.video_quality import (
     AlignmentMode,
     HandRoiMetrics,
@@ -32,7 +33,7 @@ def textured_frame(offset: int, width: int = 1280, height: int = 720) -> np.ndar
 def test_default_video_quality_config() -> None:
     config = load_video_quality_config(None)
 
-    assert config.threshold_version == "video_prefilter_v0.2.9"
+    assert config.threshold_version == "video_prefilter_v0.3.0"
     assert config.pipeline.stop_before_mask_if_fail is True
     assert config.pipeline.run_hand_roi is False
     assert config.pipeline.do_keypoint_quality_check is False
@@ -67,6 +68,11 @@ def test_default_video_quality_config() -> None:
     assert config.freeze.frozen_frame_ratio_pass == 0.05
     assert config.freeze.frozen_frame_ratio_warn == 0.10
     assert config.freeze.min_interval_frames == 6
+    assert config.freeze.min_interval_duration_ms == 100
+    assert config.freeze.ssim_min == 0.995
+    assert config.freeze.phash_hamming_max == 4
+    assert config.freeze.motion_conflict_enabled is True
+    assert config.freeze.critical_window_enabled is True
     assert config.freeze.max_consecutive_frozen_sec_fail == 1.0
     assert config.defects.max_duration_ratio_fail == 0.10
     assert config.defects.duration_ratio_warn == 0.05
@@ -200,8 +206,101 @@ def test_analyze_video_records_frozen_intervals_over_five_frames(tmp_path: Path)
     assert metrics.frozen_intervals[0].start_time_sec == 0.0
     assert metrics.frozen_intervals[0].end_time_sec == 0.7
     assert metrics.frozen_intervals[0].duration_sec == 0.7
+    assert metrics.frozen_intervals[0].duration_ms == 700.0
+    assert metrics.frozen_intervals[0].mean_ssim >= 0.995
+    assert metrics.frozen_intervals[0].max_phash_hamming <= 4
+    assert metrics.frozen_intervals[0].motion_conflict is False
+    assert metrics.frozen_intervals[0].critical_window is False
     assert metrics.frozen_intervals[1].start_frame == 12
     assert metrics.frozen_intervals[1].end_frame == 17
+
+
+def test_timeline_metrics_prefers_ffprobe_pts_and_estimates_missing_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = load_video_quality_config(None)
+
+    monkeypatch.setattr(
+        video_quality,
+        "_read_frame_timestamps_ffprobe",
+        lambda _path: video_quality.FrameTimestamps(
+            timestamps_ms=(0.0, 33.333, 66.666, 166.666),
+            source="ffprobe",
+            reliable=True,
+        ),
+    )
+
+    timeline = video_quality._timeline_metrics(Path("missing.mp4"), frame_count=5, fps=30.0, config=config.timeline)
+
+    assert timeline["drop_detection_source"] == "ffprobe"
+    assert timeline["drop_detection_reliable"] is True
+    assert timeline["estimated_missing_frames"] == 2
+    assert timeline["drop_frame_ratio"] == pytest.approx(2 / 7)
+
+
+def test_timeline_metrics_marks_opencv_fallback_unreliable(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = load_video_quality_config(None)
+
+    monkeypatch.setattr(video_quality, "_read_frame_timestamps_ffprobe", lambda _path: None)
+    monkeypatch.setattr(video_quality, "_read_frame_timestamps_pyav", lambda _path: None)
+    monkeypatch.setattr(
+        video_quality,
+        "_read_frame_timestamps_opencv",
+        lambda _path, _frame_count: video_quality.FrameTimestamps(
+            timestamps_ms=(0.0, 33.333, 66.666),
+            source="opencv",
+            reliable=False,
+        ),
+    )
+
+    timeline = video_quality._timeline_metrics(Path("missing.mp4"), frame_count=3, fps=30.0, config=config.timeline)
+
+    assert timeline["drop_detection_source"] == "opencv"
+    assert timeline["drop_detection_reliable"] is False
+    assert timeline["estimated_missing_frames"] == 0
+    assert timeline["drop_frame_ratio"] == 0.0
+
+
+def test_freeze_with_hdf5_keypoint_motion_conflict_fails(tmp_path: Path) -> None:
+    batch = tmp_path
+    video_dir = batch / "video"
+    video_dir.mkdir()
+    video = video_dir / "408817_video.mp4"
+    write_test_video(video, [solid_frame(120) for _ in range(8)], fps=10.0)
+    hdf5_path = batch / "hdf5" / "408817_hdf5.hdf5"
+    hdf5_path.parent.mkdir()
+    base = np.full((2, 21, 2), 0.45, dtype=np.float32)
+    keypoints = np.stack([base + np.array([frame_index * 0.02, 0.0], dtype=np.float32) for frame_index in range(8)])
+    with h5py.File(hdf5_path, "w") as handle:
+        label = handle.create_group("label")
+        label.create_dataset("quality_hand", data=keypoints)
+
+    config = load_video_quality_config(None)
+    metrics = analyze_video(video, config, hdf5_path=hdf5_path)
+    evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
+
+    assert metrics.frozen_intervals
+    assert any(interval.motion_conflict for interval in metrics.frozen_intervals)
+    assert "freeze_with_motion_conflict" in evaluation.reasons
+
+
+def test_freeze_in_hdf5_critical_window_fails(tmp_path: Path) -> None:
+    batch = tmp_path
+    video_dir = batch / "video"
+    video_dir.mkdir()
+    video = video_dir / "408817_video.mp4"
+    write_test_video(video, [solid_frame(120) for _ in range(8)], fps=10.0)
+    hdf5_path = batch / "hdf5" / "408817_hdf5.hdf5"
+    hdf5_path.parent.mkdir()
+    write_hand_keypoint_hdf5(hdf5_path, frame_count=8, normalized=True)
+    with h5py.File(hdf5_path, "a") as handle:
+        handle.attrs["task"] = "grasp the cube and place it on the tray"
+
+    config = load_video_quality_config(None)
+    metrics = analyze_video(video, config, hdf5_path=hdf5_path)
+    evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
+
+    assert metrics.frozen_intervals
+    assert any(interval.critical_window for interval in metrics.frozen_intervals)
+    assert "frozen_interval_in_critical_window" in evaluation.reasons
 
 
 def test_evaluate_video_quality_passes_good_metrics(tmp_path: Path) -> None:
@@ -808,7 +907,17 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     assert report["video_quality"]["metrics"]["freeze_metrics"]["frozen_intervals"] == []
     assert report["video_quality"]["metrics"]["freeze_metrics"]["frozen_interval_count"] == 0
     assert report["video_quality"]["metrics"]["freeze_metrics"]["frozen_interval_frame_count"] == 0
-    assert "timeline_metrics" in report["video_quality"]["metrics"]
+    timeline_metrics = report["video_quality"]["metrics"]["timeline_metrics"]
+    assert timeline_metrics["drop_detection_source"] in {"ffprobe", "pyav", "opencv", "synthetic"}
+    assert isinstance(timeline_metrics["drop_detection_reliable"], bool)
+    assert timeline_metrics["estimated_missing_frames"] == 0
+    assert timeline_metrics["observed_frame_interval_count"] >= 0
+    freeze_metrics = report["video_quality"]["metrics"]["freeze_metrics"]
+    assert freeze_metrics["frozen_interval_min_duration_ms"] == 100.0
+    assert freeze_metrics["frozen_interval_motion_conflict_count"] == 0
+    assert freeze_metrics["frozen_interval_critical_window_count"] == 0
+    assert freeze_metrics["ssim_min"] == 0.995
+    assert freeze_metrics["phash_hamming_max"] == 4
     assert "hand_roi_metrics" in report["video_quality"]["metrics"]
     assert report["video_quality"]["metrics"]["hand_roi_metrics"] is None
     assert report["reference_quality"]["mode"] == "none"

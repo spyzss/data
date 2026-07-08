@@ -210,7 +210,7 @@ quality_archive/408817.json  -> asset_id = 408817
 ```json
 {
   "stage": "video_prefilter",
-  "threshold_version": "video_prefilter_v0.2.9",
+  "threshold_version": "video_prefilter_v0.3.0",
   "evaluation": {
     "decision": "pass",
     "passed": true,
@@ -247,6 +247,10 @@ quality_archive/408817.json  -> asset_id = 408817
     "timeline_metrics": {
       "pts_monotonic_valid": true,
       "drop_frame_ratio": 0.0,
+      "drop_detection_source": "ffprobe",
+      "drop_detection_reliable": true,
+      "estimated_missing_frames": 0,
+      "observed_frame_interval_count": 912,
       "frame_interval_p99_ms": 35.1,
       "max_frame_gap_ms": 38.4
     },
@@ -272,9 +276,14 @@ quality_archive/408817.json  -> asset_id = 408817
       "frozen_frame_ratio": 0.0,
       "max_consecutive_frozen_sec": 0.0,
       "frozen_interval_min_frames": 6,
+      "frozen_interval_min_duration_ms": 100.0,
       "frozen_interval_count": 0,
       "frozen_interval_frame_count": 0,
       "frozen_interval_duration_sec": 0.0,
+      "frozen_interval_motion_conflict_count": 0,
+      "frozen_interval_critical_window_count": 0,
+      "ssim_min": 0.995,
+      "phash_hamming_max": 4,
       "frozen_intervals": []
     },
     "defect_metrics": {
@@ -294,7 +303,7 @@ quality_archive/408817.json  -> asset_id = 408817
     "hand_roi_metrics": null
   },
   "thresholds": {
-    "threshold_version": "video_prefilter_v0.2.9",
+    "threshold_version": "video_prefilter_v0.3.0",
     "fps": {
       "expected_fps": null,
       "min_fps_pass": 24,
@@ -336,7 +345,12 @@ quality_archive/408817.json  -> asset_id = 408817
     "freeze": {
       "frozen_frame_ratio_pass": 0.05,
       "frozen_frame_ratio_warn": 0.10,
-      "min_interval_frames": 6
+      "min_interval_frames": 6,
+      "min_interval_duration_ms": 100.0,
+      "ssim_min": 0.995,
+      "phash_hamming_max": 4,
+      "motion_conflict_enabled": true,
+      "critical_window_enabled": true
     },
     "defects": {
       "max_duration_ratio_fail": 0.10,
@@ -357,9 +371,9 @@ quality_archive/408817.json  -> asset_id = 408817
 | `hdf5_keypoints_bbox` | 从 HDF5 关键点数组生成粗 hand ROI bbox。 |
 | `hdf5_transform_keypoints_bbox` | 从 `transforms/*` 下手部、手指、拇指相关 4x4 矩阵取平移点，并使用 `camera/intrinsic` 投影后生成粗 hand ROI bbox。 |
 
-`video_prefilter_v0.2.9` 面向机器人预训练预筛，默认认为后续视频可能下采样到 448x256 一类低分辨率，因此清晰度指标主要用于发现风险，不追求高清画质硬筛。hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近整段过暗/过曝、冻帧/丢帧，以及所有瑕疵时长合计超过 10%。如果启用 `hand_roi.mode: warn_except_severe_fail`，ROI Laplacian / Tenengrad 低于 pass 线只写入 `warn_reasons`；只有 `hand_roi_severe_blur` 或 `hand_roi_blur_bad_frame_ratio_above_max` 才会把视频预筛判成 `fail`。
+`video_prefilter_v0.3.0` 面向机器人预训练预筛，默认认为后续视频可能下采样到 448x256 一类低分辨率，因此清晰度指标主要用于发现风险，不追求高清画质硬筛。hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近整段过暗/过曝、冻帧/丢帧，以及所有瑕疵时长合计超过 10%。掉帧检测优先使用 `ffprobe` 每帧真实 PTS，其次 PyAV；OpenCV `CAP_PROP_POS_MSEC` 只作为 fallback，且 `drop_detection_reliable` 必须写为 `false`。`drop_frame_ratio` 使用 `estimated_missing_frames / (video_frame_count + estimated_missing_frames)`，不再使用异常间隔次数比例。如果启用 `hand_roi.mode: warn_except_severe_fail`，ROI Laplacian / Tenengrad 低于 pass 线只写入 `warn_reasons`；只有 `hand_roi_severe_blur` 或 `hand_roi_blur_bad_frame_ratio_above_max` 才会把视频预筛判成 `fail`。
 
-`freeze_metrics.frozen_intervals` 记录连续冻帧区间，默认只记录 `frame_count >= 6` 的片段，即超过 5 帧。每个区间字段如下：
+`freeze_metrics.frozen_intervals` 记录连续冻帧区间，默认只记录同时满足 `frame_count >= 6` 和 `duration_ms >= 100` 的片段。冻帧判定保留 `mean(absdiff)+hist_diff`，并增加 SSIM/pHash 作为近重复辅助指标。每个区间字段如下：
 
 | field | 含义 |
 |---|---|
@@ -369,6 +383,15 @@ quality_archive/408817.json  -> asset_id = 408817
 | `start_time_sec` | 起始秒数，等于 `start_frame / fps`。 |
 | `end_time_sec` | 右开结束秒数，等于 `(end_frame + 1) / fps`，适合后续裁切。 |
 | `duration_sec` | 区间时长，等于 `frame_count / fps`。 |
+| `duration_ms` | 区间时长毫秒值，用于阈值判断和裁切显示。 |
+| `mean_frame_diff` / `max_frame_diff` | 区间内相邻帧灰度 `mean(absdiff)` 统计。 |
+| `mean_hist_diff` / `max_hist_diff` | 区间内相邻帧灰度直方图 chi-square 差异统计。 |
+| `mean_ssim` / `min_ssim` | 区间内相邻帧 SSIM 统计。 |
+| `mean_phash_hamming` / `max_phash_hamming` | 区间内相邻帧 pHash Hamming 距离统计。 |
+| `motion_conflict` | 是否出现视频近重复但 HDF5 hand keypoints / action / cam_pose / 4x4 transform 仍明显变化。 |
+| `motion_conflict_signals` | 触发跨模态冲突的 HDF5 信号列表。 |
+| `critical_window` | HDF5 文本是否表明该样本包含 grasp / place / contact / hand-object interaction 等关键窗口。 |
+| `critical_keywords` | 命中的关键窗口关键词。 |
 
 `video_quality.evaluation.decision` 与 `qc_summary.status` 同步，取值为 `pass | warn | fail`。`should_run_mask_qc` 是 pipeline 调度 flag，规则固定为：
 
@@ -399,6 +422,8 @@ should_run_mask_qc = decision != "fail"
 | `black_frame_count_above_max` | 估算黑帧数超过 10 帧。 |
 | `frozen_frame_ratio_above_max` | 冻帧率高于 hard fail 阈值，默认 10%。 |
 | `max_consecutive_frozen_sec_above_max` | 连续冻结时长超过阈值。 |
+| `freeze_with_motion_conflict` | 视频画面近重复，但 HDF5 hand keypoints / action / cam_pose / 4x4 transform 显示状态仍明显变化。 |
+| `frozen_interval_in_critical_window` | 冻帧区间发生在 grasp / place / contact / hand-object interaction 等关键窗口。 |
 | `defect_duration_ratio_above_max` | 曝光/黑帧类、冻帧、丢帧合计瑕疵时长比例超过 10%。 |
 | `hdf5_frame_count_mismatch` | HDF5 帧数与视频帧数不一致。 |
 | `hdf5_missing` | HDF5 缺失，且配置要求失败。 |

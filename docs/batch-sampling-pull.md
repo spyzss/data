@@ -102,7 +102,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 可选使用 YAML 覆盖阈值：
 
 ```yaml
-threshold_version: video_prefilter_v0.2.9
+threshold_version: video_prefilter_v0.3.0
 decode:
   max_sample_frames: 300
 hdf5_alignment:
@@ -137,6 +137,11 @@ freeze:
   frozen_frame_ratio_pass: 0.05
   frozen_frame_ratio_warn: 0.10
   min_interval_frames: 6
+  min_interval_duration_ms: 100
+  ssim_min: 0.995
+  phash_hamming_max: 4
+  motion_conflict_enabled: true
+  critical_window_enabled: true
 defects:
   max_duration_ratio_fail: 0.10
   duration_ratio_warn: 0.05
@@ -157,4 +162,4 @@ sampled/XJGT_20260616/
 
 `quality_archive/<asset_id>.json` 是单条数据的全流程 QC 档案，和 `hdf5/`、`video/` 同级，格式见 `docs/asset-qc-json-format.md`。上游建档模块应在拉取完成后先创建这个文件；视频质量检测后续只更新其中的 `video_quality`、`hdf5_text_info`、`reference_quality` 等 block。后续批次 summary、表格或完整报告都可以直接从这些 `<asset_id>.json` 聚合生成。
 
-当前视频模块是 `video_prefilter_v0.2.9` 低成本预筛，不使用 VMAF、CAMBI 或标准对照视频；它只计算基础可用性、fps、分辨率、时间轴连续性、抽样解码、黑帧/过暗/过曝、全帧清晰度、冻结帧、丢帧、HDF5 帧数对齐、瑕疵时长合计比例，以及连续冻帧区间。默认不再运行 hand ROI，因为粗 bbox 对预筛 gating 噪声较大。该版本按机器人预训练场景放宽清晰度硬筛：视频后续可能下采样到低分辨率，因此清晰度主要用于 warn，hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近全段过暗/过曝、冻帧/丢帧，以及所有瑕疵时长合计超过 10%。输出 JSON 里必须保存 `decision: pass|warn|fail` 和 `should_run_mask_qc`：只有 `decision == "fail"` 时后续 mask / 骨骼点比对 / 语义一致性等高成本 QC 才应跳过。`freeze_metrics.frozen_intervals` 默认记录连续冻帧 `frame_count >= 6` 的区间，供后续人工复核或裁切使用。
+当前视频模块是 `video_prefilter_v0.3.0` 低成本预筛，不使用 VMAF、CAMBI 或标准对照视频；它只计算基础可用性、fps、分辨率、时间轴连续性、抽样解码、黑帧/过暗/过曝、全帧清晰度、冻结帧、丢帧、HDF5 帧数对齐、瑕疵时长合计比例，以及连续冻帧区间。掉帧检测优先使用 `ffprobe` 每帧真实 PTS，其次 PyAV；OpenCV `CAP_PROP_POS_MSEC` 只作为 fallback，且写入 `drop_detection_reliable: false`。`drop_frame_ratio` 按 `estimated_missing_frames` 估算，不再按异常间隔次数计数。冻结帧检测保留 `mean(absdiff)+hist_diff`，并增加 SSIM/pHash 作为近重复辅助指标；`freeze_metrics.frozen_intervals` 默认只记录同时满足 `frame_count >= 6` 和 `duration_ms >= 100` 的区间。若视频近重复但 HDF5 hand keypoints / action / cam_pose / 4x4 transform 有明显变化，则写入 `freeze_with_motion_conflict`；若冻帧发生在 grasp / place / contact / hand-object interaction 关键窗口，则从严 hard fail。默认不再运行 hand ROI，因为粗 bbox 对预筛 gating 噪声较大。该版本按机器人预训练场景放宽清晰度硬筛：视频后续可能下采样到低分辨率，因此清晰度主要用于 warn，hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近全段过暗/过曝、冻帧/丢帧，以及所有瑕疵时长合计超过 10%。输出 JSON 里必须保存 `decision: pass|warn|fail` 和 `should_run_mask_qc`：只有 `decision == "fail"` 时后续 mask / 骨骼点比对 / 语义一致性等高成本 QC 才应跳过。
