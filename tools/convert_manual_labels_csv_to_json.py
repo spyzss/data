@@ -25,6 +25,13 @@ from tools.build_manual_review_queue import (  # noqa: E402
 
 
 OPTIONAL_AUTO_EVIDENCE_COLUMNS = {"severity_suggestion", "key_metrics_json", "reason"}
+OPTIONAL_SEGMENT_COLUMNS = {
+    "segment_id",
+    "affected_start_frame",
+    "affected_end_frame",
+    "acceptance_status",
+}
+ACCEPTANCE_STATUS_ENUM = ["accepted", "rejected", "review"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +72,7 @@ def convert_csv_to_patch_records(
     default_reviewer: str = "",
 ) -> list[dict[str, Any]]:
     df = pd.read_csv(path)
+    original_columns = set(df.columns)
     df = df.where(pd.notna(df), "")
     required_columns = [
         column for column in MANUAL_TEMPLATE_COLUMNS if column not in OPTIONAL_AUTO_EVIDENCE_COLUMNS
@@ -75,6 +83,12 @@ def convert_csv_to_patch_records(
     for column in OPTIONAL_AUTO_EVIDENCE_COLUMNS:
         if column not in df.columns:
             df[column] = ""
+    for column in OPTIONAL_SEGMENT_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+    has_segment_frame_columns = bool(
+        {"affected_start_frame", "affected_end_frame"} & original_columns
+    )
 
     records: list[dict[str, Any]] = []
     for row_index, row in enumerate(df.to_dict(orient="records"), start=2):
@@ -84,21 +98,40 @@ def convert_csv_to_patch_records(
         failure_mode = clean(row.get("failure_mode"))
         severity = clean(row.get("severity"))
         confidence = clean(row.get("confidence"))
+        acceptance_status = clean(row.get("acceptance_status"))
         validate_enum("manual_outcome", manual_outcome, MANUAL_OUTCOME_ENUM, row_index)
         validate_enum("failure_mode", failure_mode, FAILURE_MODE_ENUM, row_index)
         validate_enum("severity", severity, SEVERITY_ENUM, row_index)
         validate_enum("confidence", confidence, CONFIDENCE_ENUM, row_index)
+        if acceptance_status:
+            validate_enum(
+                "acceptance_status",
+                acceptance_status,
+                ACCEPTANCE_STATUS_ENUM,
+                row_index,
+            )
 
-        start = int_or_none(row.get("window_start_frame"))
-        end = int_or_none(row.get("window_end_frame"))
+        window_start = int_or_none(row.get("window_start_frame"))
+        window_end = int_or_none(row.get("window_end_frame"))
+        affected_start = int_or_none(row.get("affected_start_frame"))
+        affected_end = int_or_none(row.get("affected_end_frame"))
+        if has_segment_frame_columns:
+            start = affected_start
+            end = affected_end
+        else:
+            start = window_start
+            end = window_end
         record = {
             "review_id": clean(row.get("review_id")),
+            "segment_id": clean(row.get("segment_id")),
             "supplier_id": clean(row.get("supplier_id")),
             "asset_id": clean(row.get("asset_id")),
             "start": start,
             "end": end,
-            "window_start_frame": start,
-            "window_end_frame": end,
+            "window_start_frame": window_start,
+            "window_end_frame": window_end,
+            "affected_start_frame": affected_start,
+            "affected_end_frame": affected_end,
             "representative_frame": int_or_none(row.get("representative_frame")),
             "label": label_from_manual_outcome(manual_outcome),
             "algorithm_outcome": manual_outcome,
@@ -111,6 +144,7 @@ def convert_csv_to_patch_records(
             "failure_mode": failure_mode,
             "severity": severity,
             "confidence": confidence,
+            "acceptance_status": acceptance_status,
             "comment": clean(row.get("comment")),
             "reviewer": clean(row.get("reviewer")) or default_reviewer,
             "source": "manual_review_queue",

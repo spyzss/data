@@ -280,6 +280,227 @@ def test_convert_completed_manual_csv_to_patch_records(tmp_path: Path) -> None:
     assert record["reason"] == "side-view hand orientation makes SAM3 containment unreliable"
 
 
+def test_convert_manual_csv_preserves_multiple_segments_per_review_id(tmp_path: Path) -> None:
+    csv_path = tmp_path / "manual_labels.csv"
+    columns = [
+        "review_id",
+        "segment_id",
+        "supplier_id",
+        "asset_id",
+        "window_start_frame",
+        "window_end_frame",
+        "representative_frame",
+        "affected_start_frame",
+        "affected_end_frame",
+        "auto_verdict",
+        "suggested_issue_type",
+        "severity_suggestion",
+        "key_metrics_json",
+        "reason",
+        "manual_outcome",
+        "failure_mode",
+        "severity",
+        "confidence",
+        "acceptance_status",
+        "reviewer",
+        "comment",
+    ]
+    rows = [
+        {
+            "review_id": "rq_001",
+            "segment_id": "rq_001_seg_001",
+            "supplier_id": "supplier_a",
+            "asset_id": "100044",
+            "window_start_frame": 1,
+            "window_end_frame": 100,
+            "representative_frame": 50,
+            "affected_start_frame": 1,
+            "affected_end_frame": 10,
+            "auto_verdict": "review",
+            "suggested_issue_type": "side_view_mask_undersegmentation",
+            "severity_suggestion": "medium",
+            "key_metrics_json": "{}",
+            "reason": "large candidate window",
+            "manual_outcome": "partial",
+            "failure_mode": "side_view_mask_undersegmentation",
+            "severity": "medium",
+            "confidence": "high",
+            "acceptance_status": "rejected",
+            "reviewer": "nathan",
+            "comment": "first bad segment",
+        },
+        {
+            "review_id": "rq_001",
+            "segment_id": "rq_001_seg_002",
+            "supplier_id": "supplier_a",
+            "asset_id": "100044",
+            "window_start_frame": 1,
+            "window_end_frame": 100,
+            "representative_frame": 50,
+            "affected_start_frame": 25,
+            "affected_end_frame": 88,
+            "auto_verdict": "review",
+            "suggested_issue_type": "side_view_mask_undersegmentation",
+            "severity_suggestion": "medium",
+            "key_metrics_json": "{}",
+            "reason": "large candidate window",
+            "manual_outcome": "partial",
+            "failure_mode": "side_view_mask_undersegmentation",
+            "severity": "high",
+            "confidence": "medium",
+            "acceptance_status": "review",
+            "reviewer": "nathan",
+            "comment": "second bad segment",
+        },
+    ]
+    pd.DataFrame(rows, columns=columns).to_csv(csv_path, index=False)
+
+    records = convert_csv_to_patch_records(csv_path)
+
+    assert len(records) == 2
+    assert [record["review_id"] for record in records] == ["rq_001", "rq_001"]
+    assert [record["segment_id"] for record in records] == ["rq_001_seg_001", "rq_001_seg_002"]
+    assert records[0]["start"] == 1
+    assert records[0]["end"] == 10
+    assert records[0]["affected_start_frame"] == 1
+    assert records[0]["affected_end_frame"] == 10
+    assert records[0]["window_start_frame"] == 1
+    assert records[0]["window_end_frame"] == 100
+    assert records[0]["acceptance_status"] == "rejected"
+    assert records[1]["start"] == 25
+    assert records[1]["end"] == 88
+    assert records[1]["acceptance_status"] == "review"
+
+
+def test_convert_manual_csv_preserves_false_positive_without_affected_frames(
+    tmp_path: Path,
+) -> None:
+    csv_path = tmp_path / "manual_labels.csv"
+    columns = [
+        "review_id",
+        "segment_id",
+        "supplier_id",
+        "asset_id",
+        "window_start_frame",
+        "window_end_frame",
+        "representative_frame",
+        "affected_start_frame",
+        "affected_end_frame",
+        "auto_verdict",
+        "suggested_issue_type",
+        "severity_suggestion",
+        "key_metrics_json",
+        "reason",
+        "manual_outcome",
+        "failure_mode",
+        "severity",
+        "confidence",
+        "acceptance_status",
+        "reviewer",
+        "comment",
+    ]
+    row = {
+        "review_id": "rq_002",
+        "segment_id": "rq_002_false_positive",
+        "supplier_id": "supplier_a",
+        "asset_id": "100044",
+        "window_start_frame": 1,
+        "window_end_frame": 100,
+        "representative_frame": 50,
+        "affected_start_frame": "",
+        "affected_end_frame": "",
+        "auto_verdict": "review",
+        "suggested_issue_type": "side_view_mask_undersegmentation",
+        "severity_suggestion": "medium",
+        "key_metrics_json": "{}",
+        "reason": "large candidate window",
+        "manual_outcome": "false_positive",
+        "failure_mode": "acceptable_minor_misalignment",
+        "severity": "low",
+        "confidence": "high",
+        "acceptance_status": "accepted",
+        "reviewer": "nathan",
+        "comment": "not actually bad",
+    }
+    pd.DataFrame([row], columns=columns).to_csv(csv_path, index=False)
+
+    records = convert_csv_to_patch_records(csv_path)
+
+    assert len(records) == 1
+    assert records[0]["start"] is None
+    assert records[0]["end"] is None
+    assert records[0]["affected_start_frame"] is None
+    assert records[0]["affected_end_frame"] is None
+    assert records[0]["window_start_frame"] == 1
+    assert records[0]["window_end_frame"] == 100
+    assert records[0]["acceptance_status"] == "accepted"
+
+
+def test_convert_manual_csv_preserves_whole_window_affected_segment(
+    tmp_path: Path,
+) -> None:
+    csv_path = tmp_path / "manual_labels.csv"
+    columns = [
+        "review_id",
+        "segment_id",
+        "supplier_id",
+        "asset_id",
+        "window_start_frame",
+        "window_end_frame",
+        "representative_frame",
+        "affected_start_frame",
+        "affected_end_frame",
+        "auto_verdict",
+        "suggested_issue_type",
+        "severity_suggestion",
+        "key_metrics_json",
+        "reason",
+        "manual_outcome",
+        "failure_mode",
+        "severity",
+        "confidence",
+        "acceptance_status",
+        "reviewer",
+        "comment",
+    ]
+    row = {
+        "review_id": "rq_003",
+        "segment_id": "rq_003_seg_001",
+        "supplier_id": "supplier_a",
+        "asset_id": "100044",
+        "window_start_frame": 1,
+        "window_end_frame": 100,
+        "representative_frame": 50,
+        "affected_start_frame": 1,
+        "affected_end_frame": 100,
+        "auto_verdict": "review",
+        "suggested_issue_type": "side_view_mask_undersegmentation",
+        "severity_suggestion": "medium",
+        "key_metrics_json": "{}",
+        "reason": "large candidate window",
+        "manual_outcome": "true_positive",
+        "failure_mode": "side_view_mask_undersegmentation",
+        "severity": "high",
+        "confidence": "high",
+        "acceptance_status": "rejected",
+        "reviewer": "nathan",
+        "comment": "whole window is bad",
+    }
+    pd.DataFrame([row], columns=columns).to_csv(csv_path, index=False)
+
+    records = convert_csv_to_patch_records(csv_path)
+
+    assert len(records) == 1
+    assert records[0]["segment_id"] == "rq_003_seg_001"
+    assert records[0]["start"] == 1
+    assert records[0]["end"] == 100
+    assert records[0]["affected_start_frame"] == 1
+    assert records[0]["affected_end_frame"] == 100
+    assert records[0]["window_start_frame"] == 1
+    assert records[0]["window_end_frame"] == 100
+    assert records[0]["acceptance_status"] == "rejected"
+
+
 def test_review_queue_selection_caps_side_view_and_keeps_other_issue_types() -> None:
     assets = {
         "asset_side": {"supplier_id": "supplier_a", "asset_id": "asset_side"},
