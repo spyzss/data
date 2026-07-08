@@ -437,6 +437,68 @@ def test_video_review_html_uses_global_reviewer_without_per_segment_reviewer_inp
     assert "segmentFieldId(rowIndex,segmentIndex,'reviewer')" not in html
 
 
+def test_video_review_default_dropdowns_hide_unrelated_failure_modes() -> None:
+    html = build_review_index_video_html(
+        [
+            {
+                "review_id": "rq_overlay",
+                "supplier_id": "supplier_a",
+                "asset_id": "100030",
+                "window_start_frame": 1,
+                "window_end_frame": 10,
+                "suggested_issue_type": "projection_review",
+            }
+        ]
+    )
+
+    for hidden in [
+        '"video_blur"',
+        '"video_exposure"',
+        '"video_black_screen"',
+        '"video_stutter"',
+        '"hdf5_text_invalid"',
+        '"quality_hand_low"',
+        '"keypoint_raw_invalid"',
+        '"keypoint_low_quality_window"',
+        '"temporal_jump"',
+        '"strong_containment_mismatch"',
+        '"occlusion_or_mask_undersegmentation"',
+        '"semantic_mismatch"',
+    ]:
+        assert hidden not in html
+
+    for visible in [
+        '"severe_keypoint_offset"',
+        '"visual_skeleton_presence_mismatch"',
+        '"skeleton_pose_hallucination"',
+        '"hand_out_of_frame"',
+        '"side_view_mask_undersegmentation"',
+        '"projection_review"',
+        '"acceptable_minor_misalignment"',
+        '"unknown"',
+    ]:
+        assert visible in html
+
+
+def test_video_review_default_manual_outcomes_hide_false_negative_and_show_help() -> None:
+    html = build_review_index_video_html([])
+
+    assert '"false_negative"' not in html
+    for visible in [
+        '"true_positive"',
+        '"false_positive"',
+        '"acceptable_flagged"',
+        '"partial"',
+        '"review"',
+    ]:
+        assert visible in html
+
+    assert "true_positive = script flag is correct; real issue confirmed." in html
+    assert "partial = only some frames inside candidate window are affected." in html
+    assert "failure_mode options are limited to HDF5 skeleton projection review." in html
+    assert "severe_keypoint_offset = projected skeleton/keypoints are clearly far from the hand." in html
+
+
 def test_hand_joint_names_cover_left_and_right_acceptance_topology() -> None:
     assert len(HAND_JOINT_NAMES) == 42
     assert HAND_JOINT_NAMES[0] == "leftHand"

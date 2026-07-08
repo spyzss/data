@@ -44,6 +44,39 @@ DEFAULT_MAX_FRAMES_PER_WINDOW = 120
 DEFAULT_JPEG_QUALITY = 90
 ROUGH_STORAGE_BYTES_PER_FRAME = 200_000
 ACCEPTANCE_STATUS_ENUM = ["accepted", "rejected", "review"]
+OVERLAY_MANUAL_OUTCOME_ENUM = [
+    "true_positive",
+    "false_positive",
+    "acceptable_flagged",
+    "partial",
+    "review",
+]
+OVERLAY_FAILURE_MODE_ENUM = [
+    "severe_keypoint_offset",
+    "visual_skeleton_presence_mismatch",
+    "skeleton_pose_hallucination",
+    "hand_out_of_frame",
+    "side_view_mask_undersegmentation",
+    "projection_review",
+    "acceptable_minor_misalignment",
+    "unknown",
+]
+VIDEO_QUALITY_FAILURE_MODE_ENUM = [
+    "video_blur",
+    "video_exposure",
+    "video_black_screen",
+    "video_stutter",
+]
+SAM3_CONTAINMENT_FAILURE_MODE_ENUM = [
+    "strong_containment_mismatch",
+    "occlusion_or_mask_undersegmentation",
+]
+ASSET_LEVEL_FAILURE_MODE_ENUM = [
+    "hdf5_text_invalid",
+    "quality_hand_low",
+    "keypoint_raw_invalid",
+    "keypoint_low_quality_window",
+]
 HAND_JOINT_BASE_NAMES = [
     "Hand",
     "ThumbKnuckle",
@@ -723,15 +756,7 @@ def run_ffmpeg_clip(
 def build_review_index_video_html(rows: list[dict[str, Any]]) -> str:
     rows_json = json.dumps(json_safe(rows), ensure_ascii=False).replace("</", "<\\/")
     storage_key = build_storage_key(rows)
-    enum_json = json.dumps(
-        {
-            "manual_outcome": MANUAL_OUTCOME_ENUM,
-            "failure_mode": FAILURE_MODE_ENUM,
-            "severity": SEVERITY_ENUM,
-            "confidence": CONFIDENCE_ENUM,
-            "acceptance_status": ACCEPTANCE_STATUS_ENUM,
-        }
-    )
+    enum_json = json.dumps(build_review_ui_enums(rows))
     manual_columns_json = json.dumps(VIDEO_MANUAL_LABEL_COLUMNS)
     return (
         "<!doctype html>\n"
@@ -777,7 +802,7 @@ def build_review_index_video_html(rows: list[dict[str, Any]]) -> str:
         "document.addEventListener('keydown', handleKeydown);\n"
         "function nextSegmentId(row){const key=rowKey(row); const count=(segmentsByReviewId[key] || []).length + 1; return `${key}_seg_${String(count).padStart(3,'0')}`;}\n"
         "function makeSegment(row,overrides={}){return {segment_id:overrides.segment_id || nextSegmentId(row),affected_start_frame:overrides.affected_start_frame ?? '',affected_end_frame:overrides.affected_end_frame ?? '',manual_outcome:overrides.manual_outcome || 'partial',failure_mode:overrides.failure_mode || defaultFailureMode(row),severity:overrides.severity || defaultSeverity(row),confidence:overrides.confidence || 'medium',acceptance_status:overrides.acceptance_status || 'rejected',reviewer:overrides.reviewer || '',comment:overrides.comment || ''};}\n"
-        "function render(){const root=document.getElementById('root'); let html=''; REVIEW_ROWS.forEach((row,index)=>{const clip=row.display_clip_path && !row.clip_error ? `<video id=\"video-${index}\" class=\"video\" controls src=\"${escapeHtml(row.display_clip_path)}\"></video>` : `<div class=\"no-clip\">No clip${row.clip_error ? ': '+escapeHtml(row.clip_error) : ''}</div>`; html+=`<article class=\"item\" onclick=\"activeReviewIndex=${index}\"><div class=\"grid\"><div>${overlayViewerHtml(row,index)}${clip}</div><div><div class=\"meta\"><div><b>review_id</b>${escapeHtml(row.review_id)}</div><div><b>supplier_id</b>${escapeHtml(row.supplier_id)}</div><div><b>asset_id</b>${escapeHtml(row.asset_id)}</div><div><b>window</b>${escapeHtml(row.window_start_frame)}-${escapeHtml(row.window_end_frame)}</div><div><b>representative_frame</b>${escapeHtml(row.representative_frame)}</div><div><b>fps</b>${escapeHtml(row.fps)}</div><div><b>frame_stride</b>${escapeHtml(row.frame_stride)}</div><div><b>sampled_frame_count</b>${escapeHtml(row.sampled_frame_count)}</div><div><b>clip_start_time_sec</b>${escapeHtml(row.clip_start_time_sec)}</div><div><b>clip_duration_sec</b>${escapeHtml(row.clip_duration_sec)}</div></div><section class=\"auto\"><div class=\"title\">Auto result</div><div class=\"meta\"><div><b>suggested_issue_type</b>${escapeHtml(row.suggested_issue_type)}</div><div><b>auto_verdict</b>${escapeHtml(row.auto_verdict)}</div><div><b>severity_suggestion</b>${escapeHtml(row.severity_suggestion)}</div></div><div class=\"metrics\"><b>key_metrics_json</b>\\n${escapeHtml(row.key_metrics_json)}</div><div class=\"reason\"><b>reason</b>\\n${escapeHtml(row.reason)}</div></section><section class=\"human\"><div class=\"title\">Human affected segments</div><p class=\"empty\">Manual affected_start_frame/end_frame are original frame numbers, not sampled indexes. Use affected segments for rejected/review duration. Raw candidate windows are evidence only.</p><div class=\"help\">False positive = script flagged this window but human confirms there is no real issue.<br>Acceptable = flagged phenomenon exists but should not reduce usable duration.<br>Defer = cannot decide from current overlay; needs SAM3, stride=1, video_quality, or second reviewer.</div><div class=\"segment-toolbar\"><button onclick=\"addAffectedSegment(${index})\">Add affected segment</button><button onclick=\"confirmWholeWindowAffected(${index})\">Confirm whole candidate window affected</button><button onclick=\"markWholeWindowFalsePositive(${index})\">Mark whole candidate window false positive</button><button onclick=\"markWholeWindowAcceptable(${index})\">Mark whole candidate window acceptable</button><button onclick=\"markWholeWindowNeedsReview(${index})\">Defer / needs SAM3 or second review</button></div><div id=\"segments-${index}\"></div></section></div></div></article>`;}); root.innerHTML=html; REVIEW_ROWS.forEach((_row,index)=>renderSegments(index));}\n"
+        "function render(){const root=document.getElementById('root'); let html=''; REVIEW_ROWS.forEach((row,index)=>{const clip=row.display_clip_path && !row.clip_error ? `<video id=\"video-${index}\" class=\"video\" controls src=\"${escapeHtml(row.display_clip_path)}\"></video>` : `<div class=\"no-clip\">No clip${row.clip_error ? ': '+escapeHtml(row.clip_error) : ''}</div>`; html+=`<article class=\"item\" onclick=\"activeReviewIndex=${index}\"><div class=\"grid\"><div>${overlayViewerHtml(row,index)}${clip}</div><div><div class=\"meta\"><div><b>review_id</b>${escapeHtml(row.review_id)}</div><div><b>supplier_id</b>${escapeHtml(row.supplier_id)}</div><div><b>asset_id</b>${escapeHtml(row.asset_id)}</div><div><b>window</b>${escapeHtml(row.window_start_frame)}-${escapeHtml(row.window_end_frame)}</div><div><b>representative_frame</b>${escapeHtml(row.representative_frame)}</div><div><b>fps</b>${escapeHtml(row.fps)}</div><div><b>frame_stride</b>${escapeHtml(row.frame_stride)}</div><div><b>sampled_frame_count</b>${escapeHtml(row.sampled_frame_count)}</div><div><b>clip_start_time_sec</b>${escapeHtml(row.clip_start_time_sec)}</div><div><b>clip_duration_sec</b>${escapeHtml(row.clip_duration_sec)}</div></div><section class=\"auto\"><div class=\"title\">Auto result</div><div class=\"meta\"><div><b>suggested_issue_type</b>${escapeHtml(row.suggested_issue_type)}</div><div><b>auto_verdict</b>${escapeHtml(row.auto_verdict)}</div><div><b>severity_suggestion</b>${escapeHtml(row.severity_suggestion)}</div></div><div class=\"metrics\"><b>key_metrics_json</b>\\n${escapeHtml(row.key_metrics_json)}</div><div class=\"reason\"><b>reason</b>\\n${escapeHtml(row.reason)}</div></section><section class=\"human\"><div class=\"title\">Human affected segments</div><p class=\"empty\">Manual affected_start_frame/end_frame are original frame numbers, not sampled indexes. Use affected segments for rejected/review duration. Raw candidate windows are evidence only.</p><div class=\"help\">False positive = script flagged this window but human confirms there is no real issue.<br>Acceptable = flagged phenomenon exists but should not reduce usable duration.<br>Defer = cannot decide from current overlay; needs SAM3, stride=1, video_quality, or second reviewer.<br>true_positive = script flag is correct; real issue confirmed.<br>false_positive = script flag is wrong; no real issue.<br>acceptable_flagged = phenomenon exists but acceptable; do not reduce usable duration.<br>partial = only some frames inside candidate window are affected.<br>review = cannot decide; needs SAM3, video_quality, stride=1, or second reviewer.<br>failure_mode options are limited to HDF5 skeleton projection review.<br>severe_keypoint_offset = projected skeleton/keypoints are clearly far from the hand.<br>visual_skeleton_presence_mismatch = projected skeleton presence visibly disagrees with the hand.<br>skeleton_pose_hallucination = projected pose is anatomically implausible or follows the wrong structure.<br>hand_out_of_frame = hand is outside or partly outside the image.<br>side_view_mask_undersegmentation = side-view geometry likely causes undersegmented hand evidence upstream.<br>projection_review = projection or calibration needs review.<br>acceptable_minor_misalignment = small offset that should not reduce usable duration.<br>unknown = issue is visible but does not fit another listed mode.</div><div class=\"segment-toolbar\"><button onclick=\"addAffectedSegment(${index})\">Add affected segment</button><button onclick=\"confirmWholeWindowAffected(${index})\">Confirm whole candidate window affected</button><button onclick=\"markWholeWindowFalsePositive(${index})\">Mark whole candidate window false positive</button><button onclick=\"markWholeWindowAcceptable(${index})\">Mark whole candidate window acceptable</button><button onclick=\"markWholeWindowNeedsReview(${index})\">Defer / needs SAM3 or second review</button></div><div id=\"segments-${index}\"></div></section></div></div></article>`;}); root.innerHTML=html; REVIEW_ROWS.forEach((_row,index)=>renderSegments(index));}\n"
         "function addAffectedSegment(rowIndex){const row=REVIEW_ROWS[rowIndex]; const key=rowKey(row); if(!segmentsByReviewId[key]) segmentsByReviewId[key]=[]; segmentsByReviewId[key].push(makeSegment(row)); renderSegments(rowIndex); autosaveProgress();}\n"
         "function confirmWholeWindowAffected(rowIndex){const row=REVIEW_ROWS[rowIndex]; const key=rowKey(row); segmentsByReviewId[key]=[makeSegment(row,{affected_start_frame:row.window_start_frame,affected_end_frame:row.window_end_frame,manual_outcome:'true_positive',acceptance_status:'rejected'})]; renderSegments(rowIndex); autosaveProgress();}\n"
         "function markWholeWindowFalsePositive(rowIndex){const row=REVIEW_ROWS[rowIndex]; const key=rowKey(row); segmentsByReviewId[key]=[makeSegment(row,{segment_id:`${key}_false_positive`,affected_start_frame:'',affected_end_frame:'',manual_outcome:'false_positive',failure_mode:'acceptable_minor_misalignment',severity:'low',confidence:'medium',acceptance_status:'accepted'})]; renderSegments(rowIndex); autosaveProgress();}\n"
@@ -824,6 +849,56 @@ def build_review_index_video_html(rows: list[dict[str, Any]]) -> str:
         "document.addEventListener('DOMContentLoaded', initializePage);\n"
         "</script></body></html>\n"
     )
+
+
+def build_review_ui_enums(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+    failure_modes = list(OVERLAY_FAILURE_MODE_ENUM)
+    for row in rows:
+        module = str(row.get("module", "")).lower()
+        issue_type = str(row.get("suggested_issue_type") or row.get("issue_type") or "").lower()
+        source_level = str(row.get("source_level", "")).lower()
+        evidence_text = " ".join(
+            str(row.get(field, "")).lower()
+            for field in (
+                "module",
+                "suggested_issue_type",
+                "issue_type",
+                "source_level",
+                "auto_verdict",
+                "reason",
+                "key_metrics_json",
+            )
+        )
+        if module == "video_quality" or issue_type.startswith("video_"):
+            failure_modes.extend(VIDEO_QUALITY_FAILURE_MODE_ENUM)
+        if "sam3" in evidence_text or "containment" in evidence_text:
+            failure_modes.extend(SAM3_CONTAINMENT_FAILURE_MODE_ENUM)
+        if source_level == "asset" and (
+            "quality_hand" in issue_type
+            or "keypoint_raw" in issue_type
+            or "hdf5_text" in issue_type
+            or "keypoint_low_quality" in issue_type
+        ):
+            failure_modes.extend(ASSET_LEVEL_FAILURE_MODE_ENUM)
+
+    return {
+        "manual_outcome": list(OVERLAY_MANUAL_OUTCOME_ENUM),
+        "failure_mode": dedupe_preserve_order(failure_modes),
+        "severity": SEVERITY_ENUM,
+        "confidence": CONFIDENCE_ENUM,
+        "acceptance_status": ACCEPTANCE_STATUS_ENUM,
+    }
+
+
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        output.append(value)
+    return output
 
 
 def build_storage_key(rows: list[dict[str, Any]]) -> str:
