@@ -102,17 +102,47 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 可选使用 YAML 覆盖阈值：
 
 ```yaml
-sample_count: 10
-alignment_mode: warn
-thresholds:
-  min_fps: 1
-  min_width: 1
-  min_height: 1
-  min_sample_decode_ratio: 1.0
-  max_mean_over_dark_ratio: 0.10
-  max_mean_over_exposed_ratio: 0.05
-  max_black_frame_ratio: 0.05
-  max_frozen_frame_ratio: 0.8
+threshold_version: video_prefilter_v0.2.9
+decode:
+  max_sample_frames: 300
+hdf5_alignment:
+  mode: fail
+resolution:
+  min_short_side_fail: 720
+  min_long_side_fail: 1280
+exposure:
+  black:
+    max_frame_count_fail: 10
+    ratio_pass: 0.01
+    ratio_warn: 0.90
+  over_dark:
+    ratio_pass: 0.05
+    ratio_warn: 0.90
+  over_exposed:
+    ratio_pass: 0.05
+    ratio_warn: 0.90
+sharpness_global:
+  target_short_side: 720
+  laplacian_p10_pass: 35
+  laplacian_p10_warn: 0
+  laplacian_median_pass: 50
+  laplacian_median_warn: 0
+  laplacian_under_100_ratio_pass: 0.50
+  laplacian_under_100_ratio_warn: 1.00
+  tenengrad_p10_pass: 12
+  tenengrad_p10_warn: 6
+  tenengrad_median_pass: 13
+  tenengrad_median_warn: 8
+freeze:
+  frozen_frame_ratio_pass: 0.05
+  frozen_frame_ratio_warn: 0.10
+  min_interval_frames: 6
+defects:
+  max_duration_ratio_fail: 0.10
+  duration_ratio_warn: 0.05
+hand_roi:
+  enabled: false
+  mode: warn_except_severe_fail
 ```
 
 运行后输出：
@@ -125,4 +155,6 @@ sampled/XJGT_20260616/
     <asset_id>.json
 ```
 
-`quality_archive/<asset_id>.json` 是单条数据的全流程 QC 档案，和 `hdf5/`、`video/` 同级，格式见 `docs/asset-qc-json-format.md`。上游建档模块应在拉取完成后先创建这个文件；视频质量检测后续只更新其中的 `video_quality`、`hdf5_text_info`、`reference_quality` 等 block。后续批次 summary、表格或完整报告都可以直接从这些 `<asset_id>.json` 聚合生成。该检测不使用 VMAF、CAMBI 或标准对照视频；它只计算可解码性、fps、分辨率、抽样帧亮度/过暗/过曝/模糊代理、黑屏、冻结帧，以及可选 HDF5 帧数对齐。
+`quality_archive/<asset_id>.json` 是单条数据的全流程 QC 档案，和 `hdf5/`、`video/` 同级，格式见 `docs/asset-qc-json-format.md`。上游建档模块应在拉取完成后先创建这个文件；视频质量检测后续只更新其中的 `video_quality`、`hdf5_text_info`、`reference_quality` 等 block。后续批次 summary、表格或完整报告都可以直接从这些 `<asset_id>.json` 聚合生成。
+
+当前视频模块是 `video_prefilter_v0.2.9` 低成本预筛，不使用 VMAF、CAMBI 或标准对照视频；它只计算基础可用性、fps、分辨率、时间轴连续性、抽样解码、黑帧/过暗/过曝、全帧清晰度、冻结帧、丢帧、HDF5 帧数对齐、瑕疵时长合计比例，以及连续冻帧区间。默认不再运行 hand ROI，因为粗 bbox 对预筛 gating 噪声较大。该版本按机器人预训练场景放宽清晰度硬筛：视频后续可能下采样到低分辨率，因此清晰度主要用于 warn，hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近全段过暗/过曝、冻帧/丢帧，以及所有瑕疵时长合计超过 10%。输出 JSON 里必须保存 `decision: pass|warn|fail` 和 `should_run_mask_qc`：只有 `decision == "fail"` 时后续 mask / 骨骼点比对 / 语义一致性等高成本 QC 才应跳过。`freeze_metrics.frozen_intervals` 默认记录连续冻帧 `frame_count >= 6` 的区间，供后续人工复核或裁切使用。
