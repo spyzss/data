@@ -222,6 +222,7 @@ def test_video_review_manual_export_schema_supports_affected_segments() -> None:
         "reviewer",
         "comment",
     ]
+    assert "reviewer" in VIDEO_MANUAL_LABEL_COLUMNS
 
 
 def test_video_review_html_supports_multi_segment_labeling() -> None:
@@ -270,6 +271,73 @@ def test_video_review_html_supports_multi_segment_labeling() -> None:
     assert "candidate window start/end" in html
     assert "ArrowLeft" in html
     assert "event.shiftKey ? 10 : 1" in html
+
+
+def test_video_review_html_autosaves_and_loads_saved_progress() -> None:
+    html = build_review_index_video_html(
+        [
+            {
+                "review_id": "rq_001",
+                "supplier_id": "supplier_a",
+                "asset_id": "100030",
+                "window_start_frame": 1,
+                "window_end_frame": 10,
+                "representative_frame": 5,
+                "fps": 30.0,
+                "auto_verdict": "review",
+                "suggested_issue_type": "keypoint_low_quality_window",
+                "severity_suggestion": "medium",
+                "key_metrics_json": "{}",
+                "reason": "test persistence",
+                "display_clip_path": "clips/rq_001.mp4",
+                "clip_start_time_sec": 0.0,
+                "clip_duration_sec": 1.0,
+                "clip_error": "",
+            }
+        ]
+    )
+
+    assert "manual_review_state_v2:" in html
+    assert "localStorage key" in html
+    assert "function autosaveProgress" in html
+    assert "document.addEventListener('input', handleManualFieldChange)" in html
+    assert "document.addEventListener('change', handleManualFieldChange)" in html
+    assert "DOMContentLoaded" in html
+    assert "Loaded saved progress from localStorage" in html
+    assert "No saved progress found" in html
+    assert "Saved at" in html
+
+
+def test_video_review_html_supports_progress_json_backup() -> None:
+    html = build_review_index_video_html([])
+
+    assert "Export progress JSON" in html
+    assert "Import progress JSON" in html
+    assert "function exportProgressJson" in html
+    assert "function importProgressJson" in html
+    assert "progress-json-input" in html
+
+
+def test_video_review_html_uses_global_reviewer_without_per_segment_reviewer_input() -> None:
+    html = build_review_index_video_html(
+        [
+            {
+                "review_id": "rq_001",
+                "supplier_id": "supplier_a",
+                "asset_id": "100030",
+                "window_start_frame": 1,
+                "window_end_frame": 10,
+                "display_clip_path": "",
+                "clip_error": "missing",
+            }
+        ]
+    )
+
+    assert "id=\"global-reviewer\"" in html
+    assert "value=\"nathan\"" in html
+    assert "function globalReviewer" in html
+    assert "reviewer:globalReviewer()" in html
+    assert "segmentFieldId(rowIndex,segmentIndex,'reviewer')" not in html
 
 
 def test_hand_joint_names_cover_left_and_right_acceptance_topology() -> None:
