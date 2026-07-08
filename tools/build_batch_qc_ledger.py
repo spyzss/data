@@ -700,7 +700,8 @@ def add_video_quality(
     module_status: dict[str, dict[str, str]],
     events: list[dict[str, Any]],
 ) -> None:
-    for row in rows:
+    for raw_row in rows:
+        row = normalize_video_quality_row(raw_row)
         asset_id = asset_from_row(row, episode_to_asset)
         if asset_id is None:
             continue
@@ -708,23 +709,87 @@ def add_video_quality(
         status_value = str(first_present(row, ("status", "final_status"), default="")).lower()
         passed = first_present(row, ("passed", "pass", "video_quality_pass"))
         failed = boolish_or_none(passed) is False or status_value in {"fail", "failed"}
-        status = "fail" if failed else "pass"
-        module_status[asset_id]["video_quality_status"] = status
         if failed:
+            status = "fail"
+        elif status_value in {"warn", "warning", "risk"}:
+            status = "risk"
+        elif status_value == "review":
+            status = "review"
+        else:
+            status = "pass"
+        module_status[asset_id]["video_quality_status"] = status
+        if status != "pass":
             severity = str(row.get("severity") or "high").lower()
+            if status == "risk" and severity == "high":
+                severity = "medium"
             add_event(
                 events,
                 assets,
                 asset_id,
                 module="video_quality",
                 issue_type="video_quality_failed",
-                severity="high" if severity == "high" else "medium",
-                auto_verdict="fail" if severity == "high" else "risk",
+                severity="high" if status == "fail" and severity == "high" else "medium",
+                auto_verdict="fail" if status == "fail" and severity == "high" else status,
                 metric_name=first_present(row, ("metric_name",), default="video_quality"),
                 metric_value=first_present(row, ("metric_value", "score")),
                 reason=first_present(row, ("reason", "notes"), default="video quality failed"),
                 evidence_path=path,
             )
+
+
+def normalize_video_quality_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Accept both flat video-quality rows and asset_qc_report.v1 archive JSON."""
+    qc_summary = row.get("qc_summary")
+    video_quality = row.get("video_quality")
+    if not isinstance(qc_summary, dict) and not isinstance(video_quality, dict):
+        return row
+
+    normalized = dict(row)
+    video_quality = video_quality if isinstance(video_quality, dict) else {}
+    qc_summary = qc_summary if isinstance(qc_summary, dict) else {}
+    evaluation = video_quality.get("evaluation")
+    evaluation = evaluation if isinstance(evaluation, dict) else {}
+    metadata = video_quality.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    metrics = video_quality.get("metrics")
+    metrics = metrics if isinstance(metrics, dict) else {}
+    defect_metrics = metrics.get("defect_metrics")
+    defect_metrics = defect_metrics if isinstance(defect_metrics, dict) else {}
+    freeze_metrics = metrics.get("freeze_metrics")
+    freeze_metrics = freeze_metrics if isinstance(freeze_metrics, dict) else {}
+    source_files = row.get("source_files")
+    source_files = source_files if isinstance(source_files, dict) else {}
+    video_source = source_files.get("video")
+    video_source = video_source if isinstance(video_source, dict) else {}
+
+    reasons = list_values(qc_summary.get("reasons")) or list_values(evaluation.get("reasons"))
+    warn_reasons = list_values(qc_summary.get("warn_reasons")) or list_values(evaluation.get("warn_reasons"))
+    status = first_present(
+        {
+            "status": qc_summary.get("status"),
+            "decision": evaluation.get("decision"),
+            "final_status": row.get("final_status"),
+        },
+        ("status", "decision", "final_status"),
+        default="",
+    )
+    normalized.setdefault("status", status)
+    normalized.setdefault("passed", first_present(qc_summary, ("passed",), default=evaluation.get("passed")))
+    normalized.setdefault("reason", ";".join(reasons or warn_reasons) or "video quality review")
+    normalized.setdefault("video_path", video_source.get("path"))
+    normalized.setdefault("fps", metadata.get("fps"))
+    normalized.setdefault("frame_count", metadata.get("frame_count"))
+    normalized.setdefault("duration_sec", metadata.get("duration_seconds"))
+    normalized.setdefault("bad_duration_sec", freeze_metrics.get("frozen_interval_duration_sec"))
+    normalized.setdefault("bad_frame_count", freeze_metrics.get("frozen_interval_frame_count"))
+
+    if defect_metrics.get("defect_duration_ratio") is not None:
+        normalized.setdefault("metric_name", "defect_duration_ratio")
+        normalized.setdefault("metric_value", defect_metrics.get("defect_duration_ratio"))
+    elif freeze_metrics.get("frozen_frame_ratio") is not None:
+        normalized.setdefault("metric_name", "frozen_frame_ratio")
+        normalized.setdefault("metric_value", freeze_metrics.get("frozen_frame_ratio"))
+    return normalized
 
 
 def add_manual_review(

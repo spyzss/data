@@ -5,6 +5,7 @@ from tools.build_batch_qc_ledger import (
     add_candidate_windows,
     add_manual_review,
     add_precheck_aggregates,
+    add_video_quality,
     add_sam3_window_summaries,
     build_ledger_rows,
     build_supplier_issue_frequency,
@@ -215,6 +216,84 @@ def test_keypoint_missing_aggregate_only_is_review_not_fail(tmp_path: Path) -> N
     assert event_by_asset["100044"]["issue_type"] == "keypoint_low_quality_window"
     assert event_by_asset["100044"]["severity"] == "high"
     assert event_by_asset["100044"]["auto_verdict"] == "review"
+
+
+def test_nested_asset_qc_video_quality_feeds_ledger_events(tmp_path: Path) -> None:
+    manifest = tmp_path / "supplier_sample_manifest.csv"
+    _write_csv(
+        manifest,
+        "supplier_id,asset_id,episode_idx\n"
+        "supplier_a,100030,0\n"
+        "supplier_a,100044,1\n",
+    )
+    assets, episode_to_asset = load_manifest(manifest)
+    module_status = {asset_id: default_module_statuses() for asset_id in assets}
+    events = []
+    video_quality_path = tmp_path / "quality_archive.json"
+    rows = [
+        {
+            "schema_version": "asset_qc_report.v1",
+            "asset_id": "100030",
+            "source_files": {"video": {"path": "video/100030_video.mp4"}},
+            "qc_summary": {
+                "status": "fail",
+                "passed": False,
+                "reasons": ["defect_duration_ratio_above_max"],
+                "warn_reasons": [],
+                "should_run_mask_qc": False,
+            },
+            "video_quality": {
+                "metadata": {"fps": 30.0, "frame_count": 300, "duration_seconds": 10.0},
+                "metrics": {
+                    "defect_metrics": {"defect_duration_ratio": 0.2},
+                    "freeze_metrics": {
+                        "frozen_interval_frame_count": 45,
+                        "frozen_interval_duration_sec": 1.5,
+                    },
+                },
+            },
+        },
+        {
+            "schema_version": "asset_qc_report.v1",
+            "asset_id": "100044",
+            "source_files": {"video": {"path": "video/100044_video.mp4"}},
+            "qc_summary": {
+                "status": "warn",
+                "passed": True,
+                "reasons": [],
+                "warn_reasons": ["laplacian_under_100_ratio_warn"],
+                "should_run_mask_qc": True,
+            },
+            "video_quality": {
+                "metadata": {"fps": 30.0, "frame_count": 300, "duration_seconds": 10.0},
+                "metrics": {"defect_metrics": {"defect_duration_ratio": 0.04}},
+            },
+        },
+    ]
+
+    add_video_quality(
+        rows,
+        video_quality_path,
+        assets,
+        episode_to_asset,
+        module_status,
+        events,
+    )
+
+    ledger = {row["asset_id"]: row for row in build_ledger_rows(assets, module_status, events)}
+    event_by_asset = {event["asset_id"]: event for event in events}
+
+    assert ledger["100030"]["video_quality_status"] == "fail"
+    assert event_by_asset["100030"]["auto_verdict"] == "fail"
+    assert event_by_asset["100030"]["severity"] == "high"
+    assert event_by_asset["100030"]["metric_name"] == "defect_duration_ratio"
+    assert event_by_asset["100030"]["metric_value"] == 0.2
+    assert event_by_asset["100030"]["reason"] == "defect_duration_ratio_above_max"
+
+    assert ledger["100044"]["video_quality_status"] == "risk"
+    assert event_by_asset["100044"]["auto_verdict"] == "risk"
+    assert event_by_asset["100044"]["severity"] == "medium"
+    assert event_by_asset["100044"]["reason"] == "laplacian_under_100_ratio_warn"
 
 
 def test_keypoint_raw_invalid_evidence_is_fail(tmp_path: Path) -> None:
