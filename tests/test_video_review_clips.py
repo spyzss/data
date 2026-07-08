@@ -274,6 +274,16 @@ def test_video_review_html_supports_multi_segment_labeling() -> None:
     assert "event.shiftKey ? 10 : 1" in html
 
 
+def test_video_review_affected_frame_inputs_are_editable() -> None:
+    html = build_review_index_video_html([])
+
+    assert "affected_start_frame" in html
+    assert "affected_end_frame" in html
+    assert "readonly" not in html
+    assert "disabled" not in html
+    assert "handleManualFieldChange" in html
+
+
 def test_video_review_html_validates_segment_ranges_and_blocks_invalid_export() -> None:
     html = build_review_index_video_html(
         [
@@ -297,6 +307,17 @@ def test_video_review_html_validates_segment_ranges_and_blocks_invalid_export() 
     assert "segment-invalid" in html
     assert "validateAllSegments()" in html
     assert "Cannot export manual_labels.csv" in html
+
+
+def test_video_review_html_wraps_carousel_and_supports_frame_jump() -> None:
+    html = build_review_index_video_html([])
+
+    assert "((current+delta)%frames.length+frames.length)%frames.length" in html
+    assert "Go to original frame" in html
+    assert "function jumpToOriginalFrame" in html
+    assert "nearestSampledFrameIndex" in html
+    assert "clamped to nearest sampled frame" in html
+    assert "sampled-frame-jump" in html
 
 
 def test_video_review_html_action_semantics_clear_or_fill_affected_frames() -> None:
@@ -351,7 +372,7 @@ def test_video_review_html_autosaves_and_loads_saved_progress() -> None:
         ]
     )
 
-    assert "manual_review_state_v2:" in html
+    assert "manual_review_state_v3:" in html
     assert "localStorage key" in html
     assert "function autosaveProgress" in html
     assert "document.addEventListener('input', handleManualFieldChange)" in html
@@ -360,6 +381,28 @@ def test_video_review_html_autosaves_and_loads_saved_progress() -> None:
     assert "Loaded saved progress from localStorage" in html
     assert "No saved progress found" in html
     assert "Saved at" in html
+    assert "renderSegments(rowIndex)" in html
+    assert "validateAllSegments()" in html
+    assert "updateSampledFrame(rowIndex)" in html
+
+
+def test_video_review_storage_key_uses_v3_run_label_not_content_hash() -> None:
+    html = build_review_index_video_html(
+        [
+            {
+                "review_id": "rq_001",
+                "supplier_id": "supplier_a",
+                "asset_id": "100030",
+                "window_start_frame": 1,
+                "window_end_frame": 10,
+                "review_run_label": "video_review",
+            }
+        ]
+    )
+
+    assert "manual_review_state_v3:video_review" in html
+    assert "manual_review_state_v2" not in html
+    assert "sha1" not in html
 
 
 def test_video_review_html_supports_progress_json_backup() -> None:

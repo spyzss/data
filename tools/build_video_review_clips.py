@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import shutil
@@ -275,6 +274,7 @@ def build_clip_rows(
         output["fps"] = round(fps, 6) if fps is not None else output.get("fps", "")
         output["frame_stride"] = max(1, int(frame_stride))
         output["max_frames_per_window"] = max(1, int(max_frames_per_window))
+        output["review_run_label"] = safe_filename(output_dir.name or "review")
         output["sampled_frame_count"] = len(sampled_frame_rows)
         output["sampled_frames_json"] = json.dumps(sampled_frame_rows, ensure_ascii=False)
         output["sampled_frame_error"] = ""
@@ -768,9 +768,11 @@ def build_review_index_video_html(rows: list[dict[str, Any]]) -> str:
         "let activeReviewIndex = 0;\n"
         "let sampledFrameIndexByReviewId = {};\n"
         "function activeSampledIndex(row){const frames=sampledFrames(row); const key=rowKey(row); const current=sampledFrameIndexByReviewId[key] ?? 0; return Math.min(Math.max(current,0), Math.max(frames.length-1,0));}\n"
-        "function overlayViewerHtml(row,index){const frames=sampledFrames(row); const warning=`<div class=\"warning\">This page samples every N frames. Current sampling stride: every ${escapeHtml(row.frame_stride)} frames. For single-frame issues, regenerate this review_id with frame_stride=1.</div>`; if(!frames.length){return warning + '<div class=\"no-clip\">No sampled overlay frames</div>';} const current=activeSampledIndex(row); const frame=frames[current]; return `${warning}<div class=\"frame-viewer\" aria-label=\"Sampled overlay frame carousel\" onclick=\"activeReviewIndex=${index}\"><div class=\"frame-meta\"><b>Sampled overlay frame carousel</b></div><img id=\"sampled-frame-img-${index}\" src=\"${escapeHtml(frame.display_frame_path)}\"><div id=\"sampled-frame-meta-${index}\" class=\"frame-meta\">current sampled frame index ${current+1} / ${frames.length}; original frame_idx ${escapeHtml(frame.frame_idx)}; candidate window start/end ${escapeHtml(row.window_start_frame)}-${escapeHtml(row.window_end_frame)}; sampling stride ${escapeHtml(row.frame_stride)}</div><div class=\"viewer-controls\"><button onclick=\"moveSampledFrame(${index},-1)\">Previous sampled frame</button><button onclick=\"moveSampledFrame(${index},1)\">Next sampled frame</button></div></div>`;}\n"
-        "function moveSampledFrame(rowIndex,delta){const row=REVIEW_ROWS[rowIndex]; const frames=sampledFrames(row); if(!frames.length) return; const key=rowKey(row); const current=activeSampledIndex(row); sampledFrameIndexByReviewId[key]=Math.min(Math.max(current+delta,0),frames.length-1); activeReviewIndex=rowIndex; updateSampledFrame(rowIndex); autosaveProgress();}\n"
+        "function overlayViewerHtml(row,index){const frames=sampledFrames(row); const warning=`<div class=\"warning\">This page samples every N frames. Current sampling stride: every ${escapeHtml(row.frame_stride)} frames. For single-frame issues, regenerate this review_id with frame_stride=1.</div>`; if(!frames.length){return warning + '<div class=\"no-clip\">No sampled overlay frames</div>';} const current=activeSampledIndex(row); const frame=frames[current]; return `${warning}<div class=\"frame-viewer\" aria-label=\"Sampled overlay frame carousel\" onclick=\"activeReviewIndex=${index}\"><div class=\"frame-meta\"><b>Sampled overlay frame carousel</b></div><img id=\"sampled-frame-img-${index}\" src=\"${escapeHtml(frame.display_frame_path)}\"><div id=\"sampled-frame-meta-${index}\" class=\"frame-meta\">current sampled frame index ${current+1} / ${frames.length}; original frame_idx ${escapeHtml(frame.frame_idx)}; candidate window start/end ${escapeHtml(row.window_start_frame)}-${escapeHtml(row.window_end_frame)}; sampling stride ${escapeHtml(row.frame_stride)}</div><div class=\"viewer-controls\"><button onclick=\"moveSampledFrame(${index},-1)\">Previous sampled frame</button><button onclick=\"moveSampledFrame(${index},1)\">Next sampled frame</button></div><div class=\"viewer-controls\"><label>Go to original frame <input id=\"sampled-frame-jump-${index}\" type=\"number\"></label><button onclick=\"jumpToOriginalFrame(${index})\">Go</button><span id=\"sampled-frame-jump-note-${index}\" class=\"frame-meta\"></span></div></div>`;}\n"
+        "function moveSampledFrame(rowIndex,delta){const row=REVIEW_ROWS[rowIndex]; const frames=sampledFrames(row); if(!frames.length) return; const key=rowKey(row); const current=activeSampledIndex(row); sampledFrameIndexByReviewId[key]=((current+delta)%frames.length+frames.length)%frames.length; activeReviewIndex=rowIndex; updateSampledFrame(rowIndex); autosaveProgress();}\n"
         "function updateSampledFrame(rowIndex){const row=REVIEW_ROWS[rowIndex]; const frames=sampledFrames(row); if(!frames.length) return; const current=activeSampledIndex(row); const frame=frames[current]; const img=document.getElementById(`sampled-frame-img-${rowIndex}`); const meta=document.getElementById(`sampled-frame-meta-${rowIndex}`); if(img) img.src=frame.display_frame_path; if(meta) meta.textContent=`current sampled frame index ${current+1} / ${frames.length}; original frame_idx ${frame.frame_idx}; candidate window start/end ${row.window_start_frame}-${row.window_end_frame}; sampling stride ${row.frame_stride}`;}\n"
+        "function nearestSampledFrameIndex(frames, targetFrame){let bestIndex=0; let bestDistance=Infinity; frames.forEach((frame,index)=>{const distance=Math.abs(Number(frame.frame_idx)-targetFrame); if(distance < bestDistance){bestDistance=distance; bestIndex=index;}}); return bestIndex;}\n"
+        "function jumpToOriginalFrame(rowIndex){const row=REVIEW_ROWS[rowIndex]; const frames=sampledFrames(row); const input=document.getElementById(`sampled-frame-jump-${rowIndex}`); const note=document.getElementById(`sampled-frame-jump-note-${rowIndex}`); if(!frames.length || !input) return; const target=Number(input.value); if(!Number.isFinite(target)){if(note) note.textContent='Enter a numeric original frame'; return;} const index=nearestSampledFrameIndex(frames,target); const selected=Number(frames[index].frame_idx); sampledFrameIndexByReviewId[rowKey(row)]=index; activeReviewIndex=rowIndex; updateSampledFrame(rowIndex); if(note){const min=Number(frames[0].frame_idx); const max=Number(frames[frames.length-1].frame_idx); note.textContent=(target < min || target > max) ? `clamped to nearest sampled frame ${selected}` : `nearest sampled frame ${selected}`;} autosaveProgress();}\n"
         "function handleKeydown(event){if(event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return; const step=event.shiftKey ? 10 : 1; moveSampledFrame(activeReviewIndex,event.key === 'ArrowRight' ? step : -step); event.preventDefault();}\n"
         "document.addEventListener('keydown', handleKeydown);\n"
         "function nextSegmentId(row){const key=rowKey(row); const count=(segmentsByReviewId[key] || []).length + 1; return `${key}_seg_${String(count).padStart(3,'0')}`;}\n"
@@ -805,16 +807,18 @@ def build_review_index_video_html(rows: list[dict[str, Any]]) -> str:
         "function csvEscape(value){const text=String(value ?? ''); return /[\",\\n\\r]/.test(text) ? '\"' + text.replace(/\"/g,'\"\"') + '\"' : text;}\n"
         "function rowsToCsv(rows){return MANUAL_COLUMNS.join(',')+'\\n'+rows.map(row=>MANUAL_COLUMNS.map(col=>csvEscape(row[col])).join(',')).join('\\n')+'\\n';}\n"
         "function exportManualLabelsCsv(){if(!validateAllSegments()){setStatus('Cannot export manual_labels.csv: fix invalid affected frame ranges first'); return;} const csv=rowsToCsv(collectManualRows()); const blob=new Blob([csv],{type:'text/csv;charset=utf-8'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='manual_labels.csv'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); setStatus('Exported manual_labels.csv');}\n"
-        "function saveProgress(options={}){const progress=captureProgress(); localStorage.setItem(STORAGE_KEY,JSON.stringify(progress)); if(!options.silent){setStatus(`Saved at ${formatTimestamp(new Date())}, ${REVIEW_ROWS.length} review items, ${countSegmentRows(progress)} segment rows`);} return progress;}\n"
+        "function saveProgress(options={}){const progress=captureProgress(); localStorage.setItem(STORAGE_KEY,JSON.stringify(progress)); if(!options.silent){setStatus(`Saved at ${formatTimestamp(new Date())}: saved ${REVIEW_ROWS.length} review items, ${countSegmentRows(progress)} segment rows`);} return progress;}\n"
         "function autosaveProgress(){if(restoreInProgress) return; saveProgress({silent:true});}\n"
-        "function loadProgress(){const raw=localStorage.getItem(STORAGE_KEY); if(!raw){setStatus('No saved progress found'); return false;} restoreProgress(JSON.parse(raw)); render(); setStatus('Loaded saved progress from localStorage'); return true;}\n"
+        "function refreshRestoredUi(){REVIEW_ROWS.forEach((_row,rowIndex)=>{renderSegments(rowIndex); updateSampledFrame(rowIndex);}); validateAllSegments();}\n"
+        "function loadProgress(){const raw=localStorage.getItem(STORAGE_KEY); if(!raw){setStatus('No saved progress found'); return false;} const progress=JSON.parse(raw); restoreProgress(progress); render(); refreshRestoredUi(); setStatus(`Loaded saved progress from localStorage: loaded ${REVIEW_ROWS.length} review items, ${countSegmentRows(captureProgress())} segment rows`); return true;}\n"
         "function loadProgressOnStartup(){try{loadProgress();}catch(error){setStatus(`Could not load saved progress: ${error.message}`);}}\n"
         "function exportProgressJson(){const progress=saveProgress({silent:true}); const blob=new Blob([JSON.stringify(progress,null,2)],{type:'application/json;charset=utf-8'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='manual_review_progress.json'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); setStatus(`Exported progress JSON, ${countSegmentRows(progress)} segment rows`);}\n"
-        "function importProgressJson(event){const file=event.target.files && event.target.files[0]; if(!file) return; const reader=new FileReader(); reader.onload=()=>{try{const progress=JSON.parse(String(reader.result || '{}')); restoreProgress(progress); render(); saveProgress({silent:true}); setStatus('Imported progress JSON');}catch(error){setStatus(`Could not import progress JSON: ${error.message}`);} finally{event.target.value='';}}; reader.readAsText(file);}\n"
+        "function importProgressJson(event){const file=event.target.files && event.target.files[0]; if(!file) return; const reader=new FileReader(); reader.onload=()=>{try{const progress=JSON.parse(String(reader.result || '{}')); restoreProgress(progress); render(); refreshRestoredUi(); saveProgress({silent:true}); setStatus(`Imported progress JSON: loaded ${REVIEW_ROWS.length} review items, ${countSegmentRows(captureProgress())} segment rows`);}catch(error){setStatus(`Could not import progress JSON: ${error.message}`);} finally{event.target.value='';}}; reader.readAsText(file);}\n"
         "function clearProgress(){localStorage.removeItem(STORAGE_KEY); setStatus('Cleared local progress');}\n"
         "function parseSegmentTarget(target){const match=String(target && target.id || '').match(/^seg-(\\d+)-(\\d+)-(.+)$/); return match ? {rowIndex:Number(match[1]),segmentIndex:Number(match[2]),field:match[3]} : null;}\n"
         "function clearAcceptedFrameInputs(rowIndex,segmentIndex){const outcome=getSegmentField(rowIndex,segmentIndex,'manual_outcome'); const status=getSegmentField(rowIndex,segmentIndex,'acceptance_status'); if(outcome === 'false_positive' || outcome === 'acceptable_flagged' || status === 'accepted'){['affected_start_frame','affected_end_frame'].forEach(field=>{const el=document.getElementById(segmentFieldId(rowIndex,segmentIndex,field)); if(el) el.value='';});}}\n"
-        "function handleManualFieldChange(event){if(event.target && event.target.id === 'progress-json-input') return; const parsed=parseSegmentTarget(event.target); if(parsed){clearAcceptedFrameInputs(parsed.rowIndex,parsed.segmentIndex); validateSegment(parsed.rowIndex,parsed.segmentIndex);} if(event.target && (event.target.closest('.human') || event.target.id === 'global-reviewer')) autosaveProgress();}\n"
+        "function applyAcceptedOutcomeDefaults(rowIndex,segmentIndex){const outcome=getSegmentField(rowIndex,segmentIndex,'manual_outcome'); if(outcome === 'false_positive' || outcome === 'acceptable_flagged'){const statusEl=document.getElementById(segmentFieldId(rowIndex,segmentIndex,'acceptance_status')); const severityEl=document.getElementById(segmentFieldId(rowIndex,segmentIndex,'severity')); if(statusEl) statusEl.value='accepted'; if(severityEl) severityEl.value='low'; clearAcceptedFrameInputs(rowIndex,segmentIndex);}}\n"
+        "function handleManualFieldChange(event){if(event.target && event.target.id === 'progress-json-input') return; const parsed=parseSegmentTarget(event.target); if(parsed){applyAcceptedOutcomeDefaults(parsed.rowIndex,parsed.segmentIndex); clearAcceptedFrameInputs(parsed.rowIndex,parsed.segmentIndex); validateSegment(parsed.rowIndex,parsed.segmentIndex);} if(event.target && (event.target.closest('.human') || event.target.id === 'global-reviewer')) autosaveProgress();}\n"
         "function setStatus(text){document.getElementById('status').textContent=text;}\n"
         "function initializePage(){document.getElementById('storage-key').textContent=STORAGE_KEY; render(); loadProgressOnStartup(); document.addEventListener('input', handleManualFieldChange); document.addEventListener('change', handleManualFieldChange);}\n"
         "document.addEventListener('DOMContentLoaded', initializePage);\n"
@@ -823,23 +827,20 @@ def build_review_index_video_html(rows: list[dict[str, Any]]) -> str:
 
 
 def build_storage_key(rows: list[dict[str, Any]]) -> str:
-    identity_rows = [
-        {
-            "review_id": str(row.get("review_id", "")),
-            "supplier_id": str(row.get("supplier_id", "")),
-            "asset_id": str(row.get("asset_id", "")),
-            "window_start_frame": str(row.get("window_start_frame", "")),
-            "window_end_frame": str(row.get("window_end_frame", "")),
-        }
-        for row in rows
-    ]
-    identity_json = json.dumps(identity_rows, sort_keys=True, ensure_ascii=False)
-    digest = hashlib.sha1(identity_json.encode("utf-8")).hexdigest()[:12]
     run_label = "empty"
     if rows:
         first = rows[0]
-        run_label = safe_filename(str(first.get("supplier_id") or first.get("asset_id") or "review"))
-    return f"manual_review_state_v2:{run_label}:{digest}"
+        run_label = safe_filename(
+            str(
+                first.get("review_run_label")
+                or first.get("run_label")
+                or first.get("output_dir_name")
+                or first.get("supplier_id")
+                or first.get("asset_id")
+                or "review"
+            )
+        )
+    return f"manual_review_state_v3:{run_label}"
 
 
 def resolve_fps(row: dict[str, Any]) -> float | None:
