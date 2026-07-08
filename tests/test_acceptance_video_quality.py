@@ -9,6 +9,7 @@ import h5py
 import acceptance_pull.video_quality as video_quality
 from acceptance_pull.video_quality import (
     AlignmentMode,
+    FrozenInterval,
     HandRoiMetrics,
     analyze_video,
     check_hdf5_alignment,
@@ -30,10 +31,17 @@ def textured_frame(offset: int, width: int = 1280, height: int = 720) -> np.ndar
     return np.repeat(gray[:, :, None], 3, axis=2)
 
 
+def slow_motion_frame(index: int, width: int = 128, height: int = 128) -> np.ndarray:
+    frame = np.full((height, width, 3), 120, dtype=np.uint8)
+    left = min(width - 34, 4 + index)
+    frame[44:84, left : left + 30] = 205
+    return frame
+
+
 def test_default_video_quality_config() -> None:
     config = load_video_quality_config(None)
 
-    assert config.threshold_version == "video_prefilter_v0.3.0"
+    assert config.threshold_version == "video_prefilter_v0.3.2"
     assert config.pipeline.stop_before_mask_if_fail is True
     assert config.pipeline.run_hand_roi is False
     assert config.pipeline.do_keypoint_quality_check is False
@@ -53,26 +61,31 @@ def test_default_video_quality_config() -> None:
     assert config.exposure.over_exposed.ratio_pass == 0.05
     assert config.exposure.over_exposed.ratio_warn == 0.90
     assert config.sharpness_global.target_short_side == 720
-    assert config.sharpness_global.laplacian_p10_pass == 35
+    assert config.sharpness_global.laplacian_p10_pass == 15
     assert config.sharpness_global.laplacian_p10_warn == 0
-    assert config.sharpness_global.laplacian_median_pass == 50
+    assert config.sharpness_global.laplacian_median_pass == 20
     assert config.sharpness_global.laplacian_median_warn == 0
-    assert config.sharpness_global.laplacian_under_100_ratio_pass == 0.50
+    assert config.sharpness_global.laplacian_under_100_ratio_pass == 1.00
     assert config.sharpness_global.laplacian_under_100_ratio_warn == 1.00
-    assert config.sharpness_global.tenengrad_p10_pass == 12
-    assert config.sharpness_global.tenengrad_p10_warn == 6
-    assert config.sharpness_global.tenengrad_median_pass == 13
-    assert config.sharpness_global.tenengrad_median_warn == 8
+    assert config.sharpness_global.tenengrad_p10_pass == 6
+    assert config.sharpness_global.tenengrad_p10_warn == 4
+    assert config.sharpness_global.tenengrad_median_pass == 7
+    assert config.sharpness_global.tenengrad_median_warn == 4
     assert config.timeline.drop_frame_ratio_pass == 0.05
     assert config.timeline.drop_frame_ratio_warn == 0.10
     assert config.freeze.frozen_frame_ratio_pass == 0.05
     assert config.freeze.frozen_frame_ratio_warn == 0.10
     assert config.freeze.min_interval_frames == 6
     assert config.freeze.min_interval_duration_ms == 100
+    assert config.freeze.freeze_candidate_window_sec == 0.5
+    assert config.freeze.confirmed_freeze_window_sec == 1.0
+    assert config.freeze.adjacent_near_duplicate_ratio_warn == 0.90
     assert config.freeze.ssim_min == 0.995
     assert config.freeze.phash_hamming_max == 4
     assert config.freeze.motion_conflict_enabled is True
     assert config.freeze.critical_window_enabled is True
+    assert config.freeze.video_state_conflict_noncritical_duration_ms_fail == 1000
+    assert config.freeze.video_state_conflict_critical_duration_ms_fail == 500
     assert config.freeze.max_consecutive_frozen_sec_fail == 1.0
     assert config.defects.max_duration_ratio_fail == 0.10
     assert config.defects.duration_ratio_warn == 0.05
@@ -183,7 +196,7 @@ def test_analyze_video_marks_invalid_video_unopened(tmp_path: Path) -> None:
 
 def test_analyze_video_detects_black_and_frozen_samples(tmp_path: Path) -> None:
     video = tmp_path / "408817_video.mp4"
-    write_test_video(video, [solid_frame(0) for _ in range(6)], fps=10.0)
+    write_test_video(video, [solid_frame(0) for _ in range(16)], fps=10.0)
 
     metrics = analyze_video(video, load_video_quality_config(None))
 
@@ -193,26 +206,77 @@ def test_analyze_video_detects_black_and_frozen_samples(tmp_path: Path) -> None:
 
 def test_analyze_video_records_frozen_intervals_over_five_frames(tmp_path: Path) -> None:
     video = tmp_path / "408817_video.mp4"
-    frames = [solid_frame(80) for _ in range(7)]
-    frames.extend(solid_frame(140) for _ in range(5))
-    frames.extend(solid_frame(200) for _ in range(6))
+    frames = [solid_frame(80) for _ in range(16)]
+    frames.extend(textured_frame(index, width=32, height=24) for index in range(6))
+    frames.extend(solid_frame(200) for _ in range(16))
     write_test_video(video, frames, fps=10.0)
 
     metrics = analyze_video(video, load_video_quality_config(None))
 
-    assert [interval.frame_count for interval in metrics.frozen_intervals] == [7, 6]
+    assert metrics.adjacent_near_duplicate_ratio > 0
+    assert metrics.freeze_candidate_ratio > 0
+    assert metrics.confirmed_freeze_ratio == metrics.frozen_frame_ratio
+    assert [interval.frame_count for interval in metrics.frozen_intervals] == [16, 16]
     assert metrics.frozen_intervals[0].start_frame == 0
-    assert metrics.frozen_intervals[0].end_frame == 6
+    assert metrics.frozen_intervals[0].end_frame == 15
     assert metrics.frozen_intervals[0].start_time_sec == 0.0
-    assert metrics.frozen_intervals[0].end_time_sec == 0.7
-    assert metrics.frozen_intervals[0].duration_sec == 0.7
-    assert metrics.frozen_intervals[0].duration_ms == 700.0
+    assert metrics.frozen_intervals[0].end_time_sec == 1.6
+    assert metrics.frozen_intervals[0].duration_sec == 1.6
+    assert metrics.frozen_intervals[0].duration_ms == 1600.0
     assert metrics.frozen_intervals[0].mean_ssim >= 0.995
     assert metrics.frozen_intervals[0].max_phash_hamming <= 4
     assert metrics.frozen_intervals[0].motion_conflict is False
     assert metrics.frozen_intervals[0].critical_window is False
-    assert metrics.frozen_intervals[1].start_frame == 12
-    assert metrics.frozen_intervals[1].end_frame == 17
+    assert metrics.frozen_intervals[1].start_frame == 22
+    assert metrics.frozen_intervals[1].end_frame == 37
+
+
+def test_adjacent_near_duplicates_are_low_motion_not_rejection(tmp_path: Path) -> None:
+    video = tmp_path / "408817_video.mp4"
+    write_test_video(video, [slow_motion_frame(index, width=256, height=128) for index in range(120)], fps=60.0)
+    metrics = analyze_video(video, load_video_quality_config(None))
+    metrics = replace(
+        metrics,
+        short_side=720,
+        long_side=1280,
+        laplacian_p10=100.0,
+        laplacian_median=120.0,
+        laplacian_under_100_ratio=0.0,
+        tenengrad_p10=20.0,
+        tenengrad_median=22.0,
+        sample_decode_ratio=1.0,
+        black_frame_ratio=0.0,
+        black_frame_count_estimate=0,
+        mean_over_dark_ratio=0.0,
+        mean_over_exposed_ratio=0.0,
+        exposure_defect_frame_ratio=0.0,
+        defect_duration_ratio=metrics.frozen_frame_ratio + metrics.drop_frame_ratio,
+    )
+
+    config = load_video_quality_config(None)
+    evaluation = evaluate_video_quality(metrics, config)
+
+    assert metrics.adjacent_near_duplicate_ratio > 0.90
+    assert metrics.freeze_candidate_ratio == 0.0
+    assert metrics.confirmed_freeze_ratio == 0.0
+    assert metrics.frozen_frame_ratio == 0.0
+    assert evaluation.passed is True
+    assert evaluation.decision == "warn"
+    assert "adjacent_near_duplicate_ratio_warn" in evaluation.warn_reasons
+    assert "frozen_frame_ratio_above_max" not in evaluation.reasons
+
+
+def test_half_second_near_duplicate_is_candidate_not_confirmed_freeze(tmp_path: Path) -> None:
+    video = tmp_path / "408817_video.mp4"
+    frames = [solid_frame(120) for _ in range(8)]
+    frames.extend(textured_frame(index, width=32, height=24) for index in range(12))
+    write_test_video(video, frames, fps=10.0)
+
+    metrics = analyze_video(video, load_video_quality_config(None))
+
+    assert metrics.freeze_candidate_ratio > 0.0
+    assert metrics.confirmed_freeze_ratio == 0.0
+    assert metrics.frozen_intervals == ()
 
 
 def test_timeline_metrics_prefers_ffprobe_pts_and_estimates_missing_frames(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -264,11 +328,11 @@ def test_freeze_with_hdf5_keypoint_motion_conflict_fails(tmp_path: Path) -> None
     video_dir = batch / "video"
     video_dir.mkdir()
     video = video_dir / "408817_video.mp4"
-    write_test_video(video, [solid_frame(120) for _ in range(8)], fps=10.0)
+    write_test_video(video, [solid_frame(120) for _ in range(16)], fps=10.0)
     hdf5_path = batch / "hdf5" / "408817_hdf5.hdf5"
     hdf5_path.parent.mkdir()
     base = np.full((2, 21, 2), 0.45, dtype=np.float32)
-    keypoints = np.stack([base + np.array([frame_index * 0.02, 0.0], dtype=np.float32) for frame_index in range(8)])
+    keypoints = np.stack([base + np.array([frame_index * 0.02, 0.0], dtype=np.float32) for frame_index in range(16)])
     with h5py.File(hdf5_path, "w") as handle:
         label = handle.create_group("label")
         label.create_dataset("quality_hand", data=keypoints)
@@ -279,7 +343,7 @@ def test_freeze_with_hdf5_keypoint_motion_conflict_fails(tmp_path: Path) -> None
 
     assert metrics.frozen_intervals
     assert any(interval.motion_conflict for interval in metrics.frozen_intervals)
-    assert "freeze_with_motion_conflict" in evaluation.reasons
+    assert "video_state_conflict" in evaluation.reasons
 
 
 def test_freeze_in_hdf5_critical_window_fails(tmp_path: Path) -> None:
@@ -287,10 +351,10 @@ def test_freeze_in_hdf5_critical_window_fails(tmp_path: Path) -> None:
     video_dir = batch / "video"
     video_dir.mkdir()
     video = video_dir / "408817_video.mp4"
-    write_test_video(video, [solid_frame(120) for _ in range(8)], fps=10.0)
+    write_test_video(video, [solid_frame(120) for _ in range(16)], fps=10.0)
     hdf5_path = batch / "hdf5" / "408817_hdf5.hdf5"
     hdf5_path.parent.mkdir()
-    write_hand_keypoint_hdf5(hdf5_path, frame_count=8, normalized=True)
+    write_hand_keypoint_hdf5(hdf5_path, frame_count=16, normalized=True)
     with h5py.File(hdf5_path, "a") as handle:
         handle.attrs["task"] = "grasp the cube and place it on the tray"
 
@@ -300,7 +364,57 @@ def test_freeze_in_hdf5_critical_window_fails(tmp_path: Path) -> None:
 
     assert metrics.frozen_intervals
     assert any(interval.critical_window for interval in metrics.frozen_intervals)
-    assert "frozen_interval_in_critical_window" in evaluation.reasons
+    assert any(interval.motion_conflict for interval in metrics.frozen_intervals)
+    assert "video_state_conflict" in evaluation.reasons
+
+
+def test_video_state_conflict_uses_critical_window_duration_thresholds(tmp_path: Path) -> None:
+    video = tmp_path / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
+    metrics = analyze_video(video, load_video_quality_config(None))
+    metrics = replace(
+        metrics,
+        short_side=720,
+        long_side=1280,
+        frozen_frame_ratio=0.0,
+        max_consecutive_frozen_sec=0.0,
+        defect_duration_ratio=0.0,
+    )
+
+    noncritical_short = replace(
+        metrics,
+        frozen_intervals=(
+            FrozenInterval(0, 26, 27, 0.0, 0.9, 0.9, 900.0, motion_conflict=True),
+        ),
+    )
+    noncritical_long = replace(
+        metrics,
+        frozen_intervals=(
+            FrozenInterval(0, 29, 30, 0.0, 1.0, 1.0, 1000.0, motion_conflict=True),
+        ),
+    )
+    critical_short = replace(
+        metrics,
+        frozen_intervals=(
+            FrozenInterval(
+                0,
+                14,
+                15,
+                0.0,
+                0.5,
+                0.5,
+                500.0,
+                motion_conflict=True,
+                critical_window=True,
+                critical_keywords=("grasp",),
+            ),
+        ),
+    )
+
+    config = load_video_quality_config(None)
+    assert "video_state_conflict" not in evaluate_video_quality(noncritical_short, config).reasons
+    assert "video_state_conflict" in evaluate_video_quality(noncritical_long, config).reasons
+    assert "video_state_conflict" in evaluate_video_quality(critical_short, config).reasons
 
 
 def test_evaluate_video_quality_passes_good_metrics(tmp_path: Path) -> None:
@@ -358,7 +472,8 @@ def test_evaluate_video_quality_passes_moderate_global_blur_for_pretraining(tmp_
         tenengrad_median=41.9,
     )
 
-    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
+    config = load_video_quality_config(None)
+    evaluation = evaluate_video_quality(metrics, config)
 
     assert evaluation.passed is True
     assert evaluation.decision == "pass"
@@ -368,7 +483,7 @@ def test_evaluate_video_quality_passes_moderate_global_blur_for_pretraining(tmp_
     assert "laplacian_median_below_min" not in evaluation.reasons
 
 
-def test_evaluate_video_quality_warns_borderline_but_usable_global_blur_without_stopping_mask_qc(
+def test_evaluate_video_quality_passes_borderline_but_usable_global_blur(
     tmp_path: Path,
 ) -> None:
     video = tmp_path / "408817_video.mp4"
@@ -385,16 +500,13 @@ def test_evaluate_video_quality_warns_borderline_but_usable_global_blur_without_
         max_consecutive_frozen_sec=0.06669376218323587,
     )
 
-    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
+    config = load_video_quality_config(None)
+    evaluation = evaluate_video_quality(metrics, config)
 
     assert evaluation.passed is True
-    assert evaluation.decision == "warn"
+    assert evaluation.decision == "pass"
     assert evaluation.should_run_mask_qc is True
-    assert "laplacian_under_100_ratio_warn" in evaluation.warn_reasons
-    assert "laplacian_p10_warn" not in evaluation.warn_reasons
-    assert "laplacian_median_warn" not in evaluation.warn_reasons
-    assert "tenengrad_p10_warn" not in evaluation.warn_reasons
-    assert "tenengrad_median_warn" not in evaluation.warn_reasons
+    assert evaluation.warn_reasons == ()
     assert evaluation.reasons == ()
 
 
@@ -418,11 +530,11 @@ def test_evaluate_video_quality_warns_low_edge_quality_after_pretraining_calibra
     assert evaluation.passed is True
     assert evaluation.decision == "warn"
     assert evaluation.should_run_mask_qc is True
-    assert "laplacian_under_100_ratio_warn" in evaluation.warn_reasons
+    assert "laplacian_under_100_ratio_warn" not in evaluation.warn_reasons
     assert "laplacian_p10_warn" not in evaluation.warn_reasons
     assert "laplacian_median_warn" not in evaluation.warn_reasons
-    assert "tenengrad_p10_warn" in evaluation.warn_reasons
-    assert "tenengrad_median_warn" in evaluation.warn_reasons
+    assert "tenengrad_p10_warn" not in evaluation.warn_reasons
+    assert "tenengrad_median_warn" not in evaluation.warn_reasons
     assert evaluation.reasons == ()
     assert "frozen_frame_ratio_warn" in evaluation.warn_reasons
 
@@ -445,13 +557,68 @@ def test_evaluate_video_quality_warns_cross_provider_low_detail_tail(tmp_path: P
     evaluation = evaluate_video_quality(metrics, load_video_quality_config(config_path))
 
     assert evaluation.passed is True
-    assert evaluation.decision == "warn"
+    assert evaluation.decision == "pass"
     assert evaluation.should_run_mask_qc is True
-    assert "laplacian_p10_warn" in evaluation.warn_reasons
-    assert "laplacian_median_warn" in evaluation.warn_reasons
-    assert "laplacian_under_100_ratio_warn" in evaluation.warn_reasons
-    assert "tenengrad_p10_warn" in evaluation.warn_reasons
+    assert evaluation.warn_reasons == ()
     assert evaluation.reasons == ()
+
+
+def test_evaluate_video_quality_accepts_human_calibrated_jd_clarity_samples(tmp_path: Path) -> None:
+    video = tmp_path / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
+    base_metrics = analyze_video(video, load_video_quality_config(None))
+    config = load_video_quality_config(None)
+
+    clear_file003 = replace(
+        base_metrics,
+        laplacian_p10=18.016677077060322,
+        laplacian_median=23.905696234995084,
+        laplacian_under_100_ratio=1.0,
+        tenengrad_p10=6.7815338475290465,
+        tenengrad_median=7.50551405606198,
+        adjacent_near_duplicate_ratio=0.9474576271186441,
+    )
+    clear_file008 = replace(
+        base_metrics,
+        laplacian_p10=31.281383419232434,
+        laplacian_median=41.00769471101951,
+        laplacian_under_100_ratio=0.9898305084745763,
+        tenengrad_p10=7.953767432246552,
+        tenengrad_median=8.57515469377898,
+        adjacent_near_duplicate_ratio=0.8739130434782608,
+    )
+    borderline_file006 = replace(
+        base_metrics,
+        laplacian_p10=59.8,
+        laplacian_median=72.0,
+        laplacian_under_100_ratio=0.9104477611940298,
+        tenengrad_p10=13.0,
+        tenengrad_median=14.5,
+        adjacent_near_duplicate_ratio=0.9708333333333333,
+    )
+
+    clear_file003_evaluation = evaluate_video_quality(clear_file003, config)
+    clear_file008_evaluation = evaluate_video_quality(clear_file008, config)
+    borderline_evaluation = evaluate_video_quality(borderline_file006, config)
+
+    sharpness_codes = (
+        "laplacian_p10",
+        "laplacian_median",
+        "laplacian_under_100_ratio",
+        "tenengrad_p10",
+        "tenengrad_median",
+    )
+    assert clear_file003_evaluation.decision == "warn"
+    assert clear_file003_evaluation.reasons == ()
+    assert "adjacent_near_duplicate_ratio_warn" in clear_file003_evaluation.warn_reasons
+    assert not any(any(code in reason for code in sharpness_codes) for reason in clear_file003_evaluation.warn_reasons)
+
+    assert clear_file008_evaluation.decision == "pass"
+    assert clear_file008_evaluation.reasons == ()
+    assert clear_file008_evaluation.warn_reasons == ()
+
+    assert "adjacent_near_duplicate_ratio_warn" in borderline_evaluation.warn_reasons
+    assert not any(any(code in reason for code in sharpness_codes) for reason in borderline_evaluation.warn_reasons)
 
 
 def test_evaluate_video_quality_still_fails_severe_global_blur(tmp_path: Path) -> None:
@@ -460,11 +627,11 @@ def test_evaluate_video_quality_still_fails_severe_global_blur(tmp_path: Path) -
     metrics = analyze_video(video, load_video_quality_config(None))
     metrics = replace(
         metrics,
-        laplacian_p10=10.0,
-        laplacian_median=20.0,
-        laplacian_under_100_ratio=0.853,
-        tenengrad_p10=5.0,
-        tenengrad_median=8.0,
+        laplacian_p10=5.0,
+        laplacian_median=8.0,
+        laplacian_under_100_ratio=1.0,
+        tenengrad_p10=3.0,
+        tenengrad_median=3.5,
     )
 
     evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
@@ -476,7 +643,7 @@ def test_evaluate_video_quality_still_fails_severe_global_blur(tmp_path: Path) -
     assert "laplacian_median_warn" in evaluation.warn_reasons
     assert "laplacian_under_100_ratio_above_max" not in evaluation.reasons
     assert "tenengrad_p10_below_min" in evaluation.reasons
-    assert "tenengrad_median_below_min" not in evaluation.reasons
+    assert "tenengrad_median_below_min" in evaluation.reasons
 
 
 def test_evaluate_video_quality_fails_decode_and_threshold_reasons(tmp_path: Path) -> None:
@@ -584,7 +751,7 @@ def test_evaluate_video_quality_fails_clear_screen_thresholds(tmp_path: Path) ->
     assert "laplacian_p10_warn" in evaluation.warn_reasons
     assert "laplacian_median_warn" in evaluation.warn_reasons
     assert "laplacian_under_100_ratio_above_max" not in evaluation.reasons
-    assert "laplacian_under_100_ratio_warn" in evaluation.warn_reasons
+    assert "laplacian_under_100_ratio_warn" not in evaluation.warn_reasons
     assert "tenengrad_p10_below_min" in evaluation.reasons
     assert "tenengrad_median_below_min" in evaluation.reasons
 
@@ -875,6 +1042,8 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
         "failed_modules": [],
         "reasons": [],
         "warn_reasons": [],
+        "reason_details": [],
+        "warn_reason_details": [],
         "should_run_mask_qc": True,
     }
     assert report["source_files"]["video"]["path"] == "video/408817_video.mp4"
@@ -893,6 +1062,8 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
         "passed": True,
         "reasons": [],
         "warn_reasons": [],
+        "reason_details": [],
+        "warn_reason_details": [],
         "should_run_mask_qc": True,
     }
     assert report["video_quality"]["sampling"]["decoded_sample_count"] >= 1

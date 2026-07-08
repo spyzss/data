@@ -47,6 +47,8 @@ quality_archive/408817.json  -> asset_id = 408817
     "failed_modules": [],
     "reasons": [],
     "warn_reasons": [],
+    "reason_details": [],
+    "warn_reason_details": [],
     "should_run_mask_qc": null
   },
   "source_files": {
@@ -107,6 +109,8 @@ quality_archive/408817.json  -> asset_id = 408817
   "failed_modules": [],
   "reasons": [],
   "warn_reasons": [],
+  "reason_details": [],
+  "warn_reason_details": [],
   "should_run_mask_qc": null
 }
 ```
@@ -121,6 +125,8 @@ quality_archive/408817.json  -> asset_id = 408817
   "failed_modules": [],
   "reasons": [],
   "warn_reasons": [],
+  "reason_details": [],
+  "warn_reason_details": [],
   "should_run_mask_qc": true
 }
 ```
@@ -135,6 +141,8 @@ quality_archive/408817.json  -> asset_id = 408817
 | `failed_modules` | string[] | 有失败结论的模块名。 |
 | `reasons` | string[] | 全局 hard fail 原因，格式建议为稳定机器可读枚举。 |
 | `warn_reasons` | string[] | 全局 warning 原因，不阻断后续高成本 QC。 |
+| `reason_details` | object[] | 与 `reasons` 对应的结构化明细，包含触发指标、实际值、阈值和比较方向。 |
+| `warn_reason_details` | object[] | 与 `warn_reasons` 对应的结构化明细，不能只写原因码，必须写出实际数值。 |
 | `should_run_mask_qc` | boolean/null | 视频预筛完成后必须写入；规则是 `status != "fail"`。 |
 
 ## source_files
@@ -210,12 +218,14 @@ quality_archive/408817.json  -> asset_id = 408817
 ```json
 {
   "stage": "video_prefilter",
-  "threshold_version": "video_prefilter_v0.3.0",
+  "threshold_version": "video_prefilter_v0.3.2",
   "evaluation": {
     "decision": "pass",
     "passed": true,
     "reasons": [],
     "warn_reasons": [],
+    "reason_details": [],
+    "warn_reason_details": [],
     "should_run_mask_qc": true
   },
   "metadata": {
@@ -273,6 +283,16 @@ quality_archive/408817.json  -> asset_id = 408817
       "tenengrad_median": 42.7
     },
     "freeze_metrics": {
+      "adjacent_near_duplicate_count": 120,
+      "adjacent_near_duplicate_ratio": 0.13,
+      "freeze_candidate_window_sec": 0.5,
+      "freeze_candidate_frame_count": 0,
+      "freeze_candidate_duration_sec": 0.0,
+      "freeze_candidate_ratio": 0.0,
+      "confirmed_freeze_window_sec": 1.0,
+      "confirmed_freeze_frame_count": 0,
+      "confirmed_freeze_duration_sec": 0.0,
+      "confirmed_freeze_ratio": 0.0,
       "frozen_frame_ratio": 0.0,
       "max_consecutive_frozen_sec": 0.0,
       "frozen_interval_min_frames": 6,
@@ -303,7 +323,7 @@ quality_archive/408817.json  -> asset_id = 408817
     "hand_roi_metrics": null
   },
   "thresholds": {
-    "threshold_version": "video_prefilter_v0.3.0",
+    "threshold_version": "video_prefilter_v0.3.2",
     "fps": {
       "expected_fps": null,
       "min_fps_pass": 24,
@@ -343,6 +363,9 @@ quality_archive/408817.json  -> asset_id = 408817
       "tenengrad_median_warn": 8
     },
     "freeze": {
+      "adjacent_near_duplicate_ratio_warn": 0.90,
+      "freeze_candidate_window_sec": 0.5,
+      "confirmed_freeze_window_sec": 1.0,
       "frozen_frame_ratio_pass": 0.05,
       "frozen_frame_ratio_warn": 0.10,
       "min_interval_frames": 6,
@@ -350,7 +373,9 @@ quality_archive/408817.json  -> asset_id = 408817
       "ssim_min": 0.995,
       "phash_hamming_max": 4,
       "motion_conflict_enabled": true,
-      "critical_window_enabled": true
+      "critical_window_enabled": true,
+      "video_state_conflict_noncritical_duration_ms_fail": 1000.0,
+      "video_state_conflict_critical_duration_ms_fail": 500.0
     },
     "defects": {
       "max_duration_ratio_fail": 0.10,
@@ -371,9 +396,17 @@ quality_archive/408817.json  -> asset_id = 408817
 | `hdf5_keypoints_bbox` | 从 HDF5 关键点数组生成粗 hand ROI bbox。 |
 | `hdf5_transform_keypoints_bbox` | 从 `transforms/*` 下手部、手指、拇指相关 4x4 矩阵取平移点，并使用 `camera/intrinsic` 投影后生成粗 hand ROI bbox。 |
 
-`video_prefilter_v0.3.0` 面向机器人预训练预筛，默认认为后续视频可能下采样到 448x256 一类低分辨率，因此清晰度指标主要用于发现风险，不追求高清画质硬筛。hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近整段过暗/过曝、冻帧/丢帧，以及所有瑕疵时长合计超过 10%。掉帧检测优先使用 `ffprobe` 每帧真实 PTS，其次 PyAV；OpenCV `CAP_PROP_POS_MSEC` 只作为 fallback，且 `drop_detection_reliable` 必须写为 `false`。`drop_frame_ratio` 使用 `estimated_missing_frames / (video_frame_count + estimated_missing_frames)`，不再使用异常间隔次数比例。如果启用 `hand_roi.mode: warn_except_severe_fail`，ROI Laplacian / Tenengrad 低于 pass 线只写入 `warn_reasons`；只有 `hand_roi_severe_blur` 或 `hand_roi_blur_bad_frame_ratio_above_max` 才会把视频预筛判成 `fail`。
+`video_prefilter_v0.3.2` 面向机器人预训练预筛，默认认为后续视频可能下采样到 448x256 一类低分辨率，因此清晰度指标只用于发现极端模糊风险，不追求高清画质硬筛。该版本按人工复核反馈放宽全帧 Laplacian / Tenengrad 默认线；能看清边缘、区分物体的视频不应仅因低纹理或低锐化响应而 warn/fail。hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近整段过暗/过曝、confirmed freeze / 丢帧，以及所有瑕疵时长合计超过 10%。相邻近重复比例仍保留 `0.90` 作为低运动量 warn 线，但不作为拒收条件。掉帧检测优先使用 `ffprobe` 每帧真实 PTS，其次 PyAV；OpenCV `CAP_PROP_POS_MSEC` 只作为 fallback，且 `drop_detection_reliable` 必须写为 `false`。`drop_frame_ratio` 使用 `estimated_missing_frames / (video_frame_count + estimated_missing_frames)`，不再使用异常间隔次数比例。如果启用 `hand_roi.mode: warn_except_severe_fail`，ROI Laplacian / Tenengrad 低于 pass 线只写入 `warn_reasons`；只有 `hand_roi_severe_blur` 或 `hand_roi_blur_bad_frame_ratio_above_max` 才会把视频预筛判成 `fail`。
 
-`freeze_metrics.frozen_intervals` 记录连续冻帧区间，默认只记录同时满足 `frame_count >= 6` 和 `duration_ms >= 100` 的片段。冻帧判定保留 `mean(absdiff)+hist_diff`，并增加 SSIM/pHash 作为近重复辅助指标。每个区间字段如下：
+冻结相关指标分三层：
+
+| field | 含义 |
+|---|---|
+| `adjacent_near_duplicate_ratio` | 相邻帧近重复比例，只表示低运动量，不作为拒收条件；超过默认 0.90 只写 warn。 |
+| `freeze_candidate_ratio` | 相隔 0.5s 的两帧仍近重复时覆盖的候选冻结比例。 |
+| `confirmed_freeze_ratio` / `frozen_frame_ratio` | 相隔 1.0s 的两帧仍近重复时覆盖的 confirmed freeze 比例，才参与 frozen hard fail 和瑕疵时长。 |
+
+`freeze_metrics.frozen_intervals` 只记录 confirmed freeze 区间。冻帧判定保留 `mean(absdiff)+hist_diff`，并增加 SSIM/pHash 作为近重复辅助指标。每个区间字段如下：
 
 | field | 含义 |
 |---|---|
@@ -388,10 +421,17 @@ quality_archive/408817.json  -> asset_id = 408817
 | `mean_hist_diff` / `max_hist_diff` | 区间内相邻帧灰度直方图 chi-square 差异统计。 |
 | `mean_ssim` / `min_ssim` | 区间内相邻帧 SSIM 统计。 |
 | `mean_phash_hamming` / `max_phash_hamming` | 区间内相邻帧 pHash Hamming 距离统计。 |
-| `motion_conflict` | 是否出现视频近重复但 HDF5 hand keypoints / action / cam_pose / 4x4 transform 仍明显变化。 |
+| `motion_conflict` | 是否出现 confirmed freeze 期间 HDF5 hand keypoints / action / cam_pose / 4x4 transform 仍明显变化。 |
 | `motion_conflict_signals` | 触发跨模态冲突的 HDF5 信号列表。 |
 | `critical_window` | HDF5 文本是否表明该样本包含 grasp / place / contact / hand-object interaction 等关键窗口。 |
 | `critical_keywords` | 命中的关键窗口关键词。 |
+
+`video_state_conflict` 的 hard reject 规则：
+
+| 场景 | 阈值 |
+|---|---:|
+| 非关键窗口 confirmed freeze 且 HDF5 状态变化 | `duration_ms >= 1000` |
+| grasp/place/contact/hand-object interaction 关键窗口 confirmed freeze 且 HDF5 状态变化 | `duration_ms >= 500` |
 
 `video_quality.evaluation.decision` 与 `qc_summary.status` 同步，取值为 `pass | warn | fail`。`should_run_mask_qc` 是 pipeline 调度 flag，规则固定为：
 
@@ -399,7 +439,40 @@ quality_archive/408817.json  -> asset_id = 408817
 should_run_mask_qc = decision != "fail"
 ```
 
-`video_quality.evaluation.reasons` 和 `warn_reasons` 使用稳定机器可读枚举，例如：
+`video_quality.evaluation.reasons` 和 `warn_reasons` 使用稳定机器可读枚举；`reason_details` 和 `warn_reason_details` 保留对应的实际数值、阈值和比较方向。下游程序可以继续只看原因码，人工排查和报告生成应优先展示 details。
+
+```json
+{
+  "warn_reasons": ["laplacian_under_100_ratio_warn"],
+  "warn_reason_details": [
+    {
+      "code": "laplacian_under_100_ratio_warn",
+      "severity": "warn",
+      "metric": "sharpness_global.laplacian_under_100_ratio",
+      "value": 0.8532110091743119,
+      "pass_threshold": 0.5,
+      "fail_threshold": 1.0,
+      "comparison": ">",
+      "context": {}
+    }
+  ]
+}
+```
+
+明细字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `code` | string | 与 `reasons` / `warn_reasons` 中的原因码一致。 |
+| `severity` | string | `fail` 或 `warn`。 |
+| `metric` | string/null | 触发该原因的指标路径，例如 `sharpness_global.laplacian_under_100_ratio`。 |
+| `value` | number/string/boolean/null | 本次视频的实际指标值。 |
+| `pass_threshold` | number/string/boolean/null | 通过线；超过或低于该线会进入 warn 或 fail。 |
+| `fail_threshold` | number/string/boolean/null | hard fail 线；无 hard fail 线时可为 `null`。 |
+| `comparison` | string/null | 判定方向，常见为 `>`、`<`、`==`。 |
+| `context` | object | 补充上下文，例如估算缺失帧、HDF5 帧数、冻帧冲突区间统计。 |
+
+常见 reason 枚举：
 
 | reason | 含义 |
 |---|---|
@@ -420,10 +493,11 @@ should_run_mask_qc = decision != "fail"
 | `tenengrad_median_below_min` | Tenengrad 中位数极低，边缘几乎不可读。 |
 | `black_frame_ratio_above_max` | 黑帧率接近整段视频，超过 hard fail 阈值。 |
 | `black_frame_count_above_max` | 估算黑帧数超过 10 帧。 |
-| `frozen_frame_ratio_above_max` | 冻帧率高于 hard fail 阈值，默认 10%。 |
-| `max_consecutive_frozen_sec_above_max` | 连续冻结时长超过阈值。 |
-| `freeze_with_motion_conflict` | 视频画面近重复，但 HDF5 hand keypoints / action / cam_pose / 4x4 transform 显示状态仍明显变化。 |
-| `frozen_interval_in_critical_window` | 冻帧区间发生在 grasp / place / contact / hand-object interaction 等关键窗口。 |
+| `adjacent_near_duplicate_ratio_warn` | 相邻帧近重复比例高，提示低运动量；不作为拒收条件。 |
+| `frozen_frame_ratio_above_max` | confirmed freeze 比例高于 hard fail 阈值，默认 10%。 |
+| `max_consecutive_frozen_sec_above_max` | confirmed freeze 连续时长超过阈值。 |
+| `video_state_conflict` | confirmed freeze 期间 HDF5 hand keypoints / action / cam_pose / 4x4 transform 显示状态仍明显变化，且达到时长阈值。 |
+| `video_state_conflict_warn` | confirmed freeze 期间检测到 HDF5 状态变化，但时长未达到 hard reject 阈值。 |
 | `defect_duration_ratio_above_max` | 曝光/黑帧类、冻帧、丢帧合计瑕疵时长比例超过 10%。 |
 | `hdf5_frame_count_mismatch` | HDF5 帧数与视频帧数不一致。 |
 | `hdf5_missing` | HDF5 缺失，且配置要求失败。 |

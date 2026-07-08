@@ -112,7 +112,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 Optional config:
 
 ```yaml
-threshold_version: video_prefilter_v0.3.0
+threshold_version: video_prefilter_v0.3.2
 decode:
   max_sample_frames: 300
 hdf5_alignment:
@@ -133,17 +133,20 @@ exposure:
     ratio_warn: 0.90
 sharpness_global:
   target_short_side: 720
-  laplacian_p10_pass: 35
+  laplacian_p10_pass: 15
   laplacian_p10_warn: 0
-  laplacian_median_pass: 50
+  laplacian_median_pass: 20
   laplacian_median_warn: 0
-  laplacian_under_100_ratio_pass: 0.50
+  laplacian_under_100_ratio_pass: 1.00
   laplacian_under_100_ratio_warn: 1.00
-  tenengrad_p10_pass: 12
-  tenengrad_p10_warn: 6
-  tenengrad_median_pass: 13
-  tenengrad_median_warn: 8
+  tenengrad_p10_pass: 6
+  tenengrad_p10_warn: 4
+  tenengrad_median_pass: 7
+  tenengrad_median_warn: 4
 freeze:
+  adjacent_near_duplicate_ratio_warn: 0.90
+  freeze_candidate_window_sec: 0.5
+  confirmed_freeze_window_sec: 1.0
   frozen_frame_ratio_pass: 0.05
   frozen_frame_ratio_warn: 0.10
   min_interval_frames: 6
@@ -152,6 +155,8 @@ freeze:
   phash_hamming_max: 4
   motion_conflict_enabled: true
   critical_window_enabled: true
+  video_state_conflict_noncritical_duration_ms_fail: 1000
+  video_state_conflict_critical_duration_ms_fail: 500
 defects:
   max_duration_ratio_fail: 0.10
   duration_ratio_warn: 0.05
@@ -175,7 +180,10 @@ The video quality command writes each asset's QC result into
 documented in `docs/asset-qc-json-format.md`; future batch-level summaries or
 tables can be generated from these archive files. The video block stores
 `decision: pass|warn|fail` and `should_run_mask_qc`; downstream high-cost QC
-should run only when `should_run_mask_qc` is `true`.
+should run only when `should_run_mask_qc` is `true`. `reasons` and
+`warn_reasons` remain stable machine-readable codes, while `reason_details` and
+`warn_reason_details` carry the actual metric value, threshold, comparison, and
+context for report generation and manual review.
 
 The batch pull workflow still writes pull/sampling reports under:
 
@@ -188,7 +196,7 @@ sampled/XJGT_20260616/
     summary.json
 ```
 
-It is a `video_prefilter_v0.3.0` low-cost prefilter. It uses practical
+It is a `video_prefilter_v0.3.2` low-cost prefilter. It uses practical
 no-reference indicators: open/decode health, fps, resolution, timeline
 continuity, sampled-frame decode ratio, black/over-dark/over-exposure ratios,
 global sharpness at a normalized short side, frozen-frame risk, drop-frame risk,
@@ -196,15 +204,16 @@ total defect-duration ratio, HDF5 frame-count alignment, and continuous frozen
 intervals. Drop-frame detection prefers real per-frame PTS from `ffprobe`, then
 PyAV if available; OpenCV `CAP_PROP_POS_MSEC` is only a fallback and is recorded
 as `drop_detection_reliable: false`. `drop_frame_ratio` is computed from
-`estimated_missing_frames`, not from the count of abnormal intervals. Frozen
-interval detection keeps `mean(absdiff)+hist_diff` and adds SSIM/pHash as
-auxiliary near-duplicate checks; intervals are recorded only when they exceed
-both the frame-count and duration thresholds. If video frames are near-duplicate
-while HDF5 hand keypoints, action, cam pose, or 4x4 transform signals move, the
-interval is marked `freeze_with_motion_conflict`; freeze inside grasp/place/
-contact/hand-object interaction windows is treated strictly. Hand ROI is disabled
-by default in this prefilter because the rough bbox is too noisy for gating. It
-is calibrated for robot pretraining videos that may be downsampled to low resolution,
+`estimated_missing_frames`, not from the count of abnormal intervals.
+`adjacent_near_duplicate_ratio` is now only a low-motion indicator and never a
+reject condition. A frame range is a `freeze_candidate` only when frames 0.5s
+apart are still near-duplicates; it becomes confirmed freeze only when frames
+1.0s apart are still near-duplicates. If confirmed freeze overlaps HDF5
+hand-keypoint/action/cam-pose/4x4-transform motion, the interval is marked
+`video_state_conflict`; non-critical windows reject at >=1.0s, while
+grasp/place/contact/hand-object interaction windows reject at >=0.5s. Hand ROI is
+disabled by default in this prefilter because the rough bbox is too noisy for
+gating. It is calibrated for robot pretraining videos that may be downsampled to low resolution,
 so sharpness mostly produces warnings unless edges are nearly unreadable. It does
 not perform keypoint accuracy validation, keypoint-mask matching,
 hand-object mask IoU, trajectory jump checks, semantic consistency, or subtask
