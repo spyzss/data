@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+import shutil
+import subprocess
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -129,11 +131,32 @@ class FreezeConfig:
     downscale_short_side: int = 360
     frame_diff_mean_abs_max: float = 1.0
     hist_diff_max: float = 0.01
+    ssim_min: float = 0.995
+    phash_hamming_max: int = 4
     frozen_frame_ratio_pass: float = 0.05
     frozen_frame_ratio_warn: float = 0.10
     min_interval_frames: int = 6
+    min_interval_duration_ms: float = 100.0
     max_consecutive_frozen_sec_pass: float = 0.5
     max_consecutive_frozen_sec_fail: float = 1.0
+    motion_conflict_enabled: bool = True
+    motion_keypoint_delta_normalized_min: float = 0.02
+    motion_keypoint_delta_px_min: float = 12.0
+    motion_numeric_delta_min: float = 0.01
+    critical_window_enabled: bool = True
+    critical_window_keywords: tuple[str, ...] = (
+        "grasp",
+        "place",
+        "contact",
+        "hand-object",
+        "hand object",
+        "interaction",
+        "抓取",
+        "放置",
+        "接触",
+        "交互",
+    )
+    critical_window_interval_duration_ms_fail: float = 100.0
 
 
 @dataclass(frozen=True)
@@ -190,7 +213,7 @@ class HandRoiConfig:
 
 @dataclass(frozen=True)
 class VideoQualityConfig:
-    threshold_version: str = "video_prefilter_v0.2.9"
+    threshold_version: str = "video_prefilter_v0.3.0"
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     fps: FpsConfig = field(default_factory=FpsConfig)
     resolution: ResolutionConfig = field(default_factory=ResolutionConfig)
@@ -219,6 +242,26 @@ class FrozenInterval:
     start_time_sec: float
     end_time_sec: float
     duration_sec: float
+    duration_ms: float
+    mean_frame_diff: float = 0.0
+    max_frame_diff: float = 0.0
+    mean_hist_diff: float = 0.0
+    max_hist_diff: float = 0.0
+    mean_ssim: float = 0.0
+    min_ssim: float = 0.0
+    mean_phash_hamming: float = 0.0
+    max_phash_hamming: int = 0
+    motion_conflict: bool = False
+    motion_conflict_signals: tuple[str, ...] = ()
+    critical_window: bool = False
+    critical_keywords: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FrameTimestamps:
+    timestamps_ms: tuple[float, ...]
+    source: str
+    reliable: bool
 
 
 @dataclass(frozen=True)
@@ -278,6 +321,10 @@ class VideoMetrics:
     frozen_intervals: tuple[FrozenInterval, ...]
     pts_monotonic_valid: bool
     drop_frame_ratio: float
+    drop_detection_source: str
+    drop_detection_reliable: bool
+    estimated_missing_frames: int
+    observed_frame_interval_count: int
     frame_interval_p99_ms: float
     max_frame_gap_ms: float
     expected_interval_ms: float
@@ -499,24 +546,96 @@ def _chi_square_hist_diff(left: np.ndarray, right: np.ndarray) -> float:
     return float(0.5 * np.sum(((left_hist - right_hist) ** 2) / (left_hist + right_hist + 1e-12)))
 
 
-def _timeline_metrics(path: Path, frame_count: int, fps: float, config: TimelineConfig) -> dict[str, float | bool]:
-    expected_interval_ms = 1000.0 / fps if fps > 0 else 0.0
-    drop_interval_ms = max(
-        expected_interval_ms * config.drop_interval_factor,
-        expected_interval_ms + config.drop_interval_extra_ms,
-    )
-    max_gap_fail_ms = max(expected_interval_ms * config.max_gap_factor, config.max_gap_floor_ms)
-    if frame_count <= 1 or fps <= 0:
-        return {
-            "pts_monotonic_valid": True,
-            "drop_frame_ratio": 0.0,
-            "frame_interval_p99_ms": 0.0,
-            "max_frame_gap_ms": 0.0,
-            "expected_interval_ms": expected_interval_ms,
-            "drop_interval_ms": drop_interval_ms,
-            "max_gap_fail_ms": max_gap_fail_ms,
-        }
+def _timestamps_are_usable(timestamps_ms: tuple[float, ...]) -> bool:
+    if len(timestamps_ms) < 2:
+        return False
+    if not all(np.isfinite(item) for item in timestamps_ms):
+        return False
+    return len({round(item, 3) for item in timestamps_ms}) > 1
 
+
+def _read_frame_timestamps_ffprobe(path: Path) -> FrameTimestamps | None:
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None
+
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "frame=best_effort_timestamp_time,pts_time,pkt_pts_time",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+
+    timestamps: list[float] = []
+    for frame in payload.get("frames", []):
+        if not isinstance(frame, dict):
+            continue
+        for key in ("best_effort_timestamp_time", "pts_time", "pkt_pts_time"):
+            raw = frame.get(key)
+            if raw in (None, "N/A"):
+                continue
+            try:
+                timestamp_ms = float(raw) * 1000.0
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(timestamp_ms):
+                timestamps.append(timestamp_ms)
+                break
+
+    timestamps_tuple = tuple(timestamps)
+    if not _timestamps_are_usable(timestamps_tuple):
+        return None
+    return FrameTimestamps(timestamps_ms=timestamps_tuple, source="ffprobe", reliable=True)
+
+
+def _read_frame_timestamps_pyav(path: Path) -> FrameTimestamps | None:
+    try:
+        import av  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+
+    timestamps: list[float] = []
+    try:
+        with av.open(str(path)) as container:
+            stream = next((item for item in container.streams if item.type == "video"), None)
+            if stream is None:
+                return None
+            for frame in container.decode(stream):
+                timestamp_sec = frame.time
+                if timestamp_sec is None and frame.pts is not None and stream.time_base is not None:
+                    timestamp_sec = float(frame.pts * stream.time_base)
+                if timestamp_sec is None:
+                    continue
+                timestamp_ms = float(timestamp_sec) * 1000.0
+                if np.isfinite(timestamp_ms):
+                    timestamps.append(timestamp_ms)
+    except Exception:
+        return None
+
+    timestamps_tuple = tuple(timestamps)
+    if not _timestamps_are_usable(timestamps_tuple):
+        return None
+    return FrameTimestamps(timestamps_ms=timestamps_tuple, source="pyav", reliable=True)
+
+
+def _read_frame_timestamps_opencv(path: Path, frame_count: int) -> FrameTimestamps | None:
     timestamps: list[float] = []
     capture = cv2.VideoCapture(str(path))
     try:
@@ -528,20 +647,72 @@ def _timeline_metrics(path: Path, frame_count: int, fps: float, config: Timeline
     finally:
         capture.release()
 
-    if len(timestamps) < 2 or len(set(round(item, 3) for item in timestamps)) <= 1:
+    timestamps_tuple = tuple(timestamps)
+    if not _timestamps_are_usable(timestamps_tuple):
+        return None
+    return FrameTimestamps(timestamps_ms=timestamps_tuple, source="opencv", reliable=False)
+
+
+def _select_frame_timestamps(path: Path, frame_count: int) -> FrameTimestamps | None:
+    return (
+        _read_frame_timestamps_ffprobe(path)
+        or _read_frame_timestamps_pyav(path)
+        or _read_frame_timestamps_opencv(path, frame_count)
+    )
+
+
+def _timeline_metrics(path: Path, frame_count: int, fps: float, config: TimelineConfig) -> dict[str, float | int | bool | str]:
+    expected_interval_ms = 1000.0 / fps if fps > 0 else 0.0
+    drop_interval_ms = max(
+        expected_interval_ms * config.drop_interval_factor,
+        expected_interval_ms + config.drop_interval_extra_ms,
+    )
+    max_gap_fail_ms = max(expected_interval_ms * config.max_gap_factor, config.max_gap_floor_ms)
+    if frame_count <= 1 or fps <= 0:
+        return {
+            "pts_monotonic_valid": True,
+            "drop_frame_ratio": 0.0,
+            "drop_detection_source": "not_applicable",
+            "drop_detection_reliable": True,
+            "estimated_missing_frames": 0,
+            "observed_frame_interval_count": 0,
+            "frame_interval_p99_ms": 0.0,
+            "max_frame_gap_ms": 0.0,
+            "expected_interval_ms": expected_interval_ms,
+            "drop_interval_ms": drop_interval_ms,
+            "max_gap_fail_ms": max_gap_fail_ms,
+        }
+
+    timestamp_result = _select_frame_timestamps(path, frame_count)
+    if timestamp_result is None:
         intervals = [expected_interval_ms] * max(0, frame_count - 1)
         pts_monotonic_valid = True
+        drop_detection_source = "synthetic"
+        drop_detection_reliable = False
     else:
+        timestamps = list(timestamp_result.timestamps_ms)
         intervals = [timestamps[index] - timestamps[index - 1] for index in range(1, len(timestamps))]
         pts_monotonic_valid = all(interval >= 0 for interval in intervals)
+        drop_detection_source = timestamp_result.source
+        drop_detection_reliable = timestamp_result.reliable
 
     positive_intervals = [interval for interval in intervals if interval >= 0]
     if not positive_intervals:
         positive_intervals = [0.0]
-    drop_count = sum(1 for interval in positive_intervals if interval > drop_interval_ms)
+    estimated_missing_frames = 0
+    if expected_interval_ms > 0:
+        for interval in positive_intervals:
+            if interval > drop_interval_ms:
+                estimated_missing_frames += max(1, int(round(interval / expected_interval_ms)) - 1)
+
+    denominator = max(1, frame_count + estimated_missing_frames)
     return {
         "pts_monotonic_valid": pts_monotonic_valid,
-        "drop_frame_ratio": drop_count / len(positive_intervals) if positive_intervals else 0.0,
+        "drop_frame_ratio": estimated_missing_frames / denominator,
+        "drop_detection_source": drop_detection_source,
+        "drop_detection_reliable": drop_detection_reliable,
+        "estimated_missing_frames": estimated_missing_frames,
+        "observed_frame_interval_count": len(positive_intervals),
         "frame_interval_p99_ms": _percentile(positive_intervals, 99),
         "max_frame_gap_ms": float(max(positive_intervals)),
         "expected_interval_ms": expected_interval_ms,
@@ -772,7 +943,41 @@ def _compute_hand_roi_metrics(
     )
 
 
-def _make_frozen_interval(start_frame: int, end_frame: int, fps: float) -> FrozenInterval:
+def _ssim_score(left: np.ndarray, right: np.ndarray) -> float:
+    left_float = left.astype(np.float64)
+    right_float = right.astype(np.float64)
+    c1 = (0.01 * 255) ** 2
+    c2 = (0.03 * 255) ** 2
+    left_mean = float(np.mean(left_float))
+    right_mean = float(np.mean(right_float))
+    left_var = float(np.var(left_float))
+    right_var = float(np.var(right_float))
+    covariance = float(np.mean((left_float - left_mean) * (right_float - right_mean)))
+    denominator = (left_mean**2 + right_mean**2 + c1) * (left_var + right_var + c2)
+    if denominator == 0:
+        return 1.0
+    return float(((2 * left_mean * right_mean + c1) * (2 * covariance + c2)) / denominator)
+
+
+def _phash_bits(gray: np.ndarray) -> np.ndarray:
+    resized = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
+    dct = cv2.dct(resized.astype(np.float32))
+    low_freq = dct[:8, :8]
+    comparable = low_freq.flatten()[1:]
+    threshold = float(np.median(comparable)) if comparable.size else float(np.median(low_freq))
+    return low_freq > threshold
+
+
+def _phash_hamming(left: np.ndarray, right: np.ndarray) -> int:
+    return int(np.count_nonzero(_phash_bits(left) != _phash_bits(right)))
+
+
+def _make_frozen_interval(
+    start_frame: int,
+    end_frame: int,
+    fps: float,
+    pair_metrics: list[dict[str, float]] | None = None,
+) -> FrozenInterval:
     frame_count = end_frame - start_frame + 1
     if fps > 0:
         start_time_sec = start_frame / fps
@@ -782,6 +987,11 @@ def _make_frozen_interval(start_frame: int, end_frame: int, fps: float) -> Froze
         start_time_sec = 0.0
         end_time_sec = 0.0
         duration_sec = 0.0
+    pair_metrics = pair_metrics or []
+    frame_diffs = [item["frame_diff"] for item in pair_metrics]
+    hist_diffs = [item["hist_diff"] for item in pair_metrics]
+    ssim_values = [item["ssim"] for item in pair_metrics]
+    phash_values = [item["phash_hamming"] for item in pair_metrics]
     return FrozenInterval(
         start_frame=start_frame,
         end_frame=end_frame,
@@ -789,6 +999,15 @@ def _make_frozen_interval(start_frame: int, end_frame: int, fps: float) -> Froze
         start_time_sec=start_time_sec,
         end_time_sec=end_time_sec,
         duration_sec=duration_sec,
+        duration_ms=duration_sec * 1000.0,
+        mean_frame_diff=float(np.mean(frame_diffs)) if frame_diffs else 0.0,
+        max_frame_diff=float(max(frame_diffs)) if frame_diffs else 0.0,
+        mean_hist_diff=float(np.mean(hist_diffs)) if hist_diffs else 0.0,
+        max_hist_diff=float(max(hist_diffs)) if hist_diffs else 0.0,
+        mean_ssim=float(np.mean(ssim_values)) if ssim_values else 0.0,
+        min_ssim=float(min(ssim_values)) if ssim_values else 0.0,
+        mean_phash_hamming=float(np.mean(phash_values)) if phash_values else 0.0,
+        max_phash_hamming=int(max(phash_values)) if phash_values else 0,
     )
 
 
@@ -810,18 +1029,21 @@ def _scan_frozen_intervals(
     previous_gray: np.ndarray | None = None
     current_run_start: int | None = None
     current_run_end: int | None = None
+    current_run_metrics: list[dict[str, float]] = []
     frame_index = 0
 
     def finish_run() -> None:
-        nonlocal current_run_start, current_run_end, max_run_frames
+        nonlocal current_run_start, current_run_end, current_run_metrics, max_run_frames
         if current_run_start is None or current_run_end is None:
             return
         run_frame_count = current_run_end - current_run_start + 1
         max_run_frames = max(max_run_frames, run_frame_count)
-        if run_frame_count >= config.min_interval_frames:
-            intervals.append(_make_frozen_interval(current_run_start, current_run_end, fps))
+        interval = _make_frozen_interval(current_run_start, current_run_end, fps, current_run_metrics)
+        if run_frame_count >= config.min_interval_frames and interval.duration_ms >= config.min_interval_duration_ms:
+            intervals.append(interval)
         current_run_start = None
         current_run_end = None
+        current_run_metrics = []
 
     try:
         while True:
@@ -834,11 +1056,23 @@ def _scan_frozen_intervals(
             if previous_gray is not None:
                 diff = float(np.mean(cv2.absdiff(previous_gray, freeze_gray)))
                 hist_diff = _chi_square_hist_diff(previous_gray, freeze_gray)
-                if diff < config.frame_diff_mean_abs_max and hist_diff < config.hist_diff_max:
+                ssim = _ssim_score(previous_gray, freeze_gray)
+                phash_hamming = _phash_hamming(previous_gray, freeze_gray)
+                auxiliary_match = ssim >= config.ssim_min or phash_hamming <= config.phash_hamming_max
+                if diff < config.frame_diff_mean_abs_max and hist_diff < config.hist_diff_max and auxiliary_match:
                     frozen_pairs += 1
                     if current_run_start is None:
                         current_run_start = frame_index - 1
+                        current_run_metrics = []
                     current_run_end = frame_index
+                    current_run_metrics.append(
+                        {
+                            "frame_diff": diff,
+                            "hist_diff": hist_diff,
+                            "ssim": ssim,
+                            "phash_hamming": float(phash_hamming),
+                        }
+                    )
                 else:
                     finish_run()
             previous_gray = freeze_gray
@@ -848,6 +1082,143 @@ def _scan_frozen_intervals(
         capture.release()
 
     return tuple(intervals), frozen_pairs, max_run_frames
+
+
+def _keypoint_motion_signal(
+    keypoint_data: Hdf5KeypointData | None,
+    interval: FrozenInterval,
+    config: FreezeConfig,
+) -> str | None:
+    if keypoint_data is None:
+        return None
+    points = keypoint_data.points
+    if interval.start_frame >= points.shape[0] or interval.end_frame >= points.shape[0]:
+        return None
+
+    start_points = np.asarray(points[interval.start_frame], dtype=np.float64)
+    end_points = np.asarray(points[interval.end_frame], dtype=np.float64)
+    if start_points.size == 0 or end_points.size == 0 or start_points.shape[-1] < 2 or end_points.shape[-1] < 2:
+        return None
+    start_points = start_points.reshape(-1, start_points.shape[-1])[:, :2]
+    end_points = end_points.reshape(-1, end_points.shape[-1])[:, :2]
+    point_count = min(len(start_points), len(end_points))
+    if point_count == 0:
+        return None
+    start_points = start_points[:point_count]
+    end_points = end_points[:point_count]
+    finite = np.all(np.isfinite(start_points), axis=1) & np.all(np.isfinite(end_points), axis=1)
+    if not np.any(finite):
+        return None
+
+    start_points = start_points[finite]
+    end_points = end_points[finite]
+    delta = float(np.mean(np.linalg.norm(end_points - start_points, axis=1)))
+    normalized = max(float(np.nanmax(np.abs(start_points))), float(np.nanmax(np.abs(end_points)))) <= 1.5
+    limit = config.motion_keypoint_delta_normalized_min if normalized else config.motion_keypoint_delta_px_min
+    if delta <= limit:
+        return None
+    unit = "norm" if normalized else "px"
+    return f"{keypoint_data.source}:{delta:.4f}{unit}"
+
+
+def _numeric_motion_signals(handle: h5py.File, interval: FrozenInterval, config: FreezeConfig) -> tuple[str, ...]:
+    signals: list[str] = []
+    tokens = ("action", "cam_pose", "camera_pose", "pose", "transform", "hand", "finger", "thumb")
+    excluded_tokens = ("quality_hand", "keypoint", "landmark")
+
+    def visit(name: str, obj: h5py.Group | h5py.Dataset) -> None:
+        if not isinstance(obj, h5py.Dataset) or len(obj.shape) < 1:
+            return
+        lower_name = name.lower()
+        if any(token in lower_name for token in excluded_tokens):
+            return
+        if not any(token in lower_name for token in tokens):
+            return
+        if obj.dtype.kind not in {"f", "i", "u"}:
+            return
+        if interval.start_frame >= obj.shape[0] or interval.end_frame >= obj.shape[0]:
+            return
+        try:
+            start_value = np.asarray(obj[interval.start_frame], dtype=np.float64)
+            end_value = np.asarray(obj[interval.end_frame], dtype=np.float64)
+        except (OSError, TypeError, ValueError):
+            return
+        if start_value.size == 0 or end_value.size == 0:
+            return
+        finite = np.isfinite(start_value) & np.isfinite(end_value)
+        if not np.any(finite):
+            return
+        delta = float(np.linalg.norm(end_value[finite] - start_value[finite]) / np.sqrt(np.count_nonzero(finite)))
+        if delta > config.motion_numeric_delta_min:
+            signals.append(f"{name}:{delta:.4f}")
+
+    handle.visititems(visit)
+    return tuple(signals)
+
+
+def _critical_keywords_in_hdf5(handle: h5py.File, config: FreezeConfig) -> tuple[str, ...]:
+    if not config.critical_window_enabled:
+        return ()
+    text_parts: list[str] = []
+
+    def append_decoded(value: Any) -> None:
+        decoded = _decode_hdf5_text(value)
+        if decoded is None:
+            return
+        if isinstance(decoded, str):
+            text_parts.append(decoded)
+        else:
+            text_parts.append(json.dumps(decoded, ensure_ascii=False))
+
+    for value in handle.attrs.values():
+        append_decoded(value)
+
+    def visit(_name: str, obj: h5py.Group | h5py.Dataset) -> None:
+        for value in obj.attrs.values():
+            append_decoded(value)
+        if isinstance(obj, h5py.Dataset) and obj.dtype.kind in {"S", "U", "O"}:
+            try:
+                append_decoded(obj[()])
+            except OSError:
+                return
+
+    handle.visititems(visit)
+    text = "\n".join(text_parts).lower()
+    return tuple(keyword for keyword in config.critical_window_keywords if keyword.lower() in text)
+
+
+def _annotate_frozen_intervals_with_hdf5(
+    intervals: tuple[FrozenInterval, ...],
+    hdf5_path: Path | None,
+    config: FreezeConfig,
+) -> tuple[FrozenInterval, ...]:
+    if not intervals or hdf5_path is None or not hdf5_path.is_file():
+        return intervals
+
+    try:
+        keypoint_data = _read_keypoint_data(hdf5_path) if config.motion_conflict_enabled else None
+        with h5py.File(hdf5_path, "r") as handle:
+            critical_keywords = _critical_keywords_in_hdf5(handle, config)
+            annotated: list[FrozenInterval] = []
+            for interval in intervals:
+                motion_signals: list[str] = []
+                keypoint_signal = _keypoint_motion_signal(keypoint_data, interval, config)
+                if keypoint_signal is not None:
+                    motion_signals.append(keypoint_signal)
+                if config.motion_conflict_enabled:
+                    motion_signals.extend(_numeric_motion_signals(handle, interval, config))
+                annotated.append(
+                    replace(
+                        interval,
+                        motion_conflict=bool(motion_signals),
+                        motion_conflict_signals=tuple(dict.fromkeys(motion_signals)),
+                        critical_window=bool(critical_keywords),
+                        critical_keywords=critical_keywords,
+                    )
+                )
+            return tuple(annotated)
+    except OSError:
+        return intervals
 
 
 def _empty_metrics(path: Path, errors: tuple[str, ...]) -> VideoMetrics:
@@ -892,6 +1263,10 @@ def _empty_metrics(path: Path, errors: tuple[str, ...]) -> VideoMetrics:
         frozen_intervals=(),
         pts_monotonic_valid=False,
         drop_frame_ratio=1.0,
+        drop_detection_source="unavailable",
+        drop_detection_reliable=False,
+        estimated_missing_frames=0,
+        observed_frame_interval_count=0,
         frame_interval_p99_ms=0.0,
         max_frame_gap_ms=0.0,
         expected_interval_ms=0.0,
@@ -975,6 +1350,7 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
         black_frame_count_estimate = int(round(black_frame_ratio * frame_count)) if frame_count > 0 else 0
         exposure_defect_frame_ratio = float(np.mean(exposure_defect_values)) if exposure_defect_values else 1.0
         frozen_intervals, frozen_pairs, max_frozen_run_frames = _scan_frozen_intervals(path, fps, config.freeze)
+        frozen_intervals = _annotate_frozen_intervals_with_hdf5(frozen_intervals, hdf5_path, config.freeze)
         frozen_frame_ratio = frozen_pairs / (frame_count - 1) if frame_count > 1 and config.freeze.enabled else 0.0
         defect_duration_ratio = min(
             1.0,
@@ -1027,6 +1403,10 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
             frozen_intervals=frozen_intervals,
             pts_monotonic_valid=bool(timeline["pts_monotonic_valid"]),
             drop_frame_ratio=float(timeline["drop_frame_ratio"]),
+            drop_detection_source=str(timeline["drop_detection_source"]),
+            drop_detection_reliable=bool(timeline["drop_detection_reliable"]),
+            estimated_missing_frames=int(timeline["estimated_missing_frames"]),
+            observed_frame_interval_count=int(timeline["observed_frame_interval_count"]),
             frame_interval_p99_ms=float(timeline["frame_interval_p99_ms"]),
             max_frame_gap_ms=float(timeline["max_frame_gap_ms"]),
             expected_interval_ms=float(timeline["expected_interval_ms"]),
@@ -1299,6 +1679,14 @@ def evaluate_video_quality(
             fail.append("max_consecutive_frozen_sec_above_max")
         elif metrics.max_consecutive_frozen_sec > config.freeze.max_consecutive_frozen_sec_pass:
             warn.append("max_consecutive_frozen_sec_warn")
+        if any(interval.motion_conflict for interval in metrics.frozen_intervals):
+            fail.append("freeze_with_motion_conflict")
+        if any(
+            interval.critical_window
+            and interval.duration_ms >= config.freeze.critical_window_interval_duration_ms_fail
+            for interval in metrics.frozen_intervals
+        ):
+            fail.append("frozen_interval_in_critical_window")
 
     if isinstance(alignment, Hdf5Alignment) and config.hdf5_alignment.mode != AlignmentMode.IGNORE:
         if alignment.status == "missing":
@@ -1514,6 +1902,19 @@ def _frozen_interval_json(interval: FrozenInterval) -> dict[str, Any]:
         "start_time_sec": interval.start_time_sec,
         "end_time_sec": interval.end_time_sec,
         "duration_sec": interval.duration_sec,
+        "duration_ms": interval.duration_ms,
+        "mean_frame_diff": interval.mean_frame_diff,
+        "max_frame_diff": interval.max_frame_diff,
+        "mean_hist_diff": interval.mean_hist_diff,
+        "max_hist_diff": interval.max_hist_diff,
+        "mean_ssim": interval.mean_ssim,
+        "min_ssim": interval.min_ssim,
+        "mean_phash_hamming": interval.mean_phash_hamming,
+        "max_phash_hamming": interval.max_phash_hamming,
+        "motion_conflict": interval.motion_conflict,
+        "motion_conflict_signals": list(interval.motion_conflict_signals),
+        "critical_window": interval.critical_window,
+        "critical_keywords": list(interval.critical_keywords),
     }
 
 
@@ -1562,6 +1963,10 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
     timeline_metrics = {
         "pts_monotonic_valid": metrics.pts_monotonic_valid,
         "drop_frame_ratio": metrics.drop_frame_ratio,
+        "drop_detection_source": metrics.drop_detection_source,
+        "drop_detection_reliable": metrics.drop_detection_reliable,
+        "estimated_missing_frames": metrics.estimated_missing_frames,
+        "observed_frame_interval_count": metrics.observed_frame_interval_count,
         "frame_interval_p99_ms": metrics.frame_interval_p99_ms,
         "max_frame_gap_ms": metrics.max_frame_gap_ms,
         "expected_interval_ms": metrics.expected_interval_ms,
@@ -1597,9 +2002,14 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
         "frozen_frame_ratio": metrics.frozen_frame_ratio,
         "max_consecutive_frozen_sec": metrics.max_consecutive_frozen_sec,
         "frozen_interval_min_frames": config.freeze.min_interval_frames,
+        "frozen_interval_min_duration_ms": config.freeze.min_interval_duration_ms,
         "frozen_interval_count": len(metrics.frozen_intervals),
         "frozen_interval_frame_count": sum(interval.frame_count for interval in metrics.frozen_intervals),
         "frozen_interval_duration_sec": sum(interval.duration_sec for interval in metrics.frozen_intervals),
+        "frozen_interval_motion_conflict_count": sum(1 for interval in metrics.frozen_intervals if interval.motion_conflict),
+        "frozen_interval_critical_window_count": sum(1 for interval in metrics.frozen_intervals if interval.critical_window),
+        "ssim_min": config.freeze.ssim_min,
+        "phash_hamming_max": config.freeze.phash_hamming_max,
         "frozen_intervals": [_frozen_interval_json(interval) for interval in metrics.frozen_intervals],
     }
     defect_metrics = {

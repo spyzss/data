@@ -112,7 +112,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 Optional config:
 
 ```yaml
-threshold_version: video_prefilter_v0.2.9
+threshold_version: video_prefilter_v0.3.0
 decode:
   max_sample_frames: 300
 hdf5_alignment:
@@ -147,6 +147,11 @@ freeze:
   frozen_frame_ratio_pass: 0.05
   frozen_frame_ratio_warn: 0.10
   min_interval_frames: 6
+  min_interval_duration_ms: 100
+  ssim_min: 0.995
+  phash_hamming_max: 4
+  motion_conflict_enabled: true
+  critical_window_enabled: true
 defects:
   max_duration_ratio_fail: 0.10
   duration_ratio_warn: 0.05
@@ -183,14 +188,23 @@ sampled/XJGT_20260616/
     summary.json
 ```
 
-It is a `video_prefilter_v0.2.9` low-cost prefilter. It uses practical
+It is a `video_prefilter_v0.3.0` low-cost prefilter. It uses practical
 no-reference indicators: open/decode health, fps, resolution, timeline
 continuity, sampled-frame decode ratio, black/over-dark/over-exposure ratios,
 global sharpness at a normalized short side, frozen-frame risk, drop-frame risk,
 total defect-duration ratio, HDF5 frame-count alignment, and continuous frozen
-intervals with at least 6 frames for downstream trimming. Hand ROI is disabled by
-default in this prefilter because the rough bbox is too noisy for gating. It is
-calibrated for robot pretraining videos that may be downsampled to low resolution,
+intervals. Drop-frame detection prefers real per-frame PTS from `ffprobe`, then
+PyAV if available; OpenCV `CAP_PROP_POS_MSEC` is only a fallback and is recorded
+as `drop_detection_reliable: false`. `drop_frame_ratio` is computed from
+`estimated_missing_frames`, not from the count of abnormal intervals. Frozen
+interval detection keeps `mean(absdiff)+hist_diff` and adds SSIM/pHash as
+auxiliary near-duplicate checks; intervals are recorded only when they exceed
+both the frame-count and duration thresholds. If video frames are near-duplicate
+while HDF5 hand keypoints, action, cam pose, or 4x4 transform signals move, the
+interval is marked `freeze_with_motion_conflict`; freeze inside grasp/place/
+contact/hand-object interaction windows is treated strictly. Hand ROI is disabled
+by default in this prefilter because the rough bbox is too noisy for gating. It
+is calibrated for robot pretraining videos that may be downsampled to low resolution,
 so sharpness mostly produces warnings unless edges are nearly unreadable. It does
 not perform keypoint accuracy validation, keypoint-mask matching,
 hand-object mask IoU, trajectory jump checks, semantic consistency, or subtask
