@@ -9,6 +9,7 @@ from tools.build_video_review_clips import (
     DEFAULT_FRAME_STRIDE,
     HAND_JOINT_NAMES,
     VIDEO_MANUAL_LABEL_COLUMNS,
+    apply_video_clip_policy,
     build_clip_rows,
     build_review_index_video_html,
     compute_clip_timing,
@@ -95,7 +96,7 @@ def test_build_clip_rows_joins_manifest_and_review_queue(tmp_path: Path) -> None
     assert row["sampled_frame_count"] == 11
 
 
-def test_video_review_html_contains_video_and_export_button() -> None:
+def test_video_review_html_default_has_no_video_block_and_export_button() -> None:
     rows = [
         {
             "review_id": "rq_001",
@@ -116,12 +117,39 @@ def test_video_review_html_contains_video_and_export_button() -> None:
         }
     ]
 
+    apply_video_clip_policy(rows, render_video_clips=False)
     html = build_review_index_video_html(rows)
 
-    assert "<video" in html
-    assert "controls" in html
+    assert rows[0]["clip_path"] == ""
+    assert rows[0]["display_clip_path"] == ""
+    assert "<video" not in html
     assert "Export manual_labels.csv" in html
     assert "function exportManualLabelsCsv" in html
+
+
+def test_video_review_html_render_video_clips_preserves_video_behavior() -> None:
+    rows = [
+        {
+            "review_id": "rq_001",
+            "supplier_id": "supplier_a",
+            "asset_id": "100030",
+            "window_start_frame": 120,
+            "window_end_frame": 150,
+            "representative_frame": 135,
+            "display_clip_path": "clips/rq_001.mp4",
+            "clip_path": "/tmp/review/clips/rq_001.mp4",
+            "clip_start_time_sec": 3.0,
+            "clip_duration_sec": 3.033333,
+            "clip_error": "",
+        }
+    ]
+
+    apply_video_clip_policy(rows, render_video_clips=True)
+    html = build_review_index_video_html(rows)
+
+    assert rows[0]["display_clip_path"] == "clips/rq_001.mp4"
+    assert "<video" in html
+    assert "controls" in html
 
 
 def test_sampled_frame_indices_use_stride_and_hard_cap() -> None:
@@ -251,14 +279,15 @@ def test_video_review_html_supports_multi_segment_labeling() -> None:
 
     assert "Accept whole window" in html
     assert "Add rejected segment" in html
-    assert "Defer / needs second check" in html
     assert "accept_reason" in html
-    assert "defer_reason" in html
+    assert "defer_reason" not in html
+    assert "Defer / needs second check" not in html
     assert "Delete segment" in html
     assert "affected_start_frame" in html
     assert "affected_end_frame" in html
-    assert "Set start = current overlay frame" in html
-    assert "Set end = current overlay frame" in html
+    assert "Set start" in html
+    assert "Set end" in html
+    assert "Set start/end use current overlay original frame_idx." in html
     assert "currentOverlayFrame" in html
     assert "currentVideoFrame" in html
     assert "segmentsByReviewId" in html
@@ -333,11 +362,9 @@ def test_video_review_html_action_semantics_clear_or_fill_affected_frames() -> N
     assert "manual_outcome:'true_positive'" in html
     assert "acceptance_status:'rejected'" in html
     assert "severity:'high'" in html
-    assert "function deferWholeWindow" in html
-    assert "manual_outcome:'review'" in html
-    assert "acceptance_status:'review'" in html
-    assert "severity:'medium'" in html
-    assert "confidence:'low'" in html
+    assert "Accepted whole window: ${reason}" in html
+    assert "Rejected segments: ${segmentsByReviewId[key].length}" in html
+    assert "function deferWholeWindow" not in html
 
 
 def test_video_review_normal_ui_hides_derived_schema_dropdowns() -> None:
@@ -348,6 +375,10 @@ def test_video_review_normal_ui_hides_derived_schema_dropdowns() -> None:
     assert "severity<select" not in html
     assert "confidence<select" not in html
     assert '"partial"' not in html
+    assert "needs_sam3" not in html
+    assert "needs_video_quality" not in html
+    assert "needs_stride1" not in html
+    assert "second_reviewer" not in html
 
 
 def test_video_review_html_contains_labeling_help_and_sam3_clarification() -> None:
@@ -355,7 +386,7 @@ def test_video_review_html_contains_labeling_help_and_sam3_clarification() -> No
 
     assert "False positive = script flagged this window but human confirms there is no real issue." in html
     assert "Acceptable = flagged phenomenon exists but should not reduce usable duration." in html
-    assert "Defer = cannot decide from current overlay; needs SAM3, stride=1, video_quality, or second reviewer." in html
+    assert "Add rejected segment = true_positive, rejected, high severity, medium confidence." in html
     assert "This page shows HDF5 skeleton projection overlay only." in html
     assert "SAM3 mask containment has not been run unless a SAM3 containment input was provided upstream." in html
 
@@ -396,6 +427,30 @@ def test_video_review_html_autosaves_and_loads_saved_progress() -> None:
     assert "renderSegments(rowIndex)" in html
     assert "validateAllSegments()" in html
     assert "updateSampledFrame(rowIndex)" in html
+
+
+def test_video_review_html_contains_server_autosave_with_fallbacks() -> None:
+    html = build_review_index_video_html([])
+
+    assert "/api/manual-review/save" in html
+    assert "function buildManualLabelsCsv" in html
+    assert "function buildProgressJson" in html
+    assert "function saveToLocalStorage" in html
+    assert "function saveToServer" in html
+    assert "debouncedServerAutosave" in html
+    assert "Saved locally" in html
+    assert "Saved to server at" in html
+    assert "Server save failed:" in html
+    assert "Export manual_labels.csv" in html
+    assert "Export progress JSON" in html
+    assert "localStorage" in html
+
+
+def test_video_review_html_has_explicit_cloud_save_button() -> None:
+    html = build_review_index_video_html([])
+
+    assert "Save to cloud" in html
+    assert "saveToServer('explicit_save')" in html
 
 
 def test_video_review_storage_key_uses_v3_run_label_not_content_hash() -> None:
@@ -476,6 +531,7 @@ def test_video_review_default_dropdowns_hide_unrelated_failure_modes() -> None:
         '"strong_containment_mismatch"',
         '"occlusion_or_mask_undersegmentation"',
         '"semantic_mismatch"',
+        '"projection_ambiguous"',
     ]:
         assert hidden not in html
 
@@ -484,7 +540,6 @@ def test_video_review_default_dropdowns_hide_unrelated_failure_modes() -> None:
         '"visual_skeleton_presence_mismatch"',
         '"implausible_skeleton_pose"',
         '"hand_out_of_frame"',
-        '"projection_ambiguous"',
         '"unknown"',
     ]:
         assert visible in html
@@ -506,6 +561,27 @@ def test_video_review_default_manual_outcomes_hide_false_negative_and_show_help(
     assert "Partial bad windows are represented by adding one rejected segment per affected range." in html
     assert "failure_mode options are limited to HDF5 skeleton projection review." in html
     assert "severe_keypoint_offset = projected skeleton/keypoints are clearly far from the hand." in html
+
+
+def test_video_review_accept_reason_options_are_final_overlay_choices() -> None:
+    html = build_review_index_video_html([])
+
+    assert '"false_alarm"' in html
+    assert '"acceptable_side_view_projection"' in html
+    assert '"minor_harmless_offset"' in html
+    assert '"acceptable_side_view"' not in html
+
+
+def test_video_review_rejected_segment_export_semantics_are_segment_only() -> None:
+    html = build_review_index_video_html([])
+
+    assert "Partial bad windows are represented by adding one rejected segment per affected range." in html
+    assert "uncovered frames are implicitly acceptable" in html
+    assert "affected_start_frame:overrides.affected_start_frame ?? ''" in html
+    assert "affected_end_frame:overrides.affected_end_frame ?? ''" in html
+    assert "manual_outcome:'true_positive'" in html
+    assert "acceptance_status:'rejected'" in html
+    assert "acceptance_status:'accepted'" in html
 
 
 def test_hand_joint_names_cover_left_and_right_acceptance_topology() -> None:
