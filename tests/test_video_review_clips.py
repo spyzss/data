@@ -432,7 +432,8 @@ def test_video_review_html_autosaves_and_loads_saved_progress() -> None:
 def test_video_review_html_contains_server_autosave_with_fallbacks() -> None:
     html = build_review_index_video_html([])
 
-    assert "/api/manual-review/save" in html
+    assert "const SERVER_SAVE_ENDPOINT='api/manual-review/save'" in html
+    assert "const SERVER_SAVE_ENDPOINT='/api/manual-review/save'" not in html
     assert "function buildManualLabelsCsv" in html
     assert "function buildProgressJson" in html
     assert "function saveToLocalStorage" in html
@@ -532,13 +533,14 @@ def test_video_review_default_dropdowns_hide_unrelated_failure_modes() -> None:
         '"occlusion_or_mask_undersegmentation"',
         '"semantic_mismatch"',
         '"projection_ambiguous"',
+        '"implausible_skeleton_pose"',
     ]:
         assert hidden not in html
 
     for visible in [
         '"severe_keypoint_offset"',
         '"visual_skeleton_presence_mismatch"',
-        '"implausible_skeleton_pose"',
+        '"skeleton_pose_hallucination"',
         '"hand_out_of_frame"',
         '"unknown"',
     ]:

@@ -640,3 +640,35 @@ def test_convert_manual_csv_rejects_invalid_enum(tmp_path: Path) -> None:
         assert "manual_outcome" in str(exc)
     else:
         raise AssertionError("invalid manual_outcome should fail")
+
+
+def test_convert_manual_csv_normalizes_legacy_implausible_pose_alias(
+    tmp_path: Path,
+) -> None:
+    csv_path = tmp_path / "manual_labels_legacy_alias.csv"
+    row = {column: "" for column in MANUAL_TEMPLATE_COLUMNS}
+    row.update(
+        {
+            "review_id": "r1",
+            "supplier_id": "supplier_a",
+            "asset_id": "100044",
+            "window_start_frame": 100,
+            "window_end_frame": 120,
+            "representative_frame": 111,
+            "auto_verdict": "review",
+            "suggested_issue_type": "projection_review",
+            "manual_outcome": "true_positive",
+            "failure_mode": "implausible_skeleton_pose",
+            "severity": "high",
+            "confidence": "medium",
+            "reviewer": "nathan",
+        }
+    )
+    pd.DataFrame([row], columns=MANUAL_TEMPLATE_COLUMNS).to_csv(
+        csv_path,
+        index=False,
+    )
+
+    records = convert_csv_to_patch_records(csv_path)
+
+    assert records[0]["failure_mode"] == "skeleton_pose_hallucination"

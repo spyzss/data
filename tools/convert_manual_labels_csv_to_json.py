@@ -32,6 +32,9 @@ OPTIONAL_SEGMENT_COLUMNS = {
     "acceptance_status",
 }
 ACCEPTANCE_STATUS_ENUM = ["accepted", "rejected", "review"]
+FAILURE_MODE_ALIASES = {
+    "implausible_skeleton_pose": "skeleton_pose_hallucination",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,7 +98,7 @@ def convert_csv_to_patch_records(
         manual_outcome = clean(row.get("manual_outcome"))
         if not manual_outcome:
             continue
-        failure_mode = clean(row.get("failure_mode"))
+        failure_mode = normalize_failure_mode(row.get("failure_mode"))
         severity = clean(row.get("severity"))
         confidence = clean(row.get("confidence"))
         acceptance_status = clean(row.get("acceptance_status"))
@@ -183,6 +186,11 @@ def clean(value: Any) -> str:
     if text.endswith(".0"):
         text = text[:-2]
     return text
+
+
+def normalize_failure_mode(value: Any) -> str:
+    failure_mode = clean(value)
+    return FAILURE_MODE_ALIASES.get(failure_mode, failure_mode)
 
 
 def int_or_none(value: Any) -> int | None:
