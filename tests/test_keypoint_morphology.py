@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 
 import numpy as np
@@ -263,3 +264,40 @@ def test_clip_summary_preserves_distribution_stats_and_threshold_metadata() -> N
     assert set(acceptance_joint_names(["left"])) == {
         name for name in clip.keypoints or {} if name.startswith("left")
     }
+
+
+def test_all_morphology_verdict_metrics_are_json_serializable() -> None:
+    normal = _clip()
+
+    review = _clip()
+    assert review.keypoints is not None
+    _set_joint(
+        review,
+        "leftIndexFingerTip",
+        review.keypoints["leftIndexFingerIntermediateTip"][0],
+    )
+
+    fail = _clip()
+    assert fail.keypoints is not None
+    collapsed = fail.keypoints["leftIndexFingerKnuckle"][0].copy()
+    for base_name in ACCEPTANCE_FINGER_CHAINS["Index"][1:]:
+        _set_joint(fail, f"left{base_name}", collapsed)
+
+    not_applicable = _clip()
+    assert not_applicable.keypoints is not None
+    not_applicable.keypoints["leftThumbTip"][0, 0] = np.nan
+
+    verdicts: set[str] = set()
+    for clip in (normal, review, fail, not_applicable):
+        results = create_check("keypoint_morphology", DEFAULT_CONFIG).run(clip)
+        for result in results:
+            json.dumps(result.metrics)
+            assert isinstance(result.reason, str)
+            assert all(
+                isinstance(reason, str)
+                for reason in result.metrics["which_thresholds_exceeded"]
+            )
+        frame = next(result for result in results if result.frame_idx == 42)
+        verdicts.add(frame.metrics["left_morphology_verdict"])
+
+    assert verdicts == {"pass", "review", "fail", "not_applicable"}

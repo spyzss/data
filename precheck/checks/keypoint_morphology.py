@@ -131,7 +131,7 @@ class KeypointMorphologyCheck(BaseCheck):
                     check=self.name,
                     episode_idx=clip.episode_idx,
                     frame_idx=clip.frame_idx_at(frame_offset),
-                    metrics=metrics,
+                    metrics=_json_safe(metrics),
                     flag=flag_for_verdict(verdict),
                     reason=reason,
                 )
@@ -382,7 +382,7 @@ class KeypointMorphologyCheck(BaseCheck):
             check=self.name,
             episode_idx=clip.episode_idx,
             frame_idx=SUMMARY_FRAME_IDX,
-            metrics=metrics,
+            metrics=_json_safe(metrics),
             flag=flag_for_verdict(verdict),
             reason=(
                 "; ".join(exceeded)
@@ -464,3 +464,22 @@ def distribution_stats(values: list[float], prefix: str) -> dict[str, float]:
         f"{prefix}_p95": float(np.percentile(array, 95)),
         f"{prefix}_max": float(np.max(array)),
     }
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return [_json_safe(item) for item in value.tolist()]
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
