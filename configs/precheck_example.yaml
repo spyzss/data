@@ -13,6 +13,7 @@ enabled_checks:
   - text_integrity
   - quality_score
   - keypoint_missing
+  - keypoint_morphology
   - keypoint_temporal
   - skeleton_quality_score
   - composite_frame_verdict
@@ -44,6 +45,25 @@ keypoint_temporal:
   project_2d: true
   min_angle_degrees: 5.0
   max_angle_degrees: 175.0
+
+keypoint_morphology:
+  sides:
+    - left
+    - right
+  duplicate_joint_distance_m: 0.00001
+  min_palm_scale_m: 0.0001
+  max_bone_length_ratio_spread_review: 3.0
+  max_bone_length_ratio_spread_fail: 8.0
+  max_normalized_bone_length_review: 3.0
+  max_normalized_bone_length_fail: 6.0
+  max_zero_length_bone_count_review: 1
+  max_zero_length_bone_count_fail: 2
+  max_duplicate_joint_pair_count_review: 1
+  max_duplicate_joint_pair_count_fail: 3
+  min_joint_angle_deg_review: 5.0
+  min_joint_angle_deg_fail: 1.0
+  max_joint_angle_violation_fraction_review: 0.15
+  max_joint_angle_violation_fraction_fail: 0.40
 
 skeleton_quality_score:
   # any_threshold preserves the original behavior. temporal_triage hard-flags

@@ -3,6 +3,7 @@
 from . import (
     composite_frame_verdict,
     keypoint_missing,
+    keypoint_morphology,
     keypoint_temporal,
     mask_containment,
     overexposure,
@@ -14,6 +15,7 @@ from . import (
 __all__ = [
     "composite_frame_verdict",
     "keypoint_missing",
+    "keypoint_morphology",
     "keypoint_temporal",
     "mask_containment",
     "overexposure",

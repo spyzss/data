@@ -32,6 +32,25 @@ class KeypointMissingConfig:
 
 
 @dataclass
+class KeypointMorphologyConfig:
+    sides: list[str] = field(default_factory=lambda: ["left", "right"])
+    duplicate_joint_distance_m: float = 0.00001
+    min_palm_scale_m: float = 0.0001
+    max_bone_length_ratio_spread_review: float = 3.0
+    max_bone_length_ratio_spread_fail: float = 8.0
+    max_normalized_bone_length_review: float = 3.0
+    max_normalized_bone_length_fail: float = 6.0
+    max_zero_length_bone_count_review: int = 1
+    max_zero_length_bone_count_fail: int = 2
+    max_duplicate_joint_pair_count_review: int = 1
+    max_duplicate_joint_pair_count_fail: int = 3
+    min_joint_angle_deg_review: float = 5.0
+    min_joint_angle_deg_fail: float = 1.0
+    max_joint_angle_violation_fraction_review: float = 0.15
+    max_joint_angle_violation_fraction_fail: float = 0.40
+
+
+@dataclass
 class MaskContainmentConfig:
     sides: list[str] = field(default_factory=lambda: ["left", "right"])
     joint_names: list[str] | None = None
@@ -116,6 +135,9 @@ class PrecheckConfig:
     overexposure: OverexposureConfig = field(default_factory=OverexposureConfig)
     keypoint_temporal: KeypointTemporalConfig = field(default_factory=KeypointTemporalConfig)
     keypoint_missing: KeypointMissingConfig = field(default_factory=KeypointMissingConfig)
+    keypoint_morphology: KeypointMorphologyConfig = field(
+        default_factory=KeypointMorphologyConfig
+    )
     mask_containment: MaskContainmentConfig = field(default_factory=MaskContainmentConfig)
     quality_score: QualityScoreConfig = field(default_factory=QualityScoreConfig)
     composite_frame_verdict: CompositeFrameVerdictConfig = field(
@@ -150,6 +172,9 @@ def load_precheck_config(config_path: Path) -> PrecheckConfig:
     keypoint_missing = KeypointMissingConfig(
         **config_dict.pop("keypoint_missing", {})
     )
+    keypoint_morphology = KeypointMorphologyConfig(
+        **config_dict.pop("keypoint_morphology", {})
+    )
     mask_containment = MaskContainmentConfig(
         **config_dict.pop("mask_containment", {})
     )
@@ -165,6 +190,7 @@ def load_precheck_config(config_path: Path) -> PrecheckConfig:
         overexposure=overexposure,
         keypoint_temporal=keypoint_temporal,
         keypoint_missing=keypoint_missing,
+        keypoint_morphology=keypoint_morphology,
         mask_containment=mask_containment,
         quality_score=quality_score,
         composite_frame_verdict=composite_frame_verdict,
