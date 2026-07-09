@@ -109,10 +109,9 @@ After a batch is sampled and pulled:
 python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 ```
 
-Optional config:
+Optional video-quality config override:
 
 ```yaml
-threshold_version: video_prefilter_v0.3.2
 decode:
   max_sample_frames: 300
 hdf5_alignment:
@@ -182,8 +181,10 @@ tables can be generated from these archive files. The video block stores
 `decision: pass|warn|fail` and `should_run_mask_qc`; downstream high-cost QC
 should run only when `should_run_mask_qc` is `true`. `reasons` and
 `warn_reasons` remain stable machine-readable codes, while `reason_details` and
-`warn_reason_details` carry the actual metric value, threshold, comparison, and
-context for report generation and manual review.
+`warn_reason_details` carry the actual metric value, comparison, `rule_id`,
+`config_version`, and context for report generation and manual review. Thresholds
+are resolved from the top-level `qc_config.config_version`, not copied into each
+asset JSON.
 
 The batch pull workflow still writes pull/sampling reports under:
 

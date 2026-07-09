@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
@@ -19,6 +20,10 @@ SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi"}
 LAPLACIAN_LOW_DETAIL_THRESHOLD = 100.0
 DARK_PIXEL_Y_THRESHOLD = 20
 OVER_EXPOSED_PIXEL_Y_THRESHOLD = 245
+QC_CONFIG_SCHEMA_VERSION = "qc_acceptance_config_schema.v1"
+QC_CONFIG_VERSION = "qc_acceptance_v1.0.0"
+QC_CONFIG_NAME = "acceptance_gate"
+QC_CONFIG_RELATIVE_PATH = Path("configs/qc_acceptance.yaml")
 
 
 class AlignmentMode(StrEnum):
@@ -368,9 +373,9 @@ class ReasonDetail:
     severity: str
     metric: str | None = None
     value: Any | None = None
-    pass_threshold: Any | None = None
-    fail_threshold: Any | None = None
     comparison: str | None = None
+    rule_id: str | None = None
+    config_version: str = QC_CONFIG_VERSION
     context: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1635,6 +1640,7 @@ def _detail(
     pass_threshold: Any | None = None,
     fail_threshold: Any | None = None,
     comparison: str | None = None,
+    rule_id: str | None = None,
     context: dict[str, Any] | None = None,
 ) -> ReasonDetail:
     return ReasonDetail(
@@ -1642,9 +1648,9 @@ def _detail(
         severity=severity,
         metric=metric,
         value=value,
-        pass_threshold=pass_threshold,
-        fail_threshold=fail_threshold,
         comparison=comparison,
+        rule_id=rule_id or f"video_quality.{code}",
+        config_version=QC_CONFIG_VERSION,
         context=context or {},
     )
 
@@ -1690,8 +1696,6 @@ def _reason_details_for_codes(
         "critical_motion_conflict_count": len(critical_conflicts),
         "noncritical_motion_conflict_count": len(noncritical_conflicts),
         "max_motion_conflict_duration_ms": max((interval.duration_ms for interval in conflict_intervals), default=0.0),
-        "critical_fail_threshold_ms": config.freeze.video_state_conflict_critical_duration_ms_fail,
-        "noncritical_fail_threshold_ms": config.freeze.video_state_conflict_noncritical_duration_ms_fail,
     }
 
     for code in codes:
@@ -1935,8 +1939,6 @@ def _reason_details_for_codes(
                     "video_frame_count": metrics.frame_count,
                     "hdf5_frame_count": alignment.hdf5_frame_count,
                     "frame_count_delta_ratio": alignment.frame_count_delta_ratio,
-                    "delta_ratio_pass_threshold": config.hdf5_alignment.max_delta_ratio_pass,
-                    "delta_ratio_fail_threshold": config.hdf5_alignment.max_delta_ratio_warn,
                 },
             )
         elif code in {"hand_roi_available_ratio_below_min", "hand_roi_available_ratio_warn"} and roi is not None:
@@ -2002,10 +2004,8 @@ def _reason_details_for_codes(
                 comparison="==",
                 context={
                     "hand_roi_laplacian_p10": roi.laplacian_p10,
-                    "laplacian_p10_fail_threshold": config.hand_roi.severe_fail.laplacian_p10_fail,
                     "hand_roi_tenengrad_p10": roi.tenengrad_p10,
-                    "tenengrad_p10_fail_threshold": config.hand_roi.severe_fail.tenengrad_p10_fail,
-                    "require_both_lap_and_ten_fail": config.hand_roi.severe_fail.require_both_lap_and_ten_fail,
+                    "hand_roi_blur_bad_frame_ratio": roi.blur_bad_frame_ratio,
                 },
             )
         else:
@@ -2473,6 +2473,27 @@ def _archive_path(path: Path | None, batch_dir: Path | None) -> str | None:
         return str(path)
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _qc_config_hash() -> str | None:
+    path = _repo_root() / QC_CONFIG_RELATIVE_PATH
+    if not path.is_file():
+        return None
+    return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+
+def _qc_config_json() -> dict[str, Any]:
+    return {
+        "schema_version": QC_CONFIG_SCHEMA_VERSION,
+        "config_version": QC_CONFIG_VERSION,
+        "config_name": QC_CONFIG_NAME,
+        "config_path": str(QC_CONFIG_RELATIVE_PATH),
+        "config_hash": _qc_config_hash(),
+    }
+
+
 def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConfig) -> dict[str, Any]:
     metrics = result.metrics
     alignment = result.alignment
@@ -2579,6 +2600,7 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
 
     return {
         "schema_version": "asset_qc_report.v1",
+        "qc_config": _qc_config_json(),
         "asset_id": metrics.asset_id,
         "source_files": {
             "video": {
@@ -2608,7 +2630,6 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
         },
         "video_quality": {
             "stage": "video_prefilter",
-            "threshold_version": config.threshold_version,
             "evaluation": evaluation,
             "metadata": {
                 "opened": metrics.opened,
@@ -2638,7 +2659,6 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
                 "hdf5_alignment": hdf5_alignment,
                 "hand_roi_metrics": hand_roi_metrics,
             },
-            "thresholds": config.to_dict(),
             "errors": list(metrics.errors),
         },
         "reference_quality": {

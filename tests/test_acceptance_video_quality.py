@@ -1013,9 +1013,15 @@ def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tm
     assert not (batch / "reports").exists()
     report = json.loads((batch / "quality_archive" / "408817.json").read_text(encoding="utf-8"))
     assert report["asset_id"] == "408817"
+    assert report["qc_config"]["schema_version"] == "qc_acceptance_config_schema.v1"
+    assert report["qc_config"]["config_version"] == "qc_acceptance_v1.0.0"
+    assert report["qc_config"]["config_name"] == "acceptance_gate"
+    assert report["qc_config"]["config_path"] == "configs/qc_acceptance.yaml"
+    assert report["qc_config"]["config_hash"].startswith("sha256:")
     assert report["qc_summary"]["status"] == "pass"
     assert report["qc_summary"]["should_run_mask_qc"] is True
-    assert report["video_quality"]["thresholds"]["decode"]["sample_decode_ratio_pass"] == 0.995
+    assert "thresholds" not in report["video_quality"]
+    assert "threshold_version" not in report["video_quality"]
 
 
 def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path: Path) -> None:
@@ -1034,6 +1040,7 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["schema_version"] == "asset_qc_report.v1"
+    assert report["qc_config"]["config_version"] == "qc_acceptance_v1.0.0"
     assert report["asset_id"] == "408817"
     assert report["qc_summary"] == {
         "status": "pass",
@@ -1066,6 +1073,8 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
         "warn_reason_details": [],
         "should_run_mask_qc": True,
     }
+    assert "thresholds" not in report["video_quality"]
+    assert "threshold_version" not in report["video_quality"]
     assert report["video_quality"]["sampling"]["decoded_sample_count"] >= 1
     assert report["video_quality"]["metrics"]["video_basic"]["short_side"] == 720
     assert report["video_quality"]["metrics"]["exposure"]["mean_over_dark_ratio"] < 0.1
@@ -1108,6 +1117,15 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     assert report["qc_summary"]["status"] == "fail"
     assert report["qc_summary"]["failed_modules"] == ["video_quality"]
     assert "cannot_open_video" in report["video_quality"]["evaluation"]["reasons"]
+    detail = next(
+        item
+        for item in report["video_quality"]["evaluation"]["reason_details"]
+        if item["code"] == "cannot_open_video"
+    )
+    assert detail["rule_id"] == "video_quality.cannot_open_video"
+    assert detail["config_version"] == "qc_acceptance_v1.0.0"
+    assert "pass_threshold" not in detail
+    assert "fail_threshold" not in detail
 
 
 def test_video_quality_main_accepts_config_and_writes_quality_archive(tmp_path: Path) -> None:

@@ -8,7 +8,7 @@
 <batch>/quality_archive/<asset_id>.json
 ```
 
-视频质检模块已经按这个方向实现，本 PRD 重点约束除视频质检之外的模块，包括 HDF5 文本、`quality_hand`、21 点骨骼点、SAM/mask、语义一致性、人工质检、重复检查、有效内容与有效时长。所有模块都必须按 gate 思路读写同一份 JSON。CSV、sidecar、ledger、HTML 只能作为证据或批次派生产物，不能作为单条数据的主报告。
+视频质检模块已经按这个方向实现，本 PRD 重点约束除视频质检之外的模块，包括 HDF5 文本、`quality_hand`、21 点骨骼点存在性、21 点静态形态、21 点时间连续性、SAM/mask、语义一致性、人工质检、重复检查、有效内容与有效时长。所有模块都必须按 gate 思路读写同一份 JSON。CSV、sidecar、ledger、HTML 只能作为证据或批次派生产物，不能作为单条数据的主报告。
 
 ## 2. Contacts
 
@@ -108,20 +108,23 @@ flowchart TD
   E -->|pass/warn| F["keypoint_presence"]
   F --> G{"keypoint_presence verdict"}
   G -->|fail| Z
-  G -->|pass/warn| H["keypoint_temporal"]
-  H --> I{"keypoint_temporal verdict"}
+  G -->|pass/warn| H["keypoint_morphology"]
+  H --> I{"keypoint_morphology verdict"}
   I -->|fail| Z
-  I -->|pass/warn| J["video_quality 已实现"]
-  J --> K{"video_quality verdict"}
+  I -->|pass/warn| J["keypoint_temporal"]
+  J --> K{"keypoint_temporal verdict"}
   K -->|fail| Z
-  K -->|pass/warn| L["sam3_containment / mask_qc"]
-  L --> M{"mask verdict"}
+  K -->|pass/warn| L["video_quality 已实现"]
+  L --> M{"video_quality verdict"}
   M -->|fail| Z
-  M -->|pass/warn| N["semantic_consistency"]
-  N --> O{"semantic verdict"}
+  M -->|pass/warn| N["sam3_containment / mask_qc"]
+  N --> O{"mask verdict"}
   O -->|fail| Z
-  O -->|pass/warn| P["manual_review"]
-  P --> Q["batch_statistics"]
+  O -->|pass/warn| P["semantic_consistency"]
+  P --> R{"semantic verdict"}
+  R -->|fail| Z
+  R -->|pass/warn| S["manual_review"]
+  S --> Q["batch_statistics"]
   Z --> Q
 ```
 
@@ -172,7 +175,6 @@ flowchart TD
     "warn_reason_details": []
   },
   "metrics": {},
-  "thresholds": {},
   "evidence": {
     "sidecar_paths": [],
     "csv_paths": [],
@@ -180,6 +182,22 @@ flowchart TD
   }
 }
 ```
+
+配置版本不写在每个模块 block 内，而是写在 `<asset_id>.json` 顶层：
+
+```json
+{
+  "qc_config": {
+    "schema_version": "qc_acceptance_config_schema.v1",
+    "config_version": "qc_acceptance_v1.0.0",
+    "config_name": "acceptance_gate",
+    "config_path": "configs/qc_acceptance.yaml",
+    "config_hash": "sha256:<computed_at_runtime>"
+  }
+}
+```
+
+新版本模块不得继续向模块 block 写入 `thresholds` 或模块级 `config_ref`。阈值通过 `qc_config.config_version + rule_id` 回查版本化配置。
 
 ### 7.2.1 `entry_gate`
 
@@ -247,8 +265,9 @@ flowchart TD
   "issue_type": "quality_hand_low",
   "metric": "quality_hand.low_quality_ratio",
   "value": 0.18,
-  "threshold": 0.10,
   "comparison": ">",
+  "rule_id": "quality_hand.single_hand_low_quality",
+  "config_version": "qc_acceptance_v1.0.0",
   "source_level": "asset",
   "window_start_frame": null,
   "window_end_frame": null,
@@ -268,8 +287,9 @@ flowchart TD
 | `issue_type` | 稳定问题类型。 |
 | `metric` | 对应有问题的指标名。 |
 | `value` | 实际值。 |
-| `threshold` | 阈值。 |
 | `comparison` | 比较关系，例如 `<`、`>`、`!=`。 |
+| `rule_id` | 稳定规则 ID，用于按配置版本回查阈值和判定语义。 |
+| `config_version` | 本次 QC 使用的配置版本。 |
 | `needs_manual_review` | 是否作为人工候选。warn 通常为 `true`，fail 通常进入批次统计。 |
 
 推荐 `issue_type` 枚举：
@@ -278,6 +298,9 @@ flowchart TD
 hdf5_text_invalid
 quality_hand_low
 keypoint_raw_invalid
+keypoint_static_morphology_abnormal
+keypoint_duplicate_or_collapsed
+keypoint_joint_angle_abnormal
 keypoint_low_quality_window
 temporal_jump
 severe_keypoint_offset
@@ -344,20 +367,21 @@ unknown
 | 0 | `asset_profile` | 拉取/建档模块 | `hdf5_text_info` |
 | 1 | `hdf5_text_info` | HDF5 文本/结构检查 | `quality_hand` |
 | 2 | `quality_hand` | `label/quality_hand` 二元数组检查 | `keypoint_presence` |
-| 3 | `keypoint_presence` | 21 点存在性、NaN/Inf、原始结构检查 | `keypoint_temporal` |
-| 4 | `keypoint_temporal` | jump、断点、抖动、旋转、候选窗口 | `video_quality` |
-| 5 | `video_quality` | 已实现 | `sam3_containment` |
-| 6 | `sam3_containment` | 自有/SAM mask 抽检复核 | `semantic_consistency` |
-| 7 | `semantic_consistency` | text_label 与图像/动作语义一致性 | `manual_review` |
-| 8 | `manual_review` | 人工质检模块 | `batch_statistics` |
-| 9 | `duplicate_check` | 全量阶段重复检查 | `content_validity` |
-| 10 | `content_validity` | 视频内容是否有效 | `effective_duration` |
-| 11 | `effective_duration` | 有效时长计算 | `batch_statistics` |
+| 3 | `keypoint_presence` | 21 点存在性、NaN/Inf、原始结构检查 | `keypoint_morphology` |
+| 4 | `keypoint_morphology` | 静态 21 点手型几何/骨长/重叠点检查 | `keypoint_temporal` |
+| 5 | `keypoint_temporal` | jump、断点、抖动、旋转、候选窗口 | `video_quality` |
+| 6 | `video_quality` | 已实现 | `sam3_containment` |
+| 7 | `sam3_containment` | 自有/SAM mask 抽检复核 | `semantic_consistency` |
+| 8 | `semantic_consistency` | text_label 与图像/动作语义一致性 | `manual_review` |
+| 9 | `manual_review` | 人工质检模块 | `batch_statistics` |
+| 10 | `duplicate_check` | 全量阶段重复检查 | `content_validity` |
+| 11 | `content_validity` | 视频内容是否有效 | `effective_duration` |
+| 12 | `effective_duration` | 有效时长计算 | `batch_statistics` |
 
 说明：
 
-- 小批准入口径重点跑 1-8。
-- 当前批次全量拉取与台账阶段重点跑 9-11。
+- 小批准入口径重点跑 1-9。
+- 当前批次全量拉取与台账阶段重点跑 10-12。
 - `batch_statistics` 是批次级聚合模块，不一定写入每条 JSON；如果写，也只写消费状态和最终归档状态。
 
 ## 7.6 `asset_profile`
@@ -472,10 +496,10 @@ unknown
       "missing_required_field_count": 0,
       "json_parse_error_count": 0
     },
-    "thresholds": {
-      "missing_required_fields_fail": true,
-      "json_parse_error_fail": true
-    },
+    "rule_ids": [
+      "hdf5_text.missing_required_field",
+      "hdf5_text.missing_text_field"
+    ],
     "evidence": {
       "sidecar_paths": [],
       "csv_paths": [],
@@ -527,8 +551,9 @@ unknown
           "issue_type": "quality_hand_low",
           "metric": "quality_hand.low_quality_ratio",
           "value": 0.18,
-          "threshold": 0.10,
           "comparison": ">",
+          "rule_id": "quality_hand.single_hand_low_quality",
+          "config_version": "qc_acceptance_v1.0.0",
           "needs_manual_review": true
         }
       ]
@@ -548,11 +573,12 @@ unknown
       "low_quality_ratio": 0.18,
       "missing_ratio": 0.0
     },
-    "thresholds": {
-      "missing_fail": true,
-      "low_quality_ratio_warn": 0.10,
-      "low_quality_ratio_fail": 0.40
-    },
+    "rule_ids": [
+      "quality_hand.invalid_shape",
+      "quality_hand.invalid_value",
+      "quality_hand.single_hand_low_quality",
+      "quality_hand.both_hands_low_quality"
+    ],
     "evidence": {
       "sidecar_paths": [],
       "csv_paths": [],
@@ -593,7 +619,7 @@ unknown
       "verdict": "pass",
       "passed": true,
       "continue_to_next_module": true,
-      "next_module": "keypoint_temporal",
+      "next_module": "keypoint_morphology",
       "reasons": [],
       "warn_reasons": [],
       "reason_details": [],
@@ -617,14 +643,12 @@ unknown
       "min_valid_points_per_hand": 21
     },
     "bad_segments": [],
-    "thresholds": {
-      "expected_keypoints_per_hand": 21,
-      "min_valid_points_per_hand_warn": 18,
-      "min_valid_points_per_hand_fail": 8,
-      "missing_frame_ratio_warn": 0.05,
-      "missing_frame_ratio_fail": 0.20,
-      "nan_or_inf_fail": true
-    },
+    "rule_ids": [
+      "keypoint_presence.missing_keypoint_field",
+      "keypoint_presence.too_few_valid_points",
+      "keypoint_presence.high_missing_frame_ratio",
+      "keypoint_presence.nan_or_inf"
+    ],
     "evidence": {
       "sidecar_paths": [],
       "csv_paths": [],
@@ -644,7 +668,110 @@ unknown
 | 局部窗口缺点但未严重影响整条数据 | warn |
 | 正常 | pass |
 
-## 7.10 `keypoint_temporal`
+## 7.10 `keypoint_morphology`
+
+### 目的
+
+检查每帧 21 点手部骨骼的静态几何是否明显不合理。这个模块只看单帧手型形态，不做时间连续性、不做 mask 匹配、不判断动作语义。它来自 `tmp/integrate-colleague-acceptance-20260707` 相比 `feat/qc-modules` 新增的 `precheck/checks/keypoint_morphology.py`。
+
+### 输入
+
+- `keypoint_presence` 通过后的左右手 canonical 21 点。
+- `qc_common.keypoints` 中的 canonical joint names、finger chains、finger bones、angle triples。
+- 中心配置中的 `modules.keypoint_morphology` 阈值。
+
+### JSON block
+
+```json
+{
+  "keypoint_morphology": {
+    "flow": {},
+    "evaluation": {
+      "verdict": "warn",
+      "passed": true,
+      "continue_to_next_module": true,
+      "next_module": "keypoint_temporal",
+      "reasons": [],
+      "warn_reasons": ["static_hand_morphology_review"],
+      "reason_details": [],
+      "warn_reason_details": [
+        {
+          "code": "static_hand_morphology_review",
+          "severity": "warn",
+          "module": "keypoint_morphology",
+          "issue_type": "keypoint_static_morphology_abnormal",
+          "metric": "keypoint_morphology.left_bone_length_ratio_spread_p95",
+          "value": 3.6,
+          "comparison": ">=",
+          "rule_id": "keypoint_morphology.bone_length_ratio_spread",
+          "config_version": "qc_acceptance_v1.0.0",
+          "needs_manual_review": true
+        }
+      ]
+    },
+    "metrics": {
+      "method": "static_per_frame_21_point_hand_geometry",
+      "decision_basis": "fixed_config_thresholds",
+      "frame_count": 908,
+      "morphology_verdict": "review",
+      "which_thresholds_exceeded": [
+        "left:bone_length_ratio_spread_review"
+      ],
+      "left_valid_keypoint_count_min": 21,
+      "right_valid_keypoint_count_min": 21,
+      "left_bone_length_ratio_spread_p95": 3.6,
+      "right_bone_length_ratio_spread_p95": 2.1,
+      "left_normalized_bone_length_max_p95": 3.2,
+      "right_normalized_bone_length_max_p95": 2.7,
+      "left_zero_length_bone_count_max": 0,
+      "right_zero_length_bone_count_max": 0,
+      "left_duplicate_joint_pair_count_max": 0,
+      "right_duplicate_joint_pair_count_max": 0,
+      "left_collapsed_finger_count_max": 0,
+      "right_collapsed_finger_count_max": 0,
+      "left_joint_angle_violation_fraction_p95": 0.08,
+      "right_joint_angle_violation_fraction_p95": 0.03
+    },
+    "rule_ids": [
+      "keypoint_morphology.palm_scale_too_small",
+      "keypoint_morphology.bone_length_ratio_spread",
+      "keypoint_morphology.max_normalized_bone_length",
+      "keypoint_morphology.zero_length_bone_count",
+      "keypoint_morphology.duplicate_joint_pair_count",
+      "keypoint_morphology.collapsed_finger_count",
+      "keypoint_morphology.joint_angle_min_deg",
+      "keypoint_morphology.joint_angle_violation_fraction"
+    ],
+    "evidence": {
+      "sidecar_paths": ["qc_sidecars/keypoint_morphology/408817_summary.json"],
+      "csv_paths": [],
+      "overlay_paths": []
+    }
+  }
+}
+```
+
+### 判定
+
+| 情况 | verdict |
+|---|---|
+| 21 点不完整或 invalid | `not_applicable` 或由 `keypoint_presence` 提前 fail |
+| `palm_scale_too_small` | fail |
+| 骨长比例、归一化骨长、重复点、零长度骨骼、折叠手指达到 fail 阈值 | fail |
+| 上述指标达到 review 阈值但未达到 fail | warn |
+| 正常 | pass |
+
+### 写入 `manual_review.candidates`
+
+当 `morphology_verdict = "review"` 时，必须把异常统计转成 `manual_review.candidates[]`。建议映射：
+
+- `bone_length_ratio_spread_review`、`max_normalized_bone_length_review` -> `keypoint_static_morphology_abnormal`
+- `duplicate_joint_pair_count_review`、`zero_length_bone_count_review` -> `keypoint_duplicate_or_collapsed`
+- `joint_angle_min_deg_review`、`joint_angle_violation_fraction_review` -> `keypoint_joint_angle_abnormal`
+
+当 `morphology_verdict = "fail"` 时，写入 `manual_review.failures_for_batch_stats`，并停止后续 QC。
+
+## 7.11 `keypoint_temporal`
 
 ### 目的
 
@@ -652,7 +779,7 @@ unknown
 
 ### 输入
 
-- `keypoint_presence` 通过后的 canonical keypoints。
+- `keypoint_morphology` 通过或 warn 后的 canonical keypoints。
 - 可选 rotations、cam_pose、fps。
 
 ### JSON block
@@ -677,8 +804,9 @@ unknown
           "issue_type": "temporal_jump",
           "metric": "keypoint_temporal.candidate_window_count",
           "value": 2,
-          "threshold": 0,
           "comparison": ">",
+          "rule_id": "keypoint_temporal.composite_frame_verdict",
+          "config_version": "qc_acceptance_v1.0.0",
           "needs_manual_review": true
         }
       ]
@@ -706,12 +834,12 @@ unknown
         "sam3_containment_eligible": true
       }
     ],
-    "thresholds": {
-      "joint_displacement_m_warn": 0.12,
-      "joint_displacement_m_fail": 0.50,
-      "joint_acceleration_m_s2_warn": 30.0,
-      "rotation_delta_deg_warn": 35.0
-    },
+    "rule_ids": [
+      "keypoint_temporal.composite_frame_verdict",
+      "keypoint_temporal.skeleton_quality_score",
+      "keypoint_temporal.projection_review",
+      "keypoint_temporal.strong_temporal_failure"
+    ],
     "evidence": {
       "sidecar_paths": ["qc_sidecars/keypoint_temporal/408817_candidate_windows.json"],
       "csv_paths": [],
@@ -743,7 +871,7 @@ unknown
 - `metric/value/threshold/comparison`
 - `evidence_path`
 
-## 7.11 `sam3_containment`
+## 7.12 `sam3_containment`
 
 ### 目的
 
@@ -778,8 +906,9 @@ unknown
           "issue_type": "side_view_mask_undersegmentation",
           "metric": "sam3_containment.inside_ratio_mean",
           "value": 0.42,
-          "threshold": 0.60,
           "comparison": "<",
+          "rule_id": "sam3_containment.side_view_manual_review",
+          "config_version": "qc_acceptance_v1.0.0",
           "window_start_frame": 464,
           "window_end_frame": 502,
           "representative_frame": 480,
@@ -810,12 +939,11 @@ unknown
         "reason": "side-view hand orientation makes SAM containment unreliable"
       }
     ],
-    "thresholds": {
-      "inside_ratio_warn": 0.60,
-      "inside_ratio_fail": 0.30,
-      "strong_fail_frame_count_fail": 3,
-      "mask_available_ratio_fail": 0.70
-    },
+    "rule_ids": [
+      "sam3_containment.strong_containment_mismatch",
+      "sam3_containment.side_view_manual_review",
+      "sam3_containment.projection_review"
+    ],
     "evidence": {
       "sidecar_paths": [
         "qc_sidecars/sam3_containment/408817_window_summary.json"
@@ -838,7 +966,7 @@ unknown
 | 侧视、旋转、投影边界、轻微 mismatch | warn |
 | 正常 | pass |
 
-## 7.12 `semantic_consistency`
+## 7.13 `semantic_consistency`
 
 ### 目的
 
@@ -872,8 +1000,9 @@ unknown
           "issue_type": "semantic_mismatch",
           "metric": "semantic_consistency.object_match_score",
           "value": 0.45,
-          "threshold": 0.60,
           "comparison": "<",
+          "rule_id": "semantic_consistency.object_mismatch",
+          "config_version": "qc_acceptance_v1.0.0",
           "needs_manual_review": true
         }
       ]
@@ -902,11 +1031,10 @@ unknown
         "observation": "red cup not visible"
       }
     ],
-    "thresholds": {
-      "object_match_score_warn": 0.60,
-      "object_match_score_fail": 0.30,
-      "no_action_duration_sec_warn": 1.0
-    },
+    "rule_ids": [
+      "semantic_consistency.object_mismatch",
+      "semantic_consistency.action_mismatch"
+    ],
     "evidence": {
       "sidecar_paths": [],
       "csv_paths": [],
@@ -924,7 +1052,7 @@ unknown
 | 物体/动作/场景低置信不一致 | warn |
 | 正常 | pass |
 
-## 7.13 `manual_review`
+## 7.14 `manual_review`
 
 ### 目的
 
@@ -1034,7 +1162,7 @@ unknown
 | `acceptable_flagged` | 有问题但可接受，记 risk/warn。 |
 | `false_negative` | 人工发现漏检，置为 fail。 |
 
-## 7.14 `duplicate_check`
+## 7.15 `duplicate_check`
 
 ### 目的
 
@@ -1074,11 +1202,10 @@ unknown
       "time_overlap_ratio": 0.0
     },
     "duplicates": [],
-    "thresholds": {
-      "video_similarity_warn": 0.92,
-      "video_similarity_fail": 0.98,
-      "time_overlap_ratio_fail": 0.90
-    },
+    "rule_ids": [
+      "duplicate_check.exact_hash_duplicate",
+      "duplicate_check.high_similarity_duplicate"
+    ],
     "evidence": {
       "sidecar_paths": [],
       "csv_paths": [],
@@ -1097,7 +1224,7 @@ unknown
 | 疑似重复但证据不足 | warn |
 | 无重复 | pass |
 
-## 7.15 `content_validity`
+## 7.16 `content_validity`
 
 ### 目的
 
@@ -1140,10 +1267,10 @@ unknown
         "reason": "no action related to text_label"
       }
     ],
-    "thresholds": {
-      "invalid_content_duration_sec_warn": 1.0,
-      "invalid_content_ratio_fail": 0.90
-    },
+    "rule_ids": [
+      "content_validity.invalid_content_segment",
+      "content_validity.mostly_invalid_content"
+    ],
     "evidence": {
       "sidecar_paths": [],
       "csv_paths": [],
@@ -1161,7 +1288,7 @@ unknown
 | 无关内容超过配置阈值 | warn |
 | 正常 | pass |
 
-## 7.16 `effective_duration`
+## 7.17 `effective_duration`
 
 ### 目的
 
@@ -1206,10 +1333,10 @@ unknown
         "reason": "no action related to text_label"
       }
     ],
-    "thresholds": {
-      "effective_duration_sec_fail": 0.0,
-      "effective_ratio_warn": 0.80
-    },
+    "rule_ids": [
+      "effective_duration.no_effective_duration",
+      "effective_duration.low_effective_ratio"
+    ],
     "evidence": {
       "sidecar_paths": [],
       "csv_paths": [],
@@ -1227,7 +1354,7 @@ unknown
 | 有效比例低于 warn 阈值 | warn |
 | 正常 | pass |
 
-## 7.17 `batch_statistics`
+## 7.18 `batch_statistics`
 
 ### 目的
 
@@ -1266,7 +1393,7 @@ reports/batch_report.xlsx
 
 但批次统计不得覆盖前面模块的原始结果。
 
-## 7.18 sidecar、CSV、ledger 的定位
+## 7.19 sidecar、CSV、ledger 的定位
 
 | 类型 | 是否主报告 | 用途 |
 |---|---|---|
@@ -1275,6 +1402,89 @@ reports/batch_report.xlsx
 | CSV | 否 | 给人工或表格工具查看的派生文件。 |
 | ledger events | 否 | 从主 JSON 聚合出来的批次级事件表。 |
 | batch report | 否 | 从主 JSON 聚合出来的批次报告。 |
+
+## 7.20 统一配置文件
+
+### 目的
+
+当前各模块阈值分散在视频 QC 配置、precheck dataclass、`configs/precheck_example.yaml`、SAM/mask 配置和人工队列脚本里。后续应收敛成一个版本化中心配置，作为 QC pipeline 的唯一运行配置入口。
+
+建议路径：
+
+```text
+configs/qc_acceptance.yaml
+```
+
+### 设计原则
+
+- 中心配置负责运行时读取和阈值管理。
+- 每条 `<asset_id>.json` 顶层必须保存 `qc_config`，记录本次使用的配置版本、路径和 hash。
+- 后续调阈值只改中心配置，不在模块代码里散落硬编码。
+- 如果配置升级导致阈值或判定语义变化，必须更新 `config_version`。
+- 模块 block 不再复制 `thresholds`，也不再写模块级 `config_ref`。
+- 批次统计按 `qc_config.config_version + rule_id` 回查配置，解释历史结果。
+
+### 建议结构
+
+```yaml
+schema_version: qc_acceptance_config_schema.v1
+config_version: qc_acceptance_v1.0.0
+config_name: acceptance_gate
+config_date: "2026-07-09"
+
+pipeline:
+  stop_on_fail: true
+  default_start_module: hdf5_text_info
+  terminal_module: batch_statistics
+  modules:
+    - hdf5_text_info
+    - quality_hand
+    - keypoint_presence
+    - keypoint_morphology
+    - keypoint_temporal
+    - video_quality
+    - sam3_containment
+    - semantic_consistency
+    - manual_review
+    - duplicate_check
+    - content_validity
+    - effective_duration
+
+json_report:
+  root_dir_name: quality_archive
+  config_field_name: qc_config
+  write_config_reference_at_top_level: true
+  write_module_threshold_snapshot: false
+  preserve_unknown_fields: true
+  write_config_hash: true
+  module_block_rules:
+    write_thresholds: false
+    write_config_ref: false
+    write_rule_ids: true
+
+modules: {}
+batch_statistics: {}
+```
+
+完整配置见 `configs/qc_acceptance.yaml`。该文件当前基于 `feat/qc-modules`，并对齐 `tmp/integrate-colleague-acceptance-20260707` 新增的 `keypoint_morphology`。
+
+### JSON 顶层配置版本
+
+每条 `<asset_id>.json` 顶层必须写：
+
+```json
+{
+  "qc_config": {
+    "schema_version": "qc_acceptance_config_schema.v1",
+    "config_version": "qc_acceptance_v1.0.0",
+    "config_name": "acceptance_gate",
+    "config_path": "configs/qc_acceptance.yaml",
+    "config_hash": "sha256:<computed_at_runtime>"
+  }
+}
+```
+
+模块 warn/fail 明细必须写 `rule_id` 和 `config_version`。需要解释阈值时，通过 `config_version + rule_id` 回查中心配置。历史 JSON 中如果已有 `thresholds` 字段，新读逻辑可以兼容，但新模块不得继续写入。
 
 ## 8. Release Plan
 
@@ -1296,6 +1506,24 @@ reports/batch_report.xlsx
 - fail/warn/pass 三种路径都有单元测试。
 - 同一 issue 重跑不会无限重复追加。
 
+### V1.5: 统一配置 loader
+
+实现共享配置工具，建议放在 `qc_common/qc_config.py`：
+
+- `load_qc_acceptance_config(path)`
+- `resolve_module_config(config, module_name)`
+- `compute_config_hash(config_path)`
+- `build_top_level_qc_config(config, config_path)`
+- `resolve_rule(config, rule_id)`
+
+验收：
+
+- pipeline 顺序、模块阈值、人工抽样策略都来自 `configs/qc_acceptance.yaml`。
+- 每条 JSON 顶层写入 `qc_config`。
+- 每个 warn/fail 明细写入 `rule_id` 和 `config_version`。
+- 模块 block 不再写入新的 `thresholds` 或模块级 `config_ref`。
+- 旧模块配置可以先通过 adapter 映射到中心配置，避免一次性大重构。
+
 ### V2: precheck 模块接入主 JSON
 
 改造：
@@ -1303,12 +1531,13 @@ reports/batch_report.xlsx
 - `hdf5_text_info`
 - `quality_hand`
 - `keypoint_presence`
+- `keypoint_morphology`
 - `keypoint_temporal`
 
 验收：
 
 - 旧的 clip aggregates / candidate windows 可以继续输出，但必须同步写回 `<asset_id>.json`。
-- `manual_review.candidates` 中能看到 keypoint temporal 的窗口问题。
+- `manual_review.candidates` 中能看到 keypoint morphology 的静态形态问题和 keypoint temporal 的窗口问题。
 - fail 后不会继续进入后续模块。
 
 ### V3: SAM3/mask 模块接入主 JSON
@@ -1360,6 +1589,8 @@ reports/batch_report.xlsx
 6. 人工质检完成后，人工结果写回 `manual_review.issues`。
 7. 批次统计能从 `quality_archive/*.json` 聚合出完整质量报告。
 8. 旧 sidecar/CSV 不再是主报告，只能作为证据路径或兼容输入。
+9. 每条 JSON 顶层写入 `qc_config`，可追溯中心配置版本和配置 hash。
+10. 新模块 block 不再写入 `thresholds` 或模块级 `config_ref`。
 
 ## 10. Implementation Notes
 
@@ -1369,5 +1600,5 @@ reports/batch_report.xlsx
 - `qc_summary.overall_verdict` 是累计摘要，不是下一模块唯一入口。
 - 下一模块应优先读上一模块 `flow.exit_gate.continue_to_next_module`。
 - 所有路径建议相对 batch 根目录。
-- 所有阈值写入对应模块 `thresholds`，便于复现当时判断。
-- 所有问题都必须带 `metric`、`value`、`threshold`、`comparison`，人工质检不能只看到一句原因。
+- 所有阈值只由版本化 `configs/qc_acceptance.yaml` 管理，JSON 通过 `qc_config.config_version` 追溯。
+- 所有问题都必须带 `metric`、`value`、`comparison`、`rule_id`、`config_version`，人工质检不能只看到一句原因。

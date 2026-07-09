@@ -99,10 +99,9 @@ sampled/XJGT_20260616/
 python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 ```
 
-可选使用 YAML 覆盖阈值：
+可选使用 YAML 覆盖视频预筛参数：
 
 ```yaml
-threshold_version: video_prefilter_v0.3.2
 decode:
   max_sample_frames: 300
 hdf5_alignment:

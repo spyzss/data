@@ -41,6 +41,13 @@ quality_archive/408817.json  -> asset_id = 408817
 ```json
 {
   "schema_version": "asset_qc_report.v1",
+  "qc_config": {
+    "schema_version": "qc_acceptance_config_schema.v1",
+    "config_version": "qc_acceptance_v1.0.0",
+    "config_name": "acceptance_gate",
+    "config_path": "configs/qc_acceptance.yaml",
+    "config_hash": "sha256:<computed_at_runtime>"
+  },
   "asset_id": "408817",
   "qc_summary": {
     "status": "pending",
@@ -81,6 +88,7 @@ quality_archive/408817.json  -> asset_id = 408817
 写法要求：
 
 - `schema_version` 当前固定为 `asset_qc_report.v1`。
+- `qc_config` 必须在建档时写入，后续 QC 模块沿用同一版本；一条数据不会在 QC 中途切换标准。
 - `path` 使用相对 `<batch>` 根目录的路径，不写本机绝对路径。
 - 尚未执行的模块写 `null`，不要写空对象伪装完成。
 - `qc_summary.status` 初始为 `pending`。
@@ -92,6 +100,7 @@ quality_archive/408817.json  -> asset_id = 408817
 | 字段 | 类型 | 创建方 | 说明 |
 |---|---|---|---|
 | `schema_version` | string | 建档模块 | 当前固定为 `asset_qc_report.v1`。 |
+| `qc_config` | object | 建档模块 | 本条数据使用的版本化 QC 配置。 |
 | `asset_id` | string | 建档模块 | 单条数据稳定 ID。 |
 | `qc_summary` | object | 建档模块初始化，QC 模块更新 | 全流程 QC 汇总状态。 |
 | `source_files` | object | 建档模块 | 该数据关联的原始文件。 |
@@ -220,7 +229,6 @@ quality_archive/408817.json  -> asset_id = 408817
 ```json
 {
   "stage": "video_prefilter",
-  "threshold_version": "video_prefilter_v0.3.2",
   "evaluation": {
     "decision": "pass",
     "passed": true,
@@ -324,69 +332,6 @@ quality_archive/408817.json  -> asset_id = 408817
     },
     "hand_roi_metrics": null
   },
-  "thresholds": {
-    "threshold_version": "video_prefilter_v0.3.2",
-    "fps": {
-      "expected_fps": null,
-      "min_fps_pass": 24,
-      "min_fps_warn": 20,
-      "min_fps_fail": 20
-    },
-    "resolution": {
-      "min_short_side_fail": 720,
-      "min_long_side_fail": 1280
-    },
-    "exposure": {
-      "black": {
-        "max_frame_count_fail": 10,
-        "ratio_pass": 0.01,
-        "ratio_warn": 0.90
-      },
-      "over_dark": {
-        "ratio_pass": 0.05,
-        "ratio_warn": 0.90
-      },
-      "over_exposed": {
-        "ratio_pass": 0.05,
-        "ratio_warn": 0.90
-      }
-    },
-    "sharpness_global": {
-      "target_short_side": 720,
-      "laplacian_p10_pass": 35,
-      "laplacian_p10_warn": 0,
-      "laplacian_median_pass": 50,
-      "laplacian_median_warn": 0,
-      "laplacian_under_100_ratio_pass": 0.50,
-      "laplacian_under_100_ratio_warn": 1.00,
-      "tenengrad_p10_pass": 12,
-      "tenengrad_p10_warn": 6,
-      "tenengrad_median_pass": 13,
-      "tenengrad_median_warn": 8
-    },
-    "freeze": {
-      "adjacent_near_duplicate_ratio_warn": 0.90,
-      "freeze_candidate_window_sec": 0.5,
-      "confirmed_freeze_window_sec": 1.0,
-      "frozen_frame_ratio_pass": 0.05,
-      "frozen_frame_ratio_warn": 0.10,
-      "min_interval_frames": 6,
-      "min_interval_duration_ms": 100.0,
-      "ssim_min": 0.995,
-      "phash_hamming_max": 4,
-      "motion_conflict_enabled": true,
-      "critical_window_enabled": true,
-      "video_state_conflict_noncritical_duration_ms_fail": 1000.0,
-      "video_state_conflict_critical_duration_ms_fail": 500.0
-    },
-    "defects": {
-      "max_duration_ratio_fail": 0.10,
-      "duration_ratio_warn": 0.05
-    },
-    "hand_roi": {
-      "enabled": false
-    }
-  },
   "errors": []
 }
 ```
@@ -441,7 +386,7 @@ quality_archive/408817.json  -> asset_id = 408817
 should_run_mask_qc = decision != "fail"
 ```
 
-`video_quality.evaluation.reasons` 和 `warn_reasons` 使用稳定机器可读枚举；`reason_details` 和 `warn_reason_details` 保留对应的实际数值、阈值和比较方向。下游程序可以继续只看原因码，人工排查和报告生成应优先展示 details。
+`video_quality.evaluation.reasons` 和 `warn_reasons` 使用稳定机器可读枚举；`reason_details` 和 `warn_reason_details` 保留对应的实际数值、比较方向、`rule_id` 和 `config_version`。下游程序可以继续只看原因码，人工排查和报告生成应优先展示 details。阈值不再复制进 JSON，按顶层 `qc_config.config_version + rule_id` 回查 `configs/qc_acceptance.yaml`。
 
 ```json
 {
@@ -452,9 +397,9 @@ should_run_mask_qc = decision != "fail"
       "severity": "warn",
       "metric": "sharpness_global.laplacian_under_100_ratio",
       "value": 0.8532110091743119,
-      "pass_threshold": 0.5,
-      "fail_threshold": 1.0,
       "comparison": ">",
+      "rule_id": "video_quality.laplacian_under_100_ratio_warn",
+      "config_version": "qc_acceptance_v1.0.0",
       "context": {}
     }
   ]
@@ -469,9 +414,9 @@ should_run_mask_qc = decision != "fail"
 | `severity` | string | `fail` 或 `warn`。 |
 | `metric` | string/null | 触发该原因的指标路径，例如 `sharpness_global.laplacian_under_100_ratio`。 |
 | `value` | number/string/boolean/null | 本次视频的实际指标值。 |
-| `pass_threshold` | number/string/boolean/null | 通过线；超过或低于该线会进入 warn 或 fail。 |
-| `fail_threshold` | number/string/boolean/null | hard fail 线；无 hard fail 线时可为 `null`。 |
 | `comparison` | string/null | 判定方向，常见为 `>`、`<`、`==`。 |
+| `rule_id` | string | 版本化配置中的规则 ID。 |
+| `config_version` | string | 本次 QC 使用的配置版本。 |
 | `context` | object | 补充上下文，例如估算缺失帧、HDF5 帧数、冻帧冲突区间统计。 |
 
 常见 reason 枚举：
