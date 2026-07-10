@@ -360,6 +360,99 @@ def _write_json(path: Path, rows: Any) -> None:
     )
 
 
+def _run_clip_in_local_coordinates(
+    producer: PrecheckRunner,
+    clip: ClipInputs,
+) -> list[CheckResult]:
+    """Run slice-local checks without changing the adapter's source indices."""
+    original_frame_indices = clip.frame_indices
+    clip.frame_indices = list(range(clip.num_frames))
+    try:
+        return producer.run_clip(clip)
+    finally:
+        clip.frame_indices = original_frame_indices
+
+
+def _map_candidate_window_to_source(
+    candidate: dict[str, Any],
+    *,
+    asset_id: str,
+    supplier: str,
+    source_path: str,
+    clip_start_frame: int,
+    clip_end_frame: int,
+    clip_frame_count: int,
+) -> dict[str, Any]:
+    """Validate a candidate window and export source plus local coordinates."""
+    if clip_frame_count <= 0 or clip_end_frame - clip_start_frame + 1 != clip_frame_count:
+        raise ValueError(
+            "clip frame bounds do not match clip_frame_count: "
+            f"{clip_start_frame}..{clip_end_frame}, count={clip_frame_count}"
+        )
+
+    coordinate_space = _text(candidate.get("coordinate_space")).lower() or "local"
+    if coordinate_space not in {"local", "source"}:
+        raise ValueError(f"unsupported candidate coordinate_space: {coordinate_space}")
+
+    start_frame = _integer(candidate.get("start_frame"), "candidate start_frame")
+    end_frame = _integer(candidate.get("end_frame"), "candidate end_frame")
+    if coordinate_space == "source":
+        source_start_frame = start_frame
+        source_end_frame = end_frame
+        local_start_frame = source_start_frame - clip_start_frame
+        local_end_frame = source_end_frame - clip_start_frame
+    else:
+        local_start_frame = start_frame
+        local_end_frame = end_frame
+        source_start_frame = clip_start_frame + local_start_frame
+        source_end_frame = clip_start_frame + local_end_frame
+
+    source_bounds_valid = (
+        clip_start_frame
+        <= source_start_frame
+        <= source_end_frame
+        <= clip_end_frame
+    )
+    local_bounds_valid = (
+        0 <= local_start_frame <= local_end_frame < clip_frame_count
+    )
+    if coordinate_space == "source" and not source_bounds_valid:
+        raise ValueError(
+            "invalid source candidate bounds: "
+            f"{source_start_frame}..{source_end_frame}; "
+            f"clip={clip_start_frame}..{clip_end_frame}"
+        )
+    if not local_bounds_valid:
+        raise ValueError(
+            "invalid local candidate bounds: "
+            f"{local_start_frame}..{local_end_frame}; "
+            f"clip_frame_count={clip_frame_count}"
+        )
+    if not source_bounds_valid:
+        raise ValueError(
+            "invalid source candidate bounds: "
+            f"{source_start_frame}..{source_end_frame}; "
+            f"clip={clip_start_frame}..{clip_end_frame}"
+        )
+
+    return {
+        **candidate,
+        "asset_id": asset_id,
+        "supplier_id": supplier,
+        "source_path": source_path,
+        "clip_start_frame": clip_start_frame,
+        "clip_end_frame": clip_end_frame,
+        "local_start_frame": local_start_frame,
+        "local_end_frame": local_end_frame,
+        "start_frame": source_start_frame,
+        "end_frame": source_end_frame,
+        "source_start_frame": source_start_frame,
+        "source_end_frame": source_end_frame,
+        "coordinate_space": "source",
+        "frame_coordinate_system": "source_inclusive",
+    }
+
+
 def _result_records(
     results: list[CheckResult],
     clip: ClipInputs,
@@ -368,21 +461,34 @@ def _result_records(
     end_frame = int(getattr(clip, "clip_end_frame"))
     rows: list[dict[str, Any]] = []
     for result in results:
-        source_frame_idx = result.frame_idx if result.frame_idx >= 0 else None
+        local_frame_idx = result.frame_idx if result.frame_idx >= 0 else None
+        if local_frame_idx is not None and not (
+            0 <= local_frame_idx < clip.num_frames
+        ):
+            raise ValueError(
+                f"result local frame {local_frame_idx} outside clip frame count "
+                f"{clip.num_frames}"
+            )
+        source_frame_idx = (
+            start_frame + local_frame_idx
+            if local_frame_idx is not None
+            else None
+        )
         rows.append(
             {
                 **result.to_record(),
+                "frame_idx": (
+                    source_frame_idx
+                    if source_frame_idx is not None
+                    else result.frame_idx
+                ),
                 "asset_id": getattr(clip, "asset_id"),
                 "supplier_id": getattr(clip, "supplier_id"),
                 "source_path": getattr(clip, "source_path"),
                 "clip_start_frame": start_frame,
                 "clip_end_frame": end_frame,
                 "clip_frame_count": end_frame - start_frame + 1,
-                "local_frame_idx": (
-                    source_frame_idx - start_frame
-                    if source_frame_idx is not None
-                    else None
-                ),
+                "local_frame_idx": local_frame_idx,
                 "source_frame_idx": source_frame_idx,
                 "frame_coordinate_system": "source_inclusive",
                 "supplier_quality_signal": "not_provided",
@@ -505,6 +611,7 @@ def run_manifest_precheck(
     completed = 0
     validated = 0
     skipped = 0
+    failed_clips = 0
     for row_index, row in enumerate(rows):
         asset_id = _text(row.get("asset_id")) or f"row-{row_index}"
         if not overwrite and asset_id in completed_assets:
@@ -537,32 +644,55 @@ def run_manifest_precheck(
                 continue
             assert producer is not None
             candidate_start = len(producer.candidate_window_records)
-            results = producer.run_clip(clip)
+            results = _run_clip_in_local_coordinates(producer, clip)
             candidates = producer.candidate_window_records[candidate_start:]
-            for candidate in candidates:
-                source_start_frame = int(candidate["start_frame"])
-                source_end_frame = int(candidate["end_frame"])
-                clip_start_frame = int(getattr(clip, "clip_start_frame"))
-                candidate.update(
-                    {
-                        "asset_id": asset_id,
-                        "supplier_id": supplier,
-                        "source_path": getattr(clip, "source_path"),
-                        "clip_start_frame": getattr(clip, "clip_start_frame"),
-                        "clip_end_frame": getattr(clip, "clip_end_frame"),
-                        "source_start_frame": source_start_frame,
-                        "source_end_frame": source_end_frame,
-                        "local_start_frame": source_start_frame - clip_start_frame,
-                        "local_end_frame": source_end_frame - clip_start_frame,
-                        "frame_coordinate_system": "source_inclusive",
-                    }
-                )
+            mapped_candidates: list[dict[str, Any]] = []
+            for candidate_index, candidate in enumerate(candidates):
+                try:
+                    mapped_candidates.append(
+                        _map_candidate_window_to_source(
+                            candidate,
+                            asset_id=asset_id,
+                            supplier=supplier,
+                            source_path=str(getattr(clip, "source_path")),
+                            clip_start_frame=int(
+                                getattr(clip, "clip_start_frame")
+                            ),
+                            clip_end_frame=int(getattr(clip, "clip_end_frame")),
+                            clip_frame_count=clip.num_frames,
+                        )
+                    )
+                except (TypeError, ValueError) as exc:
+                    LOGGER.error(
+                        "Manifest row %d (%s) candidate %d failed: %s",
+                        row_index,
+                        asset_id,
+                        candidate_index,
+                        exc,
+                    )
+                    failures.append(
+                        {
+                            "row_index": row_index,
+                            "asset_id": asset_id,
+                            "source_path": str(getattr(clip, "source_path")),
+                            "clip_start_frame": getattr(
+                                clip, "clip_start_frame"
+                            ),
+                            "clip_end_frame": getattr(clip, "clip_end_frame"),
+                            "frame_coordinate_system": "source_inclusive",
+                            "failure_stage": "candidate_window_mapping",
+                            "candidate_index": candidate_index,
+                            "candidate_window": _json_safe(candidate),
+                            "error": str(exc),
+                        }
+                    )
             new_results.extend(_result_records(results, clip))
             new_aggregates.extend(_aggregate_records(results, clip))
-            new_windows.extend(candidates)
+            new_windows.extend(mapped_candidates)
             completed += 1
         except Exception as exc:
             LOGGER.error("Manifest row %d (%s) failed: %s", row_index, asset_id, exc)
+            failed_clips += 1
             failures.append(
                 {
                     "row_index": row_index,
@@ -573,6 +703,7 @@ def run_manifest_precheck(
                     "clip_start_frame": row.get(start_frame_column),
                     "clip_end_frame": row.get(end_frame_column),
                     "frame_coordinate_system": "source_inclusive",
+                    "failure_stage": "manifest_row",
                     "error": str(exc),
                 }
             )
@@ -581,7 +712,7 @@ def run_manifest_precheck(
         "manifest_row_count": len(rows),
         "validated_clip_count": validated,
         "completed_clip_count": completed,
-        "failed_clip_count": len(failures),
+        "failed_clip_count": failed_clips,
         "skipped_clip_count": skipped,
         "dry_run": dry_run,
     }

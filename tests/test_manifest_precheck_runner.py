@@ -189,7 +189,18 @@ def test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows(
     windows = json.loads((output_dir / "candidate_windows.json").read_text())
     assert windows
     assert all(window["asset_id"] == "dr-range" for window in windows)
-    assert all(3 <= window["start_frame"] <= window["end_frame"] <= 10 for window in windows)
+    assert all(
+        3 <= window["start_frame"] <= window["end_frame"] <= 10
+        for window in windows
+    )
+    assert any(
+        window["local_start_frame"] == 0
+        and window["local_end_frame"] == 7
+        and window["start_frame"] == 3
+        and window["end_frame"] == 10
+        for window in windows
+    )
+    assert all(window["coordinate_space"] == "source" for window in windows)
     assert all(window["source_start_frame"] == window["start_frame"] for window in windows)
     assert all(window["source_end_frame"] == window["end_frame"] for window in windows)
     assert all(window["local_start_frame"] == window["start_frame"] - 3 for window in windows)
@@ -216,6 +227,150 @@ def test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows(
         "run_config.json",
     ):
         assert (output_dir / filename).exists()
+
+
+def test_candidate_window_maps_local_boundaries_to_source_once() -> None:
+    from tools.run_manifest_precheck import _map_candidate_window_to_source
+
+    mapped = _map_candidate_window_to_source(
+        {"start_frame": 0, "end_frame": 7},
+        asset_id="dr-range",
+        supplier="deepreach",
+        source_path="deepreach.h5",
+        clip_start_frame=3,
+        clip_end_frame=10,
+        clip_frame_count=8,
+    )
+
+    assert mapped["local_start_frame"] == 0
+    assert mapped["local_end_frame"] == 7
+    assert mapped["start_frame"] == 3
+    assert mapped["end_frame"] == 10
+    assert mapped["source_start_frame"] == 3
+    assert mapped["source_end_frame"] == 10
+    assert mapped["coordinate_space"] == "source"
+    assert mapped["asset_id"] == "dr-range"
+    assert mapped["clip_start_frame"] == 3
+    assert mapped["clip_end_frame"] == 10
+
+
+def test_candidate_window_explicit_source_coordinates_are_not_double_offset() -> None:
+    from tools.run_manifest_precheck import _map_candidate_window_to_source
+
+    mapped = _map_candidate_window_to_source(
+        {
+            "start_frame": 3,
+            "end_frame": 10,
+            "coordinate_space": "source",
+        },
+        asset_id="dr-range",
+        supplier="deepreach",
+        source_path="deepreach.h5",
+        clip_start_frame=3,
+        clip_end_frame=10,
+        clip_frame_count=8,
+    )
+
+    assert mapped["local_start_frame"] == 0
+    assert mapped["local_end_frame"] == 7
+    assert mapped["start_frame"] == 3
+    assert mapped["end_frame"] == 10
+    assert mapped["coordinate_space"] == "source"
+
+
+@pytest.mark.parametrize(
+    ("candidate", "message"),
+    [
+        ({"start_frame": -1, "end_frame": 0}, "local candidate bounds"),
+        ({"start_frame": 0, "end_frame": 8}, "local candidate bounds"),
+        ({"start_frame": 4, "end_frame": 3}, "local candidate bounds"),
+        (
+            {
+                "start_frame": 2,
+                "end_frame": 10,
+                "coordinate_space": "source",
+            },
+            "source candidate bounds",
+        ),
+    ],
+)
+def test_candidate_window_rejects_invalid_bounds(
+    candidate: dict[str, object],
+    message: str,
+) -> None:
+    from tools.run_manifest_precheck import _map_candidate_window_to_source
+
+    with pytest.raises(ValueError, match=message):
+        _map_candidate_window_to_source(
+            candidate,
+            asset_id="dr-range",
+            supplier="deepreach",
+            source_path="deepreach.h5",
+            clip_start_frame=3,
+            clip_end_frame=10,
+            clip_frame_count=8,
+        )
+
+
+def test_manifest_precheck_isolates_invalid_candidate_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.run_manifest_precheck as runner
+
+    hdf5_path = _write_deepreach_hdf5(tmp_path / "deepreach.h5", frame_count=8)
+    manifest = tmp_path / "manifest.csv"
+    pd.DataFrame(
+        [
+            {
+                "asset_id": "invalid-window",
+                "hdf5_path": str(hdf5_path),
+                "start_frame": 0,
+                "end_frame": 3,
+                "task": "fold",
+                "subtask_description": "fold edge",
+            },
+            {
+                "asset_id": "valid-window",
+                "hdf5_path": str(hdf5_path),
+                "start_frame": 4,
+                "end_frame": 7,
+                "task": "fold",
+                "subtask_description": "fold edge",
+            },
+        ]
+    ).to_csv(manifest, index=False)
+    original = runner.PrecheckRunner.run_clip
+
+    def add_candidate(self, clip):
+        results = original(self, clip)
+        end_frame = clip.num_frames if clip.asset_id == "invalid-window" else 3
+        self.candidate_window_records.append(
+            {"start_frame": 0, "end_frame": end_frame}
+        )
+        return results
+
+    monkeypatch.setattr(runner.PrecheckRunner, "run_clip", add_candidate)
+    output_dir = tmp_path / "precheck"
+    summary = runner.run_manifest_precheck(
+        manifest,
+        supplier="deepreach",
+        output_dir=output_dir,
+        checks=["text_integrity"],
+    )
+
+    assert summary["completed_clip_count"] == 2
+    windows = json.loads((output_dir / "candidate_windows.json").read_text())
+    assert [window["asset_id"] for window in windows] == ["valid-window"]
+    assert windows[0]["local_start_frame"] == 0
+    assert windows[0]["local_end_frame"] == 3
+    assert windows[0]["start_frame"] == 4
+    assert windows[0]["end_frame"] == 7
+    failures = json.loads((output_dir / "failures.json").read_text())
+    assert len(failures) == 1
+    assert failures[0]["asset_id"] == "invalid-window"
+    assert failures[0]["failure_stage"] == "candidate_window_mapping"
+    assert "local candidate bounds" in failures[0]["error"]
 
 
 def test_manifest_precheck_isolates_bad_manifest_rows(tmp_path: Path) -> None:

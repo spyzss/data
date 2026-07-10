@@ -4,6 +4,7 @@ import argparse
 import json
 import shutil
 import subprocess
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -367,6 +368,16 @@ class VideoQualityResult:
     evaluation: QualityEvaluation
 
 
+@dataclass(frozen=True)
+class VideoFrameRangeAnalysis:
+    """Video metrics plus the decode accounting for one logical frame range."""
+
+    metrics: VideoMetrics
+    source_video_frame_count: int
+    decoded_frame_count: int
+    sampled_local_frame_indices: tuple[int, ...]
+
+
 def _to_plain(value: Any) -> Any:
     if isinstance(value, StrEnum):
         return value.value
@@ -661,7 +672,12 @@ def _select_frame_timestamps(path: Path, frame_count: int) -> FrameTimestamps | 
     )
 
 
-def _timeline_metrics(path: Path, frame_count: int, fps: float, config: TimelineConfig) -> dict[str, float | int | bool | str]:
+def _timeline_metrics_from_timestamps(
+    frame_count: int,
+    fps: float,
+    config: TimelineConfig,
+    timestamp_result: FrameTimestamps | None,
+) -> dict[str, float | int | bool | str]:
     expected_interval_ms = 1000.0 / fps if fps > 0 else 0.0
     drop_interval_ms = max(
         expected_interval_ms * config.drop_interval_factor,
@@ -683,7 +699,6 @@ def _timeline_metrics(path: Path, frame_count: int, fps: float, config: Timeline
             "max_gap_fail_ms": max_gap_fail_ms,
         }
 
-    timestamp_result = _select_frame_timestamps(path, frame_count)
     if timestamp_result is None:
         intervals = [expected_interval_ms] * max(0, frame_count - 1)
         pts_monotonic_valid = True
@@ -719,6 +734,20 @@ def _timeline_metrics(path: Path, frame_count: int, fps: float, config: Timeline
         "drop_interval_ms": drop_interval_ms,
         "max_gap_fail_ms": max_gap_fail_ms,
     }
+
+
+def _timeline_metrics(
+    path: Path,
+    frame_count: int,
+    fps: float,
+    config: TimelineConfig,
+) -> dict[str, float | int | bool | str]:
+    return _timeline_metrics_from_timestamps(
+        frame_count,
+        fps,
+        config,
+        _select_frame_timestamps(path, frame_count),
+    )
 
 
 def _keypoint_dataset_has_points(dataset: h5py.Dataset) -> bool:
@@ -1011,16 +1040,12 @@ def _make_frozen_interval(
     )
 
 
-def _scan_frozen_intervals(
-    path: Path,
+def _scan_frozen_frame_sequence(
+    indexed_frames: Iterable[tuple[int, np.ndarray]],
     fps: float,
     config: FreezeConfig,
 ) -> tuple[tuple[FrozenInterval, ...], int, int]:
     if not config.enabled:
-        return (), 0, 0
-
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
         return (), 0, 0
 
     intervals: list[FrozenInterval] = []
@@ -1030,7 +1055,6 @@ def _scan_frozen_intervals(
     current_run_start: int | None = None
     current_run_end: int | None = None
     current_run_metrics: list[dict[str, float]] = []
-    frame_index = 0
 
     def finish_run() -> None:
         nonlocal current_run_start, current_run_end, current_run_metrics, max_run_frames
@@ -1045,43 +1069,76 @@ def _scan_frozen_intervals(
         current_run_end = None
         current_run_metrics = []
 
-    try:
-        while True:
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                break
-
-            freeze_frame, _freeze_scale = _resize_keep_aspect(frame, config.downscale_short_side, no_upscale=True)
-            freeze_gray = cv2.cvtColor(freeze_frame, cv2.COLOR_BGR2GRAY)
-            if previous_gray is not None:
-                diff = float(np.mean(cv2.absdiff(previous_gray, freeze_gray)))
-                hist_diff = _chi_square_hist_diff(previous_gray, freeze_gray)
-                ssim = _ssim_score(previous_gray, freeze_gray)
-                phash_hamming = _phash_hamming(previous_gray, freeze_gray)
-                auxiliary_match = ssim >= config.ssim_min or phash_hamming <= config.phash_hamming_max
-                if diff < config.frame_diff_mean_abs_max and hist_diff < config.hist_diff_max and auxiliary_match:
-                    frozen_pairs += 1
-                    if current_run_start is None:
-                        current_run_start = frame_index - 1
-                        current_run_metrics = []
-                    current_run_end = frame_index
-                    current_run_metrics.append(
-                        {
-                            "frame_diff": diff,
-                            "hist_diff": hist_diff,
-                            "ssim": ssim,
-                            "phash_hamming": float(phash_hamming),
-                        }
-                    )
-                else:
-                    finish_run()
-            previous_gray = freeze_gray
-            frame_index += 1
-        finish_run()
-    finally:
-        capture.release()
+    previous_index: int | None = None
+    for frame_index, frame in indexed_frames:
+        freeze_frame, _freeze_scale = _resize_keep_aspect(
+            frame,
+            config.downscale_short_side,
+            no_upscale=True,
+        )
+        freeze_gray = cv2.cvtColor(freeze_frame, cv2.COLOR_BGR2GRAY)
+        if previous_gray is not None and previous_index is not None:
+            if frame_index != previous_index + 1:
+                finish_run()
+            diff = float(np.mean(cv2.absdiff(previous_gray, freeze_gray)))
+            hist_diff = _chi_square_hist_diff(previous_gray, freeze_gray)
+            ssim = _ssim_score(previous_gray, freeze_gray)
+            phash_hamming = _phash_hamming(previous_gray, freeze_gray)
+            auxiliary_match = (
+                ssim >= config.ssim_min
+                or phash_hamming <= config.phash_hamming_max
+            )
+            if (
+                diff < config.frame_diff_mean_abs_max
+                and hist_diff < config.hist_diff_max
+                and auxiliary_match
+            ):
+                frozen_pairs += 1
+                if current_run_start is None:
+                    current_run_start = previous_index
+                    current_run_metrics = []
+                current_run_end = frame_index
+                current_run_metrics.append(
+                    {
+                        "frame_diff": diff,
+                        "hist_diff": hist_diff,
+                        "ssim": ssim,
+                        "phash_hamming": float(phash_hamming),
+                    }
+                )
+            else:
+                finish_run()
+        previous_gray = freeze_gray
+        previous_index = frame_index
+    finish_run()
 
     return tuple(intervals), frozen_pairs, max_run_frames
+
+
+def _scan_frozen_intervals(
+    path: Path,
+    fps: float,
+    config: FreezeConfig,
+) -> tuple[tuple[FrozenInterval, ...], int, int]:
+    if not config.enabled:
+        return (), 0, 0
+
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        return (), 0, 0
+    try:
+        def decoded_frames() -> Iterable[tuple[int, np.ndarray]]:
+            frame_index = 0
+            while True:
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    return
+                yield frame_index, frame
+                frame_index += 1
+
+        return _scan_frozen_frame_sequence(decoded_frames(), fps, config)
+    finally:
+        capture.release()
 
 
 def _keypoint_motion_signal(
@@ -1276,147 +1333,342 @@ def _empty_metrics(path: Path, errors: tuple[str, ...]) -> VideoMetrics:
     )
 
 
-def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None = None) -> VideoMetrics:
+def _build_video_metrics(
+    *,
+    path: Path,
+    frame_count: int,
+    fps: float,
+    width: int,
+    height: int,
+    sampled_frame_count: int,
+    sampled_frames: list[np.ndarray],
+    frozen_intervals: tuple[FrozenInterval, ...],
+    frozen_pairs: int,
+    max_frozen_run_frames: int,
+    timeline: dict[str, float | int | bool | str],
+    hand_roi: HandRoiMetrics | None,
+    config: VideoQualityConfig,
+    errors: list[str],
+) -> VideoMetrics:
+    brightness_values: list[float] = []
+    black_values: list[float] = []
+    dark_values: list[float] = []
+    exposed_values: list[float] = []
+    exposure_defect_values: list[float] = []
+    blur_values: list[float] = []
+    tenengrad_values: list[float] = []
+    scale_values: list[int] = []
+    for frame in sampled_frames:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness = float(np.mean(gray))
+        dark_pixel_ratio = float(np.mean(gray < DARK_PIXEL_Y_THRESHOLD))
+        over_exposed_pixel_ratio = float(
+            np.mean(gray > OVER_EXPOSED_PIXEL_Y_THRESHOLD)
+        )
+        brightness_values.append(brightness)
+        black_frame = (
+            brightness < config.exposure.black.mean_y_max
+            or dark_pixel_ratio > config.exposure.black.dark_pixel_ratio_min
+        )
+        over_dark_frame = (
+            brightness < config.exposure.over_dark.mean_y_max
+            or dark_pixel_ratio > config.exposure.over_dark.dark_pixel_ratio_min
+        )
+        over_exposed_frame = (
+            brightness > config.exposure.over_exposed.mean_y_min
+            or over_exposed_pixel_ratio
+            > config.exposure.over_exposed.over_exposed_pixel_ratio_min
+        )
+        black_values.append(1.0 if black_frame else 0.0)
+        dark_values.append(1.0 if over_dark_frame else 0.0)
+        exposed_values.append(1.0 if over_exposed_frame else 0.0)
+        exposure_defect_values.append(
+            1.0 if black_frame or over_dark_frame or over_exposed_frame else 0.0
+        )
+        laplacian, tenengrad, scale_short_side = _sharpness_for_frame(
+            frame,
+            config.sharpness_global.target_short_side,
+            config.sharpness_global.no_upscale,
+        )
+        blur_values.append(laplacian)
+        tenengrad_values.append(tenengrad)
+        scale_values.append(scale_short_side)
+
+    decoded_samples = len(sampled_frames)
+    if sampled_frame_count and decoded_samples == 0:
+        errors.append("no_sample_frames_decoded")
+    black_frame_ratio = float(np.mean(black_values)) if black_values else 1.0
+    exposure_defect_frame_ratio = (
+        float(np.mean(exposure_defect_values))
+        if exposure_defect_values
+        else 1.0
+    )
+    frozen_frame_ratio = (
+        frozen_pairs / (frame_count - 1)
+        if frame_count > 1 and config.freeze.enabled
+        else 0.0
+    )
+    defect_duration_ratio = min(
+        1.0,
+        exposure_defect_frame_ratio
+        + frozen_frame_ratio
+        + float(timeline["drop_frame_ratio"]),
+    )
+    laplacian_under_100_ratio = (
+        float(
+            np.mean(
+                np.asarray(blur_values, dtype=np.float64)
+                < LAPLACIAN_LOW_DETAIL_THRESHOLD
+            )
+        )
+        if blur_values
+        else 1.0
+    )
+    display_width = width
+    display_height = height
+    short_side = min(width, height) if width and height else 0
+    long_side = max(width, height) if width and height else 0
+    metadata_read_ok = frame_count > 0 and fps > 0 and width > 0 and height > 0
+    return VideoMetrics(
+        path=path,
+        asset_id=asset_id_from_video(path),
+        opened=True,
+        video_stream_present=frame_count > 0,
+        codec_readable=metadata_read_ok,
+        metadata_read_ok=metadata_read_ok,
+        frame_count=frame_count,
+        fps=fps,
+        duration_seconds=frame_count / fps if frame_count > 0 and fps > 0 else 0.0,
+        width=width,
+        height=height,
+        display_width=display_width,
+        display_height=display_height,
+        short_side=short_side,
+        long_side=long_side,
+        sampled_frame_count=sampled_frame_count,
+        decoded_sample_count=decoded_samples,
+        sample_decode_ratio=(
+            decoded_samples / sampled_frame_count if sampled_frame_count else 0.0
+        ),
+        mean_brightness=(
+            float(np.mean(brightness_values)) if brightness_values else 0.0
+        ),
+        black_frame_ratio=black_frame_ratio,
+        black_frame_count_estimate=(
+            int(round(black_frame_ratio * frame_count)) if frame_count > 0 else 0
+        ),
+        exposure_defect_frame_ratio=exposure_defect_frame_ratio,
+        defect_duration_ratio=defect_duration_ratio,
+        mean_over_dark_ratio=float(np.mean(dark_values)) if dark_values else 1.0,
+        mean_over_exposed_ratio=(
+            float(np.mean(exposed_values)) if exposed_values else 0.0
+        ),
+        laplacian_min=float(min(blur_values)) if blur_values else 0.0,
+        laplacian_p10=_percentile(blur_values, 10),
+        laplacian_median=_percentile(blur_values, 50),
+        mean_blur_laplacian_var=(
+            float(np.mean(blur_values)) if blur_values else 0.0
+        ),
+        laplacian_p90=_percentile(blur_values, 90),
+        laplacian_under_100_ratio=laplacian_under_100_ratio,
+        tenengrad_p10=_percentile(tenengrad_values, 10),
+        tenengrad_median=_percentile(tenengrad_values, 50),
+        tenengrad_mean=(
+            float(np.mean(tenengrad_values)) if tenengrad_values else 0.0
+        ),
+        sharpness_scale_short_side=(
+            max(scale_values) if scale_values else short_side
+        ),
+        frozen_frame_ratio=frozen_frame_ratio,
+        max_consecutive_frozen_sec=(
+            max_frozen_run_frames / fps if fps > 0 else 0.0
+        ),
+        frozen_intervals=frozen_intervals,
+        pts_monotonic_valid=bool(timeline["pts_monotonic_valid"]),
+        drop_frame_ratio=float(timeline["drop_frame_ratio"]),
+        drop_detection_source=str(timeline["drop_detection_source"]),
+        drop_detection_reliable=bool(timeline["drop_detection_reliable"]),
+        estimated_missing_frames=int(timeline["estimated_missing_frames"]),
+        observed_frame_interval_count=int(timeline["observed_frame_interval_count"]),
+        frame_interval_p99_ms=float(timeline["frame_interval_p99_ms"]),
+        max_frame_gap_ms=float(timeline["max_frame_gap_ms"]),
+        expected_interval_ms=float(timeline["expected_interval_ms"]),
+        drop_interval_ms=float(timeline["drop_interval_ms"]),
+        max_gap_fail_ms=float(timeline["max_gap_fail_ms"]),
+        hand_roi=hand_roi,
+        errors=tuple(errors),
+    )
+
+
+def analyze_video(
+    path: Path,
+    config: VideoQualityConfig,
+    hdf5_path: Path | None = None,
+) -> VideoMetrics:
     capture = cv2.VideoCapture(str(path))
     try:
         if not capture.isOpened():
             return _empty_metrics(path, ("cannot_open_video",))
-
         frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = float(capture.get(cv2.CAP_PROP_FPS))
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         duration = frame_count / fps if frame_count > 0 and fps > 0 else 0.0
-        display_width = width
-        display_height = height
-        short_side = min(display_width, display_height) if display_width and display_height else 0
-        long_side = max(display_width, display_height) if display_width and display_height else 0
         indexes = _sample_indexes(frame_count, fps, duration, config.decode)
-        timeline = _timeline_metrics(path, frame_count, fps, config.timeline)
-
-        brightness_values: list[float] = []
-        black_values: list[float] = []
-        dark_values: list[float] = []
-        exposed_values: list[float] = []
-        exposure_defect_values: list[float] = []
-        blur_values: list[float] = []
-        tenengrad_values: list[float] = []
-        scale_values: list[int] = []
+        sampled_frames: list[np.ndarray] = []
         errors: list[str] = []
-
         for index in indexes:
             capture.set(cv2.CAP_PROP_POS_FRAMES, index)
             ok, frame = capture.read()
             if not ok or frame is None:
                 errors.append(f"sample_decode_failed:{index}")
-                continue
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            brightness = float(np.mean(gray))
-            dark_pixel_ratio = float(np.mean(gray < DARK_PIXEL_Y_THRESHOLD))
-            over_exposed_pixel_ratio = float(np.mean(gray > OVER_EXPOSED_PIXEL_Y_THRESHOLD))
-            brightness_values.append(brightness)
-            black_frame = (
-                brightness < config.exposure.black.mean_y_max
-                or dark_pixel_ratio > config.exposure.black.dark_pixel_ratio_min
-            )
-            over_dark_frame = (
-                brightness < config.exposure.over_dark.mean_y_max
-                or dark_pixel_ratio > config.exposure.over_dark.dark_pixel_ratio_min
-            )
-            over_exposed_frame = (
-                brightness > config.exposure.over_exposed.mean_y_min
-                or over_exposed_pixel_ratio > config.exposure.over_exposed.over_exposed_pixel_ratio_min
-            )
-            black_values.append(1.0 if black_frame else 0.0)
-            dark_values.append(1.0 if over_dark_frame else 0.0)
-            exposed_values.append(1.0 if over_exposed_frame else 0.0)
-            exposure_defect_values.append(1.0 if black_frame or over_dark_frame or over_exposed_frame else 0.0)
-
-            laplacian, tenengrad, scale_short_side = _sharpness_for_frame(
-                frame,
-                config.sharpness_global.target_short_side,
-                config.sharpness_global.no_upscale,
-            )
-            blur_values.append(laplacian)
-            tenengrad_values.append(tenengrad)
-            scale_values.append(scale_short_side)
-
-        decoded = len(brightness_values)
-        sampled = len(indexes)
-        if sampled and decoded == 0:
-            errors.append("no_sample_frames_decoded")
-        black_frame_ratio = float(np.mean(black_values)) if black_values else 1.0
-        black_frame_count_estimate = int(round(black_frame_ratio * frame_count)) if frame_count > 0 else 0
-        exposure_defect_frame_ratio = float(np.mean(exposure_defect_values)) if exposure_defect_values else 1.0
-        frozen_intervals, frozen_pairs, max_frozen_run_frames = _scan_frozen_intervals(path, fps, config.freeze)
-        frozen_intervals = _annotate_frozen_intervals_with_hdf5(frozen_intervals, hdf5_path, config.freeze)
-        frozen_frame_ratio = frozen_pairs / (frame_count - 1) if frame_count > 1 and config.freeze.enabled else 0.0
-        defect_duration_ratio = min(
-            1.0,
-            exposure_defect_frame_ratio + frozen_frame_ratio + float(timeline["drop_frame_ratio"]),
-        )
-        laplacian_under_100_ratio = (
-            float(np.mean(np.array(blur_values) < LAPLACIAN_LOW_DETAIL_THRESHOLD)) if blur_values else 1.0
-        )
-        metadata_read_ok = frame_count > 0 and fps > 0 and width > 0 and height > 0
-        hand_roi = _compute_hand_roi_metrics(path, hdf5_path, indexes, width, height, config.hand_roi)
-
-        return VideoMetrics(
-            path=path,
-            asset_id=asset_id_from_video(path),
-            opened=True,
-            video_stream_present=frame_count > 0,
-            codec_readable=metadata_read_ok,
-            metadata_read_ok=metadata_read_ok,
-            frame_count=frame_count,
-            fps=fps,
-            duration_seconds=duration,
-            width=width,
-            height=height,
-            display_width=display_width,
-            display_height=display_height,
-            short_side=short_side,
-            long_side=long_side,
-            sampled_frame_count=sampled,
-            decoded_sample_count=decoded,
-            sample_decode_ratio=decoded / sampled if sampled else 0.0,
-            mean_brightness=float(np.mean(brightness_values)) if brightness_values else 0.0,
-            black_frame_ratio=black_frame_ratio,
-            black_frame_count_estimate=black_frame_count_estimate,
-            exposure_defect_frame_ratio=exposure_defect_frame_ratio,
-            defect_duration_ratio=defect_duration_ratio,
-            mean_over_dark_ratio=float(np.mean(dark_values)) if dark_values else 1.0,
-            mean_over_exposed_ratio=float(np.mean(exposed_values)) if exposed_values else 0.0,
-            laplacian_min=float(min(blur_values)) if blur_values else 0.0,
-            laplacian_p10=_percentile(blur_values, 10),
-            laplacian_median=_percentile(blur_values, 50),
-            mean_blur_laplacian_var=float(np.mean(blur_values)) if blur_values else 0.0,
-            laplacian_p90=_percentile(blur_values, 90),
-            laplacian_under_100_ratio=laplacian_under_100_ratio,
-            tenengrad_p10=_percentile(tenengrad_values, 10),
-            tenengrad_median=_percentile(tenengrad_values, 50),
-            tenengrad_mean=float(np.mean(tenengrad_values)) if tenengrad_values else 0.0,
-            sharpness_scale_short_side=max(scale_values) if scale_values else short_side,
-            frozen_frame_ratio=frozen_frame_ratio,
-            max_consecutive_frozen_sec=max_frozen_run_frames / fps if fps > 0 else 0.0,
-            frozen_intervals=frozen_intervals,
-            pts_monotonic_valid=bool(timeline["pts_monotonic_valid"]),
-            drop_frame_ratio=float(timeline["drop_frame_ratio"]),
-            drop_detection_source=str(timeline["drop_detection_source"]),
-            drop_detection_reliable=bool(timeline["drop_detection_reliable"]),
-            estimated_missing_frames=int(timeline["estimated_missing_frames"]),
-            observed_frame_interval_count=int(timeline["observed_frame_interval_count"]),
-            frame_interval_p99_ms=float(timeline["frame_interval_p99_ms"]),
-            max_frame_gap_ms=float(timeline["max_frame_gap_ms"]),
-            expected_interval_ms=float(timeline["expected_interval_ms"]),
-            drop_interval_ms=float(timeline["drop_interval_ms"]),
-            max_gap_fail_ms=float(timeline["max_gap_fail_ms"]),
-            hand_roi=hand_roi,
-            errors=tuple(errors),
-        )
+            else:
+                sampled_frames.append(frame)
     finally:
         capture.release()
+
+    timeline = _timeline_metrics(path, frame_count, fps, config.timeline)
+    frozen_intervals, frozen_pairs, max_frozen_run_frames = _scan_frozen_intervals(
+        path,
+        fps,
+        config.freeze,
+    )
+    frozen_intervals = _annotate_frozen_intervals_with_hdf5(
+        frozen_intervals,
+        hdf5_path,
+        config.freeze,
+    )
+    hand_roi = _compute_hand_roi_metrics(
+        path,
+        hdf5_path,
+        indexes,
+        width,
+        height,
+        config.hand_roi,
+    )
+    return _build_video_metrics(
+        path=path,
+        frame_count=frame_count,
+        fps=fps,
+        width=width,
+        height=height,
+        sampled_frame_count=len(indexes),
+        sampled_frames=sampled_frames,
+        frozen_intervals=frozen_intervals,
+        frozen_pairs=frozen_pairs,
+        max_frozen_run_frames=max_frozen_run_frames,
+        timeline=timeline,
+        hand_roi=hand_roi,
+        config=config,
+        errors=errors,
+    )
+
+
+def analyze_video_frame_range(
+    path: Path,
+    config: VideoQualityConfig,
+    start_frame: int,
+    end_frame: int,
+    hdf5_path: Path | None = None,
+) -> VideoFrameRangeAnalysis:
+    """Analyze one inclusive logical clip without creating a split video file."""
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise ValueError(f"cannot open source video: {path}")
+    try:
+        source_frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if start_frame < 0:
+            raise ValueError("start_frame must be >= 0")
+        if end_frame < start_frame:
+            raise ValueError("end_frame must be >= start_frame")
+        if end_frame >= source_frame_count:
+            raise ValueError(
+                f"end_frame {end_frame} outside source frame count {source_frame_count}"
+            )
+
+        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        indexed_frames: list[tuple[int, np.ndarray]] = []
+        timestamps_ms: list[float] = []
+        errors: list[str] = []
+        for source_frame_idx in range(start_frame, end_frame + 1):
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                errors.append(f"range_decode_failed:{source_frame_idx}")
+                break
+            indexed_frames.append((source_frame_idx, frame))
+            timestamps_ms.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)))
+    finally:
+        capture.release()
+
+    clip_frame_count = end_frame - start_frame + 1
+    duration = clip_frame_count / fps if fps > 0 else 0.0
+    sample_local_indexes = _sample_indexes(
+        clip_frame_count,
+        fps,
+        duration,
+        config.decode,
+    )
+    frame_by_source = dict(indexed_frames)
+    sampled_frames = [
+        frame_by_source[start_frame + local_frame_idx]
+        for local_frame_idx in sample_local_indexes
+        if start_frame + local_frame_idx in frame_by_source
+    ]
+    timestamp_result = (
+        FrameTimestamps(tuple(timestamps_ms), "opencv_range", False)
+        if _timestamps_are_usable(tuple(timestamps_ms))
+        else None
+    )
+    timeline = _timeline_metrics_from_timestamps(
+        clip_frame_count,
+        fps,
+        config.timeline,
+        timestamp_result,
+    )
+    frozen_intervals, frozen_pairs, max_frozen_run_frames = (
+        _scan_frozen_frame_sequence(indexed_frames, fps, config.freeze)
+    )
+    frozen_intervals = _annotate_frozen_intervals_with_hdf5(
+        frozen_intervals,
+        hdf5_path,
+        config.freeze,
+    )
+    sampled_source_indexes = [
+        start_frame + local_frame_idx for local_frame_idx in sample_local_indexes
+    ]
+    hand_roi = _compute_hand_roi_metrics(
+        path,
+        hdf5_path,
+        sampled_source_indexes,
+        width,
+        height,
+        config.hand_roi,
+    )
+    metrics = _build_video_metrics(
+        path=path,
+        frame_count=clip_frame_count,
+        fps=fps,
+        width=width,
+        height=height,
+        sampled_frame_count=len(sample_local_indexes),
+        sampled_frames=sampled_frames,
+        frozen_intervals=frozen_intervals,
+        frozen_pairs=frozen_pairs,
+        max_frozen_run_frames=max_frozen_run_frames,
+        timeline=timeline,
+        hand_roi=hand_roi,
+        config=config,
+        errors=errors,
+    )
+    return VideoFrameRangeAnalysis(
+        metrics=metrics,
+        source_video_frame_count=source_frame_count,
+        decoded_frame_count=len(indexed_frames),
+        sampled_local_frame_indices=tuple(sample_local_indexes),
+    )
 
 
 def hdf5_path_for_video(video_path: Path, batch_dir: Path) -> Path:
