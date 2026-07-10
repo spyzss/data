@@ -568,51 +568,9 @@ modules:
       hdf5_frame_count_mismatch_warn:
         rule_id: video_quality.hdf5_frame_count_mismatch_warn
         verdict: warn
-      hand_roi_available_ratio_below_min:
-        rule_id: video_quality.hand_roi_available_ratio_below_min
-        verdict: warn
-      hand_roi_available_ratio_warn:
-        rule_id: video_quality.hand_roi_available_ratio_warn
-        verdict: warn
-      hand_roi_laplacian_p10_below_min:
-        rule_id: video_quality.hand_roi_laplacian_p10_below_min
-        verdict: fail
-      hand_roi_laplacian_p10_warn:
-        rule_id: video_quality.hand_roi_laplacian_p10_warn
-        verdict: warn
-      hand_roi_laplacian_median_below_min:
-        rule_id: video_quality.hand_roi_laplacian_median_below_min
-        verdict: fail
-      hand_roi_laplacian_median_warn:
-        rule_id: video_quality.hand_roi_laplacian_median_warn
-        verdict: warn
-      hand_roi_tenengrad_p10_below_min:
-        rule_id: video_quality.hand_roi_tenengrad_p10_below_min
-        verdict: fail
-      hand_roi_tenengrad_p10_warn:
-        rule_id: video_quality.hand_roi_tenengrad_p10_warn
-        verdict: warn
-      hand_roi_tenengrad_median_below_min:
-        rule_id: video_quality.hand_roi_tenengrad_median_below_min
-        verdict: fail
-      hand_roi_tenengrad_median_warn:
-        rule_id: video_quality.hand_roi_tenengrad_median_warn
-        verdict: warn
-      hand_roi_blur_bad_frame_ratio_above_max:
-        rule_id: video_quality.hand_roi_blur_bad_frame_ratio_above_max
-        verdict: fail
-      hand_roi_blur_bad_frame_ratio_warn:
-        rule_id: video_quality.hand_roi_blur_bad_frame_ratio_warn
-        verdict: warn
-      hand_roi_severe_blur:
-        rule_id: video_quality.hand_roi_severe_blur
-        verdict: fail
       no_sample_frames_decoded:
         rule_id: video_quality.no_sample_frames_decoded
         verdict: fail
-      roi_frame_decode_failed:
-        rule_id: video_quality.roi_frame_decode_failed
-        verdict: warn
 
   sam3_containment:
     enabled: true

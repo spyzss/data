@@ -12,7 +12,6 @@ import acceptance_pull.video_quality as video_quality
 from acceptance_pull.video_quality import (
     AlignmentMode,
     FrozenInterval,
-    HandRoiMetrics,
     analyze_video,
     check_hdf5_alignment,
     discover_batch_videos,
@@ -847,157 +846,22 @@ def test_hdf5_alignment_large_delta_fails_by_default(tmp_path: Path) -> None:
     assert "hdf5_frame_count_mismatch" in evaluation.reasons
 
 
-def test_hand_roi_is_disabled_by_default_for_video_prefilter(tmp_path: Path) -> None:
+def test_video_qc_has_no_hand_roi_surface(tmp_path: Path) -> None:
     batch = tmp_path
     video_dir = batch / "video"
     video_dir.mkdir()
     video = video_dir / "408817_video.mp4"
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
-    write_hand_keypoint_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", frame_count=3, normalized=True)
-    config = load_video_quality_config(None)
+    write_quality_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", 3)
 
-    metrics = analyze_video(video, config, hdf5_path=batch / "hdf5" / "408817_hdf5.hdf5")
-    evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
+    assert run_video_quality_check(batch) == 0
+    report = json.loads((batch / "quality_archive" / "408817.json").read_text(encoding="utf-8"))
+    serialized = json.dumps(report)
 
-    assert metrics.hand_roi is None
-    assert evaluation.reasons == ()
-    assert not any(reason.startswith("hand_roi_") for reason in evaluation.warn_reasons)
+    assert "hand_roi" not in serialized
+    assert "hand_roi_metrics" not in report["video_quality"]["metrics"]
+    assert "hand_roi" not in load_video_quality_config(None).to_dict()
 
-
-def test_hand_roi_bbox_metrics_warn_without_keypoint_quality_check(tmp_path: Path) -> None:
-    batch = tmp_path
-    video_dir = batch / "video"
-    video_dir.mkdir()
-    video = video_dir / "408817_video.mp4"
-    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
-    write_hand_keypoint_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", frame_count=3, normalized=True)
-    config_path = tmp_path / "quality.yaml"
-    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
-    config = load_video_quality_config(config_path)
-
-    metrics = analyze_video(video, config, hdf5_path=batch / "hdf5" / "408817_hdf5.hdf5")
-    evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
-
-    assert metrics.hand_roi is not None
-    assert metrics.hand_roi.source == "hdf5_keypoints_bbox"
-    assert metrics.hand_roi.available_ratio == 1.0
-    assert metrics.hand_roi.laplacian_p10 > 0
-    assert "hand_roi_available_ratio_below_min" not in evaluation.reasons
-    assert evaluation.should_run_mask_qc is True
-
-
-def test_hand_roi_uses_transform_matrices_as_keypoints(tmp_path: Path) -> None:
-    batch = tmp_path
-    video_dir = batch / "video"
-    video_dir.mkdir()
-    video = video_dir / "408817_video.mp4"
-    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
-    hdf5_path = batch / "hdf5" / "408817_hdf5.hdf5"
-    hdf5_path.parent.mkdir()
-    joint_offsets = [
-        ("leftHand", (-0.10, -0.05, 1.0)),
-        ("leftIndexFingerKnuckle", (-0.08, -0.03, 1.0)),
-        ("leftIndexFingerTip", (-0.06, -0.01, 1.0)),
-        ("leftThumbTip", (-0.04, 0.03, 1.0)),
-        ("rightHand", (0.05, -0.04, 1.0)),
-        ("rightIndexFingerKnuckle", (0.07, -0.02, 1.0)),
-        ("rightIndexFingerTip", (0.09, 0.00, 1.0)),
-        ("rightThumbTip", (0.11, 0.04, 1.0)),
-    ]
-    with h5py.File(hdf5_path, "w") as handle:
-        label = handle.create_group("label")
-        label.create_dataset("quality_hand", data=np.ones((3, 2), dtype=np.float32))
-        camera = handle.create_group("camera")
-        camera.create_dataset(
-            "intrinsic",
-            data=np.array([[1000.0, 0.0, 640.0], [0.0, 1000.0, 360.0], [0.0, 0.0, 1.0]], dtype=np.float32),
-        )
-        transforms = handle.create_group("transforms")
-        for name, offset in joint_offsets:
-            matrices = np.repeat(np.eye(4, dtype=np.float32)[None, :, :], 3, axis=0)
-            for frame_index in range(3):
-                matrices[frame_index, :3, 3] = np.array(offset, dtype=np.float32) + np.array(
-                    [frame_index * 0.002, 0.0, 0.0],
-                    dtype=np.float32,
-                )
-            transforms.create_dataset(name, data=matrices)
-    config_path = tmp_path / "quality.yaml"
-    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
-    config = load_video_quality_config(config_path)
-
-    metrics = analyze_video(video, config, hdf5_path=hdf5_path)
-    evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
-
-    assert metrics.hand_roi is not None
-    assert metrics.hand_roi.source == "hdf5_transform_keypoints_bbox"
-    assert metrics.hand_roi.available_ratio == 1.0
-    assert metrics.hand_roi.unavailable_reasons == ()
-    assert "hand_roi_available_ratio_below_min" not in evaluation.warn_reasons
-
-
-def test_hand_roi_soft_blur_warns_under_warn_except_severe_fail(tmp_path: Path) -> None:
-    video = tmp_path / "408817_video.mp4"
-    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
-    metrics = analyze_video(video, load_video_quality_config(None))
-    metrics = replace(
-        metrics,
-        hand_roi=HandRoiMetrics(
-            enabled=True,
-            source="hdf5_transform_keypoints_bbox",
-            sampled_frame_count=10,
-            available_frame_count=10,
-            available_ratio=1.0,
-            laplacian_p10=70.0,
-            laplacian_median=100.0,
-            tenengrad_p10=10.0,
-            tenengrad_median=13.0,
-            blur_bad_frame_ratio=0.60,
-        ),
-    )
-
-    config_path = tmp_path / "quality.yaml"
-    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
-    evaluation = evaluate_video_quality(metrics, load_video_quality_config(config_path))
-
-    assert evaluation.passed is True
-    assert evaluation.decision == "warn"
-    assert evaluation.should_run_mask_qc is True
-    assert "hand_roi_laplacian_p10_warn" in evaluation.warn_reasons
-    assert "hand_roi_laplacian_median_warn" in evaluation.warn_reasons
-    assert "hand_roi_laplacian_p10_below_min" not in evaluation.reasons
-    assert "hand_roi_laplacian_median_below_min" not in evaluation.reasons
-    assert "hand_roi_severe_blur" not in evaluation.reasons
-    assert "hand_roi_blur_bad_frame_ratio_above_max" not in evaluation.reasons
-
-
-def test_hand_roi_unavailable_warns_without_severe_blur_fail(tmp_path: Path) -> None:
-    batch = tmp_path
-    video_dir = batch / "video"
-    video_dir.mkdir()
-    video = video_dir / "408817_video.mp4"
-    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
-    hdf5_path = batch / "hdf5" / "408817_hdf5.hdf5"
-    hdf5_path.parent.mkdir()
-    with h5py.File(hdf5_path, "w") as handle:
-        label = handle.create_group("label")
-        label.create_dataset("quality_hand", data=np.ones((3, 2), dtype=np.float32))
-        transforms = handle.create_group("transforms")
-        transforms.create_dataset("leftHand", data=np.repeat(np.eye(4, dtype=np.float32)[None, :, :], 3, axis=0))
-    config_path = tmp_path / "quality.yaml"
-    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
-    config = load_video_quality_config(config_path)
-
-    metrics = analyze_video(video, config, hdf5_path=hdf5_path)
-    evaluation = evaluate_video_quality(metrics, config, check_hdf5_alignment(video, batch, metrics, config))
-
-    assert metrics.hand_roi is not None
-    assert metrics.hand_roi.available_ratio == 0.0
-    assert evaluation.passed is True
-    assert evaluation.decision == "warn"
-    assert evaluation.should_run_mask_qc is True
-    assert "hand_roi_available_ratio_below_min" in evaluation.warn_reasons
-    assert "hand_roi_severe_blur" not in evaluation.reasons
-    assert "hand_roi_blur_bad_frame_ratio_above_max" not in evaluation.reasons
 
 
 def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tmp_path: Path) -> None:
@@ -1099,8 +963,6 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     assert freeze_metrics["frozen_interval_critical_window_count"] == 0
     assert freeze_metrics["ssim_min"] == 0.995
     assert freeze_metrics["phash_hamming_max"] == 4
-    assert "hand_roi_metrics" in report["video_quality"]["metrics"]
-    assert report["video_quality"]["metrics"]["hand_roi_metrics"] is None
     assert report["reference_quality"]["mode"] == "none"
 
 

@@ -28,8 +28,6 @@ class AlignmentMode(StrEnum):
 @dataclass(frozen=True)
 class PipelineConfig:
     stop_before_mask_if_fail: bool = True
-    run_hand_roi: bool = False
-    hand_roi_source: str = "hdf5_keypoints"
     do_keypoint_quality_check: bool = False
     do_keypoint_mask_matching: bool = False
     do_keypoint_temporal_check: bool = False
@@ -179,42 +177,6 @@ class Hdf5AlignmentConfig:
 
 
 @dataclass(frozen=True)
-class HandRoiSevereFailConfig:
-    enabled: bool = True
-    require_both_lap_and_ten_fail: bool = True
-    laplacian_p10_fail: float = 20.0
-    tenengrad_p10_fail: float = 6.0
-    blur_bad_frame_ratio_fail: float = 0.90
-
-
-@dataclass(frozen=True)
-class HandRoiConfig:
-    enabled: bool = False
-    mode: str = "warn_except_severe_fail"
-    use_keypoints_as_bbox_only: bool = True
-    min_valid_points_for_bbox: int = 8
-    bbox_expand_scale: float = 1.8
-    min_roi_width_px: int = 64
-    min_roi_height_px: int = 64
-    min_roi_area_ratio: float = 0.002
-    roi_target_short_side: int = 256
-    no_upscale_if_roi_too_small: bool = True
-    available_ratio_pass: float = 0.70
-    available_ratio_warn: float = 0.40
-    laplacian_p10_pass: float = 80.0
-    laplacian_p10_warn: float = 20.0
-    laplacian_median_pass: float = 120.0
-    laplacian_median_warn: float = 40.0
-    tenengrad_p10_pass: float = 12.0
-    tenengrad_p10_warn: float = 6.0
-    tenengrad_median_pass: float = 14.0
-    tenengrad_median_warn: float = 8.0
-    blur_bad_frame_ratio_pass: float = 0.50
-    blur_bad_frame_ratio_warn: float = 0.90
-    severe_fail: HandRoiSevereFailConfig = field(default_factory=HandRoiSevereFailConfig)
-
-
-@dataclass(frozen=True)
 class VideoQualityConfig:
     module_version: str = ""
     qc_config_reference: dict[str, str] = field(default_factory=dict)
@@ -228,7 +190,6 @@ class VideoQualityConfig:
     freeze: FreezeConfig = field(default_factory=FreezeConfig)
     defects: DefectDurationConfig = field(default_factory=DefectDurationConfig)
     hdf5_alignment: Hdf5AlignmentConfig = field(default_factory=Hdf5AlignmentConfig)
-    hand_roi: HandRoiConfig = field(default_factory=HandRoiConfig)
 
     @property
     def sample_count(self) -> int:
@@ -281,21 +242,6 @@ class FreezeScan:
     confirmed_freeze_duration_sec: float
     confirmed_freeze_ratio: float
     max_confirmed_freeze_sec: float
-
-
-@dataclass(frozen=True)
-class HandRoiMetrics:
-    enabled: bool
-    source: str
-    sampled_frame_count: int
-    available_frame_count: int
-    available_ratio: float
-    laplacian_p10: float
-    laplacian_median: float
-    tenengrad_p10: float
-    tenengrad_median: float
-    blur_bad_frame_ratio: float
-    unavailable_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -357,7 +303,6 @@ class VideoMetrics:
     expected_interval_ms: float
     drop_interval_ms: float
     max_gap_fail_ms: float
-    hand_roi: HandRoiMetrics | None = None
     errors: tuple[str, ...] = ()
 
 
@@ -785,7 +730,7 @@ def _read_transform_keypoint_data(handle: h5py.File) -> Hdf5KeypointData | None:
         return None
     return Hdf5KeypointData(
         points=_project_camera_points(translations, intrinsic),
-        source="hdf5_transform_keypoints_bbox",
+        source="hdf5_transform_keypoints",
     )
 
 
@@ -799,7 +744,7 @@ def _read_keypoint_data(path: Path) -> Hdf5KeypointData | None:
                 if candidate in handle and isinstance(handle[candidate], h5py.Dataset):
                     dataset = handle[candidate]
                     if _keypoint_dataset_has_points(dataset):
-                        return Hdf5KeypointData(np.asarray(dataset[()]), "hdf5_keypoints_bbox")
+                        return Hdf5KeypointData(np.asarray(dataset[()]), "hdf5_keypoints")
 
             found: Hdf5KeypointData | None = None
 
@@ -813,135 +758,12 @@ def _read_keypoint_data(path: Path) -> Hdf5KeypointData | None:
                     and isinstance(obj, h5py.Dataset)
                     and _keypoint_dataset_has_points(obj)
                 ):
-                    found = Hdf5KeypointData(np.asarray(obj[()]), "hdf5_keypoints_bbox")
+                    found = Hdf5KeypointData(np.asarray(obj[()]), "hdf5_keypoints")
 
             handle.visititems(visit)
             return found or _read_transform_keypoint_data(handle)
     except OSError:
         return None
-
-
-def _points_for_frame(keypoints: np.ndarray, frame_index: int, width: int, height: int) -> np.ndarray | None:
-    if frame_index >= keypoints.shape[0]:
-        return None
-    points = np.asarray(keypoints[frame_index], dtype=np.float64)
-    if points.size == 0 or points.shape[-1] < 2:
-        return None
-    points = points.reshape(-1, points.shape[-1])[:, :2]
-    finite = np.isfinite(points[:, 0]) & np.isfinite(points[:, 1])
-    points = points[finite]
-    if points.size == 0:
-        return None
-    if np.nanmax(np.abs(points)) <= 1.5:
-        points = points * np.array([width, height], dtype=np.float64)
-    return points
-
-
-def _expanded_bbox(points: np.ndarray, scale: float, width: int, height: int) -> tuple[int, int, int, int]:
-    x1, y1 = np.min(points, axis=0)
-    x2, y2 = np.max(points, axis=0)
-    center_x = (x1 + x2) / 2.0
-    center_y = (y1 + y2) / 2.0
-    half_width = max(1.0, (x2 - x1) * scale / 2.0)
-    half_height = max(1.0, (y2 - y1) * scale / 2.0)
-    left = max(0, int(np.floor(center_x - half_width)))
-    top = max(0, int(np.floor(center_y - half_height)))
-    right = min(width, int(np.ceil(center_x + half_width)))
-    bottom = min(height, int(np.ceil(center_y + half_height)))
-    return left, top, right, bottom
-
-
-def _compute_hand_roi_metrics(
-    path: Path,
-    hdf5_path: Path | None,
-    indexes: list[int],
-    width: int,
-    height: int,
-    config: HandRoiConfig,
-) -> HandRoiMetrics | None:
-    if not config.enabled or hdf5_path is None or not hdf5_path.is_file() or not indexes:
-        return None
-
-    keypoint_data = _read_keypoint_data(hdf5_path)
-    if keypoint_data is None:
-        return HandRoiMetrics(
-            enabled=True,
-            source="hdf5_keypoints_bbox",
-            sampled_frame_count=len(indexes),
-            available_frame_count=0,
-            available_ratio=0.0,
-            laplacian_p10=0.0,
-            laplacian_median=0.0,
-            tenengrad_p10=0.0,
-            tenengrad_median=0.0,
-            blur_bad_frame_ratio=1.0,
-            unavailable_reasons=("keypoint_dataset_missing",),
-        )
-
-    capture = cv2.VideoCapture(str(path))
-    laplacian_values: list[float] = []
-    tenengrad_values: list[float] = []
-    blur_bad_values: list[float] = []
-    unavailable_reasons: list[str] = []
-    available = 0
-    try:
-        for index in indexes:
-            points = _points_for_frame(keypoint_data.points, index, width, height)
-            if points is None or len(points) < config.min_valid_points_for_bbox:
-                unavailable_reasons.append("not_enough_keypoints")
-                continue
-
-            left, top, right, bottom = _expanded_bbox(points, config.bbox_expand_scale, width, height)
-            roi_width = right - left
-            roi_height = bottom - top
-            roi_area_ratio = (roi_width * roi_height) / max(1, width * height)
-            if (
-                roi_width < config.min_roi_width_px
-                or roi_height < config.min_roi_height_px
-                or roi_area_ratio < config.min_roi_area_ratio
-            ):
-                unavailable_reasons.append("roi_too_small")
-                continue
-
-            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                unavailable_reasons.append("roi_frame_decode_failed")
-                continue
-
-            roi = frame[top:bottom, left:right]
-            if roi.size == 0:
-                unavailable_reasons.append("roi_empty")
-                continue
-
-            laplacian, tenengrad, _scale = _sharpness_for_frame(
-                roi,
-                config.roi_target_short_side,
-                config.no_upscale_if_roi_too_small,
-            )
-            laplacian_values.append(laplacian)
-            tenengrad_values.append(tenengrad)
-            blur_bad_values.append(
-                1.0 if laplacian < config.laplacian_p10_warn or tenengrad < config.tenengrad_p10_warn else 0.0
-            )
-            available += 1
-    finally:
-        capture.release()
-
-    sampled = len(indexes)
-    return HandRoiMetrics(
-        enabled=True,
-        source=keypoint_data.source,
-        sampled_frame_count=sampled,
-        available_frame_count=available,
-        available_ratio=available / sampled if sampled else 0.0,
-        laplacian_p10=_percentile(laplacian_values, 10),
-        laplacian_median=_percentile(laplacian_values, 50),
-        tenengrad_p10=_percentile(tenengrad_values, 10),
-        tenengrad_median=_percentile(tenengrad_values, 50),
-        blur_bad_frame_ratio=float(np.mean(blur_bad_values)) if blur_bad_values else 1.0,
-        unavailable_reasons=tuple(dict.fromkeys(unavailable_reasons)),
-    )
 
 
 def _ssim_score(left: np.ndarray, right: np.ndarray) -> float:
@@ -1442,8 +1264,6 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
             float(np.mean(np.array(blur_values) < LAPLACIAN_LOW_DETAIL_THRESHOLD)) if blur_values else 1.0
         )
         metadata_read_ok = frame_count > 0 and fps > 0 and width > 0 and height > 0
-        hand_roi = _compute_hand_roi_metrics(path, hdf5_path, indexes, width, height, config.hand_roi)
-
         return VideoMetrics(
             path=path,
             asset_id=asset_id_from_video(path),
@@ -1502,7 +1322,6 @@ def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None
             expected_interval_ms=float(timeline["expected_interval_ms"]),
             drop_interval_ms=float(timeline["drop_interval_ms"]),
             max_gap_fail_ms=float(timeline["max_gap_fail_ms"]),
-            hand_roi=hand_roi,
             errors=tuple(errors),
         )
     finally:
@@ -1618,8 +1437,6 @@ def _reason_details_for_codes(
     alignment: object | None,
 ) -> tuple[ReasonDetail, ...]:
     details: list[ReasonDetail] = []
-    roi = metrics.hand_roi
-
     def add(
         code: str,
         *,
@@ -1897,73 +1714,6 @@ def _reason_details_for_codes(
                     "frame_count_delta_ratio": alignment.frame_count_delta_ratio,
                 },
             )
-        elif code in {"hand_roi_available_ratio_below_min", "hand_roi_available_ratio_warn"} and roi is not None:
-            add(
-                code,
-                metric="hand_roi_metrics.hand_roi_available_ratio",
-                value=roi.available_ratio,
-                pass_threshold=config.hand_roi.available_ratio_pass,
-                fail_threshold=config.hand_roi.available_ratio_warn,
-                comparison="<",
-                context={"hand_roi_available_frame_count": roi.available_frame_count},
-            )
-        elif code in {"hand_roi_laplacian_p10_below_min", "hand_roi_laplacian_p10_warn"} and roi is not None:
-            add(
-                code,
-                metric="hand_roi_metrics.hand_roi_laplacian_p10",
-                value=roi.laplacian_p10,
-                pass_threshold=config.hand_roi.laplacian_p10_pass,
-                fail_threshold=config.hand_roi.laplacian_p10_warn,
-                comparison="<",
-            )
-        elif code in {"hand_roi_laplacian_median_below_min", "hand_roi_laplacian_median_warn"} and roi is not None:
-            add(
-                code,
-                metric="hand_roi_metrics.hand_roi_laplacian_median",
-                value=roi.laplacian_median,
-                pass_threshold=config.hand_roi.laplacian_median_pass,
-                fail_threshold=config.hand_roi.laplacian_median_warn,
-                comparison="<",
-            )
-        elif code in {"hand_roi_tenengrad_p10_below_min", "hand_roi_tenengrad_p10_warn"} and roi is not None:
-            add(
-                code,
-                metric="hand_roi_metrics.hand_roi_tenengrad_p10",
-                value=roi.tenengrad_p10,
-                pass_threshold=config.hand_roi.tenengrad_p10_pass,
-                fail_threshold=config.hand_roi.tenengrad_p10_warn,
-                comparison="<",
-            )
-        elif code in {"hand_roi_tenengrad_median_below_min", "hand_roi_tenengrad_median_warn"} and roi is not None:
-            add(
-                code,
-                metric="hand_roi_metrics.hand_roi_tenengrad_median",
-                value=roi.tenengrad_median,
-                pass_threshold=config.hand_roi.tenengrad_median_pass,
-                fail_threshold=config.hand_roi.tenengrad_median_warn,
-                comparison="<",
-            )
-        elif code in {"hand_roi_blur_bad_frame_ratio_above_max", "hand_roi_blur_bad_frame_ratio_warn"} and roi is not None:
-            add(
-                code,
-                metric="hand_roi_metrics.hand_roi_blur_bad_frame_ratio",
-                value=roi.blur_bad_frame_ratio,
-                pass_threshold=config.hand_roi.blur_bad_frame_ratio_pass,
-                fail_threshold=config.hand_roi.severe_fail.blur_bad_frame_ratio_fail,
-                comparison=">",
-            )
-        elif code == "hand_roi_severe_blur" and roi is not None:
-            add(
-                code,
-                metric="hand_roi_metrics.severe_blur",
-                value=True,
-                comparison="==",
-                context={
-                    "hand_roi_laplacian_p10": roi.laplacian_p10,
-                    "hand_roi_tenengrad_p10": roi.tenengrad_p10,
-                    "hand_roi_blur_bad_frame_ratio": roi.blur_bad_frame_ratio,
-                },
-            )
         else:
             add(code)
 
@@ -2199,92 +1949,6 @@ def evaluate_video_quality(
             elif severe or warning:
                 warn.append("hdf5_frame_count_mismatch_warn")
 
-    roi = metrics.hand_roi
-    if roi is not None and config.hand_roi.enabled:
-        hand_roi_warn_only = config.hand_roi.mode == "warn_except_severe_fail"
-
-        def add_hand_roi_quality_reason(
-            value: float,
-            pass_limit: float,
-            warn_limit: float,
-            fail_reason: str,
-            warn_reason: str,
-            higher_is_bad: bool,
-        ) -> None:
-            if hand_roi_warn_only:
-                warn_triggered = value > pass_limit if higher_is_bad else value < pass_limit
-                if warn_triggered:
-                    warn.append(warn_reason)
-                return
-            _add_threshold_reason(
-                fail,
-                warn,
-                value,
-                pass_limit,
-                warn_limit,
-                fail_reason,
-                warn_reason,
-                higher_is_bad=higher_is_bad,
-            )
-
-        if roi.available_ratio < config.hand_roi.available_ratio_warn:
-            warn.append("hand_roi_available_ratio_below_min")
-        elif roi.available_ratio < config.hand_roi.available_ratio_pass:
-            warn.append("hand_roi_available_ratio_warn")
-
-        if roi.available_frame_count > 0:
-            severe = config.hand_roi.severe_fail
-            if severe.enabled:
-                lap_fail = roi.laplacian_p10 < severe.laplacian_p10_fail
-                ten_fail = roi.tenengrad_p10 < severe.tenengrad_p10_fail
-                if severe.require_both_lap_and_ten_fail and lap_fail and ten_fail:
-                    fail.append("hand_roi_severe_blur")
-                elif not severe.require_both_lap_and_ten_fail and (lap_fail or ten_fail):
-                    fail.append("hand_roi_severe_blur")
-                if roi.blur_bad_frame_ratio > severe.blur_bad_frame_ratio_fail:
-                    fail.append("hand_roi_blur_bad_frame_ratio_above_max")
-
-            add_hand_roi_quality_reason(
-                roi.laplacian_p10,
-                config.hand_roi.laplacian_p10_pass,
-                config.hand_roi.laplacian_p10_warn,
-                "hand_roi_laplacian_p10_below_min",
-                "hand_roi_laplacian_p10_warn",
-                higher_is_bad=False,
-            )
-            add_hand_roi_quality_reason(
-                roi.laplacian_median,
-                config.hand_roi.laplacian_median_pass,
-                config.hand_roi.laplacian_median_warn,
-                "hand_roi_laplacian_median_below_min",
-                "hand_roi_laplacian_median_warn",
-                higher_is_bad=False,
-            )
-            add_hand_roi_quality_reason(
-                roi.tenengrad_p10,
-                config.hand_roi.tenengrad_p10_pass,
-                config.hand_roi.tenengrad_p10_warn,
-                "hand_roi_tenengrad_p10_below_min",
-                "hand_roi_tenengrad_p10_warn",
-                higher_is_bad=False,
-            )
-            add_hand_roi_quality_reason(
-                roi.tenengrad_median,
-                config.hand_roi.tenengrad_median_pass,
-                config.hand_roi.tenengrad_median_warn,
-                "hand_roi_tenengrad_median_below_min",
-                "hand_roi_tenengrad_median_warn",
-                higher_is_bad=False,
-            )
-            add_hand_roi_quality_reason(
-                roi.blur_bad_frame_ratio,
-                config.hand_roi.blur_bad_frame_ratio_pass,
-                config.hand_roi.blur_bad_frame_ratio_warn,
-                "hand_roi_blur_bad_frame_ratio_above_max",
-                "hand_roi_blur_bad_frame_ratio_warn",
-                higher_is_bad=True,
-            )
-
     return _make_evaluation(fail, warn, metrics=metrics, config=config, alignment=alignment)
 
 
@@ -2365,24 +2029,6 @@ def _evaluation_json(evaluation: QualityEvaluation) -> dict[str, Any]:
         "reason_details": _to_plain(evaluation.reason_details),
         "warn_reason_details": _to_plain(evaluation.warn_reason_details),
         "should_run_mask_qc": evaluation.should_run_mask_qc,
-    }
-
-
-def _hand_roi_json(metrics: HandRoiMetrics | None) -> dict[str, Any] | None:
-    if metrics is None:
-        return None
-    return {
-        "enabled": metrics.enabled,
-        "source": metrics.source,
-        "hand_roi_available_ratio": metrics.available_ratio,
-        "hand_roi_available_frame_count": metrics.available_frame_count,
-        "hand_roi_sampled_frame_count": metrics.sampled_frame_count,
-        "hand_roi_laplacian_p10": metrics.laplacian_p10,
-        "hand_roi_laplacian_median": metrics.laplacian_median,
-        "hand_roi_tenengrad_p10": metrics.tenengrad_p10,
-        "hand_roi_tenengrad_median": metrics.tenengrad_median,
-        "hand_roi_blur_bad_frame_ratio": metrics.blur_bad_frame_ratio,
-        "unavailable_reasons": list(metrics.unavailable_reasons),
     }
 
 
@@ -2531,8 +2177,6 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
         "frame_count_match": alignment.frame_count_match,
         "reason": alignment.reason,
     }
-    hand_roi_metrics = _hand_roi_json(metrics.hand_roi)
-
     return {
         "schema_version": "asset_qc_report.v1",
         "qc_config": dict(config.qc_config_reference),
@@ -2592,7 +2236,6 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
                 "freeze_metrics": freeze_metrics,
                 "defect_metrics": defect_metrics,
                 "hdf5_alignment": hdf5_alignment,
-                "hand_roi_metrics": hand_roi_metrics,
             },
             "errors": list(metrics.errors),
         },
