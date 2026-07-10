@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import logging
+import subprocess
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,14 +41,33 @@ SUMMARY_COLUMNS = [
 XJGT_DETAIL_COLUMNS = [
     "asset_id",
     "total_frames",
+    "frame_count_status",
     "text_check_status",
     "skeleton_missing_status",
+    "skeleton_missing_fail_frame_count",
+    "skeleton_missing_fail_frame_ratio",
     "skeleton_morphology_status",
+    "skeleton_morphology_fail_frame_count",
+    "skeleton_morphology_fail_frame_ratio",
+    "skeleton_static_fail_frame_count",
+    "skeleton_static_fail_frame_ratio",
+    "skeleton_static_status",
+    "supplier_quality_signal",
     "video_quality_status",
+    "video_quality_fail_frame_count",
+    "video_quality_fail_frame_ratio",
     "temporal_status",
     "sam3_containment_status",
     "manual_review_status",
-    "manual_problem_frame_ratio",
+    "temporal_sam3_manual_status",
+    "manual_problem_frame_count",
+    "manual_problem_frame_ratio_of_clip",
+    "manual_reviewed_frame_count",
+    "manual_problem_ratio_of_reviewed",
+    "abnormal_fail_frame_count",
+    "abnormal_fail_frame_ratio",
+    "abnormal_frame_status",
+    "fail_indicator_count",
     "final_clip_status",
     "main_issue_type",
     "notes",
@@ -132,6 +152,11 @@ def build_weekly_report(run_root: Path) -> WeeklyOutputPaths:
         deepreach["details"],
         xjgt["issue_events"],
     )
+    print_sanity_checks(
+        xjgt["summary"],
+        xjgt["details"],
+        deepreach["summary"],
+    )
     return WeeklyOutputPaths(workbook_xlsx, summary_csv)
 
 
@@ -142,138 +167,330 @@ def load_xjgt(run_root: Path) -> dict[str, Any]:
     ledger_dir = run_root / "xjgt" / "ledger"
     ledger_path = ledger_dir / "xjgt_100_asset_ledger.csv"
     events_path = ledger_dir / "xjgt_100_issue_events.csv"
-    summary_path = ledger_dir / "xjgt_100_summary.json"
+    manual_path = (
+        run_root
+        / "xjgt"
+        / "manual_review"
+        / "manual_labels_autosave.normalized.csv"
+    )
 
     manifest = read_csv(manifest_path)
     ledger = read_csv(ledger_path)
     events = read_csv(events_path)
-    summary_json = read_json(summary_path)
-    manifest_by_asset = {
-        normalize_asset_id(row.get("asset_id")): row for row in manifest
+    manual_labels = read_csv(manual_path)
+    ledger_by_asset = {
+        normalize_asset_id(row.get("asset_id")): row for row in ledger
     }
     manual_intervals: dict[str, list[tuple[int, int]]] = {}
+    reviewed_intervals: dict[str, list[tuple[int, int]]] = {}
+    missing_intervals: dict[str, list[tuple[int, int]]] = {}
+    morphology_intervals: dict[str, list[tuple[int, int]]] = {}
+    video_intervals: dict[str, list[tuple[int, int]]] = {}
+    abnormal_auto_fail_intervals: dict[str, list[tuple[int, int]]] = {}
     for event in events:
-        if event.get("source_module") != "manual_review":
-            continue
-        if event.get("manual_outcome") not in {
-            "true_positive",
-            "partial",
-            "positive",
-        }:
-            continue
-        start = integer_or_none(event.get("start_frame"))
-        end = integer_or_none(event.get("end_frame"))
-        if start is None or end is None:
+        interval = event_frame_interval(event)
+        if interval is None:
             continue
         asset_id = normalize_asset_id(event.get("asset_id"))
+        if event_is_hard_fail(event):
+            category = event_failure_category(event)
+            target = {
+                "skeleton_missing": missing_intervals,
+                "skeleton_morphology": morphology_intervals,
+                "video_quality": video_intervals,
+            }.get(category)
+            if target is not None:
+                target.setdefault(asset_id, []).append(interval)
+        if event_is_abnormal_auto_fail(event):
+            abnormal_auto_fail_intervals.setdefault(asset_id, []).append(
+                interval
+            )
+    manually_labeled_assets: set[str] = set()
+    for label in manual_labels:
+        asset_id = normalize_asset_id(label.get("asset_id"))
+        if not asset_id:
+            continue
+        manually_labeled_assets.add(asset_id)
+        reviewed_start = integer_or_none(label.get("window_start_frame"))
+        reviewed_end = integer_or_none(label.get("window_end_frame"))
+        if reviewed_start is None or reviewed_end is None:
+            reviewed_start = integer_or_none(
+                label.get("affected_start_frame")
+            )
+            reviewed_end = integer_or_none(label.get("affected_end_frame"))
+        if reviewed_start is not None and reviewed_end is not None:
+            reviewed_intervals.setdefault(asset_id, []).append(
+                (reviewed_start, reviewed_end)
+            )
+        if label.get("manual_outcome") != "true_positive":
+            continue
+        start = integer_or_none(label.get("affected_start_frame"))
+        end = integer_or_none(label.get("affected_end_frame"))
+        if start is None or end is None:
+            continue
         manual_intervals.setdefault(asset_id, []).append((start, end))
 
     details = []
-    for ledger_row in ledger:
-        asset_id = normalize_asset_id(ledger_row.get("asset_id"))
-        manifest_row = manifest_by_asset.get(asset_id, {})
-        total_frames = integer_or_none(
-            first_value(
-                manifest_row,
-                ("frame_count", "total_frames", "num_frames"),
+    for manifest_row in manifest:
+        asset_id = normalize_asset_id(manifest_row.get("asset_id"))
+        if not asset_id:
+            continue
+        ledger_row = ledger_by_asset.get(asset_id, {})
+        video_path = resolve_xjgt_video_path(manifest_row, asset_id)
+        probed_frames = probe_video_frame_count(video_path)
+        if probed_frames > 0:
+            total_frames = probed_frames
+            frame_count_status = "ok"
+            frame_note = ""
+        else:
+            total_frames = integer_or_none(
+                first_value(
+                    manifest_row,
+                    ("frame_count", "total_frames", "num_frames"),
+                )
+            ) or 0
+            frame_count_status = (
+                "manifest_fallback" if total_frames > 0 else "unreadable"
             )
-        ) or 0
+            frame_note = f"frame_count_unreadable:{video_path}"
         manual_problem_frames = interval_frame_count(
             manual_intervals.get(asset_id, [])
         )
+        manual_reviewed_frames = interval_frame_count(
+            reviewed_intervals.get(asset_id, [])
+        )
+        manual_problem_ratio = safe_ratio(
+            manual_problem_frames, total_frames
+        )
+        manual_problem_ratio_of_reviewed = safe_ratio(
+            manual_problem_frames, manual_reviewed_frames
+        )
+        if asset_id not in manually_labeled_assets:
+            manual_status = "not_reviewed"
+        elif manual_problem_ratio >= 0.10:
+            manual_status = "fail"
+        else:
+            manual_status = "pass"
+        text_value = first_value(
+            ledger_row,
+            ("hdf5_text_status", "text_check_status"),
+        )
+        text_status = (
+            status_value(text_value)
+            if text_value not in (None, "")
+            else "pending_rule"
+        )
+        missing_base_status = status_value(
+            first_value(
+                ledger_row,
+                (
+                    "keypoint_missing_status",
+                    "keypoint_existence_status",
+                    "skeleton_missing_status",
+                ),
+            )
+        )
+        morphology_base_status = status_value(
+            first_value(
+                ledger_row,
+                (
+                    "keypoint_morphology_status",
+                    "skeleton_morphology_status",
+                ),
+            )
+        )
+        quality_signal = supplier_quality_signal(
+            ledger_row.get("quality_hand_status")
+        )
+        video_status = status_value(
+            ledger_row.get("video_quality_status")
+        )
+        if video_status == "not_run":
+            video_status = "no_valid_output"
+        temporal_status = status_value(
+            first_value(
+                ledger_row,
+                ("temporal_status",),
+            )
+        )
+        sam3_status = status_value(
+            first_value(
+                ledger_row,
+                (
+                    "sam3_containment_status",
+                    "sam3_evidence_status",
+                ),
+            )
+        )
+        missing_fail_frames = interval_frame_count(
+            missing_intervals.get(asset_id, [])
+        )
+        missing_fail_ratio = safe_ratio(
+            missing_fail_frames, total_frames
+        )
+        morphology_fail_frames = interval_frame_count(
+            morphology_intervals.get(asset_id, [])
+        )
+        morphology_fail_ratio = safe_ratio(
+            morphology_fail_frames, total_frames
+        )
+        video_fail_frames = interval_frame_count(
+            video_intervals.get(asset_id, [])
+        )
+        video_fail_ratio = safe_ratio(video_fail_frames, total_frames)
+        skeleton_static_intervals = [
+            *missing_intervals.get(asset_id, []),
+            *morphology_intervals.get(asset_id, []),
+        ]
+        skeleton_static_fail_frames = interval_frame_count(
+            skeleton_static_intervals
+        )
+        skeleton_static_fail_ratio = safe_ratio(
+            skeleton_static_fail_frames, total_frames
+        )
+        skeleton_static_status = (
+            "fail" if skeleton_static_fail_ratio >= 0.10 else "pass"
+        )
+        abnormal_intervals = [
+            *subtract_intervals(
+                abnormal_auto_fail_intervals.get(asset_id, []),
+                reviewed_intervals.get(asset_id, []),
+            ),
+            *manual_intervals.get(asset_id, []),
+        ]
+        abnormal_fail_frames = interval_frame_count(abnormal_intervals)
+        abnormal_fail_ratio = safe_ratio(abnormal_fail_frames, total_frames)
+        missing_status = frame_ratio_status(
+            missing_base_status,
+            missing_fail_frames,
+            missing_fail_ratio,
+        )
+        morphology_status = frame_ratio_status(
+            morphology_base_status,
+            morphology_fail_frames,
+            morphology_fail_ratio,
+        )
+        temporal_sam3_manual_status = combined_temporal_status(
+            manual_review_status=manual_status,
+            temporal_status=temporal_status,
+            sam3_containment_status=sam3_status,
+        )
+        abnormal_frame_status = abnormal_status(
+            abnormal_fail_frame_ratio=abnormal_fail_ratio,
+            manual_review_status=manual_status,
+            temporal_status=temporal_status,
+            sam3_containment_status=sam3_status,
+        )
+        expected_module_missing = any(
+            status in {
+                "not_run",
+                "blocked",
+                "no_valid_output",
+                "pending_rule",
+            }
+            for status in (
+                missing_base_status,
+                morphology_base_status,
+                video_status,
+                temporal_status,
+                sam3_status,
+            )
+        )
+        fail_indicator_count = count_fail_indicators(
+            text_check_status=text_status,
+            video_quality_status=video_status,
+            skeleton_static_status=skeleton_static_status,
+            abnormal_frame_status=abnormal_frame_status,
+        )
+        final_clip_status = recompute_xjgt_final_status(
+            text_check_status=text_status,
+            video_quality_status=video_status,
+            skeleton_static_status=skeleton_static_status,
+            abnormal_frame_status=abnormal_frame_status,
+            expected_module_missing=expected_module_missing,
+        )
+        problem_intervals = [
+            *skeleton_static_intervals,
+            *abnormal_intervals,
+            *video_intervals.get(asset_id, []),
+        ]
         details.append(
             {
                 "asset_id": asset_id,
                 "total_frames": total_frames,
-                "text_check_status": status_value(
-                    first_value(
-                        ledger_row,
-                        ("hdf5_text_status", "text_check_status"),
-                    )
+                "frame_count_status": frame_count_status,
+                "text_check_status": text_status,
+                "skeleton_missing_status": missing_status,
+                "skeleton_missing_fail_frame_count": (
+                    missing_fail_frames
                 ),
-                "skeleton_missing_status": status_value(
-                    first_value(
-                        ledger_row,
-                        (
-                            "keypoint_missing_status",
-                            "keypoint_existence_status",
-                            "skeleton_missing_status",
-                        ),
-                    )
+                "skeleton_missing_fail_frame_ratio": missing_fail_ratio,
+                "skeleton_morphology_status": morphology_status,
+                "skeleton_morphology_fail_frame_count": (
+                    morphology_fail_frames
                 ),
-                "skeleton_morphology_status": status_value(
-                    first_value(
-                        ledger_row,
-                        (
-                            "keypoint_morphology_status",
-                            "skeleton_morphology_status",
-                        ),
-                    )
+                "skeleton_morphology_fail_frame_ratio": (
+                    morphology_fail_ratio
                 ),
-                "video_quality_status": status_value(
-                    ledger_row.get("video_quality_status")
+                "skeleton_static_fail_frame_count": (
+                    skeleton_static_fail_frames
                 ),
-                "temporal_status": status_value(
-                    first_value(
-                        ledger_row,
-                        ("temporal_status", "precheck_status"),
-                    )
+                "skeleton_static_fail_frame_ratio": (
+                    skeleton_static_fail_ratio
                 ),
-                "sam3_containment_status": status_value(
-                    first_value(
-                        ledger_row,
-                        (
-                            "sam3_containment_status",
-                            "sam3_evidence_status",
-                        ),
-                    )
+                "skeleton_static_status": skeleton_static_status,
+                "supplier_quality_signal": quality_signal,
+                "video_quality_status": video_status,
+                "video_quality_fail_frame_count": video_fail_frames,
+                "video_quality_fail_frame_ratio": video_fail_ratio,
+                "temporal_status": temporal_status,
+                "sam3_containment_status": sam3_status,
+                "manual_review_status": manual_status,
+                "temporal_sam3_manual_status": (
+                    temporal_sam3_manual_status
                 ),
-                "manual_review_status": status_value(
-                    ledger_row.get("manual_review_status")
+                "manual_problem_frame_count": manual_problem_frames,
+                "manual_problem_frame_ratio_of_clip": manual_problem_ratio,
+                "manual_reviewed_frame_count": manual_reviewed_frames,
+                "manual_problem_ratio_of_reviewed": (
+                    manual_problem_ratio_of_reviewed
                 ),
-                "manual_problem_frame_ratio": safe_ratio(
-                    manual_problem_frames, total_frames
-                ),
-                "final_clip_status": final_status(
-                    ledger_row.get("final_verdict")
-                ),
+                "abnormal_fail_frame_count": abnormal_fail_frames,
+                "abnormal_fail_frame_ratio": abnormal_fail_ratio,
+                "abnormal_frame_status": abnormal_frame_status,
+                "fail_indicator_count": fail_indicator_count,
+                "final_clip_status": final_clip_status,
                 "main_issue_type": first_issue(
                     ledger_row.get("top_issue_types")
                 ),
-                "notes": text(ledger_row.get("notes")),
+                "notes": "; ".join(
+                    value
+                    for value in (
+                        text(ledger_row.get("notes")),
+                        frame_note,
+                        (
+                            f"supplier_quality_signal={quality_signal}"
+                            if quality_signal != "not_provided"
+                            else ""
+                        ),
+                    )
+                    if value
+                ),
                 "evidence_path": text(
                     first_value(
                         ledger_row,
                         ("evidence_paths", "evidence_path"),
                     )
                 ),
+                "_problem_intervals": problem_intervals,
             }
         )
 
-    counts = summary_json.get("final_verdict_counts")
-    if not isinstance(counts, dict):
-        counts = dict(Counter(row["final_clip_status"] for row in details))
-    counts = {
-        "fail": int(counts.get("fail", XJGT_FALLBACK_COUNTS["fail"])),
-        "review": int(
-            counts.get("review", XJGT_FALLBACK_COUNTS["review"])
-        ),
-        "pass_with_notes": int(
-            counts.get(
-                "pass_with_notes",
-                counts.get("pass", XJGT_FALLBACK_COUNTS["pass_with_notes"]),
-            )
-        ),
-    }
-    asset_count = int(
-        summary_json.get("asset_count")
-        or sum(counts.values())
-        or len(details)
-        or 100
-    )
+    counts = Counter(row["final_clip_status"] for row in details)
+    asset_count = len(details)
     total_frames = sum(int(row["total_frames"]) for row in details)
     problem_frames = sum(
-        round(row["manual_problem_frame_ratio"] * row["total_frames"])
+        interval_frame_count(row["_problem_intervals"])
         for row in details
     )
     issue_counts = Counter(
@@ -291,11 +508,11 @@ def load_xjgt(run_root: Path) -> dict[str, Any]:
             "problem_frame_ratio": safe_ratio(
                 problem_frames, total_frames
             ),
-            "pass_clip_count": counts["pass_with_notes"],
+            "pass_clip_count": counts["pass"],
             "fail_clip_count": counts["fail"],
             "review_clip_count": counts["review"],
             "pass_clip_ratio": safe_ratio(
-                counts["pass_with_notes"], asset_count
+                counts["pass"], asset_count
             ),
             "fail_clip_ratio": safe_ratio(counts["fail"], asset_count),
             "main_issue_type": most_common(issue_counts),
@@ -340,16 +557,37 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
             {
                 "asset_id": normalize_asset_id(row.get("asset_id")),
                 "total_frames": total_frames,
+                "frame_count_status": (
+                    "manifest" if total_frames > 0 else "not_run"
+                ),
                 "text_check_status": "blocked",
                 "skeleton_missing_status": "blocked",
+                "skeleton_missing_fail_frame_count": 0,
+                "skeleton_missing_fail_frame_ratio": 0.0,
                 "skeleton_morphology_status": "blocked",
+                "skeleton_morphology_fail_frame_count": 0,
+                "skeleton_morphology_fail_frame_ratio": 0.0,
+                "skeleton_static_fail_frame_count": 0,
+                "skeleton_static_fail_frame_ratio": 0.0,
+                "skeleton_static_status": "blocked",
+                "supplier_quality_signal": "not_provided",
                 "video_quality_status": (
-                    "not_run" if not has_video_quality else "review"
+                    "no_valid_output" if not has_video_quality else "review"
                 ),
+                "video_quality_fail_frame_count": 0,
+                "video_quality_fail_frame_ratio": 0.0,
                 "temporal_status": "blocked",
                 "sam3_containment_status": "blocked",
                 "manual_review_status": "not_run",
-                "manual_problem_frame_ratio": 0.0,
+                "temporal_sam3_manual_status": "blocked",
+                "manual_problem_frame_count": 0,
+                "manual_problem_frame_ratio_of_clip": 0.0,
+                "manual_reviewed_frame_count": 0,
+                "manual_problem_ratio_of_reviewed": 0.0,
+                "abnormal_fail_frame_count": 0,
+                "abnormal_fail_frame_ratio": 0.0,
+                "abnormal_frame_status": "blocked",
+                "fail_indicator_count": 0,
                 "final_clip_status": "blocked",
                 "main_issue_type": "missing_schema_adapter",
                 "notes": (
@@ -378,10 +616,13 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
             "pass_clip_ratio": 0.0,
             "fail_clip_ratio": 0.0,
             "main_issue_type": "missing_schema_adapter",
+            "video_quality_status": (
+                "review" if has_video_quality else "no_valid_output"
+            ),
             "modules_completed": "|".join(modules_completed),
             "blocked_modules": "precheck|sam3",
             "notes": (
-                "video_quality not_run unless result/decision summary exists"
+                "video_quality not_run/no_valid_output unless result/decision summary exists"
             ),
         },
         "details": details,
@@ -574,7 +815,13 @@ def add_sheet(
         "problem_frame_ratio",
         "pass_clip_ratio",
         "fail_clip_ratio",
-        "manual_problem_frame_ratio",
+        "skeleton_missing_fail_frame_ratio",
+        "skeleton_morphology_fail_frame_ratio",
+        "skeleton_static_fail_frame_ratio",
+        "video_quality_fail_frame_ratio",
+        "manual_problem_frame_ratio_of_clip",
+        "manual_problem_ratio_of_reviewed",
+        "abnormal_fail_frame_ratio",
         "observed_ratio",
     }
     for column in percentage_columns.intersection(columns):
@@ -626,6 +873,329 @@ def interval_frame_count(intervals: list[tuple[int, int]]) -> int:
         else:
             merged[-1][1] = max(merged[-1][1], end)
     return sum(end - start + 1 for start, end in merged)
+
+
+def subtract_intervals(
+    intervals: list[tuple[int, int]],
+    excluded: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    if not intervals or not excluded:
+        return intervals
+    excluded_normalized = sorted(
+        (min(start, end), max(start, end)) for start, end in excluded
+    )
+    remaining: list[tuple[int, int]] = []
+    for interval_start, interval_end in (
+        (min(start, end), max(start, end)) for start, end in intervals
+    ):
+        pieces = [(interval_start, interval_end)]
+        for exclude_start, exclude_end in excluded_normalized:
+            next_pieces: list[tuple[int, int]] = []
+            for piece_start, piece_end in pieces:
+                if exclude_end < piece_start or exclude_start > piece_end:
+                    next_pieces.append((piece_start, piece_end))
+                    continue
+                if exclude_start > piece_start:
+                    next_pieces.append((piece_start, exclude_start - 1))
+                if exclude_end < piece_end:
+                    next_pieces.append((exclude_end + 1, piece_end))
+            pieces = next_pieces
+            if not pieces:
+                break
+        remaining.extend(pieces)
+    return remaining
+
+
+def resolve_xjgt_video_path(
+    manifest_row: dict[str, Any],
+    asset_id: str,
+) -> Path:
+    video_path = text(manifest_row.get("video_path")).strip()
+    if video_path:
+        return Path(video_path)
+    return Path(
+        f"/mnt/oss/egodata/XJGT_20260629/video/{asset_id}_video.mp4"
+    )
+
+
+def probe_video_frame_count(path: Path) -> int:
+    try:
+        import cv2
+
+        capture = cv2.VideoCapture(str(path))
+        try:
+            if capture.isOpened():
+                frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+                if frame_count > 0:
+                    return frame_count
+        finally:
+            capture.release()
+    except (ImportError, OSError, ValueError):
+        pass
+
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_frames",
+                "-show_entries",
+                "stream=nb_read_frames,nb_frames",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return 0
+    if completed.returncode != 0:
+        return 0
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return 0
+    streams = payload.get("streams")
+    if not isinstance(streams, list) or not streams:
+        return 0
+    stream = streams[0] if isinstance(streams[0], dict) else {}
+    return (
+        integer_or_none(stream.get("nb_read_frames"))
+        or integer_or_none(stream.get("nb_frames"))
+        or 0
+    )
+
+
+def frame_ratio_status(
+    base_status: str,
+    fail_frame_count: int,
+    fail_frame_ratio: float,
+) -> str:
+    if fail_frame_ratio >= 0.10:
+        return "fail"
+    if fail_frame_count > 0 or base_status == "fail":
+        return "review"
+    return base_status
+
+
+def combined_temporal_status(
+    *,
+    manual_review_status: str,
+    temporal_status: str,
+    sam3_containment_status: str,
+) -> str:
+    if manual_review_status == "fail":
+        return "fail"
+    if manual_review_status == "pass":
+        return "pass"
+    if temporal_status in {"review", "fail"} or sam3_containment_status in {
+        "review",
+        "fail",
+    }:
+        return "review"
+    if temporal_status in {"not_run", "blocked"} or sam3_containment_status in {
+        "not_run",
+        "blocked",
+    }:
+        return "review"
+    return "pass"
+
+
+def abnormal_status(
+    *,
+    abnormal_fail_frame_ratio: float,
+    manual_review_status: str,
+    temporal_status: str,
+    sam3_containment_status: str,
+) -> str:
+    if abnormal_fail_frame_ratio >= 0.10:
+        return "fail"
+    if manual_review_status == "pass":
+        return "pass"
+    if temporal_status in {"review", "fail"} or sam3_containment_status in {
+        "review",
+        "fail",
+    }:
+        return "review"
+    if temporal_status in {"not_run", "blocked"} or sam3_containment_status in {
+        "not_run",
+        "blocked",
+    }:
+        return "review"
+    return "pass"
+
+
+def count_fail_indicators(
+    *,
+    text_check_status: str,
+    video_quality_status: str,
+    skeleton_static_status: str,
+    abnormal_frame_status: str,
+) -> int:
+    return sum(
+        status == "fail"
+        for status in (
+            text_check_status,
+            video_quality_status,
+            skeleton_static_status,
+            abnormal_frame_status,
+        )
+    )
+
+
+def recompute_xjgt_final_status(
+    *,
+    text_check_status: str,
+    video_quality_status: str,
+    skeleton_static_status: str,
+    abnormal_frame_status: str,
+    expected_module_missing: bool,
+) -> str:
+    # quality_hand is intentionally absent: it is supplier evidence, not a
+    # vendor-agnostic skeleton validity or final acceptance condition.
+    fail_indicator_count = count_fail_indicators(
+        text_check_status=text_check_status,
+        video_quality_status=video_quality_status,
+        skeleton_static_status=skeleton_static_status,
+        abnormal_frame_status=abnormal_frame_status,
+    )
+    if fail_indicator_count >= 2:
+        return "fail"
+    if abnormal_frame_status == "review" or expected_module_missing:
+        return "review"
+    return "pass"
+
+
+def event_frame_interval(
+    event: dict[str, Any],
+) -> tuple[int, int] | None:
+    start = integer_or_none(
+        first_value(event, ("start_frame", "window_start_frame", "frame_idx"))
+    )
+    end = integer_or_none(
+        first_value(
+            event,
+            ("end_frame", "window_end_frame", "frame_idx"),
+        )
+    )
+    if start is None or end is None:
+        return None
+    return (start, end)
+
+
+def event_is_hard_fail(event: dict[str, Any]) -> bool:
+    return text(
+        first_value(event, ("source_verdict", "auto_verdict"))
+    ).lower() in {"fail", "failed"}
+
+
+def event_is_abnormal_auto_fail(event: dict[str, Any]) -> bool:
+    source_module = text(event.get("source_module")).lower()
+    failure_mode = text(
+        first_value(event, ("failure_mode", "issue_type"))
+    ).lower()
+    if source_module == "manual_review":
+        return False
+    if failure_mode in {
+        "projection_review",
+        "projection_ambiguous",
+        "acceptable_flagged",
+    }:
+        return False
+    is_temporal_or_containment = (
+        "sam3" in source_module
+        or "containment" in source_module
+        or "temporal" in source_module
+        or "containment" in failure_mode
+        or failure_mode in {"strong_containment_mismatch", "temporal_jump"}
+    )
+    if not is_temporal_or_containment:
+        return False
+    return event_is_hard_fail(event) or failure_mode in {
+        "containment_fail",
+        "strong_containment_mismatch",
+    }
+
+
+def event_failure_category(event: dict[str, Any]) -> str:
+    source_module = text(event.get("source_module")).lower()
+    failure_mode = text(
+        first_value(event, ("failure_mode", "issue_type"))
+    ).lower()
+    if source_module == "video_quality" or failure_mode.startswith("video_"):
+        return "video_quality"
+    if any(
+        token in failure_mode
+        for token in (
+            "morphology",
+            "bone_length",
+            "collapsed_finger",
+            "duplicate_joint",
+        )
+    ):
+        return "skeleton_morphology"
+    if any(
+        token in failure_mode
+        for token in (
+            "keypoint_raw_invalid",
+            "keypoint_missing",
+            "missing_keypoint",
+            "valid_point",
+            "nan",
+            "inf",
+        )
+    ):
+        return "skeleton_missing"
+    return ""
+
+
+def supplier_quality_signal(value: Any) -> str:
+    status = text(value).strip().lower()
+    if not status or status in {"not_run", "not_provided", "not_applicable"}:
+        return "not_provided"
+    if status in {"fail", "failed", "risk", "review", "low"}:
+        return "low"
+    if status in {"pass", "passed", "ok"}:
+        return "provided_ok"
+    return f"provided:{status}"
+
+
+def print_sanity_checks(
+    xjgt_summary: dict[str, Any],
+    xjgt_details: list[dict[str, Any]],
+    deepreach_summary: dict[str, Any],
+) -> None:
+    total_frames = int(xjgt_summary["total_frame_count"])
+    problem_frames = int(xjgt_summary["problem_frame_count"])
+    has_nonzero_manual_ratio = any(
+        float(row["manual_problem_frame_ratio_of_clip"]) > 0
+        for row in xjgt_details
+    )
+    final_counts = dict(
+        sorted(Counter(row["final_clip_status"] for row in xjgt_details).items())
+    )
+    print(f"XJGT total_frame_count={total_frames} ok={total_frames > 0}")
+    print(
+        f"XJGT problem_frame_count={problem_frames} "
+        f"ok={problem_frames > 0}"
+    )
+    print(
+        "XJGT manual_problem_ratio_nonzero="
+        f"{has_nonzero_manual_ratio}"
+    )
+    print(f"XJGT final_clip_status counts={final_counts}")
+    print(
+        "DeepReach sample_clip_count="
+        f"{deepreach_summary['sample_clip_count']} "
+        "video_quality="
+        f"{deepreach_summary['video_quality_status']}"
+    )
 
 
 def first_value(
