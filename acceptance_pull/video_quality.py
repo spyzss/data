@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ import cv2
 import h5py
 import numpy as np
 from qc_common.config import load_qc_acceptance_config
+from qc_common.report import load_asset_qc_report, write_asset_qc_report
 
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi"}
@@ -180,6 +182,7 @@ class Hdf5AlignmentConfig:
 class VideoQualityConfig:
     module_version: str = ""
     qc_config_reference: dict[str, str] = field(default_factory=dict)
+    next_module: str = ""
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     fps: FpsConfig = field(default_factory=FpsConfig)
     resolution: ResolutionConfig = field(default_factory=ResolutionConfig)
@@ -307,14 +310,18 @@ class VideoMetrics:
 
 
 @dataclass(frozen=True)
-class ReasonDetail:
+class IssueDetail:
+    issue_id: str
     code: str
     severity: str
+    module: str
+    issue_type: str
     metric: str | None = None
-    value: Any | None = None
-    comparison: str | None = None
-    rule_id: str | None = None
-    config_version: str | None = None
+    observed_value: Any | None = None
+    operator: str | None = None
+    boundary_value: Any | None = None
+    rule_id: str = ""
+    needs_manual_review: bool = False
     context: dict[str, Any] = field(default_factory=dict)
 
 
@@ -324,8 +331,8 @@ class QualityEvaluation:
     passed: bool
     reasons: tuple[str, ...]
     warn_reasons: tuple[str, ...] = ()
-    reason_details: tuple[ReasonDetail, ...] = ()
-    warn_reason_details: tuple[ReasonDetail, ...] = ()
+    reason_details: tuple[IssueDetail, ...] = ()
+    warn_reason_details: tuple[IssueDetail, ...] = ()
     should_run_mask_qc: bool = True
 
 
@@ -400,6 +407,13 @@ def load_video_quality_config(path: Path | None) -> VideoQualityConfig:
     loaded = load_qc_acceptance_config(path)
     module = loaded.raw["modules"]["video_quality"]
     parameters = loaded.module_parameters("video_quality")
+    pipeline_modules = list(loaded.raw["pipeline"]["modules"])
+    module_index = pipeline_modules.index("video_quality")
+    next_module = (
+        pipeline_modules[module_index + 1]
+        if module_index + 1 < len(pipeline_modules)
+        else str(loaded.raw["pipeline"]["terminal_module"])
+    )
     default = VideoQualityConfig()
     known = {item.name for item in fields(default)}
     unknown = sorted(set(parameters) - known)
@@ -411,6 +425,7 @@ def load_video_quality_config(path: Path | None) -> VideoQualityConfig:
         config,
         module_version=str(module["module_version"]),
         qc_config_reference=loaded.json_reference(),
+        next_module=next_module,
     )
     if config.decode.max_sample_frames < 1:
         raise ValueError("decode.max_sample_frames must be >= 1")
@@ -1404,6 +1419,45 @@ def _alignment_exceeds(alignment: Hdf5Alignment, frame_limit: int, ratio_limit: 
     )
 
 
+def _issue_type_for_code(code: str) -> str:
+    if code in {
+        "video_not_opened",
+        "cannot_open_video",
+        "video_stream_missing",
+        "codec_unreadable",
+        "metadata_unreadable",
+        "no_sample_frames_decoded",
+    }:
+        return "video_unreadable"
+    if code.startswith("fps_"):
+        return "low_fps"
+    if code in {"short_side_below_min", "long_side_below_min"}:
+        return "low_resolution"
+    if code.startswith(("drop_frame_", "frame_interval_", "max_frame_gap_", "pts_monotonic_")):
+        return "timeline_discontinuity"
+    if code.startswith("sample_decode_"):
+        return "decode_incomplete"
+    if code.startswith("black_frame_"):
+        return "black_frame"
+    if code.startswith("defect_duration_"):
+        return "visual_defect_duration"
+    if code.startswith("mean_over_dark_"):
+        return "over_dark"
+    if code.startswith("mean_over_exposed_"):
+        return "over_exposed"
+    if code.startswith(("laplacian_", "tenengrad_")):
+        return "low_sharpness"
+    if code == "adjacent_near_duplicate_ratio_warn":
+        return "low_motion"
+    if code.startswith(("frozen_frame_", "max_consecutive_frozen_")):
+        return "freeze"
+    if code.startswith("video_state_conflict"):
+        return "video_state_conflict"
+    if code.startswith("hdf5_"):
+        return "hdf5_alignment"
+    return "video_quality"
+
+
 def _detail(
     code: str,
     severity: str,
@@ -1414,17 +1468,21 @@ def _detail(
     fail_threshold: Any | None = None,
     comparison: str | None = None,
     rule_id: str | None = None,
-    config_version: str | None = None,
     context: dict[str, Any] | None = None,
-) -> ReasonDetail:
-    return ReasonDetail(
+) -> IssueDetail:
+    boundary_value = fail_threshold if severity == "fail" and fail_threshold is not None else pass_threshold
+    return IssueDetail(
+        issue_id=f"video_quality:{code}:001",
         code=code,
         severity=severity,
+        module="video_quality",
+        issue_type=_issue_type_for_code(code),
         metric=metric,
-        value=value,
-        comparison=comparison,
+        observed_value=value,
+        operator=comparison,
+        boundary_value=boundary_value,
         rule_id=rule_id or f"video_quality.{code}",
-        config_version=config_version,
+        needs_manual_review=severity == "warn",
         context=context or {},
     )
 
@@ -1435,8 +1493,8 @@ def _reason_details_for_codes(
     metrics: VideoMetrics,
     config: VideoQualityConfig,
     alignment: object | None,
-) -> tuple[ReasonDetail, ...]:
-    details: list[ReasonDetail] = []
+) -> tuple[IssueDetail, ...]:
+    details: list[IssueDetail] = []
     def add(
         code: str,
         *,
@@ -1456,7 +1514,6 @@ def _reason_details_for_codes(
                 pass_threshold=pass_threshold,
                 fail_threshold=fail_threshold,
                 comparison=comparison,
-                config_version=config.qc_config_reference["config_version"],
                 context=context,
             )
         )
@@ -2021,13 +2078,12 @@ def read_hdf5_text_fields(path: Path | None) -> dict[str, dict[str, Any]]:
 
 
 def _evaluation_json(evaluation: QualityEvaluation) -> dict[str, Any]:
+    issues = (*evaluation.reason_details, *evaluation.warn_reason_details)
     return {
         "decision": evaluation.decision,
-        "passed": evaluation.passed,
         "reasons": list(evaluation.reasons),
         "warn_reasons": list(evaluation.warn_reasons),
-        "reason_details": _to_plain(evaluation.reason_details),
-        "warn_reason_details": _to_plain(evaluation.warn_reason_details),
+        "issue_ids": [issue.issue_id for issue in issues],
         "should_run_mask_qc": evaluation.should_run_mask_qc,
     }
 
@@ -2079,9 +2135,13 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
     metrics = result.metrics
     alignment = result.alignment
     hdf5_exists = alignment.hdf5_path.is_file() if alignment.hdf5_path is not None else False
-    failed_modules = [] if result.evaluation.passed else ["video_quality"]
     evaluation = _evaluation_json(result.evaluation)
     batch_dir = _infer_batch_dir(metrics, alignment)
+    issues = (*result.evaluation.reason_details, *result.evaluation.warn_reason_details)
+    fail_issue_ids = [issue.issue_id for issue in result.evaluation.reason_details]
+    warn_issue_ids = [issue.issue_id for issue in result.evaluation.warn_reason_details]
+    failed = result.evaluation.decision == "fail"
+    next_module = "batch_statistics" if failed else config.next_module
 
     video_basic = {
         "video_open_ok": metrics.opened,
@@ -2181,6 +2241,20 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
         "schema_version": "asset_qc_report.v1",
         "qc_config": dict(config.qc_config_reference),
         "asset_id": metrics.asset_id,
+        "report_revision": 1,
+        "pipeline_state": {
+            "status": "stopped" if failed else "running",
+            "last_completed_module": "video_quality",
+            "next_module": next_module,
+        },
+        "overall_decision": "fail" if failed else None,
+        "issues": _to_plain(issues),
+        "manual_review": {
+            "required": False if failed else None,
+            "state": "skipped_due_to_fail" if failed else "not_evaluated",
+            "candidate_issue_ids": [] if failed else warn_issue_ids,
+            "failures_for_batch_stats_issue_ids": fail_issue_ids,
+        },
         "source_files": {
             "video": {
                 "path": _archive_path(metrics.path, batch_dir),
@@ -2192,23 +2266,29 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
                 "exists": hdf5_exists,
             },
         },
-        "qc_summary": {
-            "status": result.evaluation.decision,
-            "passed": result.evaluation.passed,
-            "completed_modules": ["video_quality"],
-            "failed_modules": failed_modules,
-            "reasons": list(result.evaluation.reasons),
-            "warn_reasons": list(result.evaluation.warn_reasons),
-            "reason_details": _to_plain(result.evaluation.reason_details),
-            "warn_reason_details": _to_plain(result.evaluation.warn_reason_details),
-            "should_run_mask_qc": result.evaluation.should_run_mask_qc,
-        },
-        "hdf5_text_info": {
-            "alignment": hdf5_alignment,
-            "text_fields": read_hdf5_text_fields(alignment.hdf5_path),
-        },
         "video_quality": {
             "stage": "video_prefilter",
+            "module_version": config.module_version,
+            "flow": {
+                "entry_gate": {
+                    "state": "ready",
+                    "eligible": True,
+                    "blocked_by_module": None,
+                    "required_inputs": ["source_files.video.path"],
+                    "missing_inputs": [],
+                    "upstream_continue": True,
+                },
+                "result_gate": {
+                    "verdict": result.evaluation.decision,
+                    "has_fail": failed,
+                    "has_warn": bool(result.evaluation.warn_reasons),
+                },
+                "exit_gate": {
+                    "state": "stop_qc" if failed else "continue",
+                    "continue_to_next_module": not failed,
+                    "next_module": next_module,
+                },
+            },
             "evaluation": evaluation,
             "metadata": {
                 "opened": metrics.opened,
@@ -2248,6 +2328,60 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
     }
 
 
+def _merge_video_quality_report(
+    existing: dict[str, Any] | None,
+    generated: dict[str, Any],
+) -> dict[str, Any]:
+    if existing is None:
+        return generated
+
+    if existing.get("asset_id") not in {None, generated["asset_id"]}:
+        raise ValueError(
+            f"asset_id mismatch: existing={existing.get('asset_id')} generated={generated['asset_id']}"
+        )
+    existing_config = existing.get("qc_config")
+    if existing_config is not None and existing_config != generated["qc_config"]:
+        raise ValueError("existing asset report uses a different qc_config")
+
+    merged = copy.deepcopy(existing)
+    preserved_issues = [
+        issue
+        for issue in merged.get("issues", [])
+        if isinstance(issue, dict) and issue.get("module") != "video_quality"
+    ]
+    generated_issues = list(generated["issues"])
+    existing_manual = merged.get("manual_review", {})
+    if not isinstance(existing_manual, dict):
+        raise ValueError("manual_review must be an object")
+
+    merged.update(
+        {
+            key: copy.deepcopy(value)
+            for key, value in generated.items()
+            if key not in {"source_files", "issues", "manual_review", "report_revision"}
+        }
+    )
+    source_files = copy.deepcopy(existing.get("source_files", {}))
+    if not isinstance(source_files, dict):
+        raise ValueError("source_files must be an object")
+    source_files.update(copy.deepcopy(generated["source_files"]))
+    merged["source_files"] = source_files
+    merged["issues"] = preserved_issues + generated_issues
+
+    manual_review = copy.deepcopy(existing_manual)
+    manual_review.update(copy.deepcopy(generated["manual_review"]))
+    for field_name in ("candidate_issue_ids", "failures_for_batch_stats_issue_ids"):
+        preserved_ids = [
+            issue_id
+            for issue_id in existing_manual.get(field_name, [])
+            if not str(issue_id).startswith("video_quality:")
+        ]
+        manual_review[field_name] = preserved_ids + list(generated["manual_review"][field_name])
+    merged["manual_review"] = manual_review
+    merged["report_revision"] = int(existing.get("report_revision", 0)) + 1
+    return merged
+
+
 def write_per_asset_qc_json_reports(
     quality_archive_dir: Path,
     results: list[VideoQualityResult],
@@ -2256,10 +2390,11 @@ def write_per_asset_qc_json_reports(
     quality_archive_dir.mkdir(parents=True, exist_ok=True)
     for result in results:
         path = quality_archive_dir / f"{result.metrics.asset_id}.json"
-        path.write_text(
-            json.dumps(asset_qc_result_to_json(result, config), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        existing = load_asset_qc_report(path)
+        expected_revision = 0 if existing is None else int(existing.get("report_revision", 0))
+        generated = asset_qc_result_to_json(result, config)
+        report = _merge_video_quality_report(existing, generated)
+        write_asset_qc_report(path, report, expected_revision=expected_revision)
 
 
 def run_video_quality_check(

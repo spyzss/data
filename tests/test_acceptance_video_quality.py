@@ -883,8 +883,13 @@ def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tm
     assert report["qc_config"]["config_name"] == "acceptance_gate"
     assert report["qc_config"]["config_path"] == "configs/qc_acceptance.yaml"
     assert report["qc_config"]["config_hash"].startswith("sha256:")
-    assert report["qc_summary"]["status"] == "pass"
-    assert report["qc_summary"]["should_run_mask_qc"] is True
+    assert report["pipeline_state"] == {
+        "status": "running",
+        "last_completed_module": "video_quality",
+        "next_module": "sam3_containment",
+    }
+    assert report["overall_decision"] is None
+    assert report["manual_review"]["required"] is None
     assert "thresholds" not in report["video_quality"]
     assert "threshold_version" not in report["video_quality"]
 
@@ -907,36 +912,25 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     assert report["schema_version"] == "asset_qc_report.v1"
     assert report["qc_config"]["config_version"] == "qc_acceptance_v1.1.0"
     assert report["asset_id"] == "408817"
-    assert report["qc_summary"] == {
-        "status": "pass",
-        "passed": True,
-        "completed_modules": ["video_quality"],
-        "failed_modules": [],
-        "reasons": [],
-        "warn_reasons": [],
-        "reason_details": [],
-        "warn_reason_details": [],
-        "should_run_mask_qc": True,
-    }
+    assert report["report_revision"] == 1
+    assert report["issues"] == []
+    assert report["overall_decision"] is None
     assert report["source_files"]["video"]["path"] == "video/408817_video.mp4"
     assert report["source_files"]["hdf5"]["path"] == "hdf5/408817_hdf5.hdf5"
-    assert report["hdf5_text_info"]["alignment"]["status"] == "matched"
-    assert report["hdf5_text_info"]["text_fields"]["attributes"]["/"]["task"] == "pick up red cup"
-    assert report["hdf5_text_info"]["text_fields"]["attributes"]["/meta"]["scene"] == "kitchen"
-    assert report["hdf5_text_info"]["text_fields"]["datasets"]["/meta/instruction"] == "move the cup to the tray"
-    assert report["hdf5_text_info"]["text_fields"]["datasets"]["/meta/structured_label"] == {
-        "language": "zh",
-        "task": "整理桌面",
-    }
+    assert "hdf5_text_info" not in report
     assert report["video_quality"]["metadata"]["frame_count"] == 3
     assert report["video_quality"]["evaluation"] == {
         "decision": "pass",
-        "passed": True,
         "reasons": [],
         "warn_reasons": [],
-        "reason_details": [],
-        "warn_reason_details": [],
+        "issue_ids": [],
         "should_run_mask_qc": True,
+    }
+    assert report["video_quality"]["flow"]["result_gate"]["verdict"] == "pass"
+    assert report["video_quality"]["flow"]["exit_gate"] == {
+        "state": "continue",
+        "continue_to_next_module": True,
+        "next_module": "sam3_containment",
     }
     assert "thresholds" not in report["video_quality"]
     assert "threshold_version" not in report["video_quality"]
@@ -966,6 +960,63 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     assert report["reference_quality"]["mode"] == "none"
 
 
+def test_run_video_quality_check_records_warn_issue_values(tmp_path: Path) -> None:
+    batch = tmp_path
+    video_dir = batch / "video"
+    video_dir.mkdir()
+    video = video_dir / "warn_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=22.0)
+    write_quality_hdf5(batch / "hdf5" / "warn_hdf5.hdf5", 3)
+
+    assert run_video_quality_check(batch) == 0
+    report = json.loads((batch / "quality_archive" / "warn.json").read_text(encoding="utf-8"))
+
+    assert report["pipeline_state"]["status"] == "running"
+    assert report["overall_decision"] is None
+    assert report["video_quality"]["flow"]["result_gate"]["verdict"] == "warn"
+    issue = next(item for item in report["issues"] if item["code"] == "fps_below_pass")
+    assert issue["severity"] == "warn"
+    assert issue["module"] == "video_quality"
+    assert issue["issue_type"] == "low_fps"
+    assert issue["metric"] == "video_basic.fps"
+    assert issue["observed_value"] == pytest.approx(22.0)
+    assert issue["operator"] == "<"
+    assert issue["boundary_value"] == 24.0
+    assert issue["rule_id"] == "video_quality.fps_below_pass"
+    assert issue["needs_manual_review"] is True
+    assert "config_version" not in issue
+    assert report["manual_review"]["candidate_issue_ids"] == [issue["issue_id"]]
+
+
+def test_video_qc_preserves_existing_module_blocks_and_increments_revision(tmp_path: Path) -> None:
+    batch = tmp_path
+    video_dir = batch / "video"
+    video_dir.mkdir()
+    video = video_dir / "408817_video.mp4"
+    write_test_video(video, [textured_frame(0), textured_frame(10)], fps=30.0)
+    write_quality_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", 2)
+    archive = batch / "quality_archive"
+    archive.mkdir()
+    config = load_video_quality_config(None)
+    existing = {
+        "schema_version": "asset_qc_report.v1",
+        "qc_config": config.qc_config_reference,
+        "asset_id": "408817",
+        "report_revision": 3,
+        "hdf5_text_info": {"owner": "hdf5_text_info", "text_fields": {"task": "pick cup"}},
+        "quality_hand": {"owner": "quality_hand", "metrics": {"score": 1.0}},
+    }
+    (archive / "408817.json").write_text(json.dumps(existing), encoding="utf-8")
+
+    assert run_video_quality_check(batch) == 0
+    updated = json.loads((archive / "408817.json").read_text(encoding="utf-8"))
+
+    assert updated["report_revision"] == 4
+    assert updated["hdf5_text_info"] == existing["hdf5_text_info"]
+    assert updated["quality_hand"] == existing["quality_hand"]
+    assert updated["video_quality"]["flow"]["result_gate"]["verdict"] == "pass"
+
+
 def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path) -> None:
     batch = tmp_path
     video_dir = batch / "video"
@@ -977,18 +1028,28 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     assert exit_code == 2
     assert not (batch / "reports").exists()
     report = json.loads((batch / "quality_archive" / "bad.json").read_text(encoding="utf-8"))
-    assert report["qc_summary"]["status"] == "fail"
-    assert report["qc_summary"]["failed_modules"] == ["video_quality"]
+    assert report["pipeline_state"] == {
+        "status": "stopped",
+        "last_completed_module": "video_quality",
+        "next_module": "batch_statistics",
+    }
+    assert report["overall_decision"] == "fail"
+    assert report["manual_review"]["state"] == "skipped_due_to_fail"
     assert "cannot_open_video" in report["video_quality"]["evaluation"]["reasons"]
     detail = next(
         item
-        for item in report["video_quality"]["evaluation"]["reason_details"]
+        for item in report["issues"]
         if item["code"] == "cannot_open_video"
     )
     assert detail["rule_id"] == "video_quality.cannot_open_video"
-    assert detail["config_version"] == "qc_acceptance_v1.1.0"
-    assert "pass_threshold" not in detail
-    assert "fail_threshold" not in detail
+    assert detail["issue_type"] == "video_unreadable"
+    assert detail["needs_manual_review"] is False
+    assert "config_version" not in detail
+    assert report["video_quality"]["flow"]["exit_gate"] == {
+        "state": "stop_qc",
+        "continue_to_next_module": False,
+        "next_module": "batch_statistics",
+    }
 
 
 def test_video_quality_main_accepts_config_and_writes_quality_archive(tmp_path: Path) -> None:

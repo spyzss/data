@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "asset_qc_report.v1.schema.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "qc_config",
+    "asset_id",
+    "report_revision",
+    "pipeline_state",
+    "overall_decision",
+    "issues",
+    "manual_review",
+    "video_quality"
+  ],
+  "properties": {
+    "schema_version": {"const": "asset_qc_report.v1"},
+    "qc_config": {"$ref": "#/$defs/qcConfig"},
+    "asset_id": {"type": "string", "minLength": 1},
+    "report_revision": {"type": "integer", "minimum": 1},
+    "pipeline_state": {"$ref": "#/$defs/pipelineState"},
+    "overall_decision": {
+      "oneOf": [
+        {"type": "null"},
+        {"enum": ["pass", "warn", "fail"]}
+      ]
+    },
+    "issues": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/issue"}
+    },
+    "manual_review": {"$ref": "#/$defs/manualReview"},
+    "video_quality": {"$ref": "#/$defs/videoQuality"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "pipeline_state": {
+            "properties": {"status": {"enum": ["pending", "running"]}},
+            "required": ["status"]
+          }
+        }
+      },
+      "then": {"properties": {"overall_decision": {"type": "null"}}}
+    },
+    {
+      "if": {
+        "properties": {
+          "pipeline_state": {
+            "properties": {"status": {"const": "stopped"}},
+            "required": ["status"]
+          }
+        }
+      },
+      "then": {"properties": {"overall_decision": {"const": "fail"}}}
+    },
+    {
+      "if": {
+        "properties": {
+          "pipeline_state": {
+            "properties": {"status": {"const": "completed"}},
+            "required": ["status"]
+          }
+        }
+      },
+      "then": {"properties": {"overall_decision": {"enum": ["pass", "warn"]}}}
+    }
+  ],
+  "$defs": {
+    "qcConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "config_version", "config_name", "config_path", "config_hash"],
+      "properties": {
+        "schema_version": {"const": "qc_acceptance_config_schema.v1"},
+        "config_version": {
+          "type": "string",
+          "pattern": "^qc_acceptance_v[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "config_name": {"const": "acceptance_gate"},
+        "config_path": {"type": "string", "minLength": 1},
+        "config_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "pipelineState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "last_completed_module", "next_module"],
+      "properties": {
+        "status": {"enum": ["pending", "running", "stopped", "completed"]},
+        "last_completed_module": {"type": ["string", "null"]},
+        "next_module": {"type": ["string", "null"]}
+      }
+    },
+    "manualReview": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["required", "state", "candidate_issue_ids", "failures_for_batch_stats_issue_ids"],
+      "properties": {
+        "required": {"type": ["boolean", "null"]},
+        "state": {
+          "enum": [
+            "not_evaluated",
+            "not_required",
+            "required",
+            "queued",
+            "in_progress",
+            "completed",
+            "skipped_due_to_fail"
+          ]
+        },
+        "candidate_issue_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "failures_for_batch_stats_issue_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issue_id",
+        "code",
+        "severity",
+        "module",
+        "issue_type",
+        "metric",
+        "observed_value",
+        "operator",
+        "boundary_value",
+        "rule_id",
+        "needs_manual_review",
+        "context"
+      ],
+      "properties": {
+        "issue_id": {"type": "string", "minLength": 1},
+        "code": {"type": "string", "minLength": 1},
+        "severity": {"enum": ["warn", "fail"]},
+        "module": {"type": "string", "minLength": 1},
+        "issue_type": {"type": "string", "minLength": 1},
+        "metric": {"type": ["string", "null"]},
+        "observed_value": {},
+        "operator": {"type": ["string", "null"]},
+        "boundary_value": {},
+        "rule_id": {"type": "string", "minLength": 1},
+        "needs_manual_review": {"type": "boolean"},
+        "context": {"type": "object"}
+      }
+    },
+    "videoQuality": {
+      "type": "object",
+      "required": ["flow", "evaluation", "metrics"],
+      "properties": {
+        "flow": {"$ref": "#/$defs/moduleFlow"},
+        "evaluation": {"$ref": "#/$defs/videoEvaluation"},
+        "metrics": {
+          "type": "object",
+          "propertyNames": {"not": {"pattern": "^hand_roi"}}
+        }
+      }
+    },
+    "moduleFlow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry_gate", "result_gate", "exit_gate"],
+      "properties": {
+        "entry_gate": {"type": "object"},
+        "result_gate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["verdict", "has_fail", "has_warn"],
+          "properties": {
+            "verdict": {"enum": ["pass", "warn", "fail", "skipped"]},
+            "has_fail": {"type": "boolean"},
+            "has_warn": {"type": "boolean"}
+          }
+        },
+        "exit_gate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "continue_to_next_module", "next_module"],
+          "properties": {
+            "state": {"enum": ["continue", "stop_qc", "complete_qc"]},
+            "continue_to_next_module": {"type": "boolean"},
+            "next_module": {"type": ["string", "null"]}
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result_gate": {
+                "properties": {"verdict": {"const": "fail"}},
+                "required": ["verdict"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "exit_gate": {
+                "properties": {
+                  "state": {"const": "stop_qc"},
+                  "continue_to_next_module": {"const": false},
+                  "next_module": {"const": "batch_statistics"}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "videoEvaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "reasons", "warn_reasons", "issue_ids", "should_run_mask_qc"],
+      "properties": {
+        "decision": {"enum": ["pass", "warn", "fail"]},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+        "warn_reasons": {"type": "array", "items": {"type": "string"}},
+        "issue_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "should_run_mask_qc": {"type": "boolean"}
+      }
+    }
+  }
+}

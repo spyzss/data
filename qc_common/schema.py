@@ -27,3 +27,11 @@ def validate_qc_config(data: dict[str, Any]) -> None:
         _repo_root() / "schemas" / "qc_acceptance_config.v1.schema.json",
         "QC config",
     )
+
+
+def validate_asset_qc_report(report: dict[str, Any]) -> None:
+    _validate_with_schema(
+        report,
+        _repo_root() / "schemas" / "asset_qc_report.v1.schema.json",
+        "asset QC report",
+    )
