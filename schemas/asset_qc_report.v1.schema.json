@@ -10,8 +10,7 @@
     "pipeline_state",
     "overall_decision",
     "issues",
-    "manual_review",
-    "video_quality"
+    "manual_review"
   ],
   "properties": {
     "schema_version": {"const": "asset_qc_report.v1"},
@@ -33,6 +32,29 @@
     "video_quality": {"$ref": "#/$defs/videoQuality"}
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "pipeline_state": {
+            "properties": {
+              "last_completed_module": {
+                "enum": [
+                  "video_quality",
+                  "sam3_containment",
+                  "semantic_consistency",
+                  "manual_review",
+                  "duplicate_check",
+                  "content_validity",
+                  "effective_duration"
+                ]
+              }
+            },
+            "required": ["last_completed_module"]
+          }
+        }
+      },
+      "then": {"required": ["video_quality"]}
+    },
     {
       "if": {
         "properties": {

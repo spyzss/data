@@ -87,3 +87,23 @@ def test_stopped_report_accepts_fail_decision() -> None:
     }
 
     validate_asset_qc_report(report)
+
+
+def test_pre_video_report_does_not_require_video_block() -> None:
+    report = make_valid_running_report()
+    report["pipeline_state"] = {
+        "status": "pending",
+        "last_completed_module": "keypoint_temporal",
+        "next_module": "video_quality",
+    }
+    del report["video_quality"]
+
+    validate_asset_qc_report(report)
+
+
+def test_completed_video_gate_requires_video_block() -> None:
+    report = make_valid_running_report()
+    del report["video_quality"]
+
+    with pytest.raises(ValueError, match="video_quality"):
+        validate_asset_qc_report(report)

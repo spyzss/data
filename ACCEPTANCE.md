@@ -1,12 +1,23 @@
 # Supplier Acceptance Tools
 
-This repository also includes two supplier-acceptance workflows that sit beside
-the SAM3/DA3 annotation pipeline:
+This repository contains two supplier-acceptance workflows beside the
+SAM3/DA3 annotation pipeline:
 
 - `acceptance_pull`: validate a supplier manifest, sample IDs by scene/task,
   and pull paired HDF5/video files into a local batch.
-- `acceptance_video_quality`: run no-reference video quality checks on a sampled
-  batch and write per-asset QC JSON archives.
+- `acceptance_video_quality`: run the low-cost no-reference video prefilter and
+  update one QC archive per asset.
+
+The durable per-asset report is:
+
+```text
+<batch>/quality_archive/<asset_id>.json
+```
+
+Other QC modules are described in `docs/PRD-qc-gated-json.md`. Their source
+code is owned by the corresponding module developers; this repository's
+current implementation change only covers video QC and its shared config/report
+contract.
 
 ## Batch Sampling And Pull
 
@@ -47,41 +58,36 @@ sampled/XJGT_20260616/
 ```
 
 Sampling uses the manifest/video/HDF5 ID intersection, keeps full scene
-coverage, and fills remaining quota with task diversity. `sample_ratio` defaults
-to `0.01`, using `ceil(valid_id_count * sample_ratio)` as the minimum size.
+coverage, and fills the remaining quota with task diversity. `sample_ratio`
+defaults to `0.01` and uses `ceil(valid_id_count * sample_ratio)` as the minimum
+sample size.
 
 ## Manual Inputs And Confirmation Points
 
-The workflow intentionally keeps several choices as human-owned inputs:
+The pull workflow intentionally keeps these choices human-owned:
 
-- `output`: choose the local destination directory for the sampled batch.
-- `sample_ratio`: choose the acceptance sampling ratio. The default is `0.01`
-  for 1%; set values such as `0.02` or `0.005` when the batch policy changes.
-- `workers`: choose pull concurrency for the current network and disk
-  environment. The default is `8`.
-- `seed`: leave blank to use the run date, or set an explicit value when a
-  historical sample must be reproduced.
-- Local source mode: provide `manifest`, `readme`, `hdf5.root`, and
-  `video.root`.
-- OSS source mode: provide `batch_uri` and `region`; do not put access keys,
-  tokens, or browser login state in YAML.
-- Video quality mode: confirm `hdf5_alignment.mode`, threshold overrides, and
-  the `decision` / `should_run_mask_qc` pipeline flags before using the result
-  as an acceptance gate.
+- `output`: local destination for the sampled batch.
+- `sample_ratio`: acceptance sampling ratio; default `0.01`.
+- `workers`: pull concurrency for the current network and disk; default `8`.
+- `seed`: explicit value for a reproducible historical sample, or blank to use
+  the run date.
+- Local mode: `manifest`, `readme`, `hdf5.root`, and `video.root`.
+- OSS mode: `batch_uri` and `region`. Do not put credentials or browser login
+  state in YAML.
+- Acceptance policy: the reviewed, immutable `qc_config.config_version` used
+  to initialize every asset JSON in one pipeline run.
 
-After each run, a reviewer should check:
+After pulling, review:
 
-- `reports/id_consistency.csv` for missing or extra manifest/HDF5/video IDs.
+- `reports/id_consistency.csv` for missing or extra IDs.
 - `reports/pull_report.csv` for failed pull operations.
-- `reports/summary.json` for actual sample size, scene/task coverage, seed,
-  worker count, and sampling ratio.
-- `quality_archive/<asset_id>.json` for per-asset machine-readable evidence
-  when a sample needs closer review.
+- `reports/summary.json` for actual sample size and coverage.
+- `quality_archive/<asset_id>.json` for the asset's accumulated QC evidence.
 
 ## OSS Batch Input
 
-For local OSS testing with `oss-browser2`, keep credentials outside YAML and log
-output. Open `oss-browser2`, sign in, then use a business-level batch URI:
+For local OSS testing with `oss-browser2`, keep credentials outside YAML and
+logs. Use a batch-level URI:
 
 ```yaml
 batch_uri: oss://xingjiguitu/egodata/XJGT_20260616
@@ -91,80 +97,61 @@ workers: 8
 sample_ratio: 0.01
 ```
 
-The tool derives:
+The tool derives `<batch prefix>/hdf5` and `<batch prefix>/video`, then downloads
+`README.txt` and the first `.xlsx` manifest when they are not provided.
+
+## Unified QC Config
+
+Video QC accepts only the unified versioned config:
 
 ```text
-hdf5 prefix: <batch prefix>/hdf5
-video prefix: <batch prefix>/video
+configs/qc_acceptance.yaml
 ```
 
-and downloads `README.txt` plus the first `.xlsx` manifest from the batch root
-when they are not provided explicitly.
+The immutable copy for the current release is:
+
+```text
+configs/qc_acceptance/qc_acceptance_v1.1.0.yaml
+```
+
+The video parameters live under:
+
+```yaml
+schema_version: qc_acceptance_config_schema.v1
+config_version: qc_acceptance_v1.1.0
+modules:
+  video_quality:
+    module_version: video_prefilter_v0.3.2
+    parameters:
+      decode: {}
+      exposure: {}
+      sharpness_global: {}
+      freeze: {}
+      defects: {}
+      hdf5_alignment: {}
+```
+
+Do not pass a legacy video-only YAML. To test another reviewed config, copy the
+whole unified document, bump `config_version`, edit
+`modules.video_quality.parameters`, and run with `--config`.
 
 ## Video Quality Check
 
-After a batch is sampled and pulled:
+Run the default reviewed config:
 
 ```bash
 python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 ```
 
-Optional video-quality config override:
+Run a different complete unified config:
 
-```yaml
-decode:
-  max_sample_frames: 300
-hdf5_alignment:
-  mode: fail
-resolution:
-  min_short_side_fail: 720
-  min_long_side_fail: 1280
-exposure:
-  black:
-    max_frame_count_fail: 10
-    ratio_pass: 0.01
-    ratio_warn: 0.90
-  over_dark:
-    ratio_pass: 0.05
-    ratio_warn: 0.90
-  over_exposed:
-    ratio_pass: 0.05
-    ratio_warn: 0.90
-sharpness_global:
-  target_short_side: 720
-  laplacian_p10_pass: 15
-  laplacian_p10_warn: 0
-  laplacian_median_pass: 20
-  laplacian_median_warn: 0
-  laplacian_under_100_ratio_pass: 1.00
-  laplacian_under_100_ratio_warn: 1.00
-  tenengrad_p10_pass: 6
-  tenengrad_p10_warn: 4
-  tenengrad_median_pass: 7
-  tenengrad_median_warn: 4
-freeze:
-  adjacent_near_duplicate_ratio_warn: 0.90
-  freeze_candidate_window_sec: 0.5
-  confirmed_freeze_window_sec: 1.0
-  frozen_frame_ratio_pass: 0.05
-  frozen_frame_ratio_warn: 0.10
-  min_interval_frames: 6
-  min_interval_duration_ms: 100
-  ssim_min: 0.995
-  phash_hamming_max: 4
-  motion_conflict_enabled: true
-  critical_window_enabled: true
-  video_state_conflict_noncritical_duration_ms_fail: 1000
-  video_state_conflict_critical_duration_ms_fail: 500
-defects:
-  max_duration_ratio_fail: 0.10
-  duration_ratio_warn: 0.05
-hand_roi:
-  enabled: false
-  mode: warn_except_severe_fail
+```bash
+python run_acceptance_video_quality.py \
+  --batch sampled/XJGT_20260616 \
+  --config configs/qc_acceptance/qc_acceptance_v1.1.0.yaml
 ```
 
-The video check writes:
+Output:
 
 ```text
 sampled/XJGT_20260616/
@@ -174,48 +161,65 @@ sampled/XJGT_20260616/
     <asset_id>.json
 ```
 
-The video quality command writes each asset's QC result into
-`quality_archive/<asset_id>.json`, alongside `hdf5/` and `video/`. The schema is
-documented in `docs/asset-qc-json-format.md`; future batch-level summaries or
-tables can be generated from these archive files. The video block stores
-`decision: pass|warn|fail` and `should_run_mask_qc`; downstream high-cost QC
-should run only when `should_run_mask_qc` is `true`. `reasons` and
-`warn_reasons` remain stable machine-readable codes, while `reason_details` and
-`warn_reason_details` carry the actual metric value, comparison, `rule_id`,
-`config_version`, and context for report generation and manual review. Thresholds
-are resolved from the top-level `qc_config.config_version`, not copied into each
-asset JSON.
+The command updates only video-owned content in the existing asset JSON and
+preserves unknown fields and blocks written by other modules. It increments
+`report_revision`, validates `asset_qc_report.v1`, writes a temporary file, and
+atomically replaces the archive.
 
-The batch pull workflow still writes pull/sampling reports under:
+The top-level `qc_config` records the actual loaded config's schema version,
+config version, path, and SHA-256 hash. Thresholds and per-issue config versions
+are not copied into the asset JSON. Every warn/fail item is one object in the
+top-level `issues` array with a stable `issue_id`, `rule_id`, actual value,
+operator, boundary value, and context.
 
-```text
-sampled/XJGT_20260616/
-  reports/
-    id_consistency.csv
-    sample_manifest.csv
-    pull_report.csv
-    summary.json
-```
+Video flow rules:
 
-It is a `video_prefilter_v0.3.2` low-cost prefilter. It uses practical
-no-reference indicators: open/decode health, fps, resolution, timeline
-continuity, sampled-frame decode ratio, black/over-dark/over-exposure ratios,
-global sharpness at a normalized short side, frozen-frame risk, drop-frame risk,
-total defect-duration ratio, HDF5 frame-count alignment, and continuous frozen
-intervals. Drop-frame detection prefers real per-frame PTS from `ffprobe`, then
-PyAV if available; OpenCV `CAP_PROP_POS_MSEC` is only a fallback and is recorded
-as `drop_detection_reliable: false`. `drop_frame_ratio` is computed from
-`estimated_missing_frames`, not from the count of abnormal intervals.
-`adjacent_near_duplicate_ratio` is now only a low-motion indicator and never a
-reject condition. A frame range is a `freeze_candidate` only when frames 0.5s
-apart are still near-duplicates; it becomes confirmed freeze only when frames
-1.0s apart are still near-duplicates. If confirmed freeze overlaps HDF5
-hand-keypoint/action/cam-pose/4x4-transform motion, the interval is marked
-`video_state_conflict`; non-critical windows reject at >=1.0s, while
-grasp/place/contact/hand-object interaction windows reject at >=0.5s. Hand ROI is
-disabled by default in this prefilter because the rough bbox is too noisy for
-gating. It is calibrated for robot pretraining videos that may be downsampled to low resolution,
-so sharpness mostly produces warnings unless edges are nearly unreadable. It does
-not perform keypoint accuracy validation, keypoint-mask matching,
-hand-object mask IoU, trajectory jump checks, semantic consistency, or subtask
-acceptance.
+- `pass`: continue to the next configured module.
+- `warn`: keep issue IDs in `manual_review.candidate_issue_ids` and continue.
+- `fail`: stop automated QC, route to `batch_statistics`, and do not run later
+  high-cost modules.
+- `video_quality.flow.exit_gate.continue_to_next_module` is authoritative.
+- `video_quality.evaluation.should_run_mask_qc` is a compatibility alias for
+  the same video gate and should not become the cross-module orchestrator.
+
+## Video Prefilter Scope
+
+`video_prefilter_v0.3.2` is a practical no-reference prefilter for robot
+pretraining video. It checks:
+
+- open/stream/codec/metadata health;
+- FPS and minimum display resolution;
+- PTS monotonicity, estimated missing frames, interval p99, and maximum gap;
+- sampled decode completeness;
+- black, over-dark, and over-exposed frames;
+- normalized global Laplacian and Tenengrad indicators;
+- low-motion, freeze candidates, confirmed freezes, and continuous intervals;
+- combined defect-duration ratio;
+- video/HDF5 frame-count alignment.
+
+Drop detection prefers real per-frame PTS from `ffprobe`, then PyAV. OpenCV
+`CAP_PROP_POS_MSEC` is only a fallback and records
+`drop_detection_reliable=false`. `drop_frame_ratio` is based on
+`estimated_missing_frames`.
+
+`adjacent_near_duplicate_ratio` is a low-motion indicator, not a reject rule.
+Frames 0.5 seconds apart must still be near-duplicates to become a freeze
+candidate; 1.0 second is required for confirmed freeze. A confirmed visual
+freeze with clear HDF5 keypoint/action/camera-pose motion is recorded as
+`video_state_conflict` and evaluated more strictly in critical interaction
+windows.
+
+Sharpness is calibrated for content that may later be downsampled to roughly
+448x256. The objective is to distinguish edges and objects and reject extreme
+blur, not to demand high-definition imagery. Hand ROI quality is not computed.
+
+Video QC does not perform keypoint accuracy validation, keypoint-mask matching,
+trajectory checks, mask IoU, semantic consistency, or subtask acceptance.
+
+## Contracts
+
+- Asset JSON format: `docs/asset-qc-json-format.md`
+- Gate and colleague implementation PRD: `docs/PRD-qc-gated-json.md`
+- Unified config PRD: `docs/PRD-qc-unified-config.md`
+- Config schema: `schemas/qc_acceptance_config.v1.schema.json`
+- Asset report schema: `schemas/asset_qc_report.v1.schema.json`

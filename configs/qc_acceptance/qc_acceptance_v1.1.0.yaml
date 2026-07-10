@@ -64,16 +64,18 @@ json_report:
     write_config_ref: false
     write_rule_ids: true
   issue_fields_required:
+    - issue_id
     - code
     - severity
     - module
     - issue_type
     - metric
-    - value
-    - comparison
+    - observed_value
+    - operator
+    - boundary_value
     - rule_id
-    - config_version
     - needs_manual_review
+    - context
 
 module_flow_contract:
   entry_gate_states:

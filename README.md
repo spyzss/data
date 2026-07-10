@@ -98,6 +98,7 @@ python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 详细配置见 `ACCEPTANCE.md`。
 单条数据 QC 档案 JSON 格式见 `docs/asset-qc-json-format.md`。
 非视频 QC 模块按流程图 gate 思路改造的 PRD 见 `docs/PRD-qc-gated-json.md`。
+统一版本化 QC 配置规范见 `docs/PRD-qc-unified-config.md`。
 
 ### Subtask-aware 采样
 

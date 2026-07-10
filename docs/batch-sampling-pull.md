@@ -99,60 +99,17 @@ sampled/XJGT_20260616/
 python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
 ```
 
-可选使用 YAML 覆盖视频预筛参数：
+视频参数只从完整的统一 QC 配置读取，默认路径为
+`configs/qc_acceptance.yaml`。如需测试另一个已审核版本，传入完整配置：
 
-```yaml
-decode:
-  max_sample_frames: 300
-hdf5_alignment:
-  mode: fail
-resolution:
-  min_short_side_fail: 720
-  min_long_side_fail: 1280
-exposure:
-  black:
-    max_frame_count_fail: 10
-    ratio_pass: 0.01
-    ratio_warn: 0.90
-  over_dark:
-    ratio_pass: 0.05
-    ratio_warn: 0.90
-  over_exposed:
-    ratio_pass: 0.05
-    ratio_warn: 0.90
-sharpness_global:
-  target_short_side: 720
-  laplacian_p10_pass: 15
-  laplacian_p10_warn: 0
-  laplacian_median_pass: 20
-  laplacian_median_warn: 0
-  laplacian_under_100_ratio_pass: 1.00
-  laplacian_under_100_ratio_warn: 1.00
-  tenengrad_p10_pass: 6
-  tenengrad_p10_warn: 4
-  tenengrad_median_pass: 7
-  tenengrad_median_warn: 4
-freeze:
-  adjacent_near_duplicate_ratio_warn: 0.90
-  freeze_candidate_window_sec: 0.5
-  confirmed_freeze_window_sec: 1.0
-  frozen_frame_ratio_pass: 0.05
-  frozen_frame_ratio_warn: 0.10
-  min_interval_frames: 6
-  min_interval_duration_ms: 100
-  ssim_min: 0.995
-  phash_hamming_max: 4
-  motion_conflict_enabled: true
-  critical_window_enabled: true
-  video_state_conflict_noncritical_duration_ms_fail: 1000
-  video_state_conflict_critical_duration_ms_fail: 500
-defects:
-  max_duration_ratio_fail: 0.10
-  duration_ratio_warn: 0.05
-hand_roi:
-  enabled: false
-  mode: warn_except_severe_fail
+```bash
+python run_acceptance_video_quality.py \
+  --batch sampled/XJGT_20260616 \
+  --config configs/qc_acceptance/qc_acceptance_v1.1.0.yaml
 ```
+
+视频阈值位于 `modules.video_quality.parameters`。旧的 video-only YAML 不再接受；
+调参时必须复制完整统一配置、升级 `config_version`，并保存不可变归档。
 
 运行后输出：
 
@@ -164,6 +121,21 @@ sampled/XJGT_20260616/
     <asset_id>.json
 ```
 
-`quality_archive/<asset_id>.json` 是单条数据的全流程 QC 档案，和 `hdf5/`、`video/` 同级，格式见 `docs/asset-qc-json-format.md`。上游建档模块应在拉取完成后先创建这个文件；视频质量检测后续只更新其中的 `video_quality`、`hdf5_text_info`、`reference_quality` 等 block。后续批次 summary、表格或完整报告都可以直接从这些 `<asset_id>.json` 聚合生成。
+`quality_archive/<asset_id>.json` 是单条数据的全流程 QC 档案，和 `hdf5/`、
+`video/` 同级，格式见 `docs/asset-qc-json-format.md`。上游建档模块应在拉取
+完成后创建该文件；视频 writer 只更新 `video_quality`、视频产生的顶层 issue 和
+流转状态，并保留其他模块内容。后续 summary、XLSX 或完整报告都从这些 JSON
+聚合生成。
 
-当前视频模块是 `video_prefilter_v0.3.2` 低成本预筛，不使用 VMAF、CAMBI 或标准对照视频；它只计算基础可用性、fps、分辨率、时间轴连续性、抽样解码、黑帧/过暗/过曝、全帧清晰度、冻结帧、丢帧、HDF5 帧数对齐、瑕疵时长合计比例，以及连续冻帧区间。掉帧检测优先使用 `ffprobe` 每帧真实 PTS，其次 PyAV；OpenCV `CAP_PROP_POS_MSEC` 只作为 fallback，且写入 `drop_detection_reliable: false`。`drop_frame_ratio` 按 `estimated_missing_frames` 估算，不再按异常间隔次数计数。`adjacent_near_duplicate_ratio` 只作为低运动量指标，不作为拒收条件，默认 warn 线保持 `0.90`；相隔 0.5s 的两帧仍近重复才记为 `freeze_candidate`，相隔 1.0s 的两帧仍近重复才记为 confirmed freeze 并进入 `frozen_intervals`。如果 confirmed freeze 期间 HDF5 hand keypoints / action / cam_pose / 4x4 transform 仍有明显变化，则写入 `video_state_conflict`：非关键窗口 >=1.0s hard reject，grasp / place / contact / hand-object interaction 关键窗口 >=0.5s hard reject。默认不再运行 hand ROI，因为粗 bbox 对预筛 gating 噪声较大。该版本按人工复核反馈进一步放宽清晰度线：能看清边缘、分清物体的视频不应仅因低纹理或低锐化响应而 warn/fail；清晰度 hard fail 只保留给极端模糊风险。hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近全段过暗/过曝、confirmed freeze / 丢帧，以及所有瑕疵时长合计超过 10%。输出 JSON 里必须保存 `decision: pass|warn|fail` 和 `should_run_mask_qc`：只有 `decision == "fail"` 时后续 mask / 骨骼点比对 / 语义一致性等高成本 QC 才应跳过。`reasons` / `warn_reasons` 只保存稳定原因码；报告展示和人工排查必须读取 `reason_details` / `warn_reason_details`，其中包含触发指标、实际值、阈值和比较方向。
+`video_prefilter_v0.3.2` 不使用 VMAF、CAMBI 或标准对照视频。它检查基础可用性、
+FPS、最低分辨率、时间轴、抽样解码、曝光、全帧清晰度、冻结/丢帧、HDF5 帧数
+对齐和瑕疵总时长。清晰度目标是看清边缘和区分物体，手部 ROI 不再计算。
+
+掉帧检测优先读取 `ffprobe` 的真实 PTS，其次 PyAV；OpenCV 只作为 fallback，
+并写 `drop_detection_reliable=false`。`adjacent_near_duplicate_ratio` 只表示低运动，
+不拒收；0.5 秒跨帧近重复才是 freeze candidate，1.0 秒才是 confirmed freeze。
+连续区间及 motion conflict 会写入 JSON，便于后续人工复核或裁切。
+
+下游流转读取 `video_quality.flow.exit_gate.continue_to_next_module`。warn issue 写入
+`manual_review.candidate_issue_ids` 后继续；fail 立即停止并转
+`batch_statistics`。`should_run_mask_qc` 仅保留为视频模块兼容 alias。

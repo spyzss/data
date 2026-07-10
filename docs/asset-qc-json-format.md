@@ -1,81 +1,118 @@
-# 单条数据质量档案 JSON 规范 v1
+# 单资产 QC JSON 格式
 
-本文档给上游建档同事使用：每条数据在拉取完成后必须先生成一个长期伴随全流程的质量档案文件。后续视频质量、HDF5 对齐、标注一致性、手部/物体检测等 QC 模块都只在这个文件里追加或更新自己的 block。
+## 1. 定位
 
-非视频 QC 模块如何按流程图 gate 思路写入各自 block，见 [PRD-qc-gated-json.md](PRD-qc-gated-json.md)。本文档只定义单条质量档案的基础格式和通用字段。
-
-## 文件位置
+每条数据从拉取完成开始，只维护一份主质检档案：
 
 ```text
-<batch>/
-  hdf5/
-  video/
-  quality_archive/
-    <asset_id>.json
+<batch>/quality_archive/<asset_id>.json
 ```
 
-要求：
+这份 JSON 随数据走完整个 QC 流程。模块只更新自己拥有的 block 和 issue，
+不得创建另一份模块专属主报告。CSV、HTML、sidecar、overlay 和 ledger 都只是
+证据或批次派生产物。
 
-- 质量档案目录固定为 `<batch>/quality_archive/`，与 `hdf5/`、`video/` 同级。
-- 文件名固定为 `<asset_id>.json`，例如 `408817.json`。
-- 不要把单条数据质量档案放在 `reports/` 下；`reports/` 后续只适合放由质量档案聚合出来的批次报告。
-
-## asset_id 规则
-
-`asset_id` 必须和同一条数据的 HDF5/video ID 一致。
-
-推荐命名映射：
+当前 schema：
 
 ```text
-video/408817_video.mp4       -> asset_id = 408817
-hdf5/408817_hdf5.hdf5        -> asset_id = 408817
-quality_archive/408817.json  -> asset_id = 408817
+schemas/asset_qc_report.v1.schema.json
 ```
 
-如果供应商文件名没有 `_video`、`_hdf5` 后缀，上游建档模块必须先确定唯一稳定 ID，并在 `source_files` 中记录原始文件名。
+当前代码已实现 `video_quality` 的写入合同；其余模块按
+`docs/PRD-qc-gated-json.md` 接入。
 
-## 初始最小 JSON
+## 2. 顶层结构
 
-上游建档模块在拉取完成后至少写出下面结构：
+视频质检完成后的典型结构如下。示例省略了部分 metrics：
 
 ```json
 {
   "schema_version": "asset_qc_report.v1",
   "qc_config": {
     "schema_version": "qc_acceptance_config_schema.v1",
-    "config_version": "qc_acceptance_v1.0.0",
+    "config_version": "qc_acceptance_v1.1.0",
     "config_name": "acceptance_gate",
     "config_path": "configs/qc_acceptance.yaml",
-    "config_hash": "sha256:<computed_at_runtime>"
+    "config_hash": "sha256:<64 lowercase hex characters>"
   },
-  "asset_id": "408817",
-  "qc_summary": {
-    "status": "pending",
-    "passed": null,
-    "completed_modules": [],
-    "failed_modules": [],
-    "reasons": [],
-    "warn_reasons": [],
-    "reason_details": [],
-    "warn_reason_details": [],
-    "should_run_mask_qc": null
+  "asset_id": "file-008",
+  "report_revision": 3,
+  "pipeline_state": {
+    "status": "running",
+    "last_completed_module": "video_quality",
+    "next_module": "sam3_containment"
+  },
+  "overall_decision": null,
+  "issues": [
+    {
+      "issue_id": "video_quality:fps_below_pass:001",
+      "code": "fps_below_pass",
+      "severity": "warn",
+      "module": "video_quality",
+      "issue_type": "low_fps",
+      "metric": "video_basic.fps",
+      "observed_value": 22.5,
+      "operator": "<",
+      "boundary_value": 24.0,
+      "rule_id": "video_quality.fps_below_pass",
+      "needs_manual_review": true,
+      "context": {}
+    }
+  ],
+  "manual_review": {
+    "required": null,
+    "state": "not_evaluated",
+    "candidate_issue_ids": [
+      "video_quality:fps_below_pass:001"
+    ],
+    "failures_for_batch_stats_issue_ids": []
   },
   "source_files": {
     "video": {
-      "path": "video/408817_video.mp4",
-      "filename": "408817_video.mp4",
-      "extension": ".mp4",
-      "exists": true
+      "path": "video/file-008.mp4",
+      "filename": "file-008.mp4",
+      "extension": ".mp4"
     },
     "hdf5": {
-      "path": "hdf5/408817_hdf5.hdf5",
-      "filename": "408817_hdf5.hdf5",
-      "extension": ".hdf5",
+      "path": "hdf5/file-008.hdf5",
       "exists": true
     }
   },
-  "hdf5_text_info": null,
-  "video_quality": null,
+  "video_quality": {
+    "stage": "video_prefilter",
+    "module_version": "video_prefilter_v0.3.2",
+    "flow": {
+      "entry_gate": {
+        "state": "ready",
+        "eligible": true,
+        "blocked_by_module": null,
+        "required_inputs": ["source_files.video.path"],
+        "missing_inputs": [],
+        "upstream_continue": true
+      },
+      "result_gate": {
+        "verdict": "warn",
+        "has_fail": false,
+        "has_warn": true
+      },
+      "exit_gate": {
+        "state": "continue",
+        "continue_to_next_module": true,
+        "next_module": "sam3_containment"
+      }
+    },
+    "evaluation": {
+      "decision": "warn",
+      "reasons": [],
+      "warn_reasons": ["fps_below_pass"],
+      "issue_ids": ["video_quality:fps_below_pass:001"],
+      "should_run_mask_qc": true
+    },
+    "metadata": {},
+    "sampling": {},
+    "metrics": {},
+    "errors": []
+  },
   "reference_quality": {
     "mode": "none",
     "reference_video_path": null,
@@ -85,393 +122,223 @@ quality_archive/408817.json  -> asset_id = 408817
 }
 ```
 
-写法要求：
+## 3. 顶层字段
 
-- `schema_version` 当前固定为 `asset_qc_report.v1`。
-- `qc_config` 必须在建档时写入，后续 QC 模块沿用同一版本；一条数据不会在 QC 中途切换标准。
-- `path` 使用相对 `<batch>` 根目录的路径，不写本机绝对路径。
-- 尚未执行的模块写 `null`，不要写空对象伪装完成。
-- `qc_summary.status` 初始为 `pending`。
-- `qc_summary.passed` 初始为 `null`，等至少一个 QC 模块完成后再改为 boolean。
-- `qc_summary.should_run_mask_qc` 初始为 `null`；视频预筛完成后必须写 boolean，供后续 pipeline 判断是否继续跑 mask / 骨骼点比对 / 语义一致性。
+| 字段 | 规则 |
+|---|---|
+| `schema_version` | 固定为 `asset_qc_report.v1`。 |
+| `qc_config` | 本次 pipeline 初始化时锁定的统一配置引用。 |
+| `asset_id` | 资产唯一 ID，也是 JSON 文件名。 |
+| `report_revision` | 每次成功写回加 1，用于防止旧结果覆盖新结果。 |
+| `pipeline_state` | 当前流程位置，不代表单个模块质量。 |
+| `overall_decision` | 只有流程停止或全部完成时才形成最终结论。 |
+| `issues` | 所有模块共享的 warn/fail 事实表。 |
+| `manual_review` | 人工路由输入、状态和结果。 |
+| `<module_name>` | 模块自己的 gate、指标和证据。 |
 
-## 顶层字段
+### 3.1 `qc_config`
 
-| 字段 | 类型 | 创建方 | 说明 |
-|---|---|---|---|
-| `schema_version` | string | 建档模块 | 当前固定为 `asset_qc_report.v1`。 |
-| `qc_config` | object | 建档模块 | 本条数据使用的版本化 QC 配置。 |
-| `asset_id` | string | 建档模块 | 单条数据稳定 ID。 |
-| `qc_summary` | object | 建档模块初始化，QC 模块更新 | 全流程 QC 汇总状态。 |
-| `source_files` | object | 建档模块 | 该数据关联的原始文件。 |
-| `hdf5_text_info` | object/null | HDF5/QC 模块 | HDF5 文本与帧数对齐信息。 |
-| `video_quality` | object/null | 视频质量模块 | 视频质量检测结果。 |
-| `reference_quality` | object | 建档模块初始化，后续可更新 | 标准对照质量指标预留位。 |
-
-## qc_summary
-
-初始状态：
+`qc_config` 在该资产建档时写入一次，并在整条 pipeline 中保持不变：
 
 ```json
 {
-  "status": "pending",
-  "passed": null,
-  "completed_modules": [],
-  "failed_modules": [],
-  "reasons": [],
-  "warn_reasons": [],
-  "reason_details": [],
-  "warn_reason_details": [],
-  "should_run_mask_qc": null
-}
-```
-
-模块执行后示例：
-
-```json
-{
-  "status": "pass",
-  "passed": true,
-  "completed_modules": ["video_quality"],
-  "failed_modules": [],
-  "reasons": [],
-  "warn_reasons": [],
-  "reason_details": [],
-  "warn_reason_details": [],
-  "should_run_mask_qc": true
-}
-```
-
-字段规则：
-
-| 字段 | 类型 | 规则 |
-|---|---|---|
-| `status` | string | `pending`、`pass`、`warn`、`fail` 四选一。 |
-| `passed` | boolean/null | `pending` 时为 `null`；`pass/warn` 为 `true`；`fail` 为 `false`。 |
-| `completed_modules` | string[] | 已完成并写入结果的模块名。 |
-| `failed_modules` | string[] | 有失败结论的模块名。 |
-| `reasons` | string[] | 全局 hard fail 原因，格式建议为稳定机器可读枚举。 |
-| `warn_reasons` | string[] | 全局 warning 原因，不阻断后续高成本 QC。 |
-| `reason_details` | object[] | 与 `reasons` 对应的结构化明细，包含触发指标、实际值、阈值和比较方向。 |
-| `warn_reason_details` | object[] | 与 `warn_reasons` 对应的结构化明细，不能只写原因码，必须写出实际数值。 |
-| `should_run_mask_qc` | boolean/null | 视频预筛完成后必须写入；规则是 `status != "fail"`。 |
-
-## source_files
-
-```json
-{
-  "video": {
-    "path": "video/408817_video.mp4",
-    "filename": "408817_video.mp4",
-    "extension": ".mp4",
-    "exists": true
-  },
-  "hdf5": {
-    "path": "hdf5/408817_hdf5.hdf5",
-    "filename": "408817_hdf5.hdf5",
-    "extension": ".hdf5",
-    "exists": true
-  }
+  "schema_version": "qc_acceptance_config_schema.v1",
+  "config_version": "qc_acceptance_v1.1.0",
+  "config_name": "acceptance_gate",
+  "config_path": "configs/qc_acceptance.yaml",
+  "config_hash": "sha256:..."
 }
 ```
 
 规则：
 
-- `path` 必须是批次根目录相对路径。
-- 对缺失文件也要保留对应 key，并写 `exists: false`。
-- 如果同一条数据有多路视频，`video` 可以扩展为对象集合，例如 `videos.cam_left`、`videos.cam_right`；不要把多个文件塞进一个字符串。
+- `config_hash` 必须根据实际读取的 YAML 字节计算。
+- 模块不得在自己的 block 复制 thresholds 或 `config_ref`。
+- issue 不重复写 `config_version`；顶层版本是唯一权威来源。
+- 同一次 asset pipeline 不能中途更换 config。发现 hash/version 不一致必须拒绝写入。
 
-## hdf5_text_info
+### 3.2 `pipeline_state` 与 `overall_decision`
 
-该 block 由 HDF5/QC 模块写入。未执行前为 `null`。
+| `pipeline_state.status` | 含义 | `overall_decision` |
+|---|---|---|
+| `pending` | 已建档，尚未开始或等待当前 gate。 | 必须为 `null` |
+| `running` | 自动 QC 仍在继续。 | 必须为 `null` |
+| `stopped` | 某个模块 hard fail，后续 QC 已停止。 | 必须为 `fail` |
+| `completed` | 所有应运行模块完成。 | `pass` 或 `warn` |
+
+`pending` 不是质量等级，也不等于 warn。`warn` 是模块对具体问题的判定；
+流程未结束时只保存在 module verdict 和 `issues`，不提前写进
+`overall_decision`。
+
+## 4. Issue 结构
+
+每个触发的指标单独生成一个 issue 对象。一个视频有多个 warn 时，`issues`
+中就有多个对象；不是把多个 metric/value 塞进同一个字段。
 
 ```json
 {
-  "alignment": {
-    "status": "matched",
-    "mode": "fail",
-    "video_frame_count": 913,
-    "hdf5_frame_count": 913,
-    "frame_count_delta": 0,
-    "frame_count_delta_ratio": 0.0,
-    "frame_count_match": true,
-    "reason": null
-  },
-  "text_fields": {
-    "attributes": {},
-    "datasets": {
-      "/label/text_label": {
-        "data_cn": {
-          "scene": "家庭",
-          "events": []
-        }
-      }
-    }
+  "issue_id": "video_quality:fps_below_pass:001",
+  "code": "fps_below_pass",
+  "severity": "warn",
+  "module": "video_quality",
+  "issue_type": "low_fps",
+  "metric": "video_basic.fps",
+  "observed_value": 22.5,
+  "operator": "<",
+  "boundary_value": 24.0,
+  "rule_id": "video_quality.fps_below_pass",
+  "needs_manual_review": true,
+  "context": {}
+}
+```
+
+| 字段 | 规则 |
+|---|---|
+| `issue_id` | 在该 asset 内稳定且唯一，供模块、人工和批次统计引用。 |
+| `code` | 稳定原因码，不写自然语言句子。 |
+| `severity` | 只能是 `warn` 或 `fail`。pass 不生成 issue。 |
+| `module` | 产生问题的模块名。 |
+| `issue_type` | 跨指标归类，如 `freeze`、`low_fps`、`exposure`。 |
+| `metric` | 指标路径；无单一指标时可为 `null`。 |
+| `observed_value` | 实际观测值，可为数值、布尔、字符串或结构。 |
+| `operator` | 触发比较符，如 `<`、`>`、`==`；不适用时为 `null`。 |
+| `boundary_value` | 触发边界；不适用时可为 `null`。 |
+| `rule_id` | 回查统一 config 的稳定规则 ID。 |
+| `needs_manual_review` | 该问题是否应成为人工候选。 |
+| `context` | 区间、检测可靠性、文件位置等附加证据。 |
+
+不再使用：
+
+```text
+reason_details
+warn_reason_details
+value
+comparison
+issue.config_version
+module.thresholds
+```
+
+模块内 `reasons` / `warn_reasons` 可以保留简短 code 数组以兼容和快速展示，
+但完整事实只在顶层 `issues` 保存一次。模块用 `issue_ids` 引用它们。
+
+## 5. Gate 结构
+
+每个自动 QC 模块都应写：
+
+```json
+{
+  "flow": {
+    "entry_gate": {},
+    "result_gate": {},
+    "exit_gate": {}
   }
 }
 ```
 
-`alignment.status` 可选值：
+通用规则：
 
-| status | 含义 |
-|---|---|
-| `matched` | 找到 HDF5，且帧数与视频帧数一致。 |
-| `mismatch` | 找到 HDF5，但帧数不一致。 |
-| `missing` | 未找到对应 HDF5。 |
-| `unreadable` | HDF5 存在但不可读，或缺少约定数据集。 |
+- `pass`：`continue_to_next_module=true`。
+- `warn`：生成 issue，追加到人工候选，继续下一模块。
+- `fail`：`state=stop_qc`、`continue_to_next_module=false`、
+  `next_module=batch_statistics`。
+- 下游只读取上游 `exit_gate` 或顶层 `pipeline_state`，不解析自然语言原因。
+- 上游已 fail 时，后续高成本模块不得运行。
 
-`text_fields` 只收集字符串型 HDF5 attribute 和 dataset，不收集图像、关键点、大数组等数值数据。如果字符串内容本身是 JSON object 或 array，应解析成嵌套 JSON；普通文本保持 string。
+## 6. `manual_review`
 
-## video_quality
-
-该 block 由视频预筛模块写入。未执行前为 `null`。本阶段定位是低成本视频预筛，只判断这条视频是否值得继续跑 mask、骨骼点比对、语义一致性等高成本 QC；不做 21 点精度验收、手物 mask IoU、轨迹跳变或 subtask 验收。
+自动模块只负责累计候选：
 
 ```json
 {
-  "stage": "video_prefilter",
-  "evaluation": {
-    "decision": "pass",
-    "passed": true,
-    "reasons": [],
-    "warn_reasons": [],
-    "reason_details": [],
-    "warn_reason_details": [],
-    "should_run_mask_qc": true
-  },
-  "metadata": {
-    "opened": true,
-    "frame_count": 913,
-    "fps": 29.987814371159146,
-    "duration_seconds": 30.4457,
-    "width": 1280,
-    "height": 720,
-    "short_side": 720,
-    "long_side": 1280
-  },
-  "sampling": {
-    "sample_count_configured": 30,
-    "sampled_frame_count": 30,
-    "decoded_sample_count": 30,
-    "sample_decode_ratio": 1.0
-  },
-  "metrics": {
-    "video_basic": {
-      "video_open_ok": true,
-      "video_stream_present": true,
-      "codec_readable": true,
-      "metadata_read_ok": true,
-      "fps": 29.97,
-      "short_side": 720,
-      "long_side": 1280
-    },
-    "timeline_metrics": {
-      "pts_monotonic_valid": true,
-      "drop_frame_ratio": 0.0,
-      "drop_detection_source": "ffprobe",
-      "drop_detection_reliable": true,
-      "estimated_missing_frames": 0,
-      "observed_frame_interval_count": 912,
-      "frame_interval_p99_ms": 35.1,
-      "max_frame_gap_ms": 38.4
-    },
-    "decode_metrics": {
-      "sample_decode_ratio": 1.0
-    },
-    "exposure_metrics": {
-      "black_frame_ratio": 0.0,
-      "black_frame_count_estimate": 0,
-      "exposure_defect_frame_ratio": 0.0,
-      "mean_over_dark_ratio": 0.0,
-      "mean_over_exposed_ratio": 0.0
-    },
-    "sharpness_global": {
-      "sharpness_scale_short_side": 720,
-      "laplacian_p10": 420.5,
-      "laplacian_median": 650.2,
-      "laplacian_under_100_ratio": 0.0,
-      "tenengrad_p10": 34.1,
-      "tenengrad_median": 42.7
-    },
-    "freeze_metrics": {
-      "adjacent_near_duplicate_count": 120,
-      "adjacent_near_duplicate_ratio": 0.13,
-      "freeze_candidate_window_sec": 0.5,
-      "freeze_candidate_frame_count": 0,
-      "freeze_candidate_duration_sec": 0.0,
-      "freeze_candidate_ratio": 0.0,
-      "confirmed_freeze_window_sec": 1.0,
-      "confirmed_freeze_frame_count": 0,
-      "confirmed_freeze_duration_sec": 0.0,
-      "confirmed_freeze_ratio": 0.0,
-      "frozen_frame_ratio": 0.0,
-      "max_consecutive_frozen_sec": 0.0,
-      "frozen_interval_min_frames": 6,
-      "frozen_interval_min_duration_ms": 100.0,
-      "frozen_interval_count": 0,
-      "frozen_interval_frame_count": 0,
-      "frozen_interval_duration_sec": 0.0,
-      "frozen_interval_motion_conflict_count": 0,
-      "frozen_interval_critical_window_count": 0,
-      "ssim_min": 0.995,
-      "phash_hamming_max": 4,
-      "frozen_intervals": []
-    },
-    "defect_metrics": {
-      "defect_duration_ratio": 0.0,
-      "exposure_defect_frame_ratio": 0.0,
-      "frozen_frame_ratio": 0.0,
-      "drop_frame_ratio": 0.0
-    },
-    "hdf5_alignment": {
-      "enabled": true,
-      "mode": "fail",
-      "video_frame_count": 913,
-      "hdf5_frame_count": 913,
-      "frame_count_delta": 0,
-      "frame_count_delta_ratio": 0.0
-    },
-    "hand_roi_metrics": null
-  },
-  "errors": []
+  "required": null,
+  "state": "not_evaluated",
+  "candidate_issue_ids": ["video_quality:fps_below_pass:001"],
+  "failures_for_batch_stats_issue_ids": []
 }
 ```
 
-默认视频预筛不再运行 hand ROI，因此 `hand_roi_metrics` 为 `null`。如果通过 YAML 显式启用 `hand_roi.enabled: true`，`hand_roi_metrics.source` 可为：
+到达人工路由模块后，由人工策略统一决定：
 
-| source | 含义 |
-|---|---|
-| `hdf5_keypoints_bbox` | 从 HDF5 关键点数组生成粗 hand ROI bbox。 |
-| `hdf5_transform_keypoints_bbox` | 从 `transforms/*` 下手部、手指、拇指相关 4x4 矩阵取平移点，并使用 `camera/intrinsic` 投影后生成粗 hand ROI bbox。 |
+- `required=false`：无候选或按抽样策略无需人工。
+- `required=true`：进入 `queued` / `in_progress` / `completed`。
+- 自动 QC 已 hard fail：`required=false`、`state=skipped_due_to_fail`，问题直接供
+  批次统计和返工使用。
 
-`video_prefilter_v0.3.2` 面向机器人预训练预筛，默认认为后续视频可能下采样到 448x256 一类低分辨率，因此清晰度指标只用于发现极端模糊风险，不追求高清画质硬筛。该版本按人工复核反馈放宽全帧 Laplacian / Tenengrad 默认线；能看清边缘、区分物体的视频不应仅因低纹理或低锐化响应而 warn/fail。hard fail 更关注视频打不开、解码失败、黑屏超过 10 帧、接近整段过暗/过曝、confirmed freeze / 丢帧，以及所有瑕疵时长合计超过 10%。相邻近重复比例仍保留 `0.90` 作为低运动量 warn 线，但不作为拒收条件。掉帧检测优先使用 `ffprobe` 每帧真实 PTS，其次 PyAV；OpenCV `CAP_PROP_POS_MSEC` 只作为 fallback，且 `drop_detection_reliable` 必须写为 `false`。`drop_frame_ratio` 使用 `estimated_missing_frames / (video_frame_count + estimated_missing_frames)`，不再使用异常间隔次数比例。如果启用 `hand_roi.mode: warn_except_severe_fail`，ROI Laplacian / Tenengrad 低于 pass 线只写入 `warn_reasons`；只有 `hand_roi_severe_blur` 或 `hand_roi_blur_bad_frame_ratio_above_max` 才会把视频预筛判成 `fail`。
+人工结果必须引用 `issue_id`，并写结构化结论、reviewer、时间和备注；不得覆盖
+机器观测值。完整字段由 `docs/PRD-qc-gated-json.md` 约束。
 
-冻结相关指标分三层：
+## 7. Video QC Block
 
-| field | 含义 |
-|---|---|
-| `adjacent_near_duplicate_ratio` | 相邻帧近重复比例，只表示低运动量，不作为拒收条件；超过默认 0.90 只写 warn。 |
-| `freeze_candidate_ratio` | 相隔 0.5s 的两帧仍近重复时覆盖的候选冻结比例。 |
-| `confirmed_freeze_ratio` / `frozen_frame_ratio` | 相隔 1.0s 的两帧仍近重复时覆盖的 confirmed freeze 比例，才参与 frozen hard fail 和瑕疵时长。 |
+当前视频模块写入：
 
-`freeze_metrics.frozen_intervals` 只记录 confirmed freeze 区间。冻帧判定保留 `mean(absdiff)+hist_diff`，并增加 SSIM/pHash 作为近重复辅助指标。每个区间字段如下：
+- `flow`：入口、结果、出口 gate。
+- `evaluation`：模块 decision、原因码和 issue 引用。
+- `metadata`：帧数、FPS、时长、尺寸。
+- `sampling`：配置抽样上限、实际抽样和解码数量。
+- `metrics.video_basic`：基础可用性和尺寸。
+- `metrics.timeline_metrics`：PTS、丢帧估算和时间间隔。
+- `metrics.decode_metrics`：抽样解码完整性。
+- `metrics.exposure_metrics`：黑帧、过暗、过曝。
+- `metrics.sharpness_global`：全帧清晰度代理。
+- `metrics.freeze_metrics`：低运动、候选/确认冻结和区间。
+- `metrics.defect_metrics`：瑕疵总时长比例。
+- `metrics.hdf5_alignment`：视频/HDF5 帧数对齐。
+- `errors`：运行错误。
 
-| field | 含义 |
-|---|---|
-| `start_frame` | 冻帧区间起始帧，闭区间。 |
-| `end_frame` | 冻帧区间结束帧，闭区间。 |
-| `frame_count` | 区间包含的帧数。 |
-| `start_time_sec` | 起始秒数，等于 `start_frame / fps`。 |
-| `end_time_sec` | 右开结束秒数，等于 `(end_frame + 1) / fps`，适合后续裁切。 |
-| `duration_sec` | 区间时长，等于 `frame_count / fps`。 |
-| `duration_ms` | 区间时长毫秒值，用于阈值判断和裁切显示。 |
-| `mean_frame_diff` / `max_frame_diff` | 区间内相邻帧灰度 `mean(absdiff)` 统计。 |
-| `mean_hist_diff` / `max_hist_diff` | 区间内相邻帧灰度直方图 chi-square 差异统计。 |
-| `mean_ssim` / `min_ssim` | 区间内相邻帧 SSIM 统计。 |
-| `mean_phash_hamming` / `max_phash_hamming` | 区间内相邻帧 pHash Hamming 距离统计。 |
-| `motion_conflict` | 是否出现 confirmed freeze 期间 HDF5 hand keypoints / action / cam_pose / 4x4 transform 仍明显变化。 |
-| `motion_conflict_signals` | 触发跨模态冲突的 HDF5 信号列表。 |
-| `critical_window` | HDF5 文本是否表明该样本包含 grasp / place / contact / hand-object interaction 等关键窗口。 |
-| `critical_keywords` | 命中的关键窗口关键词。 |
+不包含手部 ROI 清晰度。HDF5 文本、关键点质量、mask 和语义结果属于各自模块，
+视频 writer 不拥有也不重写这些 block。
 
-`video_state_conflict` 的 hard reject 规则：
+### 7.1 Freeze 与掉帧证据
 
-| 场景 | 阈值 |
-|---|---:|
-| 非关键窗口 confirmed freeze 且 HDF5 状态变化 | `duration_ms >= 1000` |
-| grasp/place/contact/hand-object interaction 关键窗口 confirmed freeze 且 HDF5 状态变化 | `duration_ms >= 500` |
-
-`video_quality.evaluation.decision` 与 `qc_summary.status` 同步，取值为 `pass | warn | fail`。`should_run_mask_qc` 是 pipeline 调度 flag，规则固定为：
-
-```text
-should_run_mask_qc = decision != "fail"
-```
-
-`video_quality.evaluation.reasons` 和 `warn_reasons` 使用稳定机器可读枚举；`reason_details` 和 `warn_reason_details` 保留对应的实际数值、比较方向、`rule_id` 和 `config_version`。下游程序可以继续只看原因码，人工排查和报告生成应优先展示 details。阈值不再复制进 JSON，按顶层 `qc_config.config_version + rule_id` 回查 `configs/qc_acceptance.yaml`。
+冻结区间至少记录：
 
 ```json
 {
-  "warn_reasons": ["laplacian_under_100_ratio_warn"],
-  "warn_reason_details": [
-    {
-      "code": "laplacian_under_100_ratio_warn",
-      "severity": "warn",
-      "metric": "sharpness_global.laplacian_under_100_ratio",
-      "value": 0.8532110091743119,
-      "comparison": ">",
-      "rule_id": "video_quality.laplacian_under_100_ratio_warn",
-      "config_version": "qc_acceptance_v1.0.0",
-      "context": {}
-    }
-  ]
+  "start_frame": 120,
+  "end_frame": 158,
+  "frame_count": 39,
+  "start_time_sec": 4.0,
+  "end_time_sec": 5.267,
+  "duration_sec": 1.267,
+  "duration_ms": 1267.0,
+  "mean_frame_diff": 0.3,
+  "mean_hist_diff": 0.002,
+  "mean_ssim": 0.998,
+  "mean_phash_hamming": 1.0,
+  "motion_conflict": false,
+  "motion_conflict_signals": [],
+  "critical_window": false,
+  "critical_keywords": []
 }
 ```
 
-明细字段：
+时间轴至少记录 `drop_detection_source`、`drop_detection_reliable`、
+`estimated_missing_frames` 和 `drop_frame_ratio`。这样后续裁切或人工复核能区分
+可靠 PTS 证据与 OpenCV fallback。
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `code` | string | 与 `reasons` / `warn_reasons` 中的原因码一致。 |
-| `severity` | string | `fail` 或 `warn`。 |
-| `metric` | string/null | 触发该原因的指标路径，例如 `sharpness_global.laplacian_under_100_ratio`。 |
-| `value` | number/string/boolean/null | 本次视频的实际指标值。 |
-| `comparison` | string/null | 判定方向，常见为 `>`、`<`、`==`。 |
-| `rule_id` | string | 版本化配置中的规则 ID。 |
-| `config_version` | string | 本次 QC 使用的配置版本。 |
-| `context` | object | 补充上下文，例如估算缺失帧、HDF5 帧数、冻帧冲突区间统计。 |
+## 8. 更新与并发规则
 
-常见 reason 枚举：
+模块写回必须：
 
-| reason | 含义 |
-|---|---|
-| `cannot_open_video` | 视频文件无法打开。 |
-| `video_not_opened` | OpenCV 未能打开视频流。 |
-| `fps_below_min` | FPS 低于阈值。 |
-| `short_side_below_min` | 短边分辨率低于阈值。 |
-| `long_side_below_min` | 长边分辨率低于阈值。 |
-| `drop_frame_ratio_above_max` | 时间轴疑似丢帧比例超过 hard fail 阈值，默认 10%。 |
-| `max_frame_gap_ms_above_max` | 最大帧间隔超过 hard fail 阈值。 |
-| `sample_decode_ratio_below_min` | 抽样帧解码率低于阈值。 |
-| `mean_over_dark_ratio_above_max` | 过暗帧比例接近整段视频，超过 hard fail 阈值。 |
-| `mean_over_exposed_ratio_above_max` | 过曝帧比例接近整段视频，超过 hard fail 阈值。 |
-| `laplacian_p10_below_min` | Laplacian 方差 p10 极低；默认阈值已放宽，通常只作为 warn。 |
-| `laplacian_median_below_min` | Laplacian 方差中位数极低；默认阈值已放宽，通常只作为 warn。 |
-| `laplacian_under_100_ratio_above_max` | Laplacian 方差低于 100 的帧比例高于阈值；默认不单独 hard fail。 |
-| `tenengrad_p10_below_min` | Tenengrad p10 极低，边缘几乎不可读。 |
-| `tenengrad_median_below_min` | Tenengrad 中位数极低，边缘几乎不可读。 |
-| `black_frame_ratio_above_max` | 黑帧率接近整段视频，超过 hard fail 阈值。 |
-| `black_frame_count_above_max` | 估算黑帧数超过 10 帧。 |
-| `adjacent_near_duplicate_ratio_warn` | 相邻帧近重复比例高，提示低运动量；不作为拒收条件。 |
-| `frozen_frame_ratio_above_max` | confirmed freeze 比例高于 hard fail 阈值，默认 10%。 |
-| `max_consecutive_frozen_sec_above_max` | confirmed freeze 连续时长超过阈值。 |
-| `video_state_conflict` | confirmed freeze 期间 HDF5 hand keypoints / action / cam_pose / 4x4 transform 显示状态仍明显变化，且达到时长阈值。 |
-| `video_state_conflict_warn` | confirmed freeze 期间检测到 HDF5 状态变化，但时长未达到 hard reject 阈值。 |
-| `defect_duration_ratio_above_max` | 曝光/黑帧类、冻帧、丢帧合计瑕疵时长比例超过 10%。 |
-| `hdf5_frame_count_mismatch` | HDF5 帧数与视频帧数不一致。 |
-| `hdf5_missing` | HDF5 缺失，且配置要求失败。 |
-| `hdf5_unreadable` | HDF5 不可读，且配置要求失败。 |
-| `hand_roi_severe_blur` | HDF5 粗 bbox ROI 严重模糊；bbox 可来自关键点数组或 `transforms/*` 4x4 手部/手指矩阵投影点。 |
-| `hand_roi_blur_bad_frame_ratio_above_max` | hand ROI 模糊坏帧比例超过 hard fail 阈值。 |
+1. 读取当前 JSON 和 `report_revision`。
+2. 校验 `asset_id` 与顶层 `qc_config` 未变化。
+3. 只替换本模块拥有的 block 和本模块 issue。
+4. 保留未知字段和其他模块 block。
+5. 将 revision 加 1。
+6. 通过 JSON Schema 校验。
+7. 先写临时文件并 `fsync`，再原子替换目标文件。
 
-## reference_quality
+revision 与预期不一致时必须报 stale-write 错误，不能静默覆盖。
 
-当前没有标准对照视频，建档时写：
+## 9. 批次派生输出
 
-```json
-{
-  "mode": "none",
-  "reference_video_path": null,
-  "vmaf": null,
-  "note": "当前无标准对照视频，未计算 VMAF。"
-}
-```
+以下内容可以从 `quality_archive/*.json` 生成，但都不是单资产主档案：
 
-如果未来有同内容标准对照视频，再把 `mode` 改成 `full_reference` 并补充 VMAF 等指标。
+- 批次 CSV / XLSX；
+- review queue 和 review index；
+- issue 频率、供应商对比和有效时长汇总；
+- sidecar、overlay、mask 证据；
+- ledger events。
 
-## 后续模块写入规则
-
-- 后续模块只能更新自己负责的 block，不要重写整份 JSON。
-- 更新前先读取已有 JSON，保留未知字段，避免覆盖其他模块结果。
-- 模块完成后必须更新 `qc_summary.completed_modules`。
-- 模块失败后必须更新 `qc_summary.failed_modules` 和 `qc_summary.reasons`。
-- 不要在 JSON 里写入大体积数组、图像二进制、视频帧或 token。
-- 需要生成批次 summary、表格、HTML/PDF 报告时，从 `quality_archive/*.json` 聚合生成。
+`sidecar` 是大体积模块明细的旁路文件；`ledger events` 是流程事件日志；CSV 是
+表格视图。它们可被 JSON 用相对路径引用，但不能代替 `<asset_id>.json`。

@@ -1,147 +1,169 @@
-# PRD: Gate 驱动的单条数据 QC JSON 全流程
+# PRD: Gate 驱动的单资产 QC JSON 全流程
 
-## 1. Summary
+## 1. 文档状态
 
-本 PRD 定义机器人数据验收的全流程 JSON 写入规则。目标是让每条数据只有一份主质检档案：
+| 项目 | 状态 |
+|---|---|
+| 单资产 JSON 与 gate 合同 | 本 PRD 定稿 |
+| 统一配置 loader/schema | 已实现 |
+| `video_quality` | 已实现 |
+| 其他自动 QC 模块 | 由对应同事按本 PRD改造 |
+| 人工质检模块 | 由对应同事按本 PRD 实现 |
+| 全流程 orchestrator | 待对应负责人接入 |
+
+本次代码同步只修改视频质检及其必需的公共 config/schema/report 支撑，不修改其他
+同事负责的模块源码。本 PRD 是其他模块的实现合同。
+
+## 2. 核心结论
+
+每条数据只有一份主质检档案：
 
 ```text
 <batch>/quality_archive/<asset_id>.json
 ```
 
-视频质检模块已经按这个方向实现，本 PRD 重点约束除视频质检之外的模块，包括 HDF5 文本、`quality_hand`、21 点骨骼点存在性、21 点静态形态、21 点时间连续性、SAM/mask、语义一致性、人工质检、重复检查、有效内容与有效时长。所有模块都必须按 gate 思路读写同一份 JSON。CSV、sidecar、ledger、HTML 只能作为证据或批次派生产物，不能作为单条数据的主报告。
-
-## 2. Contacts
-
-| 角色 | 责任 |
-|---|---|
-| 验收流程负责人 | 确认 gate 规则、模块顺序、fail/warn/pass 语义。 |
-| QC 模块开发同事 | 按本 PRD 修改各模块输出，接入 `quality_archive/<asset_id>.json`。 |
-| 人工质检同事 | 只读取 JSON 中的 `manual_review` block 决定是否人工、看哪些问题、写回哪些人工结果。 |
-| 批次统计/财务结算同事 | 从 `quality_archive/*.json` 聚合批次台账、问题频率、有效时长和最终批次结论。 |
-
-## 3. Background
-
-当前代码里已经有多类 QC 输出：
-
-- 视频质检已经能写入 `quality_archive/<asset_id>.json`。
-- precheck 相关模块会输出 clip aggregates、candidate windows。
-- SAM3 containment 会输出 frame/clip/window summary sidecar JSON。
-- 人工质检队列会输出 `review_queue.csv`、`manual_labels.csv`、`review_index.html`。
-- ledger 会聚合 sidecar/CSV/JSON，生成批次级 CSV/Markdown。
-
-这些输出能支持分析，但不适合作为全流程主档案。用户确认后的最终目标是：
+它从拉取完成后创建，一直伴随该资产走完整个 QC 流程：
 
 ```text
-一条数据一份 JSON。
-JSON 是这条数据从拉取到最终验收的完整质检报告。
-每个模块只追加或更新自己的 block。
-fail 立即停止后续 QC，流转到批次统计。
-warn 继续流转，把问题写入 manual_review.candidates。
-人工质检模块到达时再决定是否需要人工。
+创建档案 -> 自动 QC gate 串行执行 -> warn 累积 -> 人工路由 -> 后续批次检查 -> 批次统计
 ```
 
-## 4. Objective
+三个不可变规则：
 
-### 4.1 目标
+1. 每个自动模块 `fail` 后立即停止后续 QC，并转到 `batch_statistics`。
+2. `warn` 不阻断流程，只写顶层 issue，并成为人工质检候选。
+3. 下游判断是否运行只读结构化 gate，不解析原因文本。
 
-1. 每个 QC 模块都能读取上一模块 gate，并判断自己是否应该运行。
-2. 每个 QC 模块都把结果写回同一份 `<asset_id>.json`。
-3. 每个模块 block 都有自己的 `flow.entry_gate`、`flow.result_gate`、`flow.exit_gate`。
-4. `qc_summary` 只做累计摘要，不再承担唯一流程判断。
-5. `manual_review` block 是人工质检模块的唯一入口和出口。
-6. 批次报告、Excel、HTML、ledger 全部由 `quality_archive/*.json` 聚合生成。
+## 3. 目标与非目标
 
-### 4.2 不做的事
+### 3.1 目标
 
-- 不要求所有模块 import 彼此代码。
-- 不把 sidecar 大文件、图像、视频帧、mask 二进制写进主 JSON。
-- 不让 `qc_summary.overall_verdict` 直接决定下一模块是否运行。
-- 不把 hard fail 自动送人工质检。hard fail 直接进入批次统计/返工记录。
+- 只读一个 JSON 就知道该资产跑过哪些模块、当前在哪一步、下一步是什么。
+- 每个 warn/fail 都有稳定 code、实际值、触发边界和 rule ID。
+- 高成本模块在上游 fail 后不会继续消耗资源。
+- 人工质检只读 JSON 即可知道是否需要人工、需要看什么、证据在哪里。
+- 批次统计只聚合 `quality_archive/*.json` 就能形成验收报告。
+- 模块并行开发时互不覆盖彼此字段。
 
-### 4.3 成功标准
+### 3.2 非目标
 
-- 任意抽取一条数据，只看 `<asset_id>.json` 就能知道：
-  - 已跑哪些模块。
-  - 每个模块是 `pass`、`warn` 还是 `fail`。
-  - 下一步是否继续。
-  - fail/warn 的具体原因和数值。
-  - 是否需要人工质检。
-  - 人工质检看过哪些问题，最后确认了什么。
-  - 该条数据最终是否进入批次统计、是否有效、有效时长是多少。
-- 批次统计脚本可以只输入 `quality_archive/`，不再强依赖散落的 sidecar/CSV。
+- 不把所有 QC 模块合并进一个 Python 文件。
+- 不把视频帧、mask、overlay 等大对象直接嵌入 JSON。
+- 不要求 hard fail 再走人工确认；hard fail 直接记录并停止。
+- 不使用 CSV、sidecar 或 ledger 代替单资产主档案。
+- 本次不实现除视频质检以外的模块源码。
 
-## 5. Users And Constraints
-
-### 5.1 用户
-
-- 自动 QC pipeline：按 gate 顺序执行模块，减少不必要的高成本模型调用。
-- 人工质检人员：只看 JSON 生成的队列和证据，不需要理解每个模块内部计算。
-- 供应商验收负责人：根据 JSON 聚合出批次报告、风险点、返工原因和有效时长。
-
-### 5.2 约束
-
-- 路径用相对 batch 根目录的路径，避免写死本机绝对路径。
-- 模块更新 JSON 时必须保留未知字段，不允许重写整份 JSON 丢掉其它模块结果。
-- 大体积输出只写路径引用，例如 overlay、sidecar、mask summary。
-- 同一 issue 的字段命名必须统一，便于人工和批次统计复用。
-
-## 6. Value Proposition
-
-这次改造解决三个问题：
-
-1. **流程可控**：每一步有 gate，fail 后不会继续烧资源跑 mask、SAM、语义模型。
-2. **人工可控**：warn 问题先进入 `manual_review.candidates`，是否人工由人工模块统一决定。
-3. **报告可信**：一条数据一份档案，批次报告可以追溯到每个模块的数值和原因。
-
-## 7. Solution
-
-## 7.1 总体数据流
+## 4. 流程图
 
 ```mermaid
 flowchart TD
-  A["拉取完成: 创建 quality_archive/<asset_id>.json"] --> B["hdf5_text_info"]
-  B --> C{"hdf5_text_info verdict"}
-  C -->|fail| Z["停止 QC, 写 failures_for_batch_stats, next=batch_statistics"]
-  C -->|pass/warn| D["quality_hand"]
-  D --> E{"quality_hand verdict"}
-  E -->|fail| Z
-  E -->|pass/warn| F["keypoint_presence"]
-  F --> G{"keypoint_presence verdict"}
-  G -->|fail| Z
-  G -->|pass/warn| H["keypoint_morphology"]
-  H --> I{"keypoint_morphology verdict"}
-  I -->|fail| Z
-  I -->|pass/warn| J["keypoint_temporal"]
-  J --> K{"keypoint_temporal verdict"}
-  K -->|fail| Z
-  K -->|pass/warn| L["video_quality 已实现"]
-  L --> M{"video_quality verdict"}
-  M -->|fail| Z
-  M -->|pass/warn| N["sam3_containment / mask_qc"]
-  N --> O{"mask verdict"}
-  O -->|fail| Z
-  O -->|pass/warn| P["semantic_consistency"]
-  P --> R{"semantic verdict"}
-  R -->|fail| Z
-  R -->|pass/warn| S["manual_review"]
-  S --> Q["batch_statistics"]
+  A["拉取完成并创建 asset JSON"] --> B["hdf5_text_info"]
+  B --> BG{"result gate"}
+  BG -->|fail| Z["停止 QC并转 batch_statistics"]
+  BG -->|pass or warn| C["quality_hand"]
+  C --> CG{"result gate"}
+  CG -->|fail| Z
+  CG -->|pass or warn| D["keypoint_presence"]
+  D --> DG{"result gate"}
+  DG -->|fail| Z
+  DG -->|pass or warn| E["keypoint_morphology"]
+  E --> EG{"result gate"}
+  EG -->|fail| Z
+  EG -->|pass or warn| F["keypoint_temporal"]
+  F --> FG{"result gate"}
+  FG -->|fail| Z
+  FG -->|pass or warn| G["video_quality"]
+  G --> GG{"result gate"}
+  GG -->|fail| Z
+  GG -->|pass or warn| H["sam3_containment"]
+  H --> HG{"result gate"}
+  HG -->|fail| Z
+  HG -->|pass or warn| I["semantic_consistency"]
+  I --> IG{"result gate"}
+  IG -->|fail| Z
+  IG -->|pass or warn| J["manual_review routing"]
+  J --> JG{"manual required"}
+  JG -->|yes| K["人工复核并写回 JSON"]
+  JG -->|no| L["继续后续批次检查"]
+  K --> KR{"human verdict"}
+  KR -->|reject| Z
+  KR -->|accept or accept_with_risk| L
+  L --> M["duplicate_check"]
+  M --> N["content_validity"]
+  N --> O["effective_duration"]
+  O --> P["完成单资产流程"]
+  P --> Q["batch_statistics 聚合"]
   Z --> Q
 ```
 
-核心规则：
+模块顺序以该资产顶层 `qc_config` 指向的版本化配置为准。流程图中的名称对应
+`configs/qc_acceptance.yaml` 当前顺序。
 
-- `pass`：记录模块结果，继续下一模块。
-- `warn`：记录 warn，追加 `manual_review.candidates`，继续下一模块。
-- `fail`：记录 fail，追加 `manual_review.failures_for_batch_stats`，停止后续 QC，`next_module = "batch_statistics"`。
-
-## 7.2 每个模块必须写的通用结构
-
-除 `manual_review` 和 `batch_statistics` 外，每个模块 block 都至少包含：
+## 5. 单资产 JSON 顶层合同
 
 ```json
 {
+  "schema_version": "asset_qc_report.v1",
+  "qc_config": {
+    "schema_version": "qc_acceptance_config_schema.v1",
+    "config_version": "qc_acceptance_v1.1.0",
+    "config_name": "acceptance_gate",
+    "config_path": "configs/qc_acceptance.yaml",
+    "config_hash": "sha256:..."
+  },
+  "asset_id": "episode_000123",
+  "report_revision": 7,
+  "pipeline_state": {
+    "status": "running",
+    "last_completed_module": "video_quality",
+    "next_module": "sam3_containment"
+  },
+  "overall_decision": null,
+  "issues": [],
+  "manual_review": {
+    "required": null,
+    "state": "not_evaluated",
+    "candidate_issue_ids": [],
+    "failures_for_batch_stats_issue_ids": []
+  },
+  "source_files": {},
+  "hdf5_text_info": {},
+  "quality_hand": {},
+  "keypoint_presence": {},
+  "keypoint_morphology": {},
+  "keypoint_temporal": {},
+  "video_quality": {},
+  "sam3_containment": {},
+  "semantic_consistency": {},
+  "duplicate_check": {},
+  "content_validity": {},
+  "effective_duration": {}
+}
+```
+
+模块尚未执行时可以没有对应 block，不要提前写空 block 冒充已运行。
+
+## 6. 流程状态
+
+### 6.1 顶层状态
+
+| `pipeline_state.status` | 含义 | `overall_decision` |
+|---|---|---|
+| `pending` | 已建档，等待第一个或下一个模块。 | `null` |
+| `running` | 自动/人工 QC 仍在执行。 | `null` |
+| `stopped` | 某个 gate fail，流程提前终止。 | `fail` |
+| `completed` | 所有应运行模块完成。 | `pass` 或 `warn` |
+
+`pending` 只表示流程状态，不表示质量。`warn` 是模块或最终质量结论，两者不能混用。
+
+### 6.2 模块 gate
+
+每个自动 QC block 必须写：
+
+```json
+{
+  "module_version": "module-specific-version",
   "flow": {
-    "module": "module_name",
     "entry_gate": {
       "state": "ready",
       "eligible": true,
@@ -151,1454 +173,379 @@ flowchart TD
       "upstream_continue": true
     },
     "result_gate": {
-      "verdict": "pass",
+      "verdict": "warn",
       "has_fail": false,
-      "has_warn": false
+      "has_warn": true
     },
     "exit_gate": {
       "state": "continue",
       "continue_to_next_module": true,
-      "next_module": "next_module_name",
-      "on_pass": "continue",
-      "on_warn": "record_warning_and_continue",
-      "on_fail": "stop_qc_and_record_batch_statistics"
+      "next_module": "next_module_name"
     }
   },
   "evaluation": {
-    "verdict": "pass",
-    "passed": true,
-    "continue_to_next_module": true,
-    "next_module": "next_module_name",
+    "decision": "warn",
     "reasons": [],
-    "warn_reasons": [],
-    "reason_details": [],
-    "warn_reason_details": []
+    "warn_reasons": ["stable_reason_code"],
+    "issue_ids": ["module_name:stable_reason_code:001"]
   },
   "metrics": {},
-  "evidence": {
-    "sidecar_paths": [],
-    "csv_paths": [],
-    "overlay_paths": []
-  }
+  "evidence": {}
 }
 ```
 
-配置版本不写在每个模块 block 内，而是写在 `<asset_id>.json` 顶层：
+### 6.3 Gate 转换表
+
+| 模块 verdict | issue | 出口 | 顶层状态 | 下一步 |
+|---|---|---|---|---|
+| `pass` | 无 | `continue` | `running` | 配置中的下一模块 |
+| `warn` | 生成 warn issue | `continue` | `running` | 配置中的下一模块 |
+| `fail` | 生成 fail issue | `stop_qc` | `stopped` | `batch_statistics` |
+| `skipped` | 视原因决定 | `continue` 或 `stop_qc` | 按策略 | 显式写出 |
+
+输入缺失若使模块无法完成必要检查，通常应生成 fail issue，而不是把 `skipped`
+当成无问题。可选模块被配置关闭时才使用普通 skipped。
+
+## 7. Issue 合同
+
+所有模块共享顶层 `issues` 数组。每个触发条件单独一个对象：
 
 ```json
 {
-  "qc_config": {
-    "schema_version": "qc_acceptance_config_schema.v1",
-    "config_version": "qc_acceptance_v1.0.0",
-    "config_name": "acceptance_gate",
-    "config_path": "configs/qc_acceptance.yaml",
-    "config_hash": "sha256:<computed_at_runtime>"
-  }
-}
-```
-
-新版本模块不得继续向模块 block 写入 `thresholds` 或模块级 `config_ref`。阈值通过 `qc_config.config_version + rule_id` 回查版本化配置。
-
-### 7.2.1 `entry_gate`
-
-| 字段 | 说明 |
-|---|---|
-| `state` | `ready`、`blocked`、`skipped`。 |
-| `eligible` | 当前模块是否应该运行。 |
-| `blocked_by_module` | 被哪个上游模块 fail 阻断。没有则为 `null`。 |
-| `required_inputs` | 当前模块需要的输入路径或 JSON 字段。 |
-| `missing_inputs` | 缺失的输入。缺失导致不能运行时必须写明。 |
-| `upstream_continue` | 上游 `exit_gate.continue_to_next_module` 的结果。 |
-
-如果上游已经 fail，当前模块可以不写 block；如果为了可观测性写 block，则必须：
-
-```json
-{
-  "flow": {
-    "entry_gate": {
-      "state": "blocked",
-      "eligible": false,
-      "blocked_by_module": "previous_module",
-      "upstream_continue": false
-    },
-    "result_gate": {
-      "verdict": "skipped",
-      "has_fail": false,
-      "has_warn": false
-    },
-    "exit_gate": {
-      "state": "stop_qc",
-      "continue_to_next_module": false,
-      "next_module": "batch_statistics"
-    }
-  }
-}
-```
-
-### 7.2.2 `result_gate`
-
-| verdict | 含义 |
-|---|---|
-| `pass` | 当前模块通过。 |
-| `warn` | 当前模块发现风险，但不阻断。写入人工候选。 |
-| `fail` | 当前模块 hard fail。停止后续 QC。 |
-| `skipped` | 没有运行，通常因为上游 fail 或输入缺失且策略为跳过。 |
-
-### 7.2.3 `exit_gate`
-
-| 字段 | 说明 |
-|---|---|
-| `state` | `continue`、`stop_qc`、`complete_qc`。 |
-| `continue_to_next_module` | 下一模块是否可以运行。 |
-| `next_module` | 下一模块名；fail 时统一为 `batch_statistics`。 |
-| `on_pass/on_warn/on_fail` | 当前模块对三类结果的处理策略。 |
-
-## 7.3 issue 明细标准
-
-所有 `reason_details`、`warn_reason_details`、`manual_review.candidates`、`manual_review.failures_for_batch_stats`、`manual_review.issues` 都使用同一类 issue 字段。
-
-```json
-{
-  "code": "quality_hand_low_ratio_above_warn",
+  "issue_id": "video_quality:fps_below_pass:001",
+  "code": "fps_below_pass",
   "severity": "warn",
-  "module": "quality_hand",
-  "issue_type": "quality_hand_low",
-  "metric": "quality_hand.low_quality_ratio",
-  "value": 0.18,
-  "comparison": ">",
-  "rule_id": "quality_hand.single_hand_low_quality",
-  "config_version": "qc_acceptance_v1.0.0",
-  "source_level": "asset",
-  "window_start_frame": null,
-  "window_end_frame": null,
-  "representative_frame": null,
-  "evidence_path": "quality_sidecars/quality_hand/408817.json",
-  "needs_manual_review": true
+  "module": "video_quality",
+  "issue_type": "low_fps",
+  "metric": "video_basic.fps",
+  "observed_value": 22.5,
+  "operator": "<",
+  "boundary_value": 24.0,
+  "rule_id": "video_quality.fps_below_pass",
+  "needs_manual_review": true,
+  "context": {}
 }
 ```
 
-必填字段：
+要求：
 
-| 字段 | 说明 |
-|---|---|
-| `code` | 稳定原因码，给程序判断用。 |
-| `severity` | `warn` 或 `fail`；人工结果里可用 `low/medium/high/critical`。 |
-| `module` | 产生问题的模块。 |
-| `issue_type` | 稳定问题类型。 |
-| `metric` | 对应有问题的指标名。 |
-| `value` | 实际值。 |
-| `comparison` | 比较关系，例如 `<`、`>`、`!=`。 |
-| `rule_id` | 稳定规则 ID，用于按配置版本回查阈值和判定语义。 |
-| `config_version` | 本次 QC 使用的配置版本。 |
-| `needs_manual_review` | 是否作为人工候选。warn 通常为 `true`，fail 通常进入批次统计。 |
+- 多个异常指标生成多个 issue。
+- `issue_id` 在单个 asset 内唯一且稳定。
+- `code` 用于 UI/报表展示映射，不能是任意自然语言。
+- `rule_id` 必须在统一 config 登记且全局唯一。
+- `observed_value` 和 `boundary_value` 可以是结构，但必须可 JSON 序列化。
+- 帧区间、可靠性、source path 等放入 `context`。
+- 模块 block 只保存 `issue_ids`，不复制完整 issue。
+- config 版本只写顶层 `qc_config`，issue 内不重复。
 
-推荐 `issue_type` 枚举：
+## 8. 人工质检输入与输出
+
+### 8.1 自动模块如何提供人工输入
+
+自动模块遇到 warn 时：
+
+1. 写顶层 warn issue。
+2. 设置 `needs_manual_review`。
+3. 将 `issue_id` 追加到 `manual_review.candidate_issue_ids`。
+4. 继续后续自动模块。
+
+自动模块 fail 时：
+
+1. 写顶层 fail issue。
+2. 将 `issue_id` 追加到
+   `manual_review.failures_for_batch_stats_issue_ids`。
+3. 设置 `manual_review.required=false`、
+   `manual_review.state=skipped_due_to_fail`。
+4. 停止后续 QC，直接进入批次统计。
+
+### 8.2 人工路由模块
+
+到达 `manual_review` 时，路由器只需要读取：
 
 ```text
-hdf5_text_invalid
-quality_hand_low
-keypoint_raw_invalid
-keypoint_static_morphology_abnormal
-keypoint_duplicate_or_collapsed
-keypoint_joint_angle_abnormal
-keypoint_low_quality_window
-temporal_jump
-severe_keypoint_offset
-strong_containment_mismatch
-side_view_mask_undersegmentation
-occlusion_or_mask_undersegmentation
-hand_out_of_frame
-projection_review
-skeleton_pose_hallucination
-video_blur
-video_exposure
-video_black_screen
-video_stutter
-semantic_mismatch
-duplicate_asset
-invalid_content
-low_effective_duration
-acceptable_minor_misalignment
-visual_skeleton_presence_mismatch
-unknown
+pipeline_state
+manual_review.candidate_issue_ids
+issues
+source_files
+各 issue 的 context/evidence path
+统一 config 的 manual_review 策略
 ```
 
-## 7.4 顶层 `qc_summary` 更新规则
-
-模块运行后必须同步更新 `qc_summary`。
-
-### pass
-
-- 追加 `completed_modules`。
-- 如果没有任何 warn/fail，则 `overall_verdict = "pass"`。
-- `status = "running"`。
-- `can_continue_qc = true`。
-- `next_module = 当前模块 exit_gate.next_module`。
-
-### warn
-
-- 追加 `completed_modules`。
-- 追加 `warn_modules`。
-- 追加 `warn_reasons` 和 `warn_reason_details`。
-- 追加同一批 issue 到 `manual_review.candidates`。
-- `overall_verdict = "warn"`。
-- `status = "running"`。
-- `can_continue_qc = true`。
-
-### fail
-
-- 追加 `completed_modules`。
-- 追加 `failed_modules`。
-- 追加 `reasons` 和 `reason_details`。
-- 追加同一批 issue 到 `manual_review.failures_for_batch_stats`。
-- `overall_verdict = "fail"`。
-- `status = "stopped"`。
-- `hard_failed = true`。
-- `first_failed_module` 如果为空，则写当前模块名。
-- `passed = false`。
-- `can_continue_qc = false`。
-- `next_module = "batch_statistics"`。
-- 后续 QC 模块不得继续运行。
-
-## 7.5 模块顺序和 block 名
-
-| 顺序 | block 名 | 当前来源 | 下一模块 |
-|---:|---|---|---|
-| 0 | `asset_profile` | 拉取/建档模块 | `hdf5_text_info` |
-| 1 | `hdf5_text_info` | HDF5 文本/结构检查 | `quality_hand` |
-| 2 | `quality_hand` | `label/quality_hand` 二元数组检查 | `keypoint_presence` |
-| 3 | `keypoint_presence` | 21 点存在性、NaN/Inf、原始结构检查 | `keypoint_morphology` |
-| 4 | `keypoint_morphology` | 静态 21 点手型几何/骨长/重叠点检查 | `keypoint_temporal` |
-| 5 | `keypoint_temporal` | jump、断点、抖动、旋转、候选窗口 | `video_quality` |
-| 6 | `video_quality` | 已实现 | `sam3_containment` |
-| 7 | `sam3_containment` | 自有/SAM mask 抽检复核 | `semantic_consistency` |
-| 8 | `semantic_consistency` | text_label 与图像/动作语义一致性 | `manual_review` |
-| 9 | `manual_review` | 人工质检模块 | `batch_statistics` |
-| 10 | `duplicate_check` | 全量阶段重复检查 | `content_validity` |
-| 11 | `content_validity` | 视频内容是否有效 | `effective_duration` |
-| 12 | `effective_duration` | 有效时长计算 | `batch_statistics` |
-
-说明：
-
-- 小批准入口径重点跑 1-9。
-- 当前批次全量拉取与台账阶段重点跑 10-12。
-- `batch_statistics` 是批次级聚合模块，不一定写入每条 JSON；如果写，也只写消费状态和最终归档状态。
-
-## 7.6 `asset_profile`
-
-### 目的
-
-拉取完成后创建 `<asset_id>.json`，保证后续所有模块都有稳定写入位置。
-
-### JSON block
+路由结果建议写：
 
 ```json
 {
-  "asset_profile": {
-    "flow": {
-      "module": "asset_profile",
-      "entry_gate": {
-        "state": "ready",
-        "eligible": true,
-        "blocked_by_module": null,
-        "required_inputs": ["source_files"],
-        "missing_inputs": [],
-        "upstream_continue": true
-      },
-      "result_gate": {
-        "verdict": "pass",
-        "has_fail": false,
-        "has_warn": false
-      },
-      "exit_gate": {
-        "state": "continue",
-        "continue_to_next_module": true,
-        "next_module": "hdf5_text_info"
-      }
-    },
-    "supplier_id": "xingjiguitu",
-    "batch_id": "XJGT_20260629",
-    "asset_id": "408817",
-    "created_at": "2026-07-09T00:00:00+08:00",
-    "source_files": {
-      "video": {
-        "path": "video/408817_video.mp4",
-        "exists": true
-      },
-      "hdf5": {
-        "path": "hdf5/408817_hdf5.hdf5",
-        "exists": true
-      }
-    }
-  }
+  "required": true,
+  "state": "queued",
+  "candidate_issue_ids": ["video_quality:fps_below_pass:001"],
+  "selected_issue_ids": ["video_quality:fps_below_pass:001"],
+  "failures_for_batch_stats_issue_ids": [],
+  "routing": {
+    "policy": "warn_or_sample",
+    "reason_codes": ["warn_issue_present"],
+    "sampled": false,
+    "queue_id": "manual-review-20260710-001"
+  },
+  "reviews": []
 }
 ```
 
-### fail 条件
+`required=null` 只允许出现在尚未到达人工路由时。路由完成后必须是布尔值。
 
-- `asset_id` 为空或无法唯一确定。
-- HDF5 和 video 都缺失。
-- 同一个 batch 内 `<asset_id>.json` 冲突。
+### 8.3 人工写回
 
-## 7.7 `hdf5_text_info`
-
-### 目的
-
-检查 HDF5 是否能打开、文本字段是否存在、`text_label` 是否能解析、基础字段是否完整。它不做骨骼点质量验收。
-
-### 输入
-
-- `source_files.hdf5.path`
-
-### JSON block
+每个被复核 issue 写一条结构化记录：
 
 ```json
 {
-  "hdf5_text_info": {
-    "flow": {},
-    "evaluation": {
-      "verdict": "pass",
-      "passed": true,
-      "continue_to_next_module": true,
-      "next_module": "quality_hand",
-      "reasons": [],
-      "warn_reasons": [],
-      "reason_details": [],
-      "warn_reason_details": []
-    },
-    "file_read": {
-      "hdf5_open_ok": true,
-      "metadata_read_ok": true,
-      "file_size_bytes": 123456789
-    },
-    "text_fields": {
-      "attributes": {},
-      "datasets": {
-        "/label/text_label": {
-          "scene": "kitchen",
-          "task": "pick cup",
-          "text_label": "pick up the red cup"
-        }
-      }
-    },
-    "required_fields": {
-      "scene": "present",
-      "task": "present",
-      "text_label": "present",
-      "action": "optional_missing"
-    },
-    "frame_count": {
-      "source": "/label/quality_hand",
-      "hdf5_frame_count": 908
-    },
-    "metrics": {
-      "parsed_text_field_count": 4,
-      "missing_required_field_count": 0,
-      "json_parse_error_count": 0
-    },
-    "rule_ids": [
-      "hdf5_text.missing_required_field",
-      "hdf5_text.missing_text_field"
-    ],
-    "evidence": {
-      "sidecar_paths": [],
-      "csv_paths": [],
-      "overlay_paths": []
-    }
-  }
+  "review_id": "review-000001",
+  "issue_id": "video_quality:fps_below_pass:001",
+  "reviewer": "reviewer_id",
+  "reviewed_at": "2026-07-10T10:00:00+08:00",
+  "verdict": "accept_issue",
+  "asset_action": "accept_with_risk",
+  "comment": "动作连续，低 FPS 对当前任务可接受。",
+  "evidence_paths": []
 }
 ```
 
-### 判定
-
-| 情况 | verdict |
-|---|---|
-| HDF5 打不开 | fail |
-| `text_label` 必填字段缺失 | fail |
-| JSON 文本解析失败 | fail |
-| 可选字段缺失 | warn |
-| 文本正常 | pass |
-
-## 7.8 `quality_hand`
-
-### 目的
-
-检查供应商提供的 `quality_hand` 二元数组是否存在、左右手字段是否可用、低质量帧比例是否异常。它只做粗筛，不判断 21 点位置是否准确。
-
-### 输入
-
-- HDF5 中的 `label/quality_hand` 或适配后的同义字段。
-
-### JSON block
-
-```json
-{
-  "quality_hand": {
-    "flow": {},
-    "evaluation": {
-      "verdict": "warn",
-      "passed": true,
-      "continue_to_next_module": true,
-      "next_module": "keypoint_presence",
-      "reasons": [],
-      "warn_reasons": ["quality_hand_low_ratio_above_warn"],
-      "reason_details": [],
-      "warn_reason_details": [
-        {
-          "code": "quality_hand_low_ratio_above_warn",
-          "severity": "warn",
-          "module": "quality_hand",
-          "issue_type": "quality_hand_low",
-          "metric": "quality_hand.low_quality_ratio",
-          "value": 0.18,
-          "comparison": ">",
-          "rule_id": "quality_hand.single_hand_low_quality",
-          "config_version": "qc_acceptance_v1.0.0",
-          "needs_manual_review": true
-        }
-      ]
-    },
-    "array_info": {
-      "path": "/label/quality_hand",
-      "present": true,
-      "shape": [908, 2],
-      "left_column": 0,
-      "right_column": 1
-    },
-    "metrics": {
-      "frame_count": 908,
-      "left_valid_ratio": 0.96,
-      "right_valid_ratio": 0.94,
-      "both_hands_low_quality_ratio": 0.02,
-      "low_quality_ratio": 0.18,
-      "missing_ratio": 0.0
-    },
-    "rule_ids": [
-      "quality_hand.invalid_shape",
-      "quality_hand.invalid_value",
-      "quality_hand.single_hand_low_quality",
-      "quality_hand.both_hands_low_quality"
-    ],
-    "evidence": {
-      "sidecar_paths": [],
-      "csv_paths": [],
-      "overlay_paths": []
-    }
-  }
-}
-```
-
-### 判定
-
-| 情况 | verdict |
-|---|---|
-| `quality_hand` 缺失或无法读取 | fail |
-| shape 不符合配置 | fail |
-| 低质量比例超过 fail 阈值 | fail |
-| 低质量比例超过 warn 阈值 | warn |
-| 正常 | pass |
-
-## 7.9 `keypoint_presence`
-
-### 目的
-
-检查 21 点原始数据是否存在、是否有 NaN/Inf、每帧有效点数量是否足够。这里仍然不做精细语义验收，只做原始可用性。
-
-### 输入
-
-- HDF5 中左右手 21 点。
-- 适配器输出的 canonical joint names。
-
-### JSON block
-
-```json
-{
-  "keypoint_presence": {
-    "flow": {},
-    "evaluation": {
-      "verdict": "pass",
-      "passed": true,
-      "continue_to_next_module": true,
-      "next_module": "keypoint_morphology",
-      "reasons": [],
-      "warn_reasons": [],
-      "reason_details": [],
-      "warn_reason_details": []
-    },
-    "keypoint_source": {
-      "coordinate_space": "camera_3d",
-      "expected_keypoints_per_hand": 21,
-      "hands": ["left", "right"],
-      "joint_name_source": "adapter"
-    },
-    "metrics": {
-      "frame_count": 908,
-      "left_valid_frame_ratio": 0.98,
-      "right_valid_frame_ratio": 0.97,
-      "valid_point_ratio": 0.99,
-      "missing_frame_ratio": 0.01,
-      "nan_count": 0,
-      "inf_count": 0,
-      "invalid_transform_count": 0,
-      "min_valid_points_per_hand": 21
-    },
-    "bad_segments": [],
-    "rule_ids": [
-      "keypoint_presence.missing_keypoint_field",
-      "keypoint_presence.too_few_valid_points",
-      "keypoint_presence.high_missing_frame_ratio",
-      "keypoint_presence.nan_or_inf"
-    ],
-    "evidence": {
-      "sidecar_paths": [],
-      "csv_paths": [],
-      "overlay_paths": []
-    }
-  }
-}
-```
-
-### 判定
-
-| 情况 | verdict |
-|---|---|
-| 21 点字段缺失 | fail |
-| NaN/Inf 出现在原始关键点 | fail |
-| 有效点数量严重不足 | fail |
-| 局部窗口缺点但未严重影响整条数据 | warn |
-| 正常 | pass |
-
-## 7.10 `keypoint_morphology`
-
-### 目的
-
-检查每帧 21 点手部骨骼的静态几何是否明显不合理。这个模块只看单帧手型形态，不做时间连续性、不做 mask 匹配、不判断动作语义。它来自 `tmp/integrate-colleague-acceptance-20260707` 相比 `feat/qc-modules` 新增的 `precheck/checks/keypoint_morphology.py`。
-
-### 输入
-
-- `keypoint_presence` 通过后的左右手 canonical 21 点。
-- `qc_common.keypoints` 中的 canonical joint names、finger chains、finger bones、angle triples。
-- 中心配置中的 `modules.keypoint_morphology` 阈值。
-
-### JSON block
-
-```json
-{
-  "keypoint_morphology": {
-    "flow": {},
-    "evaluation": {
-      "verdict": "warn",
-      "passed": true,
-      "continue_to_next_module": true,
-      "next_module": "keypoint_temporal",
-      "reasons": [],
-      "warn_reasons": ["static_hand_morphology_review"],
-      "reason_details": [],
-      "warn_reason_details": [
-        {
-          "code": "static_hand_morphology_review",
-          "severity": "warn",
-          "module": "keypoint_morphology",
-          "issue_type": "keypoint_static_morphology_abnormal",
-          "metric": "keypoint_morphology.left_bone_length_ratio_spread_p95",
-          "value": 3.6,
-          "comparison": ">=",
-          "rule_id": "keypoint_morphology.bone_length_ratio_spread",
-          "config_version": "qc_acceptance_v1.0.0",
-          "needs_manual_review": true
-        }
-      ]
-    },
-    "metrics": {
-      "method": "static_per_frame_21_point_hand_geometry",
-      "decision_basis": "fixed_config_thresholds",
-      "frame_count": 908,
-      "morphology_verdict": "review",
-      "which_thresholds_exceeded": [
-        "left:bone_length_ratio_spread_review"
-      ],
-      "left_valid_keypoint_count_min": 21,
-      "right_valid_keypoint_count_min": 21,
-      "left_bone_length_ratio_spread_p95": 3.6,
-      "right_bone_length_ratio_spread_p95": 2.1,
-      "left_normalized_bone_length_max_p95": 3.2,
-      "right_normalized_bone_length_max_p95": 2.7,
-      "left_zero_length_bone_count_max": 0,
-      "right_zero_length_bone_count_max": 0,
-      "left_duplicate_joint_pair_count_max": 0,
-      "right_duplicate_joint_pair_count_max": 0,
-      "left_collapsed_finger_count_max": 0,
-      "right_collapsed_finger_count_max": 0,
-      "left_joint_angle_violation_fraction_p95": 0.08,
-      "right_joint_angle_violation_fraction_p95": 0.03
-    },
-    "rule_ids": [
-      "keypoint_morphology.palm_scale_too_small",
-      "keypoint_morphology.bone_length_ratio_spread",
-      "keypoint_morphology.max_normalized_bone_length",
-      "keypoint_morphology.zero_length_bone_count",
-      "keypoint_morphology.duplicate_joint_pair_count",
-      "keypoint_morphology.collapsed_finger_count",
-      "keypoint_morphology.joint_angle_min_deg",
-      "keypoint_morphology.joint_angle_violation_fraction"
-    ],
-    "evidence": {
-      "sidecar_paths": ["qc_sidecars/keypoint_morphology/408817_summary.json"],
-      "csv_paths": [],
-      "overlay_paths": []
-    }
-  }
-}
-```
-
-### 判定
-
-| 情况 | verdict |
-|---|---|
-| 21 点不完整或 invalid | `not_applicable` 或由 `keypoint_presence` 提前 fail |
-| `palm_scale_too_small` | fail |
-| 骨长比例、归一化骨长、重复点、零长度骨骼、折叠手指达到 fail 阈值 | fail |
-| 上述指标达到 review 阈值但未达到 fail | warn |
-| 正常 | pass |
-
-### 写入 `manual_review.candidates`
-
-当 `morphology_verdict = "review"` 时，必须把异常统计转成 `manual_review.candidates[]`。建议映射：
-
-- `bone_length_ratio_spread_review`、`max_normalized_bone_length_review` -> `keypoint_static_morphology_abnormal`
-- `duplicate_joint_pair_count_review`、`zero_length_bone_count_review` -> `keypoint_duplicate_or_collapsed`
-- `joint_angle_min_deg_review`、`joint_angle_violation_fraction_review` -> `keypoint_joint_angle_abnormal`
-
-当 `morphology_verdict = "fail"` 时，写入 `manual_review.failures_for_batch_stats`，并停止后续 QC。
-
-## 7.11 `keypoint_temporal`
-
-### 目的
-
-检查 21 点连续性、jump、断点、抖动、旋转异常、侧视/姿态导致的人工候选窗口。该模块主要产生人工候选，不应轻易 hard fail。
-
-### 输入
-
-- `keypoint_morphology` 通过或 warn 后的 canonical keypoints。
-- 可选 rotations、cam_pose、fps。
-
-### JSON block
-
-```json
-{
-  "keypoint_temporal": {
-    "flow": {},
-    "evaluation": {
-      "verdict": "warn",
-      "passed": true,
-      "continue_to_next_module": true,
-      "next_module": "video_quality",
-      "reasons": [],
-      "warn_reasons": ["temporal_candidate_windows_present"],
-      "reason_details": [],
-      "warn_reason_details": [
-        {
-          "code": "temporal_candidate_windows_present",
-          "severity": "warn",
-          "module": "keypoint_temporal",
-          "issue_type": "temporal_jump",
-          "metric": "keypoint_temporal.candidate_window_count",
-          "value": 2,
-          "comparison": ">",
-          "rule_id": "keypoint_temporal.composite_frame_verdict",
-          "config_version": "qc_acceptance_v1.0.0",
-          "needs_manual_review": true
-        }
-      ]
-    },
-    "metrics": {
-      "frame_count": 908,
-      "fps": 30.0,
-      "joint_displacement_m_max": 0.18,
-      "joint_acceleration_m_s2_max": 35.0,
-      "rotation_delta_max": 22.0,
-      "jitter_window_count": 1,
-      "candidate_window_count": 2
-    },
-    "candidate_windows": [
-      {
-        "window_start_frame": 120,
-        "window_end_frame": 150,
-        "representative_frame": 136,
-        "review_type": ["rotation_manual_review"],
-        "trigger_reason": ["rotation_delta_high"],
-        "trigger_metrics": {
-          "rotation_delta_max": 42.0
-        },
-        "needs_manual_review": true,
-        "sam3_containment_eligible": true
-      }
-    ],
-    "rule_ids": [
-      "keypoint_temporal.composite_frame_verdict",
-      "keypoint_temporal.skeleton_quality_score",
-      "keypoint_temporal.projection_review",
-      "keypoint_temporal.strong_temporal_failure"
-    ],
-    "evidence": {
-      "sidecar_paths": ["qc_sidecars/keypoint_temporal/408817_candidate_windows.json"],
-      "csv_paths": [],
-      "overlay_paths": []
-    }
-  }
-}
-```
-
-### 判定
-
-| 情况 | verdict |
-|---|---|
-| 原始关键点不可信，已经无法做连续性 | fail |
-| 明显物理不可能的巨大跳变 | fail |
-| 有 jump/抖动/侧视/旋转候选窗口 | warn |
-| 正常 | pass |
-
-### 写入 `manual_review.candidates`
-
-每个 `candidate_windows[]` 都应转换成一个 `manual_review.candidates[]` item。必须保留：
-
-- `module = "keypoint_temporal"`
-- `source_level = "window"`
-- `window_start_frame`
-- `window_end_frame`
-- `representative_frame`
-- `issue_type`
-- `metric/value/threshold/comparison`
-- `evidence_path`
-
-## 7.12 `sam3_containment`
-
-### 目的
-
-复核自有/SAM mask 与 21 点投影的一致性。它消费 keypoint 候选窗口，也可以对 pass 样本做抽样。该模块可以生成 sidecar，但主结果必须写回 `<asset_id>.json`。
-
-### 输入
-
-- `keypoint_temporal.candidate_windows`
-- 视频帧或抽帧路径。
-- SAM/self mask sidecar。
-- camera intrinsics 或投影结果。
-
-### JSON block
-
-```json
-{
-  "sam3_containment": {
-    "flow": {},
-    "evaluation": {
-      "verdict": "warn",
-      "passed": true,
-      "continue_to_next_module": true,
-      "next_module": "semantic_consistency",
-      "reasons": [],
-      "warn_reasons": ["side_view_manual_review"],
-      "reason_details": [],
-      "warn_reason_details": [
-        {
-          "code": "side_view_manual_review",
-          "severity": "warn",
-          "module": "sam3_containment",
-          "issue_type": "side_view_mask_undersegmentation",
-          "metric": "sam3_containment.inside_ratio_mean",
-          "value": 0.42,
-          "comparison": "<",
-          "rule_id": "sam3_containment.side_view_manual_review",
-          "config_version": "qc_acceptance_v1.0.0",
-          "window_start_frame": 464,
-          "window_end_frame": 502,
-          "representative_frame": 480,
-          "needs_manual_review": true
-        }
-      ]
-    },
-    "metrics": {
-      "sampled_window_count": 4,
-      "checked_frame_count": 80,
-      "inside_ratio_mean": 0.73,
-      "strong_fail_frame_count": 0,
-      "projection_review_frame_count": 2,
-      "acceptable_frame_count": 78,
-      "mask_available_ratio": 0.98
-    },
-    "window_results": [
-      {
-        "window_start_frame": 464,
-        "window_end_frame": 502,
-        "representative_frame": 480,
-        "window_containment_verdict": "side_view_manual_review",
-        "inside_ratio_mean": 0.42,
-        "strong_fail_frame_count": 0,
-        "source_review_type": ["side_view_manual_review"],
-        "source_needs_manual_review": true,
-        "source_sam3_containment_eligible": false,
-        "reason": "side-view hand orientation makes SAM containment unreliable"
-      }
-    ],
-    "rule_ids": [
-      "sam3_containment.strong_containment_mismatch",
-      "sam3_containment.side_view_manual_review",
-      "sam3_containment.projection_review"
-    ],
-    "evidence": {
-      "sidecar_paths": [
-        "qc_sidecars/sam3_containment/408817_window_summary.json"
-      ],
-      "csv_paths": [],
-      "overlay_paths": [
-        "review_assets/overlays/408817_464_502.png"
-      ]
-    }
-  }
-}
-```
-
-### 判定
-
-| 情况 | verdict |
-|---|---|
-| mask 大面积不可用，且无法复核 | warn 或 fail，按配置 |
-| 强 containment mismatch 且不是侧视/遮挡可解释 | fail |
-| 侧视、旋转、投影边界、轻微 mismatch | warn |
-| 正常 | pass |
-
-## 7.13 `semantic_consistency`
-
-### 目的
-
-检查 `text_label` 与图像/动作是否一致。它可以使用 LLM/VLM 或轻量规则，不要求在当前阶段跑重模型，但 JSON block 要先固定。
-
-### 输入
-
-- `hdf5_text_info.text_fields`
-- 视频抽帧或关键窗口。
-- 可选 mask/keypoint evidence。
-
-### JSON block
-
-```json
-{
-  "semantic_consistency": {
-    "flow": {},
-    "evaluation": {
-      "verdict": "warn",
-      "passed": true,
-      "continue_to_next_module": true,
-      "next_module": "manual_review",
-      "reasons": [],
-      "warn_reasons": ["semantic_object_mismatch"],
-      "reason_details": [],
-      "warn_reason_details": [
-        {
-          "code": "semantic_object_mismatch",
-          "severity": "warn",
-          "module": "semantic_consistency",
-          "issue_type": "semantic_mismatch",
-          "metric": "semantic_consistency.object_match_score",
-          "value": 0.45,
-          "comparison": "<",
-          "rule_id": "semantic_consistency.object_mismatch",
-          "config_version": "qc_acceptance_v1.0.0",
-          "needs_manual_review": true
-        }
-      ]
-    },
-    "text_label_snapshot": {
-      "scene": "kitchen",
-      "task": "pick red cup",
-      "objects": ["red cup"],
-      "action": "pick"
-    },
-    "metrics": {
-      "scene_match_score": 0.90,
-      "object_match_score": 0.45,
-      "action_match_score": 0.70,
-      "no_action_duration_sec": 0.3
-    },
-    "model_info": {
-      "method": "vlm_or_rule",
-      "model_name": "configured_by_runtime",
-      "prompt_version": "semantic_consistency_v1"
-    },
-    "sampled_frames": [
-      {
-        "frame_idx": 120,
-        "image_path": "review_assets/frames/408817_120.jpg",
-        "observation": "red cup not visible"
-      }
-    ],
-    "rule_ids": [
-      "semantic_consistency.object_mismatch",
-      "semantic_consistency.action_mismatch"
-    ],
-    "evidence": {
-      "sidecar_paths": [],
-      "csv_paths": [],
-      "overlay_paths": []
-    }
-  }
-}
-```
-
-### 判定
-
-| 情况 | verdict |
-|---|---|
-| 明确 text_label 和视频内容完全不一致 | fail |
-| 物体/动作/场景低置信不一致 | warn |
-| 正常 | pass |
-
-## 7.14 `manual_review`
-
-### 目的
-
-人工模块不重新跑 QC。它只做三件事：
-
-1. 读取 `manual_review.candidates`。
-2. 结合 pass sample 策略决定 `required`。
-3. 将人工结果写入 `manual_review.issues` 和 `manual_review.flow`。
-
-### 输入
-
-- `manual_review.candidates`
-- `manual_review.pass_sample_eligible`
-- 可选 pass sample 抽样规则。
-- 人工导出的 `manual_labels.csv`。
-
-### JSON block
-
-```json
-{
-  "manual_review": {
-    "state": "completed",
-    "required": true,
-    "selection_policy": "manual_review_module_decides_from_warn_candidates",
-    "candidates": [],
-    "failures_for_batch_stats": [],
-    "selected_items": [
-      {
-        "review_id": "supplier_a_408817_464_502_0001",
-        "source_module": "sam3_containment",
-        "issue_type": "side_view_mask_undersegmentation",
-        "window_start_frame": 464,
-        "window_end_frame": 502
-      }
-    ],
-    "issues": [
-      {
-        "module": "manual_review",
-        "source_module": "sam3_containment",
-        "review_id": "supplier_a_408817_464_502_0001",
-        "asset_id": "408817",
-        "source_level": "window",
-        "window_start_frame": 464,
-        "window_end_frame": 502,
-        "representative_frame": 480,
-        "auto_verdict": "fail",
-        "issue_type": "side_view_mask_undersegmentation",
-        "failure_mode": "side_view_mask_undersegmentation",
-        "severity": "medium",
-        "confidence": "high",
-        "label": "positive",
-        "manual_outcome": "true_positive",
-        "suggested_issue_type": "side_view_mask_undersegmentation",
-        "reason_code": "manual_review_confirmed_issue",
-        "reason": "side-view hand orientation makes SAM containment unreliable",
-        "comment": "confirmed by reviewer",
-        "reviewer": "reviewer_name",
-        "needs_manual_review": false
-      }
-    ],
-    "pass_sample_eligible": false,
-    "reviewed_count": 1,
-    "flow": {
-      "module": "manual_review",
-      "entry_gate": {
-        "state": "ready",
-        "eligible": true,
-        "blocked_by_module": null,
-        "required_inputs": [
-          "manual_review.candidates",
-          "manual_review.pass_sample_eligible"
-        ],
-        "missing_inputs": []
-      },
-      "result_gate": {
-        "verdict": "fail",
-        "has_fail": true,
-        "has_warn": false
-      },
-      "exit_gate": {
-        "state": "stop_qc",
-        "continue_to_next_module": false,
-        "next_module": "batch_statistics"
-      }
-    }
-  }
-}
-```
-
-### 人工结果枚举
-
-| 字段 | 枚举 |
-|---|---|
-| `manual_outcome` | `true_positive`、`false_positive`、`acceptable_flagged`、`partial`、`review`、`false_negative` |
-| `label` | `positive`、`acceptable_flagged`、`review` |
-| `failure_mode` | 使用 issue_type 枚举 |
-| `severity` | `low`、`medium`、`high`、`critical` |
-| `confidence` | `low`、`medium`、`high` |
-
-### 判定
-
-| 人工结果 | 对最终 QC 的影响 |
-|---|---|
-| `true_positive` | 人工确认问题，通常置为 fail。 |
-| `partial` | 部分确认，按配置 fail 或 warn。 |
-| `false_positive` | 自动问题误报，不影响通过。 |
-| `acceptable_flagged` | 有问题但可接受，记 risk/warn。 |
-| `false_negative` | 人工发现漏检，置为 fail。 |
-
-## 7.15 `duplicate_check`
-
-### 目的
-
-全量阶段检查重复数据、重复片段、重复 asset_id、重复文件指纹。
-
-### 输入
-
-- `asset_id`
-- HDF5/video 文件路径。
-- 文件 hash、视频 perceptual hash、时间戳、text_label hash。
-
-### JSON block
-
-```json
-{
-  "duplicate_check": {
-    "flow": {},
-    "evaluation": {
-      "verdict": "pass",
-      "passed": true,
-      "continue_to_next_module": true,
-      "next_module": "content_validity",
-      "reasons": [],
-      "warn_reasons": [],
-      "reason_details": [],
-      "warn_reason_details": []
-    },
-    "fingerprints": {
-      "hdf5_sha256": "abc",
-      "video_sha256": "def",
-      "text_label_hash": "ghi",
-      "video_phash": "jkl"
-    },
-    "metrics": {
-      "duplicate_group_size": 1,
-      "max_video_similarity": 0.12,
-      "time_overlap_ratio": 0.0
-    },
-    "duplicates": [],
-    "rule_ids": [
-      "duplicate_check.exact_hash_duplicate",
-      "duplicate_check.high_similarity_duplicate"
-    ],
-    "evidence": {
-      "sidecar_paths": [],
-      "csv_paths": [],
-      "overlay_paths": []
-    }
-  }
-}
-```
-
-### 判定
-
-| 情况 | verdict |
-|---|---|
-| 同一文件 hash 重复 | fail |
-| 高相似视频且时间/文本高度重叠 | fail |
-| 疑似重复但证据不足 | warn |
-| 无重复 | pass |
-
-## 7.16 `content_validity`
-
-### 目的
-
-判断视频内容是否有效。比如 text_label 描述动作，但视频里长时间无关、无动作、空镜、无手、目标物不存在。
-
-### 输入
-
-- `video_quality`
-- `semantic_consistency`
-- 可选人工/模型抽帧结果。
-
-### JSON block
-
-```json
-{
-  "content_validity": {
-    "flow": {},
-    "evaluation": {
-      "verdict": "warn",
-      "passed": true,
-      "continue_to_next_module": true,
-      "next_module": "effective_duration",
-      "reasons": [],
-      "warn_reasons": ["invalid_content_segment_present"],
-      "reason_details": [],
-      "warn_reason_details": []
-    },
-    "metrics": {
-      "total_duration_sec": 30.0,
-      "invalid_content_duration_sec": 1.6,
-      "invalid_content_ratio": 0.053,
-      "no_action_duration_sec": 1.2,
-      "no_hand_visible_duration_sec": 0.4
-    },
-    "invalid_segments": [
-      {
-        "start_frame": 120,
-        "end_frame": 156,
-        "duration_sec": 1.2,
-        "reason": "no action related to text_label"
-      }
-    ],
-    "rule_ids": [
-      "content_validity.invalid_content_segment",
-      "content_validity.mostly_invalid_content"
-    ],
-    "evidence": {
-      "sidecar_paths": [],
-      "csv_paths": [],
-      "overlay_paths": []
-    }
-  }
-}
-```
-
-### 判定
-
-| 情况 | verdict |
-|---|---|
-| 无效内容占比极高 | fail |
-| 无关内容超过配置阈值 | warn |
-| 正常 | pass |
-
-## 7.17 `effective_duration`
-
-### 目的
-
-计算结算/台账用的有效时长。总时长减去无效内容、重复片段、hard fail 片段。
-
-### 输入
-
-- `video_quality.metadata.duration_seconds`
-- `content_validity.invalid_segments`
-- `duplicate_check.duplicates`
-- 人工质检确认的无效片段。
-
-### JSON block
-
-```json
-{
-  "effective_duration": {
-    "flow": {},
-    "evaluation": {
-      "verdict": "pass",
-      "passed": true,
-      "continue_to_next_module": true,
-      "next_module": "batch_statistics",
-      "reasons": [],
-      "warn_reasons": [],
-      "reason_details": [],
-      "warn_reason_details": []
-    },
-    "metrics": {
-      "total_duration_sec": 30.0,
-      "invalid_duration_sec": 1.6,
-      "duplicate_duration_sec": 0.0,
-      "effective_duration_sec": 28.4,
-      "effective_ratio": 0.947
-    },
-    "deducted_segments": [
-      {
-        "source_module": "content_validity",
-        "start_frame": 120,
-        "end_frame": 156,
-        "duration_sec": 1.2,
-        "reason": "no action related to text_label"
-      }
-    ],
-    "rule_ids": [
-      "effective_duration.no_effective_duration",
-      "effective_duration.low_effective_ratio"
-    ],
-    "evidence": {
-      "sidecar_paths": [],
-      "csv_paths": [],
-      "overlay_paths": []
-    }
-  }
-}
-```
-
-### 判定
-
-| 情况 | verdict |
-|---|---|
-| 有效时长为 0 | fail |
-| 有效比例低于 warn 阈值 | warn |
-| 正常 | pass |
-
-## 7.18 `batch_statistics`
-
-### 目的
-
-批次统计模块从 `quality_archive/*.json` 聚合，不是单条数据 QC 的前置模块。
-
-### 输入
-
-- 整个 batch 的 `quality_archive/*.json`。
-
-### 输出
-
-允许输出：
+允许的 issue verdict：
 
 ```text
-reports/batch_qc_ledger.csv
-reports/issue_events.csv
-reports/supplier_issue_frequency.csv
-reports/batch_report.md
-reports/batch_report.xlsx
+accept_issue
+reject_issue
+unable_to_determine
 ```
 
-如果需要在单条 JSON 中记录已被批次统计消费，可以写：
-
-```json
-{
-  "batch_statistics": {
-    "consumed": true,
-    "batch_id": "XJGT_20260629",
-    "final_asset_verdict": "pass",
-    "risk_level": "low",
-    "top_issue_types": [],
-    "effective_duration_sec": 28.4
-  }
-}
-```
-
-但批次统计不得覆盖前面模块的原始结果。
-
-## 7.19 sidecar、CSV、ledger 的定位
-
-| 类型 | 是否主报告 | 用途 |
-|---|---|---|
-| `<asset_id>.json` | 是 | 单条数据全流程 QC source of truth。 |
-| sidecar JSON | 否 | 大量 frame/window 明细、模型输出、overlay 索引。主 JSON 只引用路径和摘要。 |
-| CSV | 否 | 给人工或表格工具查看的派生文件。 |
-| ledger events | 否 | 从主 JSON 聚合出来的批次级事件表。 |
-| batch report | 否 | 从主 JSON 聚合出来的批次报告。 |
-
-## 7.20 统一配置文件
-
-### 目的
-
-当前各模块阈值分散在视频 QC 配置、precheck dataclass、`configs/precheck_example.yaml`、SAM/mask 配置和人工队列脚本里。后续应收敛成一个版本化中心配置，作为 QC pipeline 的唯一运行配置入口。
-
-建议路径：
+允许的资产动作：
 
 ```text
-configs/qc_acceptance.yaml
+accept
+accept_with_risk
+reject
+return_for_rework
 ```
 
-### 设计原则
+人工模块完成时：
 
-- 中心配置负责运行时读取和阈值管理。
-- 每条 `<asset_id>.json` 顶层必须保存 `qc_config`，记录本次使用的配置版本、路径和 hash。
-- 后续调阈值只改中心配置，不在模块代码里散落硬编码。
-- 如果配置升级导致阈值或判定语义变化，必须更新 `config_version`。
-- 模块 block 不再复制 `thresholds`，也不再写模块级 `config_ref`。
-- 批次统计按 `qc_config.config_version + rule_id` 回查配置，解释历史结果。
+- 所有 selected issue 都必须有 review。
+- `state=completed`。
+- 写 reviewer、时间和最终 `asset_action`。
+- 人工结论不得删除或篡改机器 issue 的观测值。
+- `reject` / `return_for_rework` 使流程停止并形成 fail。
+- `accept` / `accept_with_risk` 继续配置中的下一模块。
 
-### 建议结构
+## 9. 各模块写入要求
 
-```yaml
-schema_version: qc_acceptance_config_schema.v1
-config_version: qc_acceptance_v1.0.0
-config_name: acceptance_gate
-config_date: "2026-07-09"
+以下均为其他模块同事的实现合同；视频模块除外。
 
-pipeline:
-  stop_on_fail: true
-  default_start_module: hdf5_text_info
-  terminal_module: batch_statistics
-  modules:
-    - hdf5_text_info
-    - quality_hand
-    - keypoint_presence
-    - keypoint_morphology
-    - keypoint_temporal
-    - video_quality
-    - sam3_containment
-    - semantic_consistency
-    - manual_review
-    - duplicate_check
-    - content_validity
-    - effective_duration
+### 9.1 `hdf5_text_info`
 
-json_report:
-  root_dir_name: quality_archive
-  config_field_name: qc_config
-  write_config_reference_at_top_level: true
-  write_module_threshold_snapshot: false
-  preserve_unknown_fields: true
-  write_config_hash: true
-  module_block_rules:
-    write_thresholds: false
-    write_config_ref: false
-    write_rule_ids: true
+必须写：
 
-modules: {}
-batch_statistics: {}
+- HDF5 是否可打开、文本字段是否可读取；
+- `scene`、`task` 及可选 `text_label/text_en/action/subtask` 的源值；
+- 缺失字段、类型错误和解析错误 issue；
+- HDF5 相对路径与 dataset 路径；
+- flow、evaluation、metrics、evidence。
+
+不得让视频模块代写该 block。
+
+### 9.2 `quality_hand`
+
+必须写：
+
+- 原始 `quality_hand` 值；
+- shape、左右手映射和合法值检查；
+- 单手低质量/both hands 低质量 issue；
+- 统计值和源 dataset 路径。
+
+### 9.3 `keypoint_presence`
+
+必须写：
+
+- 左右手期望点数和每帧有效点数；
+- 缺失帧比例、NaN/Inf 数量、连续缺失窗口；
+- 每个异常的区间或帧索引证据；
+- 是否达到 warn/fail 边界。
+
+### 9.4 `keypoint_morphology`
+
+必须写：
+
+- 骨长、掌宽、关节角等启用指标；
+- 异常手侧、关节、帧区间；
+- 归一化口径和参考配置 rule ID；
+- 聚合异常比例及 gate 结论。
+
+### 9.5 `keypoint_temporal`
+
+必须写：
+
+- jump、断点、抖动、漂移、长时间静止等已启用指标；
+- 帧区间、时长和 hand side；
+- 可区分关键点数据静止与视频 confirmed freeze 的证据。
+
+### 9.6 `video_quality` 已实现
+
+当前实现写：
+
+- 基础视频可用性、FPS、显示分辨率；
+- PTS 连续性、估算缺帧、抽样解码；
+- 黑帧、过暗、过曝；
+- 全帧 Laplacian/Tenengrad 清晰度代理；
+- low-motion、freeze candidate、confirmed freeze、冻结区间；
+- 视频状态与 HDF5 motion conflict；
+- 总瑕疵时长比例；
+- HDF5 帧数对齐；
+- gate、顶层 issue、manual candidate 和 pipeline state。
+
+视频模块不计算手部 ROI，也不写 HDF5 文本、关键点质量、mask 或语义 block。
+`should_run_mask_qc` 仅为兼容字段，跨模块运行以 exit gate 为准。
+
+### 9.7 `sam3_containment`
+
+必须写：
+
+- 抽样策略和抽中的 frame/window；
+- hand/object mask 可用率；
+- containment、IoU、边界距离等实际启用指标；
+- 风险区间与 overlay/sidecar 相对路径；
+- 不把逐像素 mask 放进主 JSON。
+
+### 9.8 `semantic_consistency`
+
+必须写：
+
+- 输入 text 字段和模型/规则版本；
+- 图像/视频与 text 的匹配结论、置信度和理由码；
+- 抽样帧或证据路径；
+- 无法判断与明确不一致必须分开编码。
+
+### 9.9 `duplicate_check`
+
+必须写：
+
+- 使用的时间戳、asset ID、文件指纹或特征版本；
+- exact/near duplicate 类型；
+- matched asset IDs、相似度和重复区间；
+- 原始资产与保留/剔除建议。
+
+### 9.10 `content_validity`
+
+必须写：
+
+- 是否存在与任务无关的长片段；
+- 无效区间、时长、比例和 text/task 依据；
+- 有效/无效边界的证据路径；
+- 明确区分 unknown 与 invalid。
+
+### 9.11 `effective_duration`
+
+必须写：
+
+- 原始总时长；
+- 黑屏、冻结、重复、无效内容等扣减区间；
+- 区间去重合并后的扣减时长；
+- 最终有效时长和比例；
+- 扣减项引用来源 issue ID，避免重复扣除。
+
+## 10. 模块所有权与写回
+
+每个模块只能拥有：
+
+```text
+自己的 <module_name> block
+自己产生的顶层 issue
+自己 issue 对应的 manual_review ID 引用
+自己推进后的 pipeline_state
+report_revision + 1
 ```
 
-完整配置见 `configs/qc_acceptance.yaml`。该文件当前基于 `feat/qc-modules`，并对齐 `tmp/integrate-colleague-acceptance-20260707` 新增的 `keypoint_morphology`。
+不得：
 
-### JSON 顶层配置版本
+- 删除未知字段；
+- 删除其他模块 issue；
+- 重写其他模块 metrics；
+- 改变既有顶层 `qc_config`；
+- 把 revision 从旧值直接覆盖；
+- 未通过 schema 就落盘。
 
-每条 `<asset_id>.json` 顶层必须写：
+写回顺序：读取 -> 校验 config/revision -> 合并自己的内容 -> revision 加 1 ->
+schema 校验 -> 临时文件 `fsync` -> 原子替换。
+
+## 11. Sidecar、CSV 与 Ledger Events
+
+### 11.1 Sidecar
+
+sidecar 是模块的大体积明细文件，例如逐帧 SAM 指标或完整候选窗口。主 JSON 只写：
 
 ```json
 {
-  "qc_config": {
-    "schema_version": "qc_acceptance_config_schema.v1",
-    "config_version": "qc_acceptance_v1.0.0",
-    "config_name": "acceptance_gate",
-    "config_path": "configs/qc_acceptance.yaml",
-    "config_hash": "sha256:<computed_at_runtime>"
+  "evidence": {
+    "sidecar_paths": ["qc_evidence/sam3/episode_000123.json"]
   }
 }
 ```
 
-模块 warn/fail 明细必须写 `rule_id` 和 `config_version`。需要解释阈值时，通过 `config_version + rule_id` 回查中心配置。历史 JSON 中如果已有 `thresholds` 字段，新读逻辑可以兼容，但新模块不得继续写入。
+它不是第二份主质检报告。
 
-## 8. Release Plan
+### 11.2 CSV
 
-### V1: 统一写入 helper
+CSV 是队列或批次表格视图，例如 review queue。它必须可由 asset JSON 重建，不能
+保存 JSON 中没有的唯一结论。
 
-实现共享工具，建议放在 `qc_common/asset_qc_report.py`：
+### 11.3 Ledger Events
 
-- `load_asset_qc_report(path)`
-- `write_asset_qc_report(path, report)`
-- `build_module_flow(module, verdict, next_module, required_inputs, missing_inputs, upstream_continue)`
-- `append_module_result(report, module, block, issues)`
-- `append_manual_candidates(report, issues)`
-- `append_failures_for_batch_stats(report, issues)`
-- `mark_stopped(report, module, issues)`
+ledger event 是“模块开始、结束、重试、写回”等事件日志，用于审计和监控。最终
+质量事实仍写回 asset JSON；事件日志不能作为人工质检唯一输入。
 
-验收：
+## 12. 批次统计
 
-- 更新 JSON 时保留未知字段。
-- fail/warn/pass 三种路径都有单元测试。
-- 同一 issue 重跑不会无限重复追加。
+`batch_statistics` 不再运行高成本 QC，只聚合：
 
-### V1.5: 统一配置 loader
+- `overall_decision` 和停止模块；
+- pass/warn/fail 数量；
+- issue code/type/rule ID 频率；
+- 人工结论、返工项和风险项；
+- 重复率、无效时长、有效时长；
+- config version/hash 分布；
+- 供应商、scene、task 等分层结果。
 
-实现共享配置工具，建议放在 `qc_common/qc_config.py`：
+批次统计必须保留 asset ID 和 issue ID 追溯链。
 
-- `load_qc_acceptance_config(path)`
-- `resolve_module_config(config, module_name)`
-- `compute_config_hash(config_path)`
-- `build_top_level_qc_config(config, config_path)`
-- `resolve_rule(config, rule_id)`
+## 13. 开发验收清单
 
-验收：
+每个同事提交模块时必须证明：
 
-- pipeline 顺序、模块阈值、人工抽样策略都来自 `configs/qc_acceptance.yaml`。
-- 每条 JSON 顶层写入 `qc_config`。
-- 每个 warn/fail 明细写入 `rule_id` 和 `config_version`。
-- 模块 block 不再写入新的 `thresholds` 或模块级 `config_ref`。
-- 旧模块配置可以先通过 adapter 映射到中心配置，避免一次性大重构。
+- [ ] 从统一 config 读取自己的阈值和 rule ID。
+- [ ] entry/result/exit gate 完整。
+- [ ] pass/warn/fail 与本 PRD 一致。
+- [ ] warn 继续，fail 停止并转 batch statistics。
+- [ ] 每个异常生成独立 issue，包含实际值和边界。
+- [ ] 模块只引用 issue ID，不复制 issue detail。
+- [ ] 保留未知字段和其他模块 block。
+- [ ] revision 冲突会失败，不会静默覆盖。
+- [ ] 写入前通过 JSON Schema。
+- [ ] 使用原子写入。
+- [ ] 单元测试覆盖 pass、warn、fail、blocked、重复写入和 config 不一致。
+- [ ] 文档示例与真实 writer 输出一致。
 
-### V2: precheck 模块接入主 JSON
+## 14. 当前提交边界
 
-改造：
+本次可合并内容：
 
-- `hdf5_text_info`
-- `quality_hand`
-- `keypoint_presence`
-- `keypoint_morphology`
-- `keypoint_temporal`
+- 统一 config loader 和 schema；
+- `qc_acceptance_v1.1.0` 活动/归档配置；
+- `asset_qc_report.v1` schema 和安全 writer；
+- 新 `video_quality` gate、issue、config 和 JSON 输出；
+- 本 PRD、统一 config PRD 和视频使用文档。
 
-验收：
+本次不包含：
 
-- 旧的 clip aggregates / candidate windows 可以继续输出，但必须同步写回 `<asset_id>.json`。
-- `manual_review.candidates` 中能看到 keypoint morphology 的静态形态问题和 keypoint temporal 的窗口问题。
-- fail 后不会继续进入后续模块。
+- HDF5 文本、`quality_hand`、关键点、SAM3、语义、人工、重复、内容有效性、
+  有效时长模块的源码改造；
+- 全流程 orchestrator；
+- 人工 review UI。
 
-### V3: SAM3/mask 模块接入主 JSON
-
-改造：
-
-- `sam3_containment`
-- `visual_coverage_sidecar` 消费端
-
-验收：
-
-- sidecar 仍可保存 frame 级明细。
-- 主 JSON 有窗口级摘要、问题数值、overlay 路径。
-- strong fail、side-view warn、projection review 都能正确写入。
-
-### V4: 语义一致性和人工质检闭环
-
-改造：
-
-- `semantic_consistency`
-- `manual_review`
-
-验收：
-
-- 人工模块只读 `manual_review.candidates` 和 pass sample 策略。
-- 人工结果写回 `manual_review.issues`。
-- 人工确认 fail 后，`qc_summary.status = "stopped"`，`next_module = "batch_statistics"`。
-
-### V5: 批次统计只读主 JSON
-
-改造：
-
-- `build_batch_qc_ledger.py`
-- `build_manual_review_queue.py`
-- `build_batch_qc_report.py`
-
-验收：
-
-- 只输入 `quality_archive/` 能生成完整 ledger、issue events、Excel/Markdown 报告。
-- 旧 sidecar/CSV 输入仅作为兼容 fallback。
-
-## 9. Acceptance Criteria
-
-1. 每个模块都有自己的 block。
-2. 每个模块 block 都有 `flow.entry_gate`、`flow.result_gate`、`flow.exit_gate`。
-3. 每个 warn 都能在 `manual_review.candidates` 找到对应 issue 和具体数值。
-4. 每个 fail 都能在 `manual_review.failures_for_batch_stats` 找到对应 issue 和具体数值。
-5. fail 后后续 QC 模块不运行，`pipeline_state.next_module = "batch_statistics"`。
-6. 人工质检完成后，人工结果写回 `manual_review.issues`。
-7. 批次统计能从 `quality_archive/*.json` 聚合出完整质量报告。
-8. 旧 sidecar/CSV 不再是主报告，只能作为证据路径或兼容输入。
-9. 每条 JSON 顶层写入 `qc_config`，可追溯中心配置版本和配置 hash。
-10. 新模块 block 不再写入 `thresholds` 或模块级 `config_ref`。
-
-## 10. Implementation Notes
-
-- 模块写 JSON 时，先读取旧 JSON，修改自己的 block，再写回。
-- 不要在模块之间直接 import 业务逻辑。模块之间通过 JSON 和文件路径通信。
-- 旧字段可以保留，但新逻辑优先读标准 block。
-- `qc_summary.overall_verdict` 是累计摘要，不是下一模块唯一入口。
-- 下一模块应优先读上一模块 `flow.exit_gate.continue_to_next_module`。
-- 所有路径建议相对 batch 根目录。
-- 所有阈值只由版本化 `configs/qc_acceptance.yaml` 管理，JSON 通过 `qc_config.config_version` 追溯。
-- 所有问题都必须带 `metric`、`value`、`comparison`、`rule_id`、`config_version`，人工质检不能只看到一句原因。
+这些由对应同事按本 PRD 后续提交。
