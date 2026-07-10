@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 import yaml
 from openpyxl import Workbook, load_workbook
 
@@ -19,6 +20,7 @@ from tools.build_weekly_supplier_acceptance_report import (
     acceptance_and_review_status,
     add_manual_threshold_sheet,
     aggregate_manual_review,
+    build_abnormal_source_rows,
     build_weekly_report,
     collect_input_audit,
     count_fail_indicators,
@@ -267,6 +269,244 @@ def test_abnormal_source_decomposition_segment_coverage_is_not_global_recall() -
     assert "global_recall" not in result
     assert result["evaluation_scope"] == "auto_triggered_review_only"
     assert result["blind_manual_auto_recall"] == "not_measurable"
+
+
+def test_stage_funnels_require_exact_windows_and_hand_side() -> None:
+    temporal_rows = [
+        {
+            "asset_id": "1001_video.mp4",
+            "start_frame": 0,
+            "end_frame": 9,
+            "hand_side": "left",
+            "check": "keypoint_temporal",
+        },
+        {
+            "asset_id": "1001",
+            "start_frame": 20,
+            "end_frame": 29,
+            "hand_side": "right",
+            "review_type": ["temporal_geometry_review"],
+        },
+        {
+            "asset_id": "1001",
+            "start_frame": 40,
+            "end_frame": 49,
+            "check": "keypoint_morphology",
+        },
+    ]
+    sam3_rows = [
+        {
+            "asset_id": "1001",
+            "window_start_frame": 0,
+            "window_end_frame": 9,
+            "hand_side": "left",
+            "window_containment_verdict": "review",
+        },
+        {
+            "asset_id": "1001",
+            "window_start_frame": 20,
+            "window_end_frame": 29,
+            "hand_side": "left",
+            "window_containment_verdict": "review",
+        },
+        {
+            "asset_id": "1001",
+            "window_start_frame": 25,
+            "window_end_frame": 34,
+            "hand_side": "right",
+            "window_containment_verdict": "containment_fail",
+        },
+    ]
+    submitted_rows = [
+        {
+            "review_id": "queue-1",
+            "asset_id": "1001",
+            "window_start_frame": 0,
+            "window_end_frame": 9,
+            "hand_side": "left",
+            "module": "sam3_containment",
+            "source_level": "window",
+        },
+        {
+            "review_id": "queue-hand-mismatch",
+            "asset_id": "1001",
+            "window_start_frame": 20,
+            "window_end_frame": 29,
+            "hand_side": "right",
+            "module": "sam3_containment",
+            "source_level": "window",
+        },
+        {
+            "review_id": "queue-manual-only",
+            "asset_id": "1001",
+            "window_start_frame": 50,
+            "window_end_frame": 59,
+            "module": "precheck",
+            "source_level": "window",
+        },
+        {
+            "review_id": "queue-overlap-only",
+            "asset_id": "1001",
+            "window_start_frame": 5,
+            "window_end_frame": 14,
+            "module": "precheck",
+            "source_level": "window",
+        },
+    ]
+    manual_rows = [
+        {
+            "review_id": "queue-1",
+            "asset_id": "different-stale-id",
+            "window_start_frame": 100,
+            "window_end_frame": 109,
+            "affected_start_frame": 2,
+            "affected_end_frame": 4,
+            "manual_outcome": "true_positive",
+        },
+        {
+            "asset_id": "1001.0",
+            "window_start_frame": 50,
+            "window_end_frame": 59,
+            "manual_outcome": "false_positive",
+        },
+        {
+            "asset_id": "1001",
+            "window_start_frame": 21,
+            "window_end_frame": 28,
+            "manual_outcome": "acceptable_flagged",
+        },
+    ]
+
+    result = decompose_abnormal_sources(
+        asset_id="1001",
+        temporal_rows=temporal_rows,
+        sam3_rows=sam3_rows,
+        manual_rows=manual_rows,
+        submitted_rows=submitted_rows,
+        total_frames=100,
+    )
+
+    assert result["precheck_temporal_candidate_frame_count"] == 20
+    assert result["precheck_to_sam3_frame_count"] == 10
+    assert result["precheck_to_sam3_frame_ratio"] == 0.5
+    assert result["sam3_processed_frame_count"] == 25
+    assert result["sam3_to_manual_frame_count"] == 10
+    assert result["sam3_to_manual_frame_ratio"] == 0.4
+    assert result["manual_submitted_frame_count"] == 35
+    assert result["manual_reviewed_frame_count"] == 20
+    assert result["manual_true_positive_frame_count"] == 3
+    assert result["manual_true_problem_to_submitted_ratio"] == 3 / 35
+    assert result["manual_true_problem_to_reviewed_ratio"] == 0.15
+
+
+def test_stage_funnel_zero_denominators_are_not_applicable() -> None:
+    result = decompose_abnormal_sources(
+        asset_id="1001",
+        temporal_rows=[],
+        sam3_rows=[],
+        manual_rows=[],
+        submitted_rows=[],
+        total_frames=100,
+    )
+
+    assert result["precheck_to_sam3_frame_ratio"] == "not_applicable"
+    assert result["sam3_to_manual_frame_ratio"] == "not_applicable"
+    assert result["manual_true_problem_to_submitted_ratio"] == "not_applicable"
+    assert result["manual_true_problem_to_reviewed_ratio"] == "not_applicable"
+
+
+def test_sam3_to_manual_prefers_matching_review_id_over_stale_window() -> None:
+    result = decompose_abnormal_sources(
+        asset_id="1001",
+        temporal_rows=[],
+        sam3_rows=[
+            {
+                "review_id": "shared-review-id",
+                "asset_id": "1001",
+                "window_start_frame": 10,
+                "window_end_frame": 19,
+                "window_containment_verdict": "review",
+            }
+        ],
+        submitted_rows=[
+            {
+                "review_id": "shared-review-id",
+                "asset_id": "stale-asset",
+                "window_start_frame": 50,
+                "window_end_frame": 59,
+                "module": "sam3_containment",
+                "source_level": "window",
+            }
+        ],
+        manual_rows=[],
+        total_frames=100,
+    )
+
+    assert result["sam3_processed_frame_count"] == 10
+    assert result["sam3_to_manual_frame_count"] == 10
+    assert result["sam3_to_manual_frame_ratio"] == 1.0
+
+
+def test_supplier_funnel_ratios_use_summed_counts_not_mean_asset_ratios() -> None:
+    fields = {
+        "manual_tp_frame_count": 0,
+        "manual_tp_segment_count": 0,
+        "temporal_hit_manual_tp_frame_count": 0,
+        "sam3_hit_manual_tp_frame_count": 0,
+        "auto_union_hit_manual_tp_frame_count": 0,
+        "manual_tp_missed_by_auto_frame_count": 0,
+        "temporal_hit_manual_tp_segment_count": 0,
+        "sam3_hit_manual_tp_segment_count": 0,
+        "auto_union_hit_manual_tp_segment_count": 0,
+        "manual_tp_segment_missed_by_auto_count": 0,
+        "reviewed_auto_candidate_frame_count": 0,
+        "reviewed_auto_true_positive_frame_count": 0,
+        "reviewed_auto_false_positive_frame_count": 0,
+        "reviewed_auto_acceptable_frame_count": 0,
+        "blind_manual_frame_count": 0,
+        "blind_manual_problem_frame_count": 0,
+        "blind_manual_auto_detected_frame_count": 0,
+    }
+    details = [
+        {
+            "_source_decomposition": {
+                **fields,
+                "precheck_temporal_candidate_frame_count": 10,
+                "precheck_to_sam3_frame_count": 10,
+                "sam3_processed_frame_count": 10,
+                "sam3_to_manual_frame_count": 10,
+                "manual_submitted_frame_count": 10,
+                "manual_reviewed_frame_count": 10,
+                "manual_true_positive_frame_count": 10,
+            }
+        },
+        {
+            "_source_decomposition": {
+                **fields,
+                "precheck_temporal_candidate_frame_count": 90,
+                "precheck_to_sam3_frame_count": 0,
+                "sam3_processed_frame_count": 90,
+                "sam3_to_manual_frame_count": 0,
+                "manual_submitted_frame_count": 90,
+                "manual_reviewed_frame_count": 90,
+                "manual_true_positive_frame_count": 0,
+            }
+        },
+    ]
+
+    xjgt = build_abnormal_source_rows(details)[0]
+
+    assert xjgt["precheck_temporal_candidate_frame_count"] == 100
+    assert xjgt["precheck_to_sam3_frame_count"] == 10
+    assert xjgt["precheck_to_sam3_frame_ratio"] == 0.1
+    assert xjgt["sam3_processed_frame_count"] == 100
+    assert xjgt["sam3_to_manual_frame_count"] == 10
+    assert xjgt["sam3_to_manual_frame_ratio"] == 0.1
+    assert xjgt["manual_submitted_frame_count"] == 100
+    assert xjgt["manual_reviewed_frame_count"] == 100
+    assert xjgt["manual_true_positive_frame_count"] == 10
+    assert xjgt["manual_true_problem_to_submitted_ratio"] == 0.1
+    assert xjgt["manual_true_problem_to_reviewed_ratio"] == 0.1
 
 
 def test_manual_review_origin_survives_deduped_patch_row() -> None:
@@ -1118,30 +1358,59 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "problem_frame_count",
     ):
         assert column in detail_headers
-    assert detail_headers[:8] == [
+    assert detail_headers[:14] == [
         "asset_id",
         "total_frames",
         "text_check_status",
         "skeleton_static_status",
         "video_quality_status",
         "abnormal_frame_status",
+        "precheck_temporal_status",
+        "sam3_containment_status",
+        "manual_review_status",
+        "precheck_to_sam3_frame_ratio",
+        "sam3_to_manual_frame_ratio",
+        "manual_true_problem_to_submitted_ratio",
         "fail_indicator_count",
         "acceptance_status",
     ]
-    assert detail_headers[:12] == [
-        "asset_id",
-        "total_frames",
-        "text_check_status",
-        "skeleton_static_status",
-        "video_quality_status",
-        "abnormal_frame_status",
-        "fail_indicator_count",
-        "acceptance_status",
+    assert detail_headers[14:18] == [
         "abnormal_frame_status_v2",
         "acceptance_status_v2",
         "review_status_v2",
         "text_field_present_scene_status",
     ]
+    assert "temporal_status" not in detail_headers
+    assert detail_headers.count("precheck_temporal_status") == 1
+    detail_sheet = workbook["星际归途"]
+    status_fills = {
+        detail_sheet.cell(1, detail_headers.index(column) + 1).fill.fgColor.rgb
+        for column in (
+            "precheck_temporal_status",
+            "sam3_containment_status",
+            "manual_review_status",
+        )
+    }
+    ratio_fills = {
+        detail_sheet.cell(1, detail_headers.index(column) + 1).fill.fgColor.rgb
+        for column in (
+            "precheck_to_sam3_frame_ratio",
+            "sam3_to_manual_frame_ratio",
+            "manual_true_problem_to_submitted_ratio",
+        )
+    }
+    assert len(status_fills) == 1
+    assert len(ratio_fills) == 1
+    assert status_fills != ratio_fills
+    for column in (
+        "precheck_to_sam3_frame_ratio",
+        "sam3_to_manual_frame_ratio",
+        "manual_true_problem_to_submitted_ratio",
+    ):
+        assert (
+            detail_sheet.cell(2, detail_headers.index(column) + 1).number_format
+            == "0.00%"
+        )
     assert [
         column
         for column in detail_headers
@@ -1173,7 +1442,7 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "skeleton_morphology_status"
     )
     assert detail_headers.index("abnormal_frame_status") < detail_headers.index(
-        "temporal_status"
+        "precheck_temporal_status"
     )
     rows = list(workbook["星际归途"].iter_rows(min_row=2, values_only=True))
     columns = {name: index for index, name in enumerate(detail_headers)}
@@ -1229,7 +1498,7 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1001"][columns["frame_count_status"]] == "ok"
     assert by_asset["1001"][columns["manual_problem_frame_count"]] == 10
     assert by_asset["1001"][columns["manual_problem_frame_ratio_of_clip"]] == 0.1
-    assert by_asset["1001"][columns["manual_reviewed_frame_count"]] == 100
+    assert by_asset["1001"][columns["manual_reviewed_frame_count"]] == 50
     assert by_asset["1001"][columns["manual_problem_ratio_of_reviewed"]] == 0.1
     assert by_asset["1001"][columns["manual_review_status"]] == "fail"
     assert by_asset["1001"][columns["text_check_status"]] == "fail"
@@ -1237,7 +1506,7 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1001"][columns["skeleton_missing_status"]] == "fail"
     assert by_asset["1001"][columns["skeleton_morphology_status"]] == "pass"
     assert by_asset["1001"][columns["supplier_quality_signal"]] == "provided_ok"
-    assert by_asset["1001"][columns["temporal_status"]] == "review"
+    assert by_asset["1001"][columns["precheck_temporal_status"]] == "review"
     assert by_asset["1001"][columns["skeleton_static_fail_frame_count"]] == 10
     assert by_asset["1001"][columns["skeleton_static_fail_frame_ratio"]] == 0.1
     assert by_asset["1001"][columns["skeleton_static_status"]] == "fail"
@@ -1261,12 +1530,21 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1001"][columns["manual_true_positive_frame_count"]] == 10
     assert by_asset["1001"][columns["temporal_sam3_manual_overlap_frame_count"]] == 10
     assert by_asset["1001"][columns["problem_frame_count"]] == 50
+    assert by_asset["1001"][columns["precheck_temporal_candidate_frame_count"]] == 50
+    assert by_asset["1001"][columns["precheck_to_sam3_frame_count"]] == 50
+    assert by_asset["1001"][columns["precheck_to_sam3_frame_ratio"]] == 1.0
+    assert by_asset["1001"][columns["sam3_processed_frame_count"]] == 50
+    assert by_asset["1001"][columns["sam3_to_manual_frame_count"]] == 50
+    assert by_asset["1001"][columns["sam3_to_manual_frame_ratio"]] == 1.0
+    assert by_asset["1001"][columns["manual_submitted_frame_count"]] == 50
+    assert by_asset["1001"][columns["manual_true_problem_to_submitted_ratio"]] == 0.2
+    assert by_asset["1001"][columns["manual_true_problem_to_reviewed_ratio"]] == 0.2
 
     assert by_asset["1002"][columns["total_frames"]] == 200
     assert by_asset["1002"][columns["frame_count_status"]] == "ok"
     assert by_asset["1002"][columns["manual_problem_frame_count"]] == 10
     assert by_asset["1002"][columns["manual_problem_frame_ratio_of_clip"]] == 0.05
-    assert by_asset["1002"][columns["manual_reviewed_frame_count"]] == 150
+    assert by_asset["1002"][columns["manual_reviewed_frame_count"]] == 0
     assert by_asset["1002"][columns["manual_problem_ratio_of_reviewed"]] == 10 / 150
     assert by_asset["1002"][columns["manual_review_status"]] == "pass"
     assert by_asset["1002"][columns["text_check_status"]] == "pass"
@@ -1301,6 +1579,20 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1002"][columns["auto_union_frame_count"]] == 100
     assert by_asset["1002"][columns["manual_tp_not_detected_by_auto_frame_count"]] == 10
     assert by_asset["1002"][columns["problem_frame_count"]] == 110
+    assert by_asset["1002"][columns["precheck_temporal_candidate_frame_count"]] == 100
+    assert by_asset["1002"][columns["precheck_to_sam3_frame_count"]] == 0
+    assert by_asset["1002"][columns["precheck_to_sam3_frame_ratio"]] == 0.0
+    assert by_asset["1002"][columns["sam3_processed_frame_count"]] == 60
+    assert by_asset["1002"][columns["sam3_to_manual_frame_count"]] == 60
+    assert by_asset["1002"][columns["sam3_to_manual_frame_ratio"]] == 1.0
+    assert by_asset["1002"][columns["manual_submitted_frame_count"]] == 60
+    assert by_asset["1002"][
+        columns["manual_true_problem_to_submitted_ratio"]
+    ] == pytest.approx(1 / 6)
+    assert (
+        by_asset["1002"][columns["manual_true_problem_to_reviewed_ratio"]]
+        == "not_applicable"
+    )
 
     assert by_asset["1003"][columns["total_frames"]] == 100
     assert by_asset["1003"][columns["frame_count_status"]] == "ok"
@@ -1350,6 +1642,21 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     }
     xjgt_source = decomposition_rows["星际归途 / XJGT"]
     assert xjgt_source[source_columns["evaluation_scope"]] == "auto_triggered_review_only"
+    assert xjgt_source[source_columns["precheck_temporal_candidate_frame_count"]] == 171
+    assert xjgt_source[source_columns["precheck_to_sam3_frame_count"]] == 71
+    assert xjgt_source[
+        source_columns["precheck_to_sam3_frame_ratio"]
+    ] == pytest.approx(71 / 171)
+    assert xjgt_source[source_columns["sam3_processed_frame_count"]] == 131
+    assert xjgt_source[source_columns["sam3_to_manual_frame_count"]] == 131
+    assert xjgt_source[source_columns["sam3_to_manual_frame_ratio"]] == 1.0
+    assert xjgt_source[source_columns["manual_submitted_frame_count"]] == 131
+    assert xjgt_source[source_columns["manual_reviewed_frame_count"]] == 50
+    assert xjgt_source[source_columns["manual_true_positive_frame_count"]] == 20
+    assert xjgt_source[
+        source_columns["manual_true_problem_to_submitted_ratio"]
+    ] == pytest.approx(20 / 131)
+    assert xjgt_source[source_columns["manual_true_problem_to_reviewed_ratio"]] == 0.4
     assert xjgt_source[source_columns["manual_tp_frame_count"]] == 20
     assert xjgt_source[source_columns["manual_tp_segment_count"]] == 2
     assert xjgt_source[source_columns["temporal_hit_manual_tp_frame_count"]] == 10
