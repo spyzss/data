@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import subprocess
@@ -13,19 +12,13 @@ from typing import Any
 import cv2
 import h5py
 import numpy as np
-import yaml
+from qc_common.config import load_qc_acceptance_config
 
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi"}
 LAPLACIAN_LOW_DETAIL_THRESHOLD = 100.0
 DARK_PIXEL_Y_THRESHOLD = 20
 OVER_EXPOSED_PIXEL_Y_THRESHOLD = 245
-QC_CONFIG_SCHEMA_VERSION = "qc_acceptance_config_schema.v1"
-QC_CONFIG_VERSION = "qc_acceptance_v1.0.0"
-QC_CONFIG_NAME = "acceptance_gate"
-QC_CONFIG_RELATIVE_PATH = Path("configs/qc_acceptance.yaml")
-
-
 class AlignmentMode(StrEnum):
     IGNORE = "ignore"
     WARN = "warn"
@@ -223,7 +216,8 @@ class HandRoiConfig:
 
 @dataclass(frozen=True)
 class VideoQualityConfig:
-    threshold_version: str = "video_prefilter_v0.3.2"
+    module_version: str = ""
+    qc_config_reference: dict[str, str] = field(default_factory=dict)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     fps: FpsConfig = field(default_factory=FpsConfig)
     resolution: ResolutionConfig = field(default_factory=ResolutionConfig)
@@ -375,7 +369,7 @@ class ReasonDetail:
     value: Any | None = None
     comparison: str | None = None
     rule_id: str | None = None
-    config_version: str = QC_CONFIG_VERSION
+    config_version: str | None = None
     context: dict[str, Any] = field(default_factory=dict)
 
 
@@ -449,70 +443,30 @@ def _merge_dataclass(default_obj: Any, raw: dict[str, Any], section: str) -> Any
             values[item.name] = _merge_dataclass(current, incoming or {}, f"{section}.{item.name}")
         elif isinstance(current, AlignmentMode):
             values[item.name] = AlignmentMode(str(incoming).lower())
+        elif isinstance(current, tuple):
+            values[item.name] = tuple(incoming)
         else:
             values[item.name] = incoming
 
     return type(default_obj)(**values)
 
 
-def _apply_legacy_config(raw: dict[str, Any]) -> dict[str, Any]:
-    migrated = dict(raw)
-    if "sample_count" in migrated:
-        migrated.setdefault("decode", {})["max_sample_frames"] = int(migrated.pop("sample_count"))
-    if "alignment_mode" in migrated:
-        migrated.setdefault("hdf5_alignment", {})["mode"] = migrated.pop("alignment_mode")
-    if "thresholds" in migrated:
-        thresholds = migrated.pop("thresholds") or {}
-        decode = migrated.setdefault("decode", {})
-        exposure = migrated.setdefault("exposure", {})
-        black = exposure.setdefault("black", {})
-        over_dark = exposure.setdefault("over_dark", {})
-        over_exposed = exposure.setdefault("over_exposed", {})
-        sharpness = migrated.setdefault("sharpness_global", {})
-        freeze = migrated.setdefault("freeze", {})
-        hdf5_alignment = migrated.setdefault("hdf5_alignment", {})
-
-        if "min_sample_decode_ratio" in thresholds:
-            decode["sample_decode_ratio_pass"] = thresholds["min_sample_decode_ratio"]
-        if "max_black_frame_ratio" in thresholds:
-            black["ratio_warn"] = thresholds["max_black_frame_ratio"]
-        if "max_mean_over_dark_ratio" in thresholds:
-            over_dark["ratio_warn"] = thresholds["max_mean_over_dark_ratio"]
-        if "max_mean_over_exposed_ratio" in thresholds:
-            over_exposed["ratio_warn"] = thresholds["max_mean_over_exposed_ratio"]
-        if "min_laplacian_p10" in thresholds:
-            sharpness["laplacian_p10_pass"] = thresholds["min_laplacian_p10"]
-        if "min_laplacian_median" in thresholds:
-            sharpness["laplacian_median_pass"] = thresholds["min_laplacian_median"]
-        if "max_laplacian_under_100_ratio" in thresholds:
-            sharpness["laplacian_under_100_ratio_pass"] = thresholds["max_laplacian_under_100_ratio"]
-        if "min_tenengrad_p10" in thresholds:
-            sharpness["tenengrad_p10_pass"] = thresholds["min_tenengrad_p10"]
-        if "min_tenengrad_median" in thresholds:
-            sharpness["tenengrad_median_pass"] = thresholds["min_tenengrad_median"]
-        if "max_frozen_frame_ratio" in thresholds:
-            freeze["frozen_frame_ratio_warn"] = thresholds["max_frozen_frame_ratio"]
-        if "fail_on_hdf5_frame_mismatch" in thresholds and not thresholds["fail_on_hdf5_frame_mismatch"]:
-            hdf5_alignment["mode"] = AlignmentMode.WARN.value
-
-    return migrated
-
-
 def load_video_quality_config(path: Path | None) -> VideoQualityConfig:
+    loaded = load_qc_acceptance_config(path)
+    module = loaded.raw["modules"]["video_quality"]
+    parameters = loaded.module_parameters("video_quality")
     default = VideoQualityConfig()
-    if path is None:
-        return default
-
-    with path.open("r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle) or {}
-    raw = _apply_legacy_config(raw)
-
     known = {item.name for item in fields(default)}
-    unknown = sorted(set(raw) - known)
+    unknown = sorted(set(parameters) - known)
     if unknown:
         raise ValueError(f"unknown video quality config key: {unknown[0]}")
 
-    config = _merge_dataclass(default, raw, "video_quality")
+    config = _merge_dataclass(default, parameters, "video_quality")
+    config = replace(
+        config,
+        module_version=str(module["module_version"]),
+        qc_config_reference=loaded.json_reference(),
+    )
     if config.decode.max_sample_frames < 1:
         raise ValueError("decode.max_sample_frames must be >= 1")
     return config
@@ -1641,6 +1595,7 @@ def _detail(
     fail_threshold: Any | None = None,
     comparison: str | None = None,
     rule_id: str | None = None,
+    config_version: str | None = None,
     context: dict[str, Any] | None = None,
 ) -> ReasonDetail:
     return ReasonDetail(
@@ -1650,7 +1605,7 @@ def _detail(
         value=value,
         comparison=comparison,
         rule_id=rule_id or f"video_quality.{code}",
-        config_version=QC_CONFIG_VERSION,
+        config_version=config_version,
         context=context or {},
     )
 
@@ -1684,6 +1639,7 @@ def _reason_details_for_codes(
                 pass_threshold=pass_threshold,
                 fail_threshold=fail_threshold,
                 comparison=comparison,
+                config_version=config.qc_config_reference["config_version"],
                 context=context,
             )
         )
@@ -2473,27 +2429,6 @@ def _archive_path(path: Path | None, batch_dir: Path | None) -> str | None:
         return str(path)
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _qc_config_hash() -> str | None:
-    path = _repo_root() / QC_CONFIG_RELATIVE_PATH
-    if not path.is_file():
-        return None
-    return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
-
-
-def _qc_config_json() -> dict[str, Any]:
-    return {
-        "schema_version": QC_CONFIG_SCHEMA_VERSION,
-        "config_version": QC_CONFIG_VERSION,
-        "config_name": QC_CONFIG_NAME,
-        "config_path": str(QC_CONFIG_RELATIVE_PATH),
-        "config_hash": _qc_config_hash(),
-    }
-
-
 def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConfig) -> dict[str, Any]:
     metrics = result.metrics
     alignment = result.alignment
@@ -2600,7 +2535,7 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
 
     return {
         "schema_version": "asset_qc_report.v1",
-        "qc_config": _qc_config_json(),
+        "qc_config": dict(config.qc_config_reference),
         "asset_id": metrics.asset_id,
         "source_files": {
             "video": {

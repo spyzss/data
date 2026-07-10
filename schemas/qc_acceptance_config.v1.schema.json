@@ -2,36 +2,22 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "qc_acceptance_config.v1.schema.json",
   "type": "object",
-  "required": [
-    "schema_version",
-    "config_version",
-    "config_name",
-    "pipeline",
-    "modules"
-  ],
+  "required": ["schema_version", "config_version", "config_name", "pipeline", "modules"],
   "properties": {
-    "schema_version": {
-      "const": "qc_acceptance_config_schema.v1"
-    },
+    "schema_version": {"const": "qc_acceptance_config_schema.v1"},
     "config_version": {
       "type": "string",
       "pattern": "^qc_acceptance_v[0-9]+\\.[0-9]+\\.[0-9]+$"
     },
-    "config_name": {
-      "const": "acceptance_gate"
-    },
+    "config_name": {"const": "acceptance_gate"},
     "pipeline": {
       "type": "object",
       "required": ["stop_on_fail", "modules"],
       "properties": {
-        "stop_on_fail": {
-          "const": true
-        },
+        "stop_on_fail": {"const": true},
         "modules": {
           "type": "array",
-          "items": {
-            "type": "string"
-          },
+          "items": {"type": "string"},
           "minItems": 1,
           "uniqueItems": true
         }
@@ -41,31 +27,319 @@
       "type": "object",
       "required": ["video_quality", "manual_review"],
       "properties": {
-        "video_quality": {
-          "type": "object",
-          "required": ["enabled", "rules"],
-          "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
-            "rules": {
-              "type": "object",
-              "minProperties": 1
-            }
-          }
-        },
+        "video_quality": {"$ref": "#/$defs/videoQuality"},
         "manual_review": {
           "type": "object",
           "required": ["enabled", "selection_policy"],
           "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
-            "selection_policy": {
-              "type": "string"
-            }
+            "enabled": {"type": "boolean"},
+            "selection_policy": {"type": "string"}
           }
         }
+      }
+    }
+  },
+  "$defs": {
+    "nonNegativeNumber": {"type": "number", "minimum": 0},
+    "positiveNumber": {"type": "number", "exclusiveMinimum": 0},
+    "ratio": {"type": "number", "minimum": 0, "maximum": 1},
+    "nonNegativeInteger": {"type": "integer", "minimum": 0},
+    "positiveInteger": {"type": "integer", "minimum": 1},
+    "videoQuality": {
+      "type": "object",
+      "required": ["enabled", "module_version", "parameters", "rules"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "module_version": {"type": "string", "minLength": 1},
+        "parameters": {"$ref": "#/$defs/videoParameters"},
+        "rules": {"type": "object", "minProperties": 1}
+      }
+    },
+    "videoParameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pipeline",
+        "fps",
+        "resolution",
+        "timeline",
+        "decode",
+        "exposure",
+        "sharpness_global",
+        "freeze",
+        "defects",
+        "hdf5_alignment"
+      ],
+      "properties": {
+        "pipeline": {"$ref": "#/$defs/videoPipeline"},
+        "fps": {"$ref": "#/$defs/fps"},
+        "resolution": {"$ref": "#/$defs/resolution"},
+        "timeline": {"$ref": "#/$defs/timeline"},
+        "decode": {"$ref": "#/$defs/decode"},
+        "exposure": {"$ref": "#/$defs/exposure"},
+        "sharpness_global": {"$ref": "#/$defs/sharpness"},
+        "freeze": {"$ref": "#/$defs/freeze"},
+        "defects": {"$ref": "#/$defs/defects"},
+        "hdf5_alignment": {"$ref": "#/$defs/hdf5Alignment"}
+      }
+    },
+    "videoPipeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stop_before_mask_if_fail",
+        "do_keypoint_quality_check",
+        "do_keypoint_mask_matching",
+        "do_keypoint_temporal_check"
+      ],
+      "properties": {
+        "stop_before_mask_if_fail": {"type": "boolean"},
+        "do_keypoint_quality_check": {"type": "boolean"},
+        "do_keypoint_mask_matching": {"type": "boolean"},
+        "do_keypoint_temporal_check": {"type": "boolean"}
+      }
+    },
+    "fps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected_fps", "min_fps_pass", "min_fps_warn", "min_fps_fail"],
+      "properties": {
+        "expected_fps": {
+          "oneOf": [{"$ref": "#/$defs/positiveNumber"}, {"type": "null"}]
+        },
+        "min_fps_pass": {"$ref": "#/$defs/nonNegativeNumber"},
+        "min_fps_warn": {"$ref": "#/$defs/nonNegativeNumber"},
+        "min_fps_fail": {"$ref": "#/$defs/nonNegativeNumber"}
+      }
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exact_resolution_required",
+        "use_display_size_after_rotation",
+        "min_short_side_fail",
+        "min_long_side_fail",
+        "min_short_side_warn",
+        "min_long_side_warn"
+      ],
+      "properties": {
+        "exact_resolution_required": {"type": "boolean"},
+        "use_display_size_after_rotation": {"type": "boolean"},
+        "min_short_side_fail": {"$ref": "#/$defs/nonNegativeInteger"},
+        "min_long_side_fail": {"$ref": "#/$defs/nonNegativeInteger"},
+        "min_short_side_warn": {"$ref": "#/$defs/nonNegativeInteger"},
+        "min_long_side_warn": {"$ref": "#/$defs/nonNegativeInteger"}
+      }
+    },
+    "timeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "use_actual_fps",
+        "drop_interval_factor",
+        "drop_interval_extra_ms",
+        "drop_frame_ratio_pass",
+        "drop_frame_ratio_warn",
+        "max_gap_factor",
+        "max_gap_floor_ms",
+        "pts_monotonic_required"
+      ],
+      "properties": {
+        "use_actual_fps": {"type": "boolean"},
+        "drop_interval_factor": {"$ref": "#/$defs/nonNegativeNumber"},
+        "drop_interval_extra_ms": {"$ref": "#/$defs/nonNegativeNumber"},
+        "drop_frame_ratio_pass": {"$ref": "#/$defs/ratio"},
+        "drop_frame_ratio_warn": {"$ref": "#/$defs/ratio"},
+        "max_gap_factor": {"$ref": "#/$defs/nonNegativeNumber"},
+        "max_gap_floor_ms": {"$ref": "#/$defs/nonNegativeNumber"},
+        "pts_monotonic_required": {"type": "boolean"}
+      }
+    },
+    "decode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_decode_ratio_pass",
+        "sample_decode_ratio_warn",
+        "max_sample_frames",
+        "sample_interval_sec",
+        "include_head_tail_frames"
+      ],
+      "properties": {
+        "sample_decode_ratio_pass": {"$ref": "#/$defs/ratio"},
+        "sample_decode_ratio_warn": {"$ref": "#/$defs/ratio"},
+        "max_sample_frames": {"$ref": "#/$defs/positiveInteger"},
+        "sample_interval_sec": {"$ref": "#/$defs/nonNegativeNumber"},
+        "include_head_tail_frames": {"$ref": "#/$defs/nonNegativeInteger"}
+      }
+    },
+    "exposure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["black", "over_dark", "over_exposed"],
+      "properties": {
+        "black": {"$ref": "#/$defs/blackExposure"},
+        "over_dark": {"$ref": "#/$defs/darkExposure"},
+        "over_exposed": {"$ref": "#/$defs/overExposure"}
+      }
+    },
+    "blackExposure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mean_y_max", "dark_pixel_ratio_min", "ratio_pass", "ratio_warn", "max_frame_count_fail"],
+      "properties": {
+        "mean_y_max": {"$ref": "#/$defs/nonNegativeNumber"},
+        "dark_pixel_ratio_min": {"$ref": "#/$defs/ratio"},
+        "ratio_pass": {"$ref": "#/$defs/ratio"},
+        "ratio_warn": {"$ref": "#/$defs/ratio"},
+        "max_frame_count_fail": {"$ref": "#/$defs/nonNegativeInteger"}
+      }
+    },
+    "darkExposure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mean_y_max", "dark_pixel_ratio_min", "ratio_pass", "ratio_warn"],
+      "properties": {
+        "mean_y_max": {"$ref": "#/$defs/nonNegativeNumber"},
+        "dark_pixel_ratio_min": {"$ref": "#/$defs/ratio"},
+        "ratio_pass": {"$ref": "#/$defs/ratio"},
+        "ratio_warn": {"$ref": "#/$defs/ratio"}
+      }
+    },
+    "overExposure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mean_y_min", "over_exposed_pixel_ratio_min", "ratio_pass", "ratio_warn"],
+      "properties": {
+        "mean_y_min": {"$ref": "#/$defs/nonNegativeNumber"},
+        "over_exposed_pixel_ratio_min": {"$ref": "#/$defs/ratio"},
+        "ratio_pass": {"$ref": "#/$defs/ratio"},
+        "ratio_warn": {"$ref": "#/$defs/ratio"}
+      }
+    },
+    "sharpness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "normalize_before_compute",
+        "target_short_side",
+        "no_upscale",
+        "laplacian_p10_pass",
+        "laplacian_p10_warn",
+        "laplacian_median_pass",
+        "laplacian_median_warn",
+        "laplacian_under_100_ratio_pass",
+        "laplacian_under_100_ratio_warn",
+        "tenengrad_p10_pass",
+        "tenengrad_p10_warn",
+        "tenengrad_median_pass",
+        "tenengrad_median_warn"
+      ],
+      "properties": {
+        "normalize_before_compute": {"type": "boolean"},
+        "target_short_side": {"$ref": "#/$defs/positiveInteger"},
+        "no_upscale": {"type": "boolean"},
+        "laplacian_p10_pass": {"$ref": "#/$defs/nonNegativeNumber"},
+        "laplacian_p10_warn": {"$ref": "#/$defs/nonNegativeNumber"},
+        "laplacian_median_pass": {"$ref": "#/$defs/nonNegativeNumber"},
+        "laplacian_median_warn": {"$ref": "#/$defs/nonNegativeNumber"},
+        "laplacian_under_100_ratio_pass": {"$ref": "#/$defs/ratio"},
+        "laplacian_under_100_ratio_warn": {"$ref": "#/$defs/ratio"},
+        "tenengrad_p10_pass": {"$ref": "#/$defs/nonNegativeNumber"},
+        "tenengrad_p10_warn": {"$ref": "#/$defs/nonNegativeNumber"},
+        "tenengrad_median_pass": {"$ref": "#/$defs/nonNegativeNumber"},
+        "tenengrad_median_warn": {"$ref": "#/$defs/nonNegativeNumber"}
+      }
+    },
+    "freeze": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "downscale_short_side",
+        "frame_diff_mean_abs_max",
+        "hist_diff_max",
+        "ssim_min",
+        "phash_hamming_max",
+        "freeze_candidate_window_sec",
+        "confirmed_freeze_window_sec",
+        "adjacent_near_duplicate_ratio_warn",
+        "frozen_frame_ratio_pass",
+        "frozen_frame_ratio_warn",
+        "min_interval_frames",
+        "min_interval_duration_ms",
+        "max_consecutive_frozen_sec_pass",
+        "max_consecutive_frozen_sec_fail",
+        "motion_conflict_enabled",
+        "motion_keypoint_delta_normalized_min",
+        "motion_keypoint_delta_px_min",
+        "motion_numeric_delta_min",
+        "critical_window_enabled",
+        "critical_window_keywords",
+        "critical_window_interval_duration_ms_fail",
+        "video_state_conflict_noncritical_duration_ms_fail",
+        "video_state_conflict_critical_duration_ms_fail"
+      ],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "downscale_short_side": {"$ref": "#/$defs/positiveInteger"},
+        "frame_diff_mean_abs_max": {"$ref": "#/$defs/nonNegativeNumber"},
+        "hist_diff_max": {"$ref": "#/$defs/nonNegativeNumber"},
+        "ssim_min": {"$ref": "#/$defs/ratio"},
+        "phash_hamming_max": {"$ref": "#/$defs/nonNegativeInteger"},
+        "freeze_candidate_window_sec": {"$ref": "#/$defs/nonNegativeNumber"},
+        "confirmed_freeze_window_sec": {"$ref": "#/$defs/nonNegativeNumber"},
+        "adjacent_near_duplicate_ratio_warn": {"$ref": "#/$defs/ratio"},
+        "frozen_frame_ratio_pass": {"$ref": "#/$defs/ratio"},
+        "frozen_frame_ratio_warn": {"$ref": "#/$defs/ratio"},
+        "min_interval_frames": {"$ref": "#/$defs/positiveInteger"},
+        "min_interval_duration_ms": {"$ref": "#/$defs/nonNegativeNumber"},
+        "max_consecutive_frozen_sec_pass": {"$ref": "#/$defs/nonNegativeNumber"},
+        "max_consecutive_frozen_sec_fail": {"$ref": "#/$defs/nonNegativeNumber"},
+        "motion_conflict_enabled": {"type": "boolean"},
+        "motion_keypoint_delta_normalized_min": {"$ref": "#/$defs/nonNegativeNumber"},
+        "motion_keypoint_delta_px_min": {"$ref": "#/$defs/nonNegativeNumber"},
+        "motion_numeric_delta_min": {"$ref": "#/$defs/nonNegativeNumber"},
+        "critical_window_enabled": {"type": "boolean"},
+        "critical_window_keywords": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "critical_window_interval_duration_ms_fail": {"$ref": "#/$defs/nonNegativeNumber"},
+        "video_state_conflict_noncritical_duration_ms_fail": {"$ref": "#/$defs/nonNegativeNumber"},
+        "video_state_conflict_critical_duration_ms_fail": {"$ref": "#/$defs/nonNegativeNumber"}
+      }
+    },
+    "defects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_duration_ratio_fail", "duration_ratio_warn"],
+      "properties": {
+        "max_duration_ratio_fail": {"$ref": "#/$defs/ratio"},
+        "duration_ratio_warn": {"$ref": "#/$defs/ratio"}
+      }
+    },
+    "hdf5Alignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "mode",
+        "max_delta_frames_pass",
+        "max_delta_frames_warn",
+        "max_delta_ratio_pass",
+        "max_delta_ratio_warn"
+      ],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "mode": {"enum": ["ignore", "warn", "fail"]},
+        "max_delta_frames_pass": {"$ref": "#/$defs/nonNegativeInteger"},
+        "max_delta_frames_warn": {"$ref": "#/$defs/nonNegativeInteger"},
+        "max_delta_ratio_pass": {"$ref": "#/$defs/ratio"},
+        "max_delta_ratio_warn": {"$ref": "#/$defs/ratio"}
       }
     }
   }

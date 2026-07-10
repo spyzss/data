@@ -1,10 +1,12 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 import pytest
 import h5py
+import yaml
 
 import acceptance_pull.video_quality as video_quality
 from acceptance_pull.video_quality import (
@@ -38,12 +40,22 @@ def slow_motion_frame(index: int, width: int = 128, height: int = 128) -> np.nda
     return frame
 
 
-def test_default_video_quality_config() -> None:
+def write_unified_video_config(tmp_path: Path, mutate: Callable[[dict[str, Any]], None]) -> Path:
+    raw = yaml.safe_load(Path("configs/qc_acceptance.yaml").read_text(encoding="utf-8"))
+    raw["config_version"] = "qc_acceptance_v1.1.1"
+    mutate(raw["modules"]["video_quality"]["parameters"])
+    path = tmp_path / "qc_acceptance.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return path
+
+
+def test_default_video_quality_config_comes_from_unified_config() -> None:
     config = load_video_quality_config(None)
 
-    assert config.threshold_version == "video_prefilter_v0.3.2"
+    assert config.module_version == "video_prefilter_v0.3.2"
+    assert config.qc_config_reference["config_version"] == "qc_acceptance_v1.1.0"
+    assert not hasattr(config, "threshold_version")
     assert config.pipeline.stop_before_mask_if_fail is True
-    assert config.pipeline.run_hand_roi is False
     assert config.pipeline.do_keypoint_quality_check is False
     assert config.fps.expected_fps is None
     assert config.fps.min_fps_pass == 24
@@ -91,40 +103,31 @@ def test_default_video_quality_config() -> None:
     assert config.defects.duration_ratio_warn == 0.05
     assert config.hdf5_alignment.mode == AlignmentMode.FAIL
     assert config.hdf5_alignment.max_delta_frames_pass == 2
-    assert config.hand_roi.enabled is False
-    assert config.hand_roi.mode == "warn_except_severe_fail"
-    assert config.hand_roi.use_keypoints_as_bbox_only is True
-    assert config.hand_roi.blur_bad_frame_ratio_pass == 0.50
-    assert config.hand_roi.blur_bad_frame_ratio_warn == 0.90
 
 
-def test_video_quality_config_yaml_override(tmp_path: Path) -> None:
-    path = tmp_path / "quality.yaml"
-    path.write_text(
-        """
-threshold_version: video_prefilter_v0.2-custom
-decode:
-  max_sample_frames: 4
-hdf5_alignment:
-  mode: warn
-fps:
-  expected_fps: 30
-resolution:
-  min_short_side_fail: 480
-hand_roi:
-  enabled: false
-""",
-        encoding="utf-8",
-    )
+def test_unified_video_threshold_override_changes_runtime_config(tmp_path: Path) -> None:
+    def mutate(parameters: dict[str, Any]) -> None:
+        parameters["fps"]["min_fps_pass"] = 26
+        parameters["decode"]["max_sample_frames"] = 4
+        parameters["hdf5_alignment"]["mode"] = "warn"
 
+    path = write_unified_video_config(tmp_path, mutate)
     config = load_video_quality_config(path)
 
-    assert config.threshold_version == "video_prefilter_v0.2-custom"
+    assert config.fps.min_fps_pass == 26
     assert config.decode.max_sample_frames == 4
     assert config.hdf5_alignment.mode == AlignmentMode.WARN
-    assert config.fps.expected_fps == 30
-    assert config.resolution.min_short_side_fail == 480
-    assert config.hand_roi.enabled is False
+    assert config.qc_config_reference["config_version"] == "qc_acceptance_v1.1.1"
+
+
+def test_unified_config_missing_video_parameters_is_rejected(tmp_path: Path) -> None:
+    raw = yaml.safe_load(Path("configs/qc_acceptance.yaml").read_text(encoding="utf-8"))
+    del raw["modules"]["video_quality"]["parameters"]["freeze"]
+    path = tmp_path / "missing-freeze.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="freeze"):
+        load_video_quality_config(path)
 
 
 def test_discover_batch_videos_requires_video_dir(tmp_path: Path) -> None:
@@ -422,9 +425,7 @@ def test_evaluate_video_quality_passes_good_metrics(tmp_path: Path) -> None:
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     metrics = analyze_video(video, load_video_quality_config(None))
 
-    config_path = tmp_path / "quality.yaml"
-    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
-    evaluation = evaluate_video_quality(metrics, load_video_quality_config(config_path))
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
 
     assert evaluation.passed is True
     assert evaluation.decision == "pass"
@@ -448,9 +449,7 @@ def test_evaluate_video_quality_passes_calibrated_provider_quality_metrics(tmp_p
         max_consecutive_frozen_sec=0.0,
     )
 
-    config_path = tmp_path / "quality.yaml"
-    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
-    evaluation = evaluate_video_quality(metrics, load_video_quality_config(config_path))
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
 
     assert evaluation.passed is True
     assert evaluation.decision == "pass"
@@ -552,9 +551,7 @@ def test_evaluate_video_quality_warns_cross_provider_low_detail_tail(tmp_path: P
         tenengrad_median=14.5,
     )
 
-    config_path = tmp_path / "quality.yaml"
-    config_path.write_text("hand_roi:\n  enabled: true\n", encoding="utf-8")
-    evaluation = evaluate_video_quality(metrics, load_video_quality_config(config_path))
+    evaluation = evaluate_video_quality(metrics, load_video_quality_config(None))
 
     assert evaluation.passed is True
     assert evaluation.decision == "pass"
@@ -791,8 +788,10 @@ def test_hdf5_alignment_small_delta_warns_without_stopping_mask_qc(tmp_path: Pat
     video = video_dir / "408817_video.mp4"
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20), textured_frame(30)], fps=30.0)
     write_quality_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", 8)
-    config_path = tmp_path / "quality.yaml"
-    config_path.write_text("hdf5_alignment:\n  max_delta_ratio_warn: 1.0\n", encoding="utf-8")
+    config_path = write_unified_video_config(
+        tmp_path,
+        lambda parameters: parameters["hdf5_alignment"].update(max_delta_ratio_warn=1.0),
+    )
     config = load_video_quality_config(config_path)
     metrics = analyze_video(video, config)
     alignment = check_hdf5_alignment(video, batch, metrics, config)
@@ -815,8 +814,10 @@ def test_hdf5_alignment_missing_warn_mode_does_not_fail(tmp_path: Path) -> None:
     video_dir.mkdir()
     video = video_dir / "408817_video.mp4"
     write_test_video(video, [solid_frame(100) for _ in range(4)], fps=10.0)
-    config_path = tmp_path / "quality.yaml"
-    config_path.write_text("hdf5_alignment:\n  mode: warn\n", encoding="utf-8")
+    config_path = write_unified_video_config(
+        tmp_path,
+        lambda parameters: parameters["hdf5_alignment"].update(mode="warn"),
+    )
     config = load_video_quality_config(config_path)
     metrics = analyze_video(video, config)
 
@@ -1014,7 +1015,7 @@ def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tm
     report = json.loads((batch / "quality_archive" / "408817.json").read_text(encoding="utf-8"))
     assert report["asset_id"] == "408817"
     assert report["qc_config"]["schema_version"] == "qc_acceptance_config_schema.v1"
-    assert report["qc_config"]["config_version"] == "qc_acceptance_v1.0.0"
+    assert report["qc_config"]["config_version"] == "qc_acceptance_v1.1.0"
     assert report["qc_config"]["config_name"] == "acceptance_gate"
     assert report["qc_config"]["config_path"] == "configs/qc_acceptance.yaml"
     assert report["qc_config"]["config_hash"].startswith("sha256:")
@@ -1040,7 +1041,7 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["schema_version"] == "asset_qc_report.v1"
-    assert report["qc_config"]["config_version"] == "qc_acceptance_v1.0.0"
+    assert report["qc_config"]["config_version"] == "qc_acceptance_v1.1.0"
     assert report["asset_id"] == "408817"
     assert report["qc_summary"] == {
         "status": "pass",
@@ -1123,7 +1124,7 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
         if item["code"] == "cannot_open_video"
     )
     assert detail["rule_id"] == "video_quality.cannot_open_video"
-    assert detail["config_version"] == "qc_acceptance_v1.0.0"
+    assert detail["config_version"] == "qc_acceptance_v1.1.0"
     assert "pass_threshold" not in detail
     assert "fail_threshold" not in detail
 
@@ -1133,8 +1134,11 @@ def test_video_quality_main_accepts_config_and_writes_quality_archive(tmp_path: 
     video_dir = batch / "video"
     video_dir.mkdir(parents=True)
     write_test_video(video_dir / "408817_video.mp4", [textured_frame(0), textured_frame(10)], fps=30.0)
-    config = tmp_path / "quality.yaml"
-    config.write_text("decode:\n  max_sample_frames: 2\nhdf5_alignment:\n  mode: warn\n", encoding="utf-8")
+    def mutate(parameters: dict[str, Any]) -> None:
+        parameters["decode"]["max_sample_frames"] = 2
+        parameters["hdf5_alignment"]["mode"] = "warn"
+
+    config = write_unified_video_config(tmp_path, mutate)
 
     exit_code = main(["--batch", str(batch), "--config", str(config)])
 
