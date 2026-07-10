@@ -1,6 +1,9 @@
 import ast
 import csv
+import inspect
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -13,9 +16,12 @@ from tools.build_weekly_supplier_acceptance_report import (
     aggregate_manual_review,
     build_weekly_report,
     collect_input_audit,
+    count_fail_indicators,
     main,
     normalize_asset_id,
     recompute_xjgt_final_status,
+    resolve_xjgt_text_status,
+    skeleton_static_status_from_parts,
 )
 
 
@@ -35,6 +41,48 @@ def test_weekly_builder_has_no_duplicate_top_level_definitions() -> None:
         name: lines for name, lines in definitions.items() if len(lines) > 1
     }
     assert duplicates == {}
+
+
+def test_weekly_builder_cli_supports_script_and_module_invocation(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).parents[1]
+    script = repo_root / "tools" / "build_weekly_supplier_acceptance_report.py"
+    commands = [
+        [sys.executable, str(script), "--help"],
+        [sys.executable, "-m", "tools.build_weekly_supplier_acceptance_report", "--help"],
+    ]
+    for command in commands:
+        completed = subprocess.run(
+            command,
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "--audit-inputs" in completed.stdout
+        assert "--skip-xjgt-text" in completed.stdout
+
+    run_root = tmp_path / "acceptance_5x100"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--run-root",
+            str(run_root),
+            "--audit-inputs",
+        ],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    audit = json.loads(completed.stdout)
+    assert audit["run_root"] == str(run_root)
+    assert not (run_root / "weekly_supplier_acceptance_report.xlsx").exists()
+    assert not (run_root / "weekly_supplier_summary.csv").exists()
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -556,6 +604,8 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "unreviewed_auto_fail_frame_count",
         "auto_fail_precision_on_reviewed",
         "abnormal_status_reason",
+        "text_status_reason",
+        "skeleton_static_status_reason",
         "mapped_precheck_checks",
         "missing_expected_checks",
         "precheck_mapping_status",
@@ -570,7 +620,8 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1001"][columns["manual_reviewed_frame_count"]] == 100
     assert by_asset["1001"][columns["manual_problem_ratio_of_reviewed"]] == 0.1
     assert by_asset["1001"][columns["manual_review_status"]] == "fail"
-    assert by_asset["1001"][columns["text_check_status"]] == "pending_rule"
+    assert by_asset["1001"][columns["text_check_status"]] == "fail"
+    assert "mapped_text_integrity=fail" in by_asset["1001"][columns["text_status_reason"]]
     assert by_asset["1001"][columns["skeleton_missing_status"]] == "fail"
     assert by_asset["1001"][columns["skeleton_morphology_status"]] == "pass"
     assert by_asset["1001"][columns["supplier_quality_signal"]] == "provided_ok"
@@ -578,10 +629,11 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1001"][columns["skeleton_static_fail_frame_count"]] == 10
     assert by_asset["1001"][columns["skeleton_static_fail_frame_ratio"]] == 0.1
     assert by_asset["1001"][columns["skeleton_static_status"]] == "fail"
+    assert "missing_status=fail" in by_asset["1001"][columns["skeleton_static_status_reason"]]
     assert by_asset["1001"][columns["abnormal_fail_frame_count"]] == 10
     assert by_asset["1001"][columns["abnormal_fail_frame_ratio"]] == 0.1
     assert by_asset["1001"][columns["abnormal_frame_status"]] == "fail"
-    assert by_asset["1001"][columns["fail_indicator_count"]] == 2
+    assert by_asset["1001"][columns["fail_indicator_count"]] == 3
     assert by_asset["1001"][columns["final_clip_status"]] == "fail"
     assert "skeleton_static_status" in by_asset["1001"][columns["final_status_reason"]]
     assert "abnormal_frame_status" in by_asset["1001"][columns["final_status_reason"]]
@@ -596,6 +648,8 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1002"][columns["manual_reviewed_frame_count"]] == 150
     assert by_asset["1002"][columns["manual_problem_ratio_of_reviewed"]] == 10 / 150
     assert by_asset["1002"][columns["manual_review_status"]] == "pass"
+    assert by_asset["1002"][columns["text_check_status"]] == "pass"
+    assert "mapped_text_integrity=pass" in by_asset["1002"][columns["text_status_reason"]]
     assert by_asset["1002"][columns["skeleton_static_status"]] == "pass"
     assert by_asset["1002"][columns["abnormal_fail_frame_count"]] == 30
     assert by_asset["1002"][columns["abnormal_fail_frame_ratio"]] == 0.15
@@ -626,6 +680,7 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1003"][columns["manual_review_status"]] == "not_reviewed"
     assert by_asset["1003"][columns["skeleton_morphology_status"]] == "not_run"
     assert by_asset["1003"][columns["skeleton_static_status"]] == "not_run"
+    assert "morphology_status=not_run" in by_asset["1003"][columns["skeleton_static_status_reason"]]
     assert by_asset["1003"][columns["abnormal_frame_status"]] == "review"
     assert by_asset["1003"][columns["fail_indicator_count"]] == 0
     assert by_asset["1003"][columns["final_clip_status"]] == "review"
@@ -654,6 +709,16 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert xjgt["blocked_clip_count"] == "0"
     assert xjgt["not_run_clip_count"] == "0"
     assert xjgt["coverage_ratio"] == "1.0"
+    assert xjgt["sample_coverage_ratio"] == str(3 / 100)
+    assert xjgt["manual_reviewed_clip_count"] == "2"
+    assert xjgt["manual_review_coverage_ratio"] == str(2 / 3)
+    assert xjgt["manual_pass_clip_count"] == "1"
+    assert xjgt["manual_fail_clip_count"] == "1"
+    assert xjgt["manual_not_reviewed_clip_count"] == "1"
+    assert xjgt["manual_confirmed_problem_frame_count"] == "20"
+    assert xjgt["abnormal_pass_clip_count"] == "0"
+    assert xjgt["abnormal_fail_clip_count"] == "2"
+    assert xjgt["abnormal_review_clip_count"] == "1"
     assert sum(
         int(xjgt[name])
         for name in (
@@ -692,6 +757,102 @@ def test_pending_optional_text_rule_does_not_force_review() -> None:
         )
         == "pass"
     )
+
+
+def test_xjgt_text_mapping_uses_real_evidence_by_default() -> None:
+    assert resolve_xjgt_text_status(
+        source_status="readable",
+        mapped_checks={"text_integrity"},
+        observed_status="pass",
+        has_unmatched_source_rows=False,
+        skip_xjgt_text=False,
+    ) == ("pass", "mapped_text_integrity=pass")
+    assert resolve_xjgt_text_status(
+        source_status="readable",
+        mapped_checks={"text_integrity"},
+        observed_status="fail",
+        has_unmatched_source_rows=False,
+        skip_xjgt_text=False,
+    ) == ("fail", "mapped_text_integrity=fail")
+
+
+def test_xjgt_text_mapping_reports_unresolved_source_states() -> None:
+    assert resolve_xjgt_text_status(
+        source_status="missing",
+        mapped_checks=set(),
+        observed_status="not_run",
+        has_unmatched_source_rows=False,
+        skip_xjgt_text=False,
+    ) == ("not_run", "text_integrity_source_missing")
+    assert resolve_xjgt_text_status(
+        source_status="unreadable:ArrowInvalid",
+        mapped_checks=set(),
+        observed_status="not_run",
+        has_unmatched_source_rows=False,
+        skip_xjgt_text=False,
+    ) == ("review", "text_integrity_source_unreadable:ArrowInvalid")
+    assert resolve_xjgt_text_status(
+        source_status="readable",
+        mapped_checks=set(),
+        observed_status="not_run",
+        has_unmatched_source_rows=True,
+        skip_xjgt_text=False,
+    ) == ("review", "text_integrity_source_readable_asset_unmatched")
+    assert resolve_xjgt_text_status(
+        source_status="readable",
+        mapped_checks={"skeleton_quality_score"},
+        observed_status="not_run",
+        has_unmatched_source_rows=False,
+        skip_xjgt_text=False,
+    ) == ("review", "text_integrity_expected_check_missing")
+
+
+def test_xjgt_text_can_be_explicitly_skipped() -> None:
+    assert resolve_xjgt_text_status(
+        source_status="readable",
+        mapped_checks={"text_integrity"},
+        observed_status="fail",
+        has_unmatched_source_rows=False,
+        skip_xjgt_text=True,
+    ) == ("not_applicable", "text_integrity_skipped_by_cli")
+
+
+def test_skeleton_static_status_preserves_subcheck_review_and_missing() -> None:
+    assert skeleton_static_status_from_parts(
+        missing_status="pass",
+        morphology_status="review",
+        fail_frame_ratio=0.0,
+    ) == "review"
+    assert skeleton_static_status_from_parts(
+        missing_status="review",
+        morphology_status="pass",
+        fail_frame_ratio=0.0,
+    ) == "review"
+    assert skeleton_static_status_from_parts(
+        missing_status="pass",
+        morphology_status="not_run",
+        fail_frame_ratio=0.0,
+    ) == "not_run"
+    assert skeleton_static_status_from_parts(
+        missing_status="fail",
+        morphology_status="pass",
+        fail_frame_ratio=0.01,
+    ) == "fail"
+
+
+def test_fail_indicator_count_has_exactly_four_top_level_dimensions() -> None:
+    assert set(inspect.signature(count_fail_indicators).parameters) == {
+        "text_check_status",
+        "video_quality_status",
+        "skeleton_static_status",
+        "abnormal_frame_status",
+    }
+    assert count_fail_indicators(
+        text_check_status="pass",
+        video_quality_status="pass",
+        skeleton_static_status="fail",
+        abnormal_frame_status="pass",
+    ) == 1
 
 
 def test_single_abnormal_indicator_does_not_fail_final_clip() -> None:
@@ -759,6 +920,9 @@ def test_deepreach_and_placeholders_remain_honest(
     deepreach_rows = list(workbook["DeepReach"].iter_rows(min_row=2, values_only=True))
     columns = {name: index for index, name in enumerate(DETAIL_COLUMNS)}
     assert len(deepreach_rows) == 8
+    assert {row[columns["text_check_status"]] for row in deepreach_rows} == {
+        "pending_rule"
+    }
     assert {row[columns["skeleton_missing_status"]] for row in deepreach_rows} == {
         "blocked"
     }

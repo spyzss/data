@@ -18,7 +18,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from tools.build_batch_qc_ledger import normalize_video_quality_row
+if __package__:
+    from tools.build_batch_qc_ledger import normalize_video_quality_row
+else:
+    from build_batch_qc_ledger import normalize_video_quality_row
 
 
 LOGGER = logging.getLogger("build_weekly_supplier_acceptance_report")
@@ -36,8 +39,18 @@ SUMMARY_COLUMNS = [
     "blocked_clip_count",
     "not_run_clip_count",
     "coverage_ratio",
+    "sample_coverage_ratio",
     "pass_clip_ratio",
     "fail_clip_ratio",
+    "manual_reviewed_clip_count",
+    "manual_review_coverage_ratio",
+    "manual_pass_clip_count",
+    "manual_fail_clip_count",
+    "manual_not_reviewed_clip_count",
+    "manual_confirmed_problem_frame_count",
+    "abnormal_pass_clip_count",
+    "abnormal_fail_clip_count",
+    "abnormal_review_clip_count",
     "main_issue_type",
     "modules_completed",
     "blocked_modules",
@@ -49,6 +62,7 @@ XJGT_DETAIL_COLUMNS = [
     "total_frames",
     "frame_count_status",
     "text_check_status",
+    "text_status_reason",
     "skeleton_missing_status",
     "skeleton_missing_fail_intervals",
     "skeleton_missing_fail_frame_count",
@@ -61,6 +75,7 @@ XJGT_DETAIL_COLUMNS = [
     "skeleton_static_fail_intervals",
     "skeleton_static_fail_frame_ratio",
     "skeleton_static_status",
+    "skeleton_static_status_reason",
     "supplier_quality_signal",
     "video_quality_status",
     "video_quality_fail_frame_count",
@@ -166,9 +181,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--require-xjgt-text",
         action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--skip-xjgt-text",
+        action="store_true",
         help=(
-            "Treat missing XJGT text_integrity rows as a required unresolved "
-            "rule. The default is not_applicable."
+            "Ignore XJGT text_integrity evidence and mark the text dimension "
+            "not_applicable."
         ),
     )
     parser.add_argument("--log-level", default="INFO")
@@ -186,7 +206,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     outputs = build_weekly_report(
         args.run_root,
-        require_xjgt_text=args.require_xjgt_text,
+        require_xjgt_text=(
+            args.require_xjgt_text or not args.skip_xjgt_text
+        ),
     )
     LOGGER.info("Wrote %s", outputs.workbook_xlsx)
     LOGGER.info("Wrote %s", outputs.summary_csv)
@@ -196,7 +218,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def build_weekly_report(
     run_root: Path,
     *,
-    require_xjgt_text: bool = False,
+    require_xjgt_text: bool = True,
 ) -> WeeklyOutputPaths:
     run_root.mkdir(parents=True, exist_ok=True)
     xjgt = load_xjgt(run_root, require_xjgt_text=require_xjgt_text)
@@ -483,7 +505,7 @@ def load_precheck_evidence(
         else:
             record["precheck_mapping_status"] = "mapped"
 
-    source_status = "readable" if check_rows or candidate_rows else sources["precheck_check_results"].status
+    source_status = sources["precheck_check_results"].status
     return PrecheckEvidence(
         by_asset=by_asset,
         source_status=source_status,
@@ -528,9 +550,9 @@ def worst_status(current: str, incoming: str) -> str:
         "fail": 5,
         "review": 4,
         "blocked": 3,
-        "not_run": 2,
+        "pass": 2,
         "not_applicable": 1,
-        "pass": 0,
+        "not_run": 0,
     }
     return incoming if rank.get(incoming, 0) > rank.get(current, 0) else current
 
@@ -538,7 +560,7 @@ def worst_status(current: str, incoming: str) -> str:
 def load_xjgt(
     run_root: Path,
     *,
-    require_xjgt_text: bool = False,
+    require_xjgt_text: bool = True,
 ) -> dict[str, Any]:
     manifest_path = run_root / "manifests" / "supplier_manifest_xjgt_100.csv"
     manifest = read_csv(manifest_path)
@@ -727,7 +749,8 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
                     if fallback_frames > 0
                     else "not_run"
                 ),
-                "text_check_status": "blocked",
+                "text_check_status": "pending_rule",
+                "text_status_reason": "supplier_text_schema_not_defined",
                 "skeleton_missing_status": "blocked",
                 "skeleton_missing_fail_frame_count": 0,
                 "skeleton_missing_fail_frame_ratio": 0.0,
@@ -737,6 +760,10 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
                 "skeleton_static_fail_frame_count": 0,
                 "skeleton_static_fail_frame_ratio": 0.0,
                 "skeleton_static_status": "blocked",
+                "skeleton_static_status_reason": (
+                    "missing_status=blocked; morphology_status=blocked; "
+                    "skeleton_static_status=blocked"
+                ),
                 "supplier_quality_signal": "not_provided",
                 "video_quality_status": (
                     "no_valid_output" if not has_video_quality else "review"
@@ -796,8 +823,18 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
             "blocked_clip_count": counts["blocked"],
             "not_run_clip_count": counts["not_run"],
             "coverage_ratio": safe_ratio(covered_count, len(manifest)),
+            "sample_coverage_ratio": safe_ratio(len(manifest), 100),
             "pass_clip_ratio": 0.0,
             "fail_clip_ratio": 0.0,
+            "manual_reviewed_clip_count": 0,
+            "manual_review_coverage_ratio": 0.0,
+            "manual_pass_clip_count": 0,
+            "manual_fail_clip_count": 0,
+            "manual_not_reviewed_clip_count": len(manifest),
+            "manual_confirmed_problem_frame_count": 0,
+            "abnormal_pass_clip_count": 0,
+            "abnormal_fail_clip_count": 0,
+            "abnormal_review_clip_count": 0,
             "main_issue_type": "missing_schema_adapter",
             "video_quality_status": (
                 "review" if has_video_quality else "no_valid_output"
@@ -826,8 +863,18 @@ def placeholder_supplier(index: int) -> dict[str, Any]:
         "blocked_clip_count": 0,
         "not_run_clip_count": 0,
         "coverage_ratio": 0.0,
+        "sample_coverage_ratio": 0.0,
         "pass_clip_ratio": 0.0,
         "fail_clip_ratio": 0.0,
+        "manual_reviewed_clip_count": 0,
+        "manual_review_coverage_ratio": 0.0,
+        "manual_pass_clip_count": 0,
+        "manual_fail_clip_count": 0,
+        "manual_not_reviewed_clip_count": 0,
+        "manual_confirmed_problem_frame_count": 0,
+        "abnormal_pass_clip_count": 0,
+        "abnormal_fail_clip_count": 0,
+        "abnormal_review_clip_count": 0,
         "main_issue_type": "",
         "modules_completed": "",
         "blocked_modules": "missing_input",
@@ -1045,6 +1092,8 @@ def add_sheet(
         "pass_clip_ratio",
         "fail_clip_ratio",
         "coverage_ratio",
+        "sample_coverage_ratio",
+        "manual_review_coverage_ratio",
         "skeleton_missing_fail_frame_ratio",
         "skeleton_morphology_fail_frame_ratio",
         "skeleton_static_fail_frame_ratio",
@@ -1393,16 +1442,16 @@ def build_xjgt_detail(
     )
     if not morphology_seen:
         morphology_status = "not_run"
+    elif text(precheck_row.get("morphology_status")).lower() == "fail":
+        morphology_status = "fail"
+    elif text(precheck_row.get("morphology_status")).lower() == "review":
+        morphology_status = "review"
     elif morphology_count:
         morphology_status = frame_ratio_status(
             "pass", morphology_count, morphology_ratio
         )
     else:
-        morphology_status = (
-            "review"
-            if text(precheck_row.get("morphology_status")).lower() == "review"
-            else "pass"
-        )
+        morphology_status = "pass"
     static_intervals = [*missing_intervals, *morphology_intervals]
     static_count = interval_frame_count(static_intervals)
     static_ratio = safe_ratio(static_count, total_frames)
@@ -1410,6 +1459,12 @@ def build_xjgt_detail(
         missing_status=missing_status,
         morphology_status=morphology_status,
         fail_frame_ratio=static_ratio,
+    )
+    static_reason = skeleton_static_status_reason(
+        missing_status=missing_status,
+        morphology_status=morphology_status,
+        fail_frame_ratio=static_ratio,
+        static_status=static_status,
     )
 
     mapped_checks = sorted(precheck_row.get("checks", set()))
@@ -1421,22 +1476,21 @@ def build_xjgt_detail(
         )
         if not present
     ]
+    if require_xjgt_text and "text_integrity" not in mapped_checks:
+        missing_expected.append("text_integrity")
     mapping_status = source_mapping_status(
         precheck_source_status,
         mapped_checks,
         missing_expected,
         bool(precheck_unmatched),
     )
-    if "text_integrity" in mapped_checks:
-        observed_text_status = text(precheck_row.get("text_status")) or "pass"
-        text_status = observed_text_status if require_xjgt_text else "pending_rule"
-    else:
-        observed_text_status = "not_run"
-        text_status = (
-            "pending_required_rule"
-            if require_xjgt_text
-            else "not_applicable"
-        )
+    text_status, text_reason = resolve_xjgt_text_status(
+        source_status=precheck_source_status,
+        mapped_checks=set(mapped_checks),
+        observed_status=text(precheck_row.get("text_status")) or "not_run",
+        has_unmatched_source_rows=bool(precheck_unmatched),
+        skip_xjgt_text=not require_xjgt_text,
+    )
     quality_signal = text(
         precheck_row.get("supplier_quality_signal")
     ) or "not_provided"
@@ -1540,8 +1594,8 @@ def build_xjgt_detail(
         unresolved.append(f"skeleton_static_status={static_status}")
     if abnormal_frame_status == "review":
         unresolved.append("abnormal_frame_status=review")
-    if text_status == "pending_required_rule":
-        unresolved.append("text_check_status=pending_required_rule")
+    if text_status in {"review", "not_run", "blocked", "no_valid_output"}:
+        unresolved.append(f"text_check_status={text_status}")
     if frame_count_status == "unreadable":
         unresolved.append("frame_count_status=unreadable")
     final_status, final_reason = final_status_with_reason(
@@ -1555,11 +1609,6 @@ def build_xjgt_detail(
         text(ledger_row.get("notes")),
         f"supplier_quality_signal={quality_signal}",
     ]
-    if not require_xjgt_text and observed_text_status != "not_run":
-        notes.append(
-            "text_integrity_observed="
-            f"{observed_text_status}; text_schema_required=false"
-        )
     if frame_count_status == "unreadable":
         notes.append(f"frame_count_unreadable:{video_path}")
     if mapping_status != "mapped":
@@ -1572,6 +1621,7 @@ def build_xjgt_detail(
         "total_frames": total_frames,
         "frame_count_status": frame_count_status,
         "text_check_status": text_status,
+        "text_status_reason": text_reason,
         "skeleton_missing_status": missing_status,
         "skeleton_missing_fail_intervals": format_intervals(missing_intervals),
         "skeleton_missing_fail_frame_count": missing_count,
@@ -1588,6 +1638,7 @@ def build_xjgt_detail(
         "skeleton_static_fail_frame_count": static_count,
         "skeleton_static_fail_frame_ratio": static_ratio,
         "skeleton_static_status": static_status,
+        "skeleton_static_status_reason": static_reason,
         "supplier_quality_signal": quality_signal,
         "video_quality_status": video_status,
         "video_quality_fail_frame_count": video_count,
@@ -1662,10 +1713,35 @@ def source_mapping_status(
     if source_status.startswith("unreadable"):
         return "source_unreadable"
     if not mapped_checks:
-        return "unmatched" if has_unmatched_source_rows else "check_absent"
+        return "unmatched"
     if missing_expected:
         return "partial"
     return "mapped"
+
+
+def resolve_xjgt_text_status(
+    *,
+    source_status: str,
+    mapped_checks: set[str],
+    observed_status: str,
+    has_unmatched_source_rows: bool,
+    skip_xjgt_text: bool,
+) -> tuple[str, str]:
+    if skip_xjgt_text:
+        return "not_applicable", "text_integrity_skipped_by_cli"
+    if "text_integrity" in mapped_checks:
+        status = status_value(observed_status)
+        if status not in {"pass", "fail", "review"}:
+            status = "review"
+        return status, f"mapped_text_integrity={status}"
+    if source_status == "missing":
+        return "not_run", "text_integrity_source_missing"
+    if source_status.startswith("unreadable"):
+        detail = source_status.split(":", 1)[1] if ":" in source_status else "unknown"
+        return "review", f"text_integrity_source_unreadable:{detail}"
+    if not mapped_checks:
+        return "review", "text_integrity_source_readable_asset_unmatched"
+    return "review", "text_integrity_expected_check_missing"
 
 
 def final_status_with_reason(
@@ -1712,6 +1788,12 @@ def supplier_summary_from_details(
     notes: str,
 ) -> dict[str, Any]:
     counts = Counter(text(row.get("final_clip_status")) for row in details)
+    manual_counts = Counter(
+        text(row.get("manual_review_status")) for row in details
+    )
+    abnormal_counts = Counter(
+        text(row.get("abnormal_frame_status")) for row in details
+    )
     sample_count = len(details)
     total_frames = sum(int(row.get("total_frames") or 0) for row in details)
     problem_frames = sum(
@@ -1732,8 +1814,24 @@ def supplier_summary_from_details(
         "blocked_clip_count": counts["blocked"],
         "not_run_clip_count": counts["not_run"],
         "coverage_ratio": safe_ratio(covered, sample_count),
+        "sample_coverage_ratio": safe_ratio(sample_count, expected_clip_count),
         "pass_clip_ratio": safe_ratio(counts["pass"], sample_count),
         "fail_clip_ratio": safe_ratio(counts["fail"], sample_count),
+        "manual_reviewed_clip_count": manual_counts["pass"] + manual_counts["fail"],
+        "manual_review_coverage_ratio": safe_ratio(
+            manual_counts["pass"] + manual_counts["fail"], sample_count
+        ),
+        "manual_pass_clip_count": manual_counts["pass"],
+        "manual_fail_clip_count": manual_counts["fail"],
+        "manual_not_reviewed_clip_count": sample_count
+        - manual_counts["pass"]
+        - manual_counts["fail"],
+        "manual_confirmed_problem_frame_count": sum(
+            int(row.get("manual_problem_frame_count") or 0) for row in details
+        ),
+        "abnormal_pass_clip_count": abnormal_counts["pass"],
+        "abnormal_fail_clip_count": abnormal_counts["fail"],
+        "abnormal_review_clip_count": abnormal_counts["review"],
         "main_issue_type": main_issue_type,
         "modules_completed": modules_completed,
         "blocked_modules": blocked_modules,
@@ -2031,12 +2129,34 @@ def skeleton_static_status_from_parts(
     morphology_status: str,
     fail_frame_ratio: float,
 ) -> str:
+    statuses = (missing_status, morphology_status)
+    if "fail" in statuses:
+        return "fail"
+    if "review" in statuses:
+        return "review"
+    if statuses == ("pass", "pass"):
+        return "pass"
     if any(
         status in {"not_run", "blocked", "no_valid_output", "source_missing", "unmatched"}
-        for status in (missing_status, morphology_status)
+        for status in statuses
     ):
         return "not_run"
-    return "fail" if fail_frame_ratio >= 0.10 else "pass"
+    return "review"
+
+
+def skeleton_static_status_reason(
+    *,
+    missing_status: str,
+    morphology_status: str,
+    fail_frame_ratio: float,
+    static_status: str,
+) -> str:
+    return (
+        f"missing_status={missing_status}; "
+        f"morphology_status={morphology_status}; "
+        f"union_fail_frame_ratio={fail_frame_ratio:.6f}; "
+        f"skeleton_static_status={static_status}"
+    )
 
 
 
