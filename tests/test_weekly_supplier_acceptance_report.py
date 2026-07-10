@@ -8,28 +8,141 @@ from pathlib import Path
 
 import pandas as pd
 import yaml
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from tools.build_weekly_supplier_acceptance_report import (
+    ABNORMAL_SOURCE_COLUMNS,
     CORE_DETAIL_COLUMNS,
     MANUAL_ISSUE_COLUMNS,
     SUMMARY_COLUMNS,
     THRESHOLD_RULE_COLUMNS,
     acceptance_and_review_status,
+    add_manual_threshold_sheet,
     aggregate_manual_review,
     build_weekly_report,
     collect_input_audit,
     count_fail_indicators,
+    dedupe_manual_labels,
+    decompose_abnormal_sources,
     detail_columns_for_rows,
     load_xjgt,
+    match_submitted_review_rows,
     main,
     normalize_asset_id,
     recompute_xjgt_final_status,
     resolve_xjgt_text_status,
     skeleton_static_status_from_parts,
     supplier_summary_from_details,
+    threshold_rule_row,
     video_quality_atomic_statuses,
 )
+
+
+def _abnormal_source_fixture(*, include_blind: bool = True):
+    temporal_rows = [
+        {
+            "asset_id": "1001",
+            "start_frame": 0,
+            "end_frame": 19,
+            "review_type": ["temporal_geometry_review"],
+        },
+        {
+            "asset_id": "1001",
+            "start_frame": 30,
+            "end_frame": 49,
+            "check": "keypoint_temporal",
+        },
+        {
+            "asset_id": "1001",
+            "start_frame": 100,
+            "end_frame": 109,
+            "check": "keypoint_morphology",
+        },
+        {
+            "asset_id": "1001",
+            "start_frame": 110,
+            "end_frame": 119,
+            "issue_type": "keypoint_raw_invalid",
+        },
+    ]
+    sam3_rows = [
+        {
+            "asset_id": "1001",
+            "window_start_frame": 10,
+            "window_end_frame": 29,
+            "window_containment_verdict": "containment_fail",
+        },
+        {
+            "asset_id": "1001",
+            "window_start_frame": 60,
+            "window_end_frame": 69,
+            "window_containment_verdict": "projection_review",
+        },
+        {
+            "asset_id": "1001",
+            "window_start_frame": 80,
+            "window_end_frame": 89,
+            "window_containment_verdict": "acceptable_flagged",
+        },
+    ]
+    manual_rows = [
+        {
+            "asset_id": "1001",
+            "window_start_frame": 0,
+            "window_end_frame": 19,
+            "affected_start_frame": 5,
+            "affected_end_frame": 14,
+            "manual_outcome": "true_positive",
+            "review_origin": "temporal_triggered",
+        },
+        {
+            "asset_id": "1001",
+            "window_start_frame": 60,
+            "window_end_frame": 69,
+            "affected_start_frame": 65,
+            "affected_end_frame": 74,
+            "manual_outcome": "true_positive",
+            "review_origin": "sam3_triggered",
+        },
+        {
+            "asset_id": "1001",
+            "window_start_frame": 30,
+            "window_end_frame": 49,
+            "manual_outcome": "false_positive",
+            "review_origin": "temporal_triggered",
+        },
+    ]
+    if include_blind:
+        manual_rows.append(
+            {
+                "asset_id": "1001",
+                "window_start_frame": 120,
+                "window_end_frame": 139,
+                "affected_start_frame": 125,
+                "affected_end_frame": 129,
+                "manual_outcome": "true_positive",
+                "review_origin": "blind_random",
+            }
+        )
+    submitted_rows = [
+        {
+            "review_id": "temporal-0-19",
+            "asset_id": "1001",
+            "module": "keypoint_temporal",
+            "source_level": "window",
+            "window_start_frame": 0,
+            "window_end_frame": 19,
+        },
+        {
+            "review_id": "temporal-30-49",
+            "asset_id": "1001",
+            "module": "keypoint_temporal",
+            "source_level": "window",
+            "window_start_frame": 30,
+            "window_end_frame": 49,
+        },
+    ]
+    return temporal_rows, sam3_rows, manual_rows, submitted_rows
 
 
 def test_weekly_builder_has_no_duplicate_top_level_definitions() -> None:
@@ -48,6 +161,132 @@ def test_weekly_builder_has_no_duplicate_top_level_definitions() -> None:
         name: lines for name, lines in definitions.items() if len(lines) > 1
     }
     assert duplicates == {}
+
+
+def test_abnormal_source_decomposition_uses_only_temporal_candidates_and_all_sam3() -> None:
+    temporal_rows, sam3_rows, manual_rows, submitted_rows = (
+        _abnormal_source_fixture()
+    )
+
+    result = decompose_abnormal_sources(
+        temporal_rows=temporal_rows,
+        sam3_rows=sam3_rows,
+        manual_rows=manual_rows,
+        submitted_rows=submitted_rows,
+        total_frames=200,
+    )
+
+    assert result["temporal_detected_interval_count"] == 2
+    assert result["temporal_detected_frame_count"] == 40
+    assert result["temporal_v1_problem_frame_count"] == 20
+    assert result["sam3_detected_interval_count"] == 3
+    assert result["sam3_detected_frame_count"] == 40
+    assert result["sam3_hard_fail_frame_count"] == 20
+    assert result["sam3_review_like_frame_count"] == 10
+    assert result["sam3_v1_problem_frame_count"] == 30
+    assert result["manual_true_positive_interval_count"] == 3
+    assert result["manual_true_positive_frame_count"] == 25
+
+
+def test_abnormal_source_decomposition_merges_union_and_overlaps() -> None:
+    temporal_rows, sam3_rows, manual_rows, submitted_rows = (
+        _abnormal_source_fixture()
+    )
+
+    result = decompose_abnormal_sources(
+        temporal_rows=temporal_rows,
+        sam3_rows=sam3_rows,
+        manual_rows=manual_rows,
+        submitted_rows=submitted_rows,
+        total_frames=200,
+    )
+
+    assert result["temporal_sam3_overlap_frame_count"] == 10
+    assert result["temporal_manual_overlap_frame_count"] == 10
+    assert result["sam3_manual_overlap_frame_count"] == 10
+    assert result["temporal_sam3_manual_overlap_frame_count"] == 5
+    assert result["auto_union_frame_count"] == 70
+    assert result["auto_union_manual_tp_overlap_frame_count"] == 15
+    assert result["manual_tp_not_detected_by_auto_frame_count"] == 10
+    assert result["problem_frame_count"] == 50
+    assert result["problem_frame_count"] < (
+        result["temporal_v1_problem_frame_count"]
+        + result["sam3_v1_problem_frame_count"]
+        + result["manual_true_positive_frame_count"]
+    )
+
+
+def test_abnormal_source_decomposition_tracks_blind_recall_only_for_blind_rows() -> None:
+    temporal_rows, sam3_rows, manual_rows, submitted_rows = (
+        _abnormal_source_fixture()
+    )
+    with_blind = decompose_abnormal_sources(
+        temporal_rows=temporal_rows,
+        sam3_rows=sam3_rows,
+        manual_rows=manual_rows,
+        submitted_rows=submitted_rows,
+        total_frames=200,
+    )
+    without_blind = decompose_abnormal_sources(
+        temporal_rows=temporal_rows,
+        sam3_rows=sam3_rows,
+        manual_rows=[
+            row
+            for row in manual_rows
+            if row.get("review_origin") != "blind_random"
+        ],
+        submitted_rows=submitted_rows,
+        total_frames=200,
+    )
+
+    assert with_blind["blind_manual_frame_count"] == 20
+    assert with_blind["blind_manual_problem_frame_count"] == 5
+    assert with_blind["blind_manual_auto_detected_frame_count"] == 0
+    assert with_blind["blind_manual_auto_recall"] == 0.0
+    assert without_blind["blind_manual_frame_count"] == 0
+    assert without_blind["blind_manual_auto_recall"] == "not_measurable"
+
+
+def test_abnormal_source_decomposition_segment_coverage_is_not_global_recall() -> None:
+    temporal_rows, sam3_rows, manual_rows, submitted_rows = (
+        _abnormal_source_fixture(include_blind=False)
+    )
+    result = decompose_abnormal_sources(
+        temporal_rows=temporal_rows,
+        sam3_rows=sam3_rows,
+        manual_rows=manual_rows,
+        submitted_rows=submitted_rows,
+        total_frames=200,
+    )
+
+    assert result["manual_tp_segment_count"] == 2
+    assert result["temporal_hit_manual_tp_segment_count"] == 1
+    assert result["sam3_hit_manual_tp_segment_count"] == 2
+    assert result["auto_union_hit_manual_tp_segment_count"] == 2
+    assert result["manual_tp_segment_missed_by_auto_count"] == 0
+    assert "global_recall" not in result
+    assert result["evaluation_scope"] == "auto_triggered_review_only"
+    assert result["blind_manual_auto_recall"] == "not_measurable"
+
+
+def test_manual_review_origin_survives_deduped_patch_row() -> None:
+    base = {
+        "review_id": "review-1",
+        "segment_id": "segment-1",
+        "asset_id": "1001",
+        "window_start_frame": 10,
+        "window_end_frame": 19,
+        "affected_start_frame": 12,
+        "affected_end_frame": 14,
+        "manual_outcome": "true_positive",
+    }
+
+    rows = dedupe_manual_labels(
+        [base, {**base, "review_origin": "blind_random"}]
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["review_origin"] == "blind_random"
 
 
 def test_weekly_builder_cli_supports_script_and_module_invocation(
@@ -218,6 +457,32 @@ def _video_quality_result(asset_id: str, frame_count: int) -> dict[str, object]:
             },
         },
     }
+
+
+def _deepreach_sample_manifest_rows() -> list[dict[str, object]]:
+    frame_counts = [944] * 34 + [943] * 66
+    offsets = {episode_idx: 0 for episode_idx in range(8)}
+    rows: list[dict[str, object]] = []
+    for clip_idx, frame_count in enumerate(frame_counts):
+        episode_idx = clip_idx % 8
+        start_frame = offsets[episode_idx]
+        end_frame = start_frame + frame_count - 1
+        offsets[episode_idx] = end_frame + 1
+        rows.append(
+            {
+                "supplier_id": "deepreach",
+                "asset_id": f"deepreach_subtask_{clip_idx:03d}",
+                "primary_video_path": f"/deepreach/episode_{episode_idx:02d}.mp4",
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+            }
+        )
+    assert len(rows) == 100
+    assert sum(
+        int(row["end_frame"]) - int(row["start_frame"]) + 1
+        for row in rows
+    ) == 94334
+    return rows
 
 
 def _prepare_inputs(run_root: Path) -> None:
@@ -777,15 +1042,11 @@ top_level_fail_count: 1
         run_root / "xjgt" / "manual_review" / "manual_labels_patch.json"
     ).write_text(json.dumps(manual_patch), encoding="utf-8")
     _write_csv(
-        run_root / "deepreach" / "manifests" / "supplier_manifest_deepreach.csv",
-        [
-            {
-                "supplier_id": "deepreach",
-                "asset_id": f"task_{index:03d}__head",
-                "video_path": f"/deepreach/task_{index:03d}.mp4",
-            }
-            for index in range(8)
-        ],
+        run_root
+        / "deepreach"
+        / "manifest"
+        / "deepreach_sample_100_manifest.csv",
+        _deepreach_sample_manifest_rows(),
     )
 
 
@@ -798,7 +1059,6 @@ def _patch_frame_probe(monkeypatch) -> list[Path]:
             "1001.mp4": 100,
             "1002.mp4": 200,
             "1003_video.mp4": 100,
-            **{f"task_{index:03d}.mp4": 30 + index for index in range(8)},
         }[path.name]
 
     monkeypatch.setattr(
@@ -815,7 +1075,13 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     _prepare_inputs(run_root)
     observed_paths = _patch_frame_probe(monkeypatch)
 
-    outputs = build_weekly_report(run_root)
+    precheck_config = (
+        run_root / "xjgt" / "precheck" / "precheck_config.yaml"
+    )
+    outputs = build_weekly_report(
+        run_root,
+        xjgt_precheck_config=precheck_config,
+    )
 
     workbook = load_workbook(outputs.workbook_xlsx, read_only=True)
     assert workbook.sheetnames == [
@@ -825,11 +1091,33 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "供应商3",
         "供应商4",
         "供应商5",
+        "异常检测拆解",
         "人工问题与阈值",
     ]
     assert [cell.value for cell in workbook["五供应商总览"][1]] == SUMMARY_COLUMNS
     detail_headers = [cell.value for cell in workbook["星际归途"][1]]
     assert detail_headers[: len(CORE_DETAIL_COLUMNS)] == CORE_DETAIL_COLUMNS
+    for column in (
+        "temporal_detected_interval_count",
+        "temporal_detected_frame_count",
+        "temporal_v1_problem_frame_count",
+        "sam3_detected_interval_count",
+        "sam3_detected_frame_count",
+        "sam3_hard_fail_frame_count",
+        "sam3_review_like_frame_count",
+        "sam3_v1_problem_frame_count",
+        "manual_true_positive_interval_count",
+        "manual_true_positive_frame_count",
+        "temporal_sam3_overlap_frame_count",
+        "temporal_manual_overlap_frame_count",
+        "sam3_manual_overlap_frame_count",
+        "temporal_sam3_manual_overlap_frame_count",
+        "auto_union_frame_count",
+        "auto_union_manual_tp_overlap_frame_count",
+        "manual_tp_not_detected_by_auto_frame_count",
+        "problem_frame_count",
+    ):
+        assert column in detail_headers
     assert detail_headers[:8] == [
         "asset_id",
         "total_frames",
@@ -917,6 +1205,8 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "unreviewed_submitted_frame_count",
         "abnormal_v1_unreviewed_as_fail_frame_count",
         "abnormal_v2_unreviewed_as_review_frame_count",
+        "unmatched_submitted_review_ids",
+        "unmatched_submitted_review_windows",
         "text_status_reason",
         "skeleton_static_status_reason",
         "mapped_precheck_checks",
@@ -952,8 +1242,8 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1001"][columns["skeleton_static_fail_frame_ratio"]] == 0.1
     assert by_asset["1001"][columns["skeleton_static_status"]] == "fail"
     assert "missing_status=fail" in by_asset["1001"][columns["skeleton_static_status_reason"]]
-    assert by_asset["1001"][columns["abnormal_fail_frame_count"]] == 10
-    assert by_asset["1001"][columns["abnormal_fail_frame_ratio"]] == 0.1
+    assert by_asset["1001"][columns["abnormal_fail_frame_count"]] == 50
+    assert by_asset["1001"][columns["abnormal_fail_frame_ratio"]] == 0.5
     assert by_asset["1001"][columns["abnormal_frame_status"]] == "fail"
     assert by_asset["1001"][columns["fail_indicator_count"]] == 3
     assert by_asset["1001"][columns["acceptance_status"]] == "fail"
@@ -966,6 +1256,12 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert "skeleton_quality_score" in by_asset["1001"][columns["mapped_precheck_checks"]]
     assert by_asset["1001"][columns["missing_expected_checks"]] in (None, "")
 
+    assert by_asset["1001"][columns["temporal_detected_frame_count"]] == 50
+    assert by_asset["1001"][columns["sam3_detected_frame_count"]] == 50
+    assert by_asset["1001"][columns["manual_true_positive_frame_count"]] == 10
+    assert by_asset["1001"][columns["temporal_sam3_manual_overlap_frame_count"]] == 10
+    assert by_asset["1001"][columns["problem_frame_count"]] == 50
+
     assert by_asset["1002"][columns["total_frames"]] == 200
     assert by_asset["1002"][columns["frame_count_status"]] == "ok"
     assert by_asset["1002"][columns["manual_problem_frame_count"]] == 10
@@ -976,8 +1272,8 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1002"][columns["text_check_status"]] == "pass"
     assert "mapped_text_integrity=pass" in by_asset["1002"][columns["text_status_reason"]]
     assert by_asset["1002"][columns["skeleton_static_status"]] == "pass"
-    assert by_asset["1002"][columns["abnormal_fail_frame_count"]] == 60
-    assert by_asset["1002"][columns["abnormal_fail_frame_ratio"]] == 0.30
+    assert by_asset["1002"][columns["abnormal_fail_frame_count"]] == 110
+    assert by_asset["1002"][columns["abnormal_fail_frame_ratio"]] == 0.55
     assert by_asset["1002"][columns["abnormal_frame_status"]] == "fail"
     assert by_asset["1002"][columns["fail_indicator_count"]] == 1
     assert by_asset["1002"][columns["acceptance_status"]] == "fail"
@@ -999,6 +1295,12 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1002"][columns["auto_fail_precision_on_reviewed"]] == 0.0
     assert "unreviewed_auto_fail_frames=20" in by_asset["1002"][columns["abnormal_status_reason"]]
     assert "acceptance_status=fail" in by_asset["1002"][columns["final_status_reason"]]
+    assert by_asset["1002"][columns["temporal_detected_frame_count"]] == 100
+    assert by_asset["1002"][columns["sam3_detected_frame_count"]] == 60
+    assert by_asset["1002"][columns["manual_true_positive_frame_count"]] == 10
+    assert by_asset["1002"][columns["auto_union_frame_count"]] == 100
+    assert by_asset["1002"][columns["manual_tp_not_detected_by_auto_frame_count"]] == 10
+    assert by_asset["1002"][columns["problem_frame_count"]] == 110
 
     assert by_asset["1003"][columns["total_frames"]] == 100
     assert by_asset["1003"][columns["frame_count_status"]] == "ok"
@@ -1021,6 +1323,14 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1003"][columns["abnormal_v1_unreviewed_as_fail_frame_count"]] == 21
     assert by_asset["1003"][columns["abnormal_v2_unreviewed_as_review_frame_count"]] == 21
     assert (
+        by_asset["1003"][columns["unmatched_submitted_review_ids"]]
+        == "rq_1003_0_20"
+    )
+    assert (
+        by_asset["1003"][columns["unmatched_submitted_review_windows"]]
+        == "0-20"
+    )
+    assert (
         by_asset["1003"][columns["supplier_quality_signal"]]
         == "not_provided"
     )
@@ -1028,6 +1338,38 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert Path(
         "/mnt/oss/egodata/XJGT_20260629/video/1003_video.mp4"
     ) in observed_paths
+
+    decomposition = workbook["异常检测拆解"]
+    assert [cell.value for cell in decomposition[1]] == ABNORMAL_SOURCE_COLUMNS
+    decomposition_rows = {
+        row[0]: row
+        for row in decomposition.iter_rows(min_row=2, values_only=True)
+    }
+    source_columns = {
+        name: index for index, name in enumerate(ABNORMAL_SOURCE_COLUMNS)
+    }
+    xjgt_source = decomposition_rows["星际归途 / XJGT"]
+    assert xjgt_source[source_columns["evaluation_scope"]] == "auto_triggered_review_only"
+    assert xjgt_source[source_columns["manual_tp_frame_count"]] == 20
+    assert xjgt_source[source_columns["manual_tp_segment_count"]] == 2
+    assert xjgt_source[source_columns["temporal_hit_manual_tp_frame_count"]] == 10
+    assert xjgt_source[source_columns["sam3_hit_manual_tp_frame_count"]] == 10
+    assert xjgt_source[source_columns["auto_union_hit_manual_tp_frame_count"]] == 10
+    assert xjgt_source[source_columns["manual_tp_missed_by_auto_frame_count"]] == 10
+    assert xjgt_source[source_columns["temporal_hit_manual_tp_segment_count"]] == 1
+    assert xjgt_source[source_columns["sam3_hit_manual_tp_segment_count"]] == 1
+    assert xjgt_source[source_columns["auto_union_hit_manual_tp_segment_count"]] == 1
+    assert xjgt_source[source_columns["manual_tp_segment_missed_by_auto_count"]] == 1
+    assert xjgt_source[source_columns["temporal_manual_tp_coverage_rate"]] == 0.5
+    assert xjgt_source[source_columns["sam3_manual_tp_coverage_rate"]] == 0.5
+    assert xjgt_source[source_columns["auto_union_manual_tp_coverage_rate"]] == 0.5
+    assert xjgt_source[source_columns["reviewed_auto_candidate_frame_count"]] == 50
+    assert xjgt_source[source_columns["reviewed_auto_true_positive_frame_count"]] == 10
+    assert xjgt_source[source_columns["reviewed_auto_false_positive_frame_count"]] == 0
+    assert xjgt_source[source_columns["reviewed_auto_acceptable_frame_count"]] == 0
+    assert xjgt_source[source_columns["reviewed_auto_confirmation_rate"]] == 0.2
+    assert xjgt_source[source_columns["blind_manual_auto_recall"]] == "not_measurable"
+    assert "global recall" in xjgt_source[source_columns["measurement_note"]]
 
     with outputs.summary_csv.open(newline="", encoding="utf-8") as handle:
         summary = list(csv.DictReader(handle))
@@ -1045,8 +1387,8 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     xjgt = summary[0]
     assert xjgt["sample_clip_count"] == "3"
     assert xjgt["total_frame_count"] == "400"
-    assert xjgt["problem_frame_count"] == "101"
-    assert xjgt["problem_frame_ratio"] == str(101 / 400)
+    assert xjgt["problem_frame_count"] == "191"
+    assert xjgt["problem_frame_ratio"] == str(191 / 400)
     assert xjgt["pass_clip_count"] == "0"
     assert xjgt["pass_clip_ratio"] == "0.0"
     assert xjgt["fail_clip_count"] == "3"
@@ -1071,7 +1413,13 @@ def test_final_sheet_combines_manual_issues_and_long_form_thresholds(
     _prepare_inputs(run_root)
     _patch_frame_probe(monkeypatch)
 
-    outputs = build_weekly_report(run_root)
+    precheck_config = (
+        run_root / "xjgt" / "precheck" / "precheck_config.yaml"
+    )
+    outputs = build_weekly_report(
+        run_root,
+        xjgt_precheck_config=precheck_config,
+    )
 
     workbook = load_workbook(outputs.workbook_xlsx)
     sheet = workbook["人工问题与阈值"]
@@ -1157,6 +1505,12 @@ def test_final_sheet_combines_manual_issues_and_long_form_thresholds(
     }
     assert config_summary["actual_config_leaf_count"] == expected_leaf_count
     assert config_summary["exported_run_config_row_count"] == expected_leaf_count
+    assert config_summary["precheck_run_config_leaf_count"] == _scalar_leaf_count(
+        yaml.safe_load(precheck_config.read_text(encoding="utf-8"))
+    )
+    assert config_summary["video_quality_run_config_leaf_count"] > 0
+    assert config_summary["sam3_run_config_leaf_count"] > 0
+    assert config_summary["weekly_policy_config_leaf_count"] > 0
     assert config_summary["missing_config_keys"] in (None, "")
     assert config_summary["submitted_review_source_path"] == str(
         run_root
@@ -1221,17 +1575,24 @@ def test_final_sheet_combines_manual_issues_and_long_form_thresholds(
         and row["value_source"] == "unavailable"
         for row in threshold_rows
     )
-    hard_metric_count = next(
+    temporal_thresholds = [
         row
         for row in threshold_rows
-        if row["config_key"]
-        == "skeleton_quality_score.hard_exceeded_metric_count"
-    )
-    assert hard_metric_count["effective_value"] == 3
-    assert hard_metric_count["value_source"] == "code_default"
-    assert hard_metric_count["source_path"].endswith(
-        "configs/precheck_example.yaml"
-    )
+        if row["metric_or_field"]
+        in {
+            "joint_angle_change_deg_max",
+            "rotation_delta_max",
+            "joint_acceleration_m_s2_max",
+            "joint_displacement_m_max",
+        }
+    ]
+    assert temporal_thresholds
+    assert {row["value_source"] for row in temporal_thresholds} == {
+        "run_config"
+    }
+    assert {row["source_path"] for row in temporal_thresholds} == {
+        str(precheck_config)
+    }
     keys = [
         (
             row["module"],
@@ -1243,6 +1604,166 @@ def test_final_sheet_combines_manual_issues_and_long_form_thresholds(
         for row in threshold_rows
     ]
     assert len(keys) == len(set(keys))
+
+
+def test_generated_workbook_has_no_formula_errors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_root = tmp_path / "acceptance_5x100"
+    _prepare_inputs(run_root)
+    _patch_frame_probe(monkeypatch)
+    outputs = build_weekly_report(
+        run_root,
+        xjgt_precheck_config=(
+            run_root / "xjgt" / "precheck" / "precheck_config.yaml"
+        ),
+    )
+
+    error_tokens = {"#NAME?", "#REF!", "#VALUE!", "#DIV/0!"}
+    for data_only in (False, True):
+        workbook = load_workbook(outputs.workbook_xlsx, data_only=data_only)
+        errors = [
+            (sheet.title, cell.coordinate, cell.value)
+            for sheet in workbook.worksheets
+            for row in sheet.iter_rows()
+            for cell in row
+            if cell.data_type == "e" or cell.value in error_tokens
+        ]
+        assert errors == []
+
+
+def test_bare_equals_operator_is_written_as_literal_text(tmp_path: Path) -> None:
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    row = threshold_rule_row(
+        parent_indicator="test",
+        module="test",
+        check_name="test",
+        metric_or_field="status",
+        rule_type="status_mapping",
+        threshold_level="test",
+        operator="=",
+        effective_value="fail",
+        unit="status",
+        aggregation_scope="asset",
+        output_status="fail",
+        config_key="test.status",
+        value_source="run_config",
+        source_path="test.yaml",
+    )
+    add_manual_threshold_sheet(
+        workbook,
+        manual_issue_rows=[],
+        threshold_rule_rows=[row],
+        config_audit={},
+    )
+    workbook_path = tmp_path / "literal_operator.xlsx"
+    workbook.save(workbook_path)
+
+    loaded = load_workbook(workbook_path, data_only=False)
+    sheet = loaded["人工问题与阈值"]
+    operator_column = THRESHOLD_RULE_COLUMNS.index("operator") + 1
+    equals_cells = [
+        sheet.cell(row_index, operator_column)
+        for row_index in range(1, sheet.max_row + 1)
+        if sheet.cell(row_index, operator_column).value == "="
+    ]
+    assert len(equals_cells) == 1
+    assert equals_cells[0].data_type == "s"
+
+
+def test_missing_explicit_precheck_config_stays_unavailable_and_incomplete(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_root = tmp_path / "acceptance_5x100"
+    _prepare_inputs(run_root)
+    _patch_frame_probe(monkeypatch)
+
+    xjgt = load_xjgt(run_root)
+
+    audit = xjgt["config_audit"]
+    assert audit["precheck_run_config_leaf_count"] == 0
+    assert audit["video_quality_run_config_leaf_count"] > 0
+    assert audit["sam3_run_config_leaf_count"] > 0
+    assert audit["weekly_policy_config_leaf_count"] > 0
+    assert "precheck" in audit["missing_config_keys"]
+    assert audit["config_reconciliation_status"] == "incomplete"
+    temporal_metrics = {
+        "joint_angle_change_deg_max",
+        "rotation_delta_max",
+        "joint_acceleration_m_s2_max",
+        "joint_displacement_m_max",
+    }
+    temporal_rows = [
+        row
+        for row in xjgt["threshold_rule_rows"]
+        if row["metric_or_field"] in temporal_metrics
+    ]
+    assert temporal_rows
+    assert {row["effective_value"] for row in temporal_rows} == {"unresolved"}
+    assert {row["value_source"] for row in temporal_rows} == {"unavailable"}
+    assert not any(
+        row["source_path"].endswith("configs/precheck_example.yaml")
+        for row in temporal_rows
+    )
+
+
+def test_submitted_review_matching_prefers_review_id_then_exact_window() -> None:
+    submitted = [
+        {
+            "review_id": "review-id-match",
+            "asset_id": "1001",
+            "window_start_frame": 0,
+            "window_end_frame": 49,
+        },
+        {
+            "review_id": "review-window-match",
+            "asset_id": "1001",
+            "window_start_frame": 50,
+            "window_end_frame": 99,
+        },
+        {
+            "review_id": "review-unmatched",
+            "asset_id": "1001",
+            "window_start_frame": 100,
+            "window_end_frame": 149,
+        },
+    ]
+    labels = [
+        {
+            "review_id": "review-id-match",
+            "asset_id": "/videos/1001_video.mp4",
+            "window_start_frame": 10,
+            "window_end_frame": 19,
+            "manual_outcome": "false_positive",
+        },
+        {
+            "asset_id": "1001.0",
+            "window_start_frame": 50,
+            "window_end_frame": 99,
+            "manual_outcome": "acceptable_flagged",
+        },
+        {
+            "asset_id": "1001",
+            "window_start_frame": 120,
+            "window_end_frame": 160,
+            "manual_outcome": "false_positive",
+        },
+    ]
+
+    match = match_submitted_review_rows(submitted, labels)
+
+    assert [row["review_id"] for row in match["matched_rows"]] == [
+        "review-id-match",
+        "review-window-match",
+    ]
+    assert match["match_methods"] == {
+        "review-id-match": "review_id",
+        "review-window-match": "asset_exact_window",
+    }
+    assert [row["review_id"] for row in match["unmatched_rows"]] == [
+        "review-unmatched"
+    ]
 
 
 def test_video_output_threshold_snapshot_is_run_config_fallback(
@@ -1565,7 +2086,7 @@ def test_deepreach_and_placeholders_remain_honest(
     deepreach_rows = list(workbook["DeepReach"].iter_rows(min_row=2, values_only=True))
     headers = [cell.value for cell in workbook["DeepReach"][1]]
     columns = {name: index for index, name in enumerate(headers)}
-    assert len(deepreach_rows) == 8
+    assert len(deepreach_rows) == 100
     assert {row[columns["text_check_status"]] for row in deepreach_rows} == {
         "not_ready"
     }
@@ -1588,16 +2109,15 @@ def test_deepreach_and_placeholders_remain_honest(
     assert {row[columns["review_status_v2"]] for row in deepreach_rows} == {
         "blocked"
     }
-    assert sum(row[columns["total_frames"]] for row in deepreach_rows) == sum(
-        30 + index for index in range(8)
-    )
+    assert sum(row[columns["total_frames"]] for row in deepreach_rows) == 94334
     assert {row[columns["frame_count_status"]] for row in deepreach_rows} == {
-        "ok"
+        "manifest_range"
     }
 
     with outputs.summary_csv.open(newline="", encoding="utf-8") as handle:
         summary = list(csv.DictReader(handle))
-    assert summary[1]["sample_clip_count"] == "8"
+    assert summary[1]["sample_clip_count"] == "100"
+    assert summary[1]["total_frame_count"] == "94334"
     assert summary[1]["pass_clip_count"] == ""
     for row in summary[2:]:
         assert row["sample_clip_count"] == "0"
@@ -1615,11 +2135,11 @@ def test_generation_prints_sanity_checks(
 
     output = capsys.readouterr().out
     assert "XJGT total_frame_count=400 ok=True" in output
-    assert "XJGT problem_frame_count=101 ok=True" in output
+    assert "XJGT problem_frame_count=191 ok=True" in output
     assert "XJGT manual_problem_ratio_nonzero=True" in output
     assert "XJGT acceptance_status counts={'fail': 3}" in output
     assert "XJGT review_status counts={'completed': 3}" in output
-    assert "DeepReach sample_clip_count=8" in output
+    assert "DeepReach sample_clip_count=100" in output
     assert "video_quality=no_valid_output" in output
 
 

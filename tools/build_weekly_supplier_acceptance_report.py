@@ -82,6 +82,24 @@ ABNORMAL_DETAIL_COLUMNS = [
     "temporal_status",
     "sam3_containment_status",
     "manual_review_status",
+    "temporal_detected_interval_count",
+    "temporal_detected_frame_count",
+    "temporal_v1_problem_frame_count",
+    "sam3_detected_interval_count",
+    "sam3_detected_frame_count",
+    "sam3_hard_fail_frame_count",
+    "sam3_review_like_frame_count",
+    "sam3_v1_problem_frame_count",
+    "manual_true_positive_interval_count",
+    "manual_true_positive_frame_count",
+    "temporal_sam3_overlap_frame_count",
+    "temporal_manual_overlap_frame_count",
+    "sam3_manual_overlap_frame_count",
+    "temporal_sam3_manual_overlap_frame_count",
+    "auto_union_frame_count",
+    "auto_union_manual_tp_overlap_frame_count",
+    "manual_tp_not_detected_by_auto_frame_count",
+    "problem_frame_count",
     "abnormal_fail_frame_count",
     "abnormal_fail_frame_ratio",
     "auto_fail_frame_count",
@@ -105,7 +123,44 @@ ABNORMAL_DETAIL_COLUMNS = [
     "unreviewed_submitted_frame_count",
     "abnormal_v1_unreviewed_as_fail_frame_count",
     "abnormal_v2_unreviewed_as_review_frame_count",
+    "unmatched_submitted_review_ids",
+    "unmatched_submitted_review_windows",
 ]
+
+ABNORMAL_SOURCE_COLUMNS = [
+    "supplier_name",
+    "evaluation_scope",
+    "manual_tp_frame_count",
+    "manual_tp_segment_count",
+    "temporal_hit_manual_tp_frame_count",
+    "sam3_hit_manual_tp_frame_count",
+    "auto_union_hit_manual_tp_frame_count",
+    "manual_tp_missed_by_auto_frame_count",
+    "temporal_hit_manual_tp_segment_count",
+    "sam3_hit_manual_tp_segment_count",
+    "auto_union_hit_manual_tp_segment_count",
+    "manual_tp_segment_missed_by_auto_count",
+    "temporal_manual_tp_coverage_rate",
+    "sam3_manual_tp_coverage_rate",
+    "auto_union_manual_tp_coverage_rate",
+    "reviewed_auto_candidate_frame_count",
+    "reviewed_auto_true_positive_frame_count",
+    "reviewed_auto_false_positive_frame_count",
+    "reviewed_auto_acceptable_frame_count",
+    "reviewed_auto_confirmation_rate",
+    "blind_manual_frame_count",
+    "blind_manual_problem_frame_count",
+    "blind_manual_auto_detected_frame_count",
+    "blind_manual_auto_recall",
+    "measurement_note",
+]
+
+ABNORMAL_COVERAGE_NOTE = (
+    "Current manual labels are primarily auto-triggered reviews. Coverage "
+    "describes which automatic source surfaced manually confirmed errors; it "
+    "does not measure global false negatives or global recall. Independent "
+    "blind/random manual audit is required for recall."
+)
 
 DIAGNOSTIC_DETAIL_COLUMNS = [
     "frame_count_status",
@@ -167,6 +222,7 @@ SHEET_NAMES = [
     "供应商3",
     "供应商4",
     "供应商5",
+    "异常检测拆解",
     "人工问题与阈值",
 ]
 
@@ -287,6 +343,7 @@ def build_weekly_report(
         summary_rows,
         xjgt["details"],
         deepreach["details"],
+        build_abnormal_source_rows(xjgt["details"]),
         xjgt["manual_issue_rows"],
         xjgt["threshold_rule_rows"],
         xjgt["config_audit"],
@@ -860,11 +917,22 @@ def load_xjgt(
 
 
 def load_deepreach(run_root: Path) -> dict[str, Any]:
-    manifest_path = (
+    formal_manifest_path = (
+        run_root
+        / "deepreach"
+        / "manifest"
+        / "deepreach_sample_100_manifest.csv"
+    )
+    legacy_manifest_path = (
         run_root
         / "deepreach"
         / "manifests"
         / "supplier_manifest_deepreach.csv"
+    )
+    manifest_path = (
+        formal_manifest_path
+        if formal_manifest_path.is_file()
+        else legacy_manifest_path
     )
     manifest = read_csv(manifest_path)
     video_results = (
@@ -883,18 +951,36 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
     details = []
     for row in manifest:
         asset_id = normalize_asset_id(row.get("asset_id"))
-        video_path = Path(text(row.get("video_path")))
-        probed_frames = probe_video_frame_count(video_path) if video_path else 0
+        video_path = Path(
+            text(first_value(row, ("primary_video_path", "video_path")))
+        )
+        start_frame = integer_or_none(row.get("start_frame"))
+        end_frame = integer_or_none(row.get("end_frame"))
+        range_frames = (
+            end_frame - start_frame + 1
+            if start_frame is not None
+            and end_frame is not None
+            and start_frame >= 0
+            and end_frame >= start_frame
+            else 0
+        )
+        probed_frames = (
+            probe_video_frame_count(video_path)
+            if video_path and not range_frames
+            else 0
+        )
         fallback_frames = integer_or_none(
             first_value(row, ("frame_count", "total_frames", "num_frames"))
         ) or 0
-        total_frames = probed_frames or fallback_frames
+        total_frames = range_frames or probed_frames or fallback_frames
         details.append(
             {
                 "asset_id": asset_id,
                 "total_frames": total_frames,
                 "frame_count_status": (
-                    "ok"
+                    "manifest_range"
+                    if range_frames > 0
+                    else "ok"
                     if probed_frames > 0
                     else "manifest_fallback"
                     if fallback_frames > 0
@@ -1092,33 +1178,7 @@ def load_precheck_rule_config(
     if actual_config_path is not None:
         loaded = read_config_mapping(actual_config_path)
         return loaded, "run_config", str(actual_config_path)
-    candidates = [
-        run_root / "xjgt" / "precheck" / "precheck_config.yaml",
-        run_root / "xjgt" / "precheck" / "config.yaml",
-        run_root / "xjgt" / "precheck" / "run_config.yaml",
-    ]
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            loaded = read_config_mapping(path)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            continue
-        if isinstance(loaded, dict):
-            return loaded, "run_config", str(path)
-
-    default_path = Path(__file__).parents[1] / "configs" / "precheck_example.yaml"
-    try:
-        import yaml
-
-        loaded = yaml.safe_load(default_path.read_text(encoding="utf-8")) or {}
-    except (OSError, ValueError, TypeError):
-        return {}, "unavailable", str(default_path)
-    return (
-        loaded if isinstance(loaded, dict) else {},
-        "code_default",
-        str(default_path),
-    )
+    return {}, "unavailable", ""
 
 
 def read_config_mapping(path: Path) -> dict[str, Any]:
@@ -1216,13 +1276,11 @@ def discover_xjgt_config_paths(
     weekly_policy_config: Path | None,
 ) -> dict[str, Path | None]:
     xjgt = run_root / "xjgt"
-    logged_precheck = logged_config_candidates(run_root, ("precheck",))
     logged_video = logged_config_candidates(
         run_root, ("video_quality", "videoquality")
     )
     logged_weekly = logged_config_candidates(run_root, ("weekly", "report"))
     for option_name, candidates in (
-        ("--xjgt-precheck-config", logged_precheck),
         ("--xjgt-video-quality-config", logged_video),
         ("--xjgt-weekly-policy-config", logged_weekly),
     ):
@@ -1231,18 +1289,13 @@ def discover_xjgt_config_paths(
                 f"ambiguous logged config paths for {option_name}: "
                 f"{', '.join(str(path) for path in candidates)}"
             )
+    if precheck_config is not None and not precheck_config.is_file():
+        raise ValueError(
+            f"--xjgt-precheck-config does not exist: {precheck_config}"
+        )
     return {
-        "precheck": discover_single_config(
-            explicit=precheck_config,
-            preferred=[
-                xjgt / "precheck" / "precheck_config.yaml",
-                xjgt / "precheck" / "config.yaml",
-                xjgt / "precheck" / "run_config.yaml",
-                *logged_precheck,
-            ],
-            glob_dir=xjgt / "precheck",
-            glob_patterns=("*.yaml", "*.yml"),
-            option_name="--xjgt-precheck-config",
+        "precheck": (
+            precheck_config.resolve() if precheck_config is not None else None
         ),
         "video_quality": discover_single_config(
             explicit=video_quality_config,
@@ -1424,6 +1477,12 @@ def build_run_config_inventory(
     missing: list[str] = []
     discovered: list[str] = []
     actual_leaf_count = 0
+    module_leaf_counts = {
+        "precheck": 0,
+        "video_quality": 0,
+        "sam3_containment": 0,
+        "weekly_report": 0,
+    }
     for module, path in config_paths.items():
         source_path = str(path) if path is not None else ""
         mapping: dict[str, Any] | None = (
@@ -1438,6 +1497,7 @@ def build_run_config_inventory(
             continue
         discovered.append(source_path)
         leaves = config_leaf_items(mapping)
+        module_leaf_counts[module] = len(leaves)
         actual_leaf_count += len(leaves)
         for config_key, value in leaves:
             parent, check_name = config_parent_and_check(module, config_key)
@@ -1468,13 +1528,30 @@ def build_run_config_inventory(
         missing.append(
             f"config_leaf_reconciliation:{actual_leaf_count - exported}"
         )
+    required_modules_resolved = all(
+        module_leaf_counts[module] > 0 for module in module_leaf_counts
+    )
     audit = {
         "actual_config_files_discovered": discovered,
         "actual_config_leaf_count": actual_leaf_count,
         "exported_run_config_row_count": exported,
+        "precheck_run_config_leaf_count": module_leaf_counts["precheck"],
+        "video_quality_run_config_leaf_count": module_leaf_counts[
+            "video_quality"
+        ],
+        "sam3_run_config_leaf_count": module_leaf_counts[
+            "sam3_containment"
+        ],
+        "weekly_policy_config_leaf_count": module_leaf_counts[
+            "weekly_report"
+        ],
         "missing_config_keys": missing,
         "config_reconciliation_status": (
-            "complete" if not missing and exported == actual_leaf_count else "incomplete"
+            "complete"
+            if required_modules_resolved
+            and not missing
+            and exported == actual_leaf_count
+            else "incomplete"
         ),
     }
     return rows, audit
@@ -1505,10 +1582,6 @@ def precheck_effective_value(
     run_section = run_section if isinstance(run_section, dict) else {}
     if key in run_section:
         return run_section[key], run_value_source, run_source_path
-    default_section = code_defaults.get(section)
-    default_section = default_section if isinstance(default_section, dict) else {}
-    if key in default_section:
-        return default_section[key], "code_default", code_default_path
     return "unresolved", "unavailable", run_source_path
 
 
@@ -2158,11 +2231,133 @@ def build_threshold_rule_rows(
     return deduped
 
 
+def build_abnormal_source_rows(
+    xjgt_details: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    decompositions = [
+        row.get("_source_decomposition", {})
+        for row in xjgt_details
+        if row.get("_source_decomposition")
+    ]
+
+    def total(field: str) -> int:
+        return sum(int(row.get(field) or 0) for row in decompositions)
+
+    manual_tp_frames = total("manual_tp_frame_count")
+    manual_tp_segments = total("manual_tp_segment_count")
+    reviewed_auto_frames = total("reviewed_auto_candidate_frame_count")
+    blind_problem_frames = total("blind_manual_problem_frame_count")
+    has_blind = any(
+        row.get("evaluation_scope") == "includes_blind_manual_audit"
+        for row in decompositions
+    )
+    xjgt = {
+        "supplier_name": "星际归途 / XJGT",
+        "evaluation_scope": (
+            "includes_blind_manual_audit"
+            if has_blind
+            else "auto_triggered_review_only"
+        ),
+        "manual_tp_frame_count": manual_tp_frames,
+        "manual_tp_segment_count": manual_tp_segments,
+        "temporal_hit_manual_tp_frame_count": total(
+            "temporal_hit_manual_tp_frame_count"
+        ),
+        "sam3_hit_manual_tp_frame_count": total(
+            "sam3_hit_manual_tp_frame_count"
+        ),
+        "auto_union_hit_manual_tp_frame_count": total(
+            "auto_union_hit_manual_tp_frame_count"
+        ),
+        "manual_tp_missed_by_auto_frame_count": total(
+            "manual_tp_missed_by_auto_frame_count"
+        ),
+        "temporal_hit_manual_tp_segment_count": total(
+            "temporal_hit_manual_tp_segment_count"
+        ),
+        "sam3_hit_manual_tp_segment_count": total(
+            "sam3_hit_manual_tp_segment_count"
+        ),
+        "auto_union_hit_manual_tp_segment_count": total(
+            "auto_union_hit_manual_tp_segment_count"
+        ),
+        "manual_tp_segment_missed_by_auto_count": total(
+            "manual_tp_segment_missed_by_auto_count"
+        ),
+        "reviewed_auto_candidate_frame_count": reviewed_auto_frames,
+        "reviewed_auto_true_positive_frame_count": total(
+            "reviewed_auto_true_positive_frame_count"
+        ),
+        "reviewed_auto_false_positive_frame_count": total(
+            "reviewed_auto_false_positive_frame_count"
+        ),
+        "reviewed_auto_acceptable_frame_count": total(
+            "reviewed_auto_acceptable_frame_count"
+        ),
+        "blind_manual_frame_count": total("blind_manual_frame_count"),
+        "blind_manual_problem_frame_count": blind_problem_frames,
+        "blind_manual_auto_detected_frame_count": total(
+            "blind_manual_auto_detected_frame_count"
+        ),
+        "measurement_note": ABNORMAL_COVERAGE_NOTE,
+    }
+    xjgt["temporal_manual_tp_coverage_rate"] = (
+        safe_ratio(xjgt["temporal_hit_manual_tp_frame_count"], manual_tp_frames)
+        if manual_tp_frames
+        else "not_measurable"
+    )
+    xjgt["sam3_manual_tp_coverage_rate"] = (
+        safe_ratio(xjgt["sam3_hit_manual_tp_frame_count"], manual_tp_frames)
+        if manual_tp_frames
+        else "not_measurable"
+    )
+    xjgt["auto_union_manual_tp_coverage_rate"] = (
+        safe_ratio(xjgt["auto_union_hit_manual_tp_frame_count"], manual_tp_frames)
+        if manual_tp_frames
+        else "not_measurable"
+    )
+    xjgt["reviewed_auto_confirmation_rate"] = (
+        safe_ratio(
+            xjgt["reviewed_auto_true_positive_frame_count"],
+            reviewed_auto_frames,
+        )
+        if reviewed_auto_frames
+        else "not_measurable"
+    )
+    xjgt["blind_manual_auto_recall"] = (
+        safe_ratio(
+            xjgt["blind_manual_auto_detected_frame_count"],
+            blind_problem_frames,
+        )
+        if blind_problem_frames
+        else "not_measurable"
+    )
+
+    unavailable_rows = []
+    for supplier_name in ("DeepReach", "供应商3", "供应商4", "供应商5"):
+        row = {column: 0 for column in ABNORMAL_SOURCE_COLUMNS}
+        row.update(
+            {
+                "supplier_name": supplier_name,
+                "evaluation_scope": "not_ready",
+                "temporal_manual_tp_coverage_rate": "not_measurable",
+                "sam3_manual_tp_coverage_rate": "not_measurable",
+                "auto_union_manual_tp_coverage_rate": "not_measurable",
+                "reviewed_auto_confirmation_rate": "not_measurable",
+                "blind_manual_auto_recall": "not_measurable",
+                "measurement_note": ABNORMAL_COVERAGE_NOTE,
+            }
+        )
+        unavailable_rows.append(row)
+    return [xjgt, *unavailable_rows]
+
+
 def write_workbook(
     path: Path,
     summary_rows: list[dict[str, Any]],
     xjgt_details: list[dict[str, Any]],
     deepreach_details: list[dict[str, Any]],
+    abnormal_source_rows: list[dict[str, Any]],
     manual_issue_rows: list[dict[str, Any]],
     threshold_rule_rows: list[dict[str, Any]],
     config_audit: dict[str, Any],
@@ -2189,6 +2384,12 @@ def write_workbook(
             detail_columns_for_rows([]),
             [],
         )
+    add_sheet(
+        workbook,
+        "异常检测拆解",
+        ABNORMAL_SOURCE_COLUMNS,
+        abnormal_source_rows,
+    )
     add_manual_threshold_sheet(
         workbook,
         manual_issue_rows,
@@ -2266,6 +2467,22 @@ def add_manual_threshold_sheet(
             "exported_run_config_row_count",
             config_audit.get("exported_run_config_row_count", 0),
         ),
+        (
+            "precheck_run_config_leaf_count",
+            config_audit.get("precheck_run_config_leaf_count", 0),
+        ),
+        (
+            "video_quality_run_config_leaf_count",
+            config_audit.get("video_quality_run_config_leaf_count", 0),
+        ),
+        (
+            "sam3_run_config_leaf_count",
+            config_audit.get("sam3_run_config_leaf_count", 0),
+        ),
+        (
+            "weekly_policy_config_leaf_count",
+            config_audit.get("weekly_policy_config_leaf_count", 0),
+        ),
         ("code_default_row_count", config_audit.get("code_default_row_count", 0)),
         (
             "producer_metadata_row_count",
@@ -2318,7 +2535,13 @@ def add_manual_threshold_sheet(
         threshold_rule_rows, threshold_header_row + 1
     ):
         for column_index, column in enumerate(THRESHOLD_RULE_COLUMNS, 1):
-            cell = sheet.cell(row_index, column_index, row.get(column, ""))
+            value = row.get(column, "")
+            cell = sheet.cell(row_index, column_index)
+            cell.value = value
+            if column == "operator" or (
+                isinstance(value, str) and value.startswith("=")
+            ):
+                cell.data_type = "s"
             if column in {"notes", "source_path"}:
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
 
@@ -2571,6 +2794,522 @@ def map_submitted_review_intervals(
     return map_window_rows(submitted, asset_ids, episode_asset)
 
 
+def metadata_values(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [text(item).lower() for item in value if text(item)]
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, list):
+            return [text(item).lower() for item in decoded if text(item)]
+        return [part.strip().lower() for part in re.split(r"[|,;]", value) if part.strip()]
+    return [text(value).lower()]
+
+
+def is_temporal_candidate_row(row: dict[str, Any]) -> bool:
+    values = metadata_values(
+        [
+            row.get("check"),
+            row.get("module"),
+            row.get("source_module"),
+            row.get("issue_type"),
+            row.get("suggested_issue_type"),
+            *metadata_values(row.get("review_type")),
+            *metadata_values(row.get("trigger_reason")),
+        ]
+    )
+    joined = " ".join(values)
+    if any(
+        token in joined
+        for token in (
+            "keypoint_morphology",
+            "skeleton_morphology",
+            "keypoint_missing",
+            "missing_keypoint",
+            "keypoint_raw_invalid",
+            "skeleton_static",
+        )
+    ):
+        return False
+    if any(
+        token in joined
+        for token in (
+            "keypoint_temporal",
+            "temporal_",
+            "rotation_",
+            "joint_acceleration",
+            "joint_displacement",
+            "continuity",
+            "side_view_manual_review",
+            "projection_review",
+            "out_of_frame_review",
+        )
+    ):
+        return True
+    # The producer's candidate_windows artifact is emitted by the temporal
+    # skeleton candidate builder. Rows with explicit static provenance were
+    # rejected above; old artifacts may have no check/module field at all.
+    return event_frame_interval(row) is not None
+
+
+def sam3_evidence_kind(row: dict[str, Any]) -> str:
+    verdict = text(
+        first_value(
+            row,
+            ("window_containment_verdict", "containment_verdict", "verdict"),
+        )
+    ).lower()
+    if verdict == "containment_fail":
+        return "hard_fail"
+    if verdict in {
+        "review",
+        "projection_review",
+        "mixed_review",
+        "side_view_manual_review",
+        "rotation_manual_review",
+    }:
+        return "review_like"
+    if verdict == "acceptable_flagged":
+        return "acceptable"
+    return ""
+
+
+def submitted_review_origin(row: dict[str, Any]) -> str:
+    module = text(first_value(row, ("module", "source_module"))).lower()
+    issue = " ".join(
+        metadata_values(
+            first_value(
+                row,
+                ("suggested_issue_type", "issue_type", "failure_mode"),
+            )
+        )
+    )
+    evidence = text(row.get("evidence_path")).lower()
+    sam3 = module == "sam3_containment" or any(
+        token in issue or token in evidence
+        for token in ("containment", "sam3", "projection", "side_view_mask")
+    )
+    temporal = module in {"precheck", "keypoint_temporal"} or any(
+        token in issue or token in evidence
+        for token in ("temporal", "candidate_windows", "rotation")
+    )
+    if temporal and sam3:
+        return "temporal_and_sam3_triggered"
+    if temporal:
+        return "temporal_triggered"
+    if sam3:
+        return "sam3_triggered"
+    return "unknown"
+
+
+def resolve_manual_review_origin(
+    row: dict[str, Any],
+    *,
+    submitted_by_review_id: dict[str, dict[str, Any]],
+    submitted_by_exact_window: dict[tuple[int, int], list[dict[str, Any]]],
+    temporal_intervals: set[tuple[int, int]],
+    sam3_intervals: set[tuple[int, int]],
+    total_frames: int,
+) -> tuple[str, tuple[int, int] | None]:
+    valid_origins = {
+        "temporal_triggered",
+        "sam3_triggered",
+        "temporal_and_sam3_triggered",
+        "blind_random",
+        "full_clip_audit",
+        "unknown",
+    }
+    explicit = text(row.get("review_origin")).lower()
+    review_id = text(row.get("review_id"))
+    submitted = submitted_by_review_id.get(review_id) if review_id else None
+    interval = event_frame_interval(submitted) if submitted else manual_reviewed_interval(row)
+    if explicit in valid_origins:
+        if explicit == "full_clip_audit" and interval is None and total_frames > 0:
+            interval = (0, total_frames - 1)
+        return explicit, interval
+    if submitted is not None:
+        origin = submitted_review_origin(submitted)
+        if origin != "unknown":
+            return origin, interval
+    if interval is not None and interval in submitted_by_exact_window:
+        origins = {
+            submitted_review_origin(submitted_row)
+            for submitted_row in submitted_by_exact_window[interval]
+        }
+        origins.discard("unknown")
+        if origins == {"temporal_triggered", "sam3_triggered"}:
+            return "temporal_and_sam3_triggered", interval
+        if len(origins) == 1:
+            return origins.pop(), interval
+    if interval is None:
+        return "unknown", None
+    temporal = interval in temporal_intervals
+    sam3 = interval in sam3_intervals
+    if temporal and sam3:
+        return "temporal_and_sam3_triggered", interval
+    if temporal:
+        return "temporal_triggered", interval
+    if sam3:
+        return "sam3_triggered", interval
+    return "unknown", interval
+
+
+def outcome_value(row: dict[str, Any]) -> str:
+    return text(
+        first_value(row, ("manual_outcome", "algorithm_outcome", "label"))
+    ).lower()
+
+
+def intervals_hit_segment_count(
+    segments: list[tuple[int, int]],
+    evidence: list[tuple[int, int]],
+) -> int:
+    return sum(bool(intersect_intervals([segment], evidence)) for segment in segments)
+
+
+def decompose_abnormal_sources(
+    *,
+    temporal_rows: list[dict[str, Any]],
+    sam3_rows: list[dict[str, Any]],
+    manual_rows: list[dict[str, Any]],
+    submitted_rows: list[dict[str, Any]],
+    total_frames: int,
+) -> dict[str, Any]:
+    temporal_source_rows = [
+        row
+        for row in temporal_rows
+        if is_temporal_candidate_row(row) and event_frame_interval(row) is not None
+    ]
+    temporal_raw = [event_frame_interval(row) for row in temporal_source_rows]
+    temporal_raw = [interval for interval in temporal_raw if interval is not None]
+    temporal_detected = clip_intervals(temporal_raw, total_frames)
+
+    sam3_classified = [
+        (row, sam3_evidence_kind(row), event_frame_interval(row))
+        for row in sam3_rows
+    ]
+    sam3_classified = [
+        (row, kind, interval)
+        for row, kind, interval in sam3_classified
+        if kind and interval is not None
+    ]
+    sam3_detected = clip_intervals(
+        [interval for _, _, interval in sam3_classified], total_frames
+    )
+    sam3_hard = clip_intervals(
+        [
+            interval
+            for _, kind, interval in sam3_classified
+            if kind == "hard_fail"
+        ],
+        total_frames,
+    )
+    sam3_review_like = clip_intervals(
+        [
+            interval
+            for _, kind, interval in sam3_classified
+            if kind == "review_like"
+        ],
+        total_frames,
+    )
+    sam3_acceptable = clip_intervals(
+        [
+            interval
+            for _, kind, interval in sam3_classified
+            if kind == "acceptable"
+        ],
+        total_frames,
+    )
+
+    manual_tp = clip_intervals(
+        [
+            interval
+            for interval in (
+                manual_affected_interval(row)
+                for row in manual_rows
+                if is_confirmed_manual_outcome(row)
+            )
+            if interval is not None
+        ],
+        total_frames,
+    )
+    temporal_exact = set(temporal_raw)
+    sam3_exact = {interval for _, _, interval in sam3_classified}
+    submitted_by_review_id = {
+        text(row.get("review_id")): row
+        for row in submitted_rows
+        if text(row.get("review_id"))
+    }
+    submitted_by_exact_window: dict[
+        tuple[int, int], list[dict[str, Any]]
+    ] = defaultdict(list)
+    for row in submitted_rows:
+        interval = event_frame_interval(row)
+        if interval is not None:
+            submitted_by_exact_window[interval].append(row)
+
+    resolved_manual: list[tuple[dict[str, Any], str, tuple[int, int] | None]] = []
+    clear_temporal: set[tuple[int, int]] = set()
+    clear_sam3: set[tuple[int, int]] = set()
+    blind_rows: list[tuple[dict[str, Any], tuple[int, int] | None]] = []
+    for row in manual_rows:
+        origin, reviewed_interval = resolve_manual_review_origin(
+            row,
+            submitted_by_review_id=submitted_by_review_id,
+            submitted_by_exact_window=submitted_by_exact_window,
+            temporal_intervals=temporal_exact,
+            sam3_intervals=sam3_exact,
+            total_frames=total_frames,
+        )
+        resolved_manual.append((row, origin, reviewed_interval))
+        if origin in {"blind_random", "full_clip_audit"}:
+            blind_rows.append((row, reviewed_interval))
+        if outcome_value(row) not in {"false_positive", "acceptable_flagged"}:
+            continue
+        if reviewed_interval is None:
+            continue
+        if origin in {"temporal_triggered", "temporal_and_sam3_triggered"}:
+            clear_temporal.add(reviewed_interval)
+        if origin in {"sam3_triggered", "temporal_and_sam3_triggered"}:
+            clear_sam3.add(reviewed_interval)
+
+    temporal_v1 = clip_intervals(
+        [interval for interval in temporal_raw if interval not in clear_temporal],
+        total_frames,
+    )
+    sam3_v1_base = clip_intervals(
+        [
+            interval
+            for _, kind, interval in sam3_classified
+            if kind in {"hard_fail", "review_like"} and interval not in clear_sam3
+        ],
+        total_frames,
+    )
+    sam3_acceptable_manual_tp = intersect_intervals(sam3_acceptable, manual_tp)
+    sam3_v1 = clip_intervals(
+        [*sam3_v1_base, *sam3_acceptable_manual_tp], total_frames
+    )
+    problem_v1 = clip_intervals(
+        [*manual_tp, *temporal_v1, *sam3_v1], total_frames
+    )
+    auto_union = clip_intervals(
+        [*temporal_detected, *sam3_detected], total_frames
+    )
+
+    reviewed_auto: list[tuple[int, int]] = []
+    reviewed_tp: list[tuple[int, int]] = []
+    reviewed_fp: list[tuple[int, int]] = []
+    reviewed_acceptable: list[tuple[int, int]] = []
+    for row, origin, reviewed_interval in resolved_manual:
+        if origin not in {
+            "temporal_triggered",
+            "sam3_triggered",
+            "temporal_and_sam3_triggered",
+        } or reviewed_interval is None:
+            continue
+        reviewed_auto.append(reviewed_interval)
+        outcome = outcome_value(row)
+        if outcome in {"true_positive", "positive"}:
+            affected = manual_affected_interval(row)
+            if affected is not None:
+                reviewed_tp.extend(intersect_intervals([affected], [reviewed_interval]))
+        elif outcome == "false_positive":
+            reviewed_fp.append(reviewed_interval)
+        elif outcome == "acceptable_flagged":
+            reviewed_acceptable.append(reviewed_interval)
+
+    reviewed_auto = clip_intervals(reviewed_auto, total_frames)
+    reviewed_tp = clip_intervals(reviewed_tp, total_frames)
+    reviewed_fp = clip_intervals(reviewed_fp, total_frames)
+    reviewed_acceptable = clip_intervals(reviewed_acceptable, total_frames)
+
+    blind_reviewed = clip_intervals(
+        [
+            interval
+            for _, interval in blind_rows
+            if interval is not None
+        ],
+        total_frames,
+    )
+    blind_problem = clip_intervals(
+        [
+            interval
+            for interval in (
+                manual_affected_interval(row)
+                for row, _ in blind_rows
+                if is_confirmed_manual_outcome(row)
+            )
+            if interval is not None
+        ],
+        total_frames,
+    )
+    blind_detected = clip_intervals(
+        intersect_intervals(blind_problem, auto_union), total_frames
+    )
+
+    temporal_manual = clip_intervals(
+        intersect_intervals(temporal_detected, manual_tp), total_frames
+    )
+    sam3_manual = clip_intervals(
+        intersect_intervals(sam3_detected, manual_tp), total_frames
+    )
+    auto_manual = clip_intervals(
+        intersect_intervals(auto_union, manual_tp), total_frames
+    )
+    manual_missed = clip_intervals(
+        subtract_intervals(manual_tp, auto_union), total_frames
+    )
+    manual_tp_count = interval_frame_count(manual_tp)
+    reviewed_auto_count = interval_frame_count(reviewed_auto)
+    blind_problem_count = interval_frame_count(blind_problem)
+    has_blind_audit = bool(blind_rows)
+    return {
+        "temporal_detected_interval_count": len(temporal_detected),
+        "temporal_detected_frame_count": interval_frame_count(temporal_detected),
+        "temporal_v1_problem_frame_count": interval_frame_count(temporal_v1),
+        "sam3_detected_interval_count": len(sam3_detected),
+        "sam3_detected_frame_count": interval_frame_count(sam3_detected),
+        "sam3_hard_fail_frame_count": interval_frame_count(sam3_hard),
+        "sam3_review_like_frame_count": interval_frame_count(sam3_review_like),
+        "sam3_v1_problem_frame_count": interval_frame_count(sam3_v1),
+        "manual_true_positive_interval_count": len(manual_tp),
+        "manual_true_positive_frame_count": manual_tp_count,
+        "temporal_sam3_overlap_frame_count": interval_frame_count(
+            intersect_intervals(temporal_detected, sam3_detected)
+        ),
+        "temporal_manual_overlap_frame_count": interval_frame_count(temporal_manual),
+        "sam3_manual_overlap_frame_count": interval_frame_count(sam3_manual),
+        "temporal_sam3_manual_overlap_frame_count": interval_frame_count(
+            intersect_intervals(
+                intersect_intervals(temporal_detected, sam3_detected),
+                manual_tp,
+            )
+        ),
+        "auto_union_frame_count": interval_frame_count(auto_union),
+        "auto_union_manual_tp_overlap_frame_count": interval_frame_count(auto_manual),
+        "manual_tp_not_detected_by_auto_frame_count": interval_frame_count(
+            manual_missed
+        ),
+        "problem_frame_count": interval_frame_count(problem_v1),
+        "evaluation_scope": (
+            "includes_blind_manual_audit"
+            if has_blind_audit
+            else "auto_triggered_review_only"
+        ),
+        "manual_tp_frame_count": manual_tp_count,
+        "manual_tp_segment_count": len(manual_tp),
+        "temporal_hit_manual_tp_frame_count": interval_frame_count(temporal_manual),
+        "sam3_hit_manual_tp_frame_count": interval_frame_count(sam3_manual),
+        "auto_union_hit_manual_tp_frame_count": interval_frame_count(auto_manual),
+        "manual_tp_missed_by_auto_frame_count": interval_frame_count(manual_missed),
+        "temporal_hit_manual_tp_segment_count": intervals_hit_segment_count(
+            manual_tp, temporal_detected
+        ),
+        "sam3_hit_manual_tp_segment_count": intervals_hit_segment_count(
+            manual_tp, sam3_detected
+        ),
+        "auto_union_hit_manual_tp_segment_count": intervals_hit_segment_count(
+            manual_tp, auto_union
+        ),
+        "manual_tp_segment_missed_by_auto_count": sum(
+            not intersect_intervals([segment], auto_union) for segment in manual_tp
+        ),
+        "temporal_manual_tp_coverage_rate": safe_ratio(
+            interval_frame_count(temporal_manual), manual_tp_count
+        ),
+        "sam3_manual_tp_coverage_rate": safe_ratio(
+            interval_frame_count(sam3_manual), manual_tp_count
+        ),
+        "auto_union_manual_tp_coverage_rate": safe_ratio(
+            interval_frame_count(auto_manual), manual_tp_count
+        ),
+        "reviewed_auto_candidate_frame_count": reviewed_auto_count,
+        "reviewed_auto_true_positive_frame_count": interval_frame_count(reviewed_tp),
+        "reviewed_auto_false_positive_frame_count": interval_frame_count(reviewed_fp),
+        "reviewed_auto_acceptable_frame_count": interval_frame_count(
+            reviewed_acceptable
+        ),
+        "reviewed_auto_confirmation_rate": (
+            safe_ratio(interval_frame_count(reviewed_tp), reviewed_auto_count)
+            if reviewed_auto_count
+            else "not_measurable"
+        ),
+        "blind_manual_frame_count": interval_frame_count(blind_reviewed),
+        "blind_manual_problem_frame_count": blind_problem_count,
+        "blind_manual_auto_detected_frame_count": interval_frame_count(
+            blind_detected
+        ),
+        "blind_manual_auto_recall": (
+            safe_ratio(interval_frame_count(blind_detected), blind_problem_count)
+            if blind_problem_count
+            else "not_measurable"
+        ),
+        "measurement_note": ABNORMAL_COVERAGE_NOTE,
+        "_temporal_detected_intervals": temporal_detected,
+        "_temporal_v1_problem_intervals": temporal_v1,
+        "_sam3_detected_intervals": sam3_detected,
+        "_sam3_v1_problem_intervals": sam3_v1,
+        "_manual_tp_intervals": manual_tp,
+        "_auto_union_intervals": auto_union,
+        "_problem_intervals": problem_v1,
+    }
+
+
+def match_submitted_review_rows(
+    submitted_rows: list[dict[str, Any]],
+    manual_label_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Resolve submitted windows by review_id, then exact asset/window only."""
+    labels_by_review_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    labels_by_exact_window: dict[
+        tuple[str, tuple[int, int]], list[dict[str, Any]]
+    ] = defaultdict(list)
+    for label in manual_label_rows:
+        review_id = text(label.get("review_id"))
+        if review_id:
+            labels_by_review_id[review_id].append(label)
+        asset_id = normalize_asset_id(label.get("asset_id"))
+        interval = manual_reviewed_interval(label)
+        if asset_id and interval is not None:
+            labels_by_exact_window[(asset_id, interval)].append(label)
+
+    matched_rows: list[dict[str, Any]] = []
+    unmatched_rows: list[dict[str, Any]] = []
+    match_methods: dict[str, str] = {}
+    for row in submitted_rows:
+        review_id = text(row.get("review_id"))
+        asset_id = normalize_asset_id(row.get("asset_id"))
+        interval = event_frame_interval(row)
+        method = ""
+        if review_id and review_id in labels_by_review_id:
+            method = "review_id"
+        elif (
+            asset_id
+            and interval is not None
+            and (asset_id, interval) in labels_by_exact_window
+        ):
+            method = "asset_exact_window"
+        if method:
+            matched_rows.append(row)
+            diagnostic_key = review_id or (
+                f"{asset_id}:{interval[0]}-{interval[1]}"
+                if interval is not None
+                else asset_id
+            )
+            match_methods[diagnostic_key] = method
+        else:
+            unmatched_rows.append(row)
+    return {
+        "matched_rows": matched_rows,
+        "unmatched_rows": unmatched_rows,
+        "match_methods": match_methods,
+    }
+
+
 def is_submitted_temporal_or_sam3_row(row: dict[str, Any]) -> bool:
     if text(row.get("source_level")).lower() != "window":
         return False
@@ -2786,6 +3525,7 @@ def map_sam3_evidence(
             "status": "pass",
             "auto_fail_intervals": [],
             "review_intervals": [],
+            "rows": [],
         }
     )
     unmatched: set[str] = set()
@@ -2811,6 +3551,7 @@ def map_sam3_evidence(
             else "pass"
         )
         record = mapped[asset_id]
+        record["rows"].append(row)
         record["status"] = worst_status(record["status"], status)
         interval = event_frame_interval(row)
         if interval is not None and status != "pass":
@@ -2824,7 +3565,7 @@ def dedupe_manual_labels(
     labels: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    seen: set[tuple[Any, ...]] = set()
+    seen: dict[tuple[Any, ...], int] = {}
     for row in labels:
         key = (
             normalize_asset_id(row.get("asset_id")),
@@ -2837,9 +3578,14 @@ def dedupe_manual_labels(
             integer_or_none(row.get("affected_end_frame")),
         )
         if key in seen:
+            existing = result[seen[key]]
+            if not text(existing.get("review_origin")) and text(
+                row.get("review_origin")
+            ):
+                existing["review_origin"] = row["review_origin"]
             continue
-        seen.add(key)
-        result.append(row)
+        seen[key] = len(result)
+        result.append(dict(row))
     return result
 
 
@@ -2849,12 +3595,14 @@ def aggregate_manual_review(
 ) -> dict[str, dict[str, Any]]:
     problems: dict[str, list[tuple[int, int]]] = defaultdict(list)
     reviewed: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    label_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
     labeled_assets: set[str] = set()
     for row in labels:
         asset_id = normalize_asset_id(row.get("asset_id"))
         if not asset_id or asset_id not in total_frames_by_asset:
             continue
         labeled_assets.add(asset_id)
+        label_rows[asset_id].append(row)
         start = integer_or_none(row.get("window_start_frame"))
         end = integer_or_none(row.get("window_end_frame"))
         if start is None or end is None:
@@ -2889,6 +3637,7 @@ def aggregate_manual_review(
             ),
             "problem_intervals": problem_intervals,
             "reviewed_intervals": reviewed_intervals,
+            "label_rows": label_rows[asset_id],
         }
     return output
 
@@ -3056,6 +3805,7 @@ def empty_manual_evidence(total_frames: int) -> dict[str, Any]:
         "manual_problem_ratio_of_reviewed": 0.0,
         "problem_intervals": [],
         "reviewed_intervals": [],
+        "label_rows": [],
     }
 
 
@@ -3155,8 +3905,20 @@ def build_xjgt_detail(
     quality_signal = text(
         precheck_row.get("supplier_quality_signal")
     ) or "not_provided"
+    temporal_candidate_rows = [
+        row
+        for row in candidate_row.get("rows", [])
+        if is_temporal_candidate_row(row)
+    ]
     candidate_intervals = clip_intervals(
-        candidate_row.get("intervals", []), total_frames
+        [
+            interval
+            for interval in (
+                event_frame_interval(row) for row in temporal_candidate_rows
+            )
+            if interval is not None
+        ],
+        total_frames,
     )
     temporal_seen = bool(
         precheck_row.get("has_skeleton_quality")
@@ -3184,8 +3946,25 @@ def build_xjgt_detail(
         ],
         total_frames,
     )
+    submitted_rows = [
+        row
+        for row in submitted_review_row.get("rows", [])
+        if event_frame_interval(row) is not None
+    ]
+    submitted_match = match_submitted_review_rows(
+        submitted_rows,
+        manual_row.get("label_rows", []),
+    )
+    source_decomposition = decompose_abnormal_sources(
+        temporal_rows=temporal_candidate_rows,
+        sam3_rows=sam3_row.get("rows", []),
+        manual_rows=manual_row.get("label_rows", []),
+        submitted_rows=submitted_rows,
+        total_frames=total_frames,
+    )
     submitted_review_intervals = clip_intervals(
-        submitted_review_row.get("intervals", []), total_frames
+        [event_frame_interval(row) for row in submitted_rows],
+        total_frames,
     )
     reviewed_intervals = manual_row["reviewed_intervals"]
     manual_intervals = manual_row["problem_intervals"]
@@ -3201,17 +3980,21 @@ def build_xjgt_detail(
     unreviewed_auto = subtract_intervals(
         auto_fail_intervals, reviewed_intervals
     )
-    reviewed_submitted = intersect_intervals(
-        submitted_review_intervals, reviewed_intervals
+    reviewed_submitted = clip_intervals(
+        [
+            event_frame_interval(row)
+            for row in submitted_match["matched_rows"]
+        ],
+        total_frames,
     )
-    unreviewed_submitted = subtract_intervals(
-        submitted_review_intervals, reviewed_intervals
+    unreviewed_submitted = clip_intervals(
+        [
+            event_frame_interval(row)
+            for row in submitted_match["unmatched_rows"]
+        ],
+        total_frames,
     )
-    abnormal_intervals = [
-        *unreviewed_auto,
-        *manual_intervals,
-        *unreviewed_submitted,
-    ]
+    abnormal_intervals = source_decomposition["_problem_intervals"]
     abnormal_intervals_v2 = [*unreviewed_auto, *manual_intervals]
     unresolved_review_v2 = unreviewed_submitted
     auto_count = interval_frame_count(auto_fail_intervals)
@@ -3223,12 +4006,14 @@ def build_xjgt_detail(
         reviewed_auto_false_positive
     )
     unreviewed_auto_count = interval_frame_count(unreviewed_auto)
-    submitted_review_count = len(submitted_review_intervals)
+    submitted_review_count = len(submitted_rows)
     submitted_review_frame_count = interval_frame_count(
         submitted_review_intervals
     )
-    reviewed_submitted_count = len(reviewed_submitted)
-    unreviewed_submitted_interval_count = len(unreviewed_submitted)
+    reviewed_submitted_count = len(submitted_match["matched_rows"])
+    unreviewed_submitted_interval_count = len(
+        submitted_match["unmatched_rows"]
+    )
     unreviewed_submitted_count = interval_frame_count(unreviewed_submitted)
     unresolved_review_count_v2 = interval_frame_count(unresolved_review_v2)
     abnormal_count = interval_frame_count(abnormal_intervals)
@@ -3258,6 +4043,8 @@ def build_xjgt_detail(
         "policy=v1_conservative; "
         f"abnormal_ratio={abnormal_ratio:.6f}; "
         f"manual_true_positive_frames={manual_row['manual_problem_frame_count']}; "
+        f"temporal_v1_frames={source_decomposition['temporal_v1_problem_frame_count']}; "
+        f"sam3_v1_frames={source_decomposition['sam3_v1_problem_frame_count']}; "
         f"auto_fail_frames={auto_count}; "
         f"reviewed_auto_fail_frames={reviewed_auto_count}; "
         f"unreviewed_auto_fail_frames={unreviewed_auto_count}; "
@@ -3388,6 +4175,11 @@ def build_xjgt_detail(
         "temporal_status": temporal_status,
         "sam3_containment_status": sam3_status,
         "manual_review_status": manual_row["manual_review_status"],
+        **{
+            column: source_decomposition[column]
+            for column in ABNORMAL_DETAIL_COLUMNS
+            if column in source_decomposition
+        },
         "manual_problem_frame_count": manual_row[
             "manual_problem_frame_count"
         ],
@@ -3438,6 +4230,18 @@ def build_xjgt_detail(
         "abnormal_v2_unreviewed_as_review_frame_count": (
             unreviewed_submitted_count
         ),
+        "unmatched_submitted_review_ids": "|".join(
+            text(row.get("review_id")) or "<missing_review_id>"
+            for row in submitted_match["unmatched_rows"]
+        ),
+        "unmatched_submitted_review_windows": "|".join(
+            f"{interval[0]}-{interval[1]}"
+            for interval in (
+                event_frame_interval(row)
+                for row in submitted_match["unmatched_rows"]
+            )
+            if interval is not None
+        ),
         "fail_indicator_count": count_fail_indicators(
             text_check_status=text_status,
             video_quality_status=video_status,
@@ -3456,6 +4260,7 @@ def build_xjgt_detail(
         "main_issue_type": first_issue(ledger_row.get("top_issue_types")),
         "notes": "; ".join(note for note in notes if note),
         "evidence_path": "|".join(str(path) for path in evidence_paths),
+        "_source_decomposition": source_decomposition,
         "_problem_intervals": [
             *static_intervals,
             *abnormal_intervals,
