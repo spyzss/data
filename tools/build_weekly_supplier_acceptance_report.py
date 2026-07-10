@@ -16,6 +16,7 @@ from typing import Any, Iterable, Sequence
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 
 if __package__:
@@ -31,7 +32,17 @@ SUMMARY_COLUMNS = [
     "sample_clip_count",
     "total_frame_count",
     "problem_frame_count",
+    "problem_frame_ratio",
     "pass_clip_count",
+    "pass_clip_ratio",
+    "fail_clip_count",
+    "fail_clip_ratio",
+    "problem_frame_count_v2",
+    "problem_frame_ratio_v2",
+    "pass_clip_count_v2",
+    "pass_clip_ratio_v2",
+    "fail_clip_count_v2",
+    "fail_clip_ratio_v2",
 ]
 
 CORE_DETAIL_COLUMNS = [
@@ -43,7 +54,9 @@ CORE_DETAIL_COLUMNS = [
     "abnormal_frame_status",
     "fail_indicator_count",
     "acceptance_status",
-    "review_status",
+    "abnormal_frame_status_v2",
+    "acceptance_status_v2",
+    "review_status_v2",
 ]
 
 TEXT_DETAIL_COLUMNS = ["text_status_reason"]
@@ -87,6 +100,9 @@ ABNORMAL_DETAIL_COLUMNS = [
     "manual_reviewed_frame_count",
     "manual_problem_ratio_of_reviewed",
     "abnormal_status_reason",
+    "abnormal_fail_frame_count_v2",
+    "abnormal_fail_frame_ratio_v2",
+    "abnormal_status_reason_v2",
 ]
 
 DIAGNOSTIC_DETAIL_COLUMNS = [
@@ -126,6 +142,38 @@ HARD_ISSUE_COLUMNS = [
     "next_action",
 ]
 
+MANUAL_ISSUE_COLUMNS = [
+    "supplier_name",
+    "issue_type",
+    "confirmed_issue_clip_count",
+    "confirmed_issue_clip_ratio_of_reviewed",
+    "confirmed_problem_frame_count",
+    "confirmed_problem_frame_ratio_of_reviewed_frames",
+    "manual_label_count",
+    "true_positive_count",
+    "false_positive_count",
+    "acceptable_flagged_count",
+    "review_count",
+]
+
+THRESHOLD_RULE_COLUMNS = [
+    "parent_indicator",
+    "module",
+    "check_name",
+    "metric_or_field",
+    "rule_type",
+    "threshold_level",
+    "operator",
+    "effective_value",
+    "unit",
+    "aggregation_scope",
+    "output_status",
+    "config_key",
+    "value_source",
+    "source_path",
+    "notes",
+]
+
 SHEET_NAMES = [
     "五供应商总览",
     "星际归途",
@@ -134,6 +182,7 @@ SHEET_NAMES = [
     "供应商4",
     "供应商5",
     "人工与难测问题统计",
+    "人工问题与阈值",
 ]
 
 XJGT_FALLBACK_COUNTS = {
@@ -235,6 +284,8 @@ def build_weekly_report(
         xjgt["details"],
         deepreach["details"],
         xjgt["issue_events"],
+        xjgt["manual_issue_rows"],
+        xjgt["threshold_rule_rows"],
     )
     print_sanity_checks(
         xjgt["summary"],
@@ -309,6 +360,21 @@ def load_xjgt_source_reads(run_root: Path) -> dict[str, SourceRead]:
         "manual_patch_labels": read_first_records(
             "manual_patch_labels",
             [manual_dir / "manual_labels_patch.json"],
+        ),
+        "manual_review_queue": read_first_records(
+            "manual_review_queue",
+            [
+                run_root
+                / "xjgt"
+                / "video_review_full"
+                / "review_queue_with_clips.csv",
+                run_root / "xjgt" / "review_full" / "review_queue.csv",
+                run_root
+                / "xjgt"
+                / "video_review"
+                / "review_queue_with_clips.csv",
+                run_root / "xjgt" / "review" / "review_queue.csv",
+            ],
         ),
     }
 
@@ -595,6 +661,13 @@ def load_xjgt(
         asset_ids,
         episode_asset,
     )
+    submitted_sam3_by_asset, submitted_sam3_unmatched = (
+        map_submitted_sam3_review_intervals(
+            sources["manual_review_queue"].records,
+            asset_ids,
+            episode_asset,
+        )
+    )
     manual_labels = dedupe_manual_labels(
         [
             *sources["manual_normalized_labels"].records,
@@ -652,6 +725,7 @@ def load_xjgt(
             candidate_row=candidate_by_asset.get(asset_id, {}),
             video_row=video_by_asset.get(asset_id, {}),
             sam3_row=sam3_by_asset.get(asset_id, {}),
+            submitted_sam3_row=submitted_sam3_by_asset.get(asset_id, {}),
             manual_row=manual_by_asset.get(
                 asset_id,
                 empty_manual_evidence(
@@ -664,6 +738,15 @@ def load_xjgt(
         )
         for asset_id in asset_rows
     ]
+    manual_main_by_asset = manual_main_issue_by_asset(manual_labels)
+    for row in details:
+        row["main_issue_type"] = manual_main_by_asset.get(
+            row["asset_id"], ""
+        )
+    manual_issue_rows = build_manual_issue_rows(
+        supplier_name="星际归途 / XJGT",
+        labels=manual_labels,
+    )
     issue_events = build_weekly_issue_events(
         manual_labels,
         sources["sam3_window_summary"].records,
@@ -692,12 +775,10 @@ def load_xjgt(
         supplier_name="星际归途 / XJGT",
         expected_clip_count=100,
         details=details,
-        main_issue_type=most_common(
-            Counter(
-                text(event.get("failure_mode"))
-                for event in issue_events
-                if event.get("failure_mode")
-            )
+        main_issue_type=(
+            manual_issue_rows[0]["issue_type"]
+            if manual_issue_rows
+            else ""
         ),
         modules_completed="|".join(modules_completed),
         blocked_modules="|".join(blocked_modules),
@@ -708,12 +789,15 @@ def load_xjgt(
             f"unmatched_candidate={len(candidate_unmatched)}; "
             f"unmatched_video={len(video_unmatched)}; "
             f"unmatched_sam3={len(sam3_unmatched)}"
+            f"; unmatched_submitted_sam3={len(submitted_sam3_unmatched)}"
         ),
     )
     return {
         "summary": summary,
         "details": details,
         "issue_events": issue_events,
+        "manual_issue_rows": manual_issue_rows,
+        "threshold_rule_rows": build_threshold_rule_rows(run_root, sources),
     }
 
 
@@ -794,6 +878,7 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
                 "abnormal_fail_frame_count": 0,
                 "abnormal_fail_frame_ratio": 0.0,
                 "abnormal_frame_status": "blocked",
+                "abnormal_frame_status_v2": "blocked",
                 "auto_fail_frame_count": 0,
                 "reviewed_auto_fail_frame_count": 0,
                 "reviewed_auto_fail_true_positive_frame_count": 0,
@@ -801,9 +886,14 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
                 "unreviewed_auto_fail_frame_count": 0,
                 "auto_fail_precision_on_reviewed": 0.0,
                 "abnormal_status_reason": "blocked:sam3_projection_mapping",
+                "abnormal_fail_frame_count_v2": 0,
+                "abnormal_fail_frame_ratio_v2": 0.0,
+                "abnormal_status_reason_v2": "blocked:sam3_projection_mapping",
                 "fail_indicator_count": 0,
                 "acceptance_status": "not_ready",
                 "review_status": "blocked",
+                "acceptance_status_v2": "not_ready",
+                "review_status_v2": "blocked",
                 "mapped_precheck_checks": "",
                 "missing_expected_checks": "skeleton_quality_score|keypoint_morphology",
                 "precheck_mapping_status": "blocked",
@@ -1035,12 +1125,738 @@ def hard_issue_rows(
     return rows
 
 
+def threshold_rule_row(
+    *,
+    parent_indicator: str,
+    module: str,
+    check_name: str,
+    metric_or_field: str,
+    rule_type: str,
+    threshold_level: str,
+    operator: str,
+    effective_value: Any,
+    unit: str,
+    aggregation_scope: str,
+    output_status: str,
+    config_key: str,
+    value_source: str,
+    source_path: str,
+    notes: str = "",
+) -> dict[str, Any]:
+    return {
+        "parent_indicator": parent_indicator,
+        "module": module,
+        "check_name": check_name,
+        "metric_or_field": metric_or_field,
+        "rule_type": rule_type,
+        "threshold_level": threshold_level,
+        "operator": operator,
+        "effective_value": effective_value,
+        "unit": unit,
+        "aggregation_scope": aggregation_scope,
+        "output_status": output_status,
+        "config_key": config_key,
+        "value_source": value_source,
+        "source_path": source_path,
+        "notes": notes,
+    }
+
+
+def load_precheck_rule_config(
+    run_root: Path,
+) -> tuple[dict[str, Any], str, str]:
+    candidates = [
+        run_root / "xjgt" / "precheck" / "precheck_config.yaml",
+        run_root / "xjgt" / "precheck" / "config.yaml",
+        run_root / "xjgt" / "precheck" / "run_config.yaml",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            import yaml
+
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(loaded, dict):
+            return loaded, "run_config", str(path)
+
+    default_path = Path(__file__).parents[1] / "configs" / "precheck_example.yaml"
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(default_path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError, TypeError):
+        return {}, "unavailable", str(default_path)
+    return (
+        loaded if isinstance(loaded, dict) else {},
+        "code_default",
+        str(default_path),
+    )
+
+
+def load_precheck_code_defaults() -> tuple[dict[str, Any], str]:
+    path = Path(__file__).parents[1] / "configs" / "precheck_example.yaml"
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError, TypeError):
+        return {}, str(path)
+    return loaded if isinstance(loaded, dict) else {}, str(path)
+
+
+def precheck_effective_value(
+    *,
+    section: str,
+    key: str,
+    run_config: dict[str, Any],
+    run_value_source: str,
+    run_source_path: str,
+    code_defaults: dict[str, Any],
+    code_default_path: str,
+) -> tuple[Any, str, str]:
+    run_section = run_config.get(section)
+    run_section = run_section if isinstance(run_section, dict) else {}
+    if key in run_section:
+        return run_section[key], run_value_source, run_source_path
+    default_section = code_defaults.get(section)
+    default_section = default_section if isinstance(default_section, dict) else {}
+    if key in default_section:
+        return default_section[key], "code_default", code_default_path
+    return "unresolved", "unavailable", run_source_path
+
+
+def first_morphology_threshold_metadata(
+    sources: dict[str, SourceRead],
+) -> tuple[dict[str, Any], str] | None:
+    source = sources["precheck_check_results"]
+    for row in source.records:
+        if text(row.get("check")) != "keypoint_morphology":
+            continue
+        thresholds = parse_metrics(row).get("thresholds")
+        if isinstance(thresholds, dict):
+            return thresholds, (
+                f"{source.path}::keypoint_morphology.summary.metrics.thresholds"
+            )
+    return None
+
+
+def inferred_text_fields(sources: dict[str, SourceRead]) -> list[str]:
+    fields: set[str] = set()
+    for row in sources["precheck_check_results"].records:
+        if text(row.get("check")) != "text_integrity":
+            continue
+        for key in parse_metrics(row):
+            for prefix in ("field_present_", "field_nonempty_"):
+                if key.startswith(prefix):
+                    fields.add(key.removeprefix(prefix))
+    return sorted(fields)
+
+
+def first_video_threshold_metadata(
+    sources: dict[str, SourceRead],
+) -> tuple[dict[str, Any], str] | None:
+    source = sources["video_quality_results"]
+    for row in source.records:
+        video_quality = row.get("video_quality")
+        if not isinstance(video_quality, dict):
+            continue
+        thresholds = video_quality.get("thresholds")
+        if isinstance(thresholds, dict):
+            return thresholds, f"{source.path}::video_quality.thresholds"
+    return None
+
+
+def nested_scalar_items(
+    value: Any,
+    prefix: str = "",
+) -> list[tuple[str, Any]]:
+    if isinstance(value, dict):
+        output: list[tuple[str, Any]] = []
+        for key, nested in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            output.extend(nested_scalar_items(nested, path))
+        return output
+    if isinstance(value, (list, tuple)):
+        return [(prefix, "|".join(str(item) for item in value))]
+    return [(prefix, value)]
+
+
+def video_threshold_semantics(config_key: str) -> tuple[str, str, str, str, str]:
+    leaf = config_key.rsplit(".", 1)[-1]
+    section = config_key.split(".")
+    level = (
+        "fail"
+        if leaf.endswith("_fail")
+        else "review"
+        if leaf.endswith("_warn")
+        else "pass"
+        if leaf.endswith("_pass")
+        else "configured"
+    )
+    metric = leaf
+    for suffix in ("_fail", "_warn", "_pass"):
+        if metric.endswith(suffix):
+            metric = metric[: -len(suffix)]
+            break
+    if leaf in {"ratio_pass", "ratio_warn"} and len(section) >= 2:
+        metric = {
+            "black": "black_frame_ratio",
+            "over_dark": "mean_over_dark_ratio",
+            "over_exposed": "mean_over_exposed_ratio",
+        }.get(section[-2], f"{section[-2]}_ratio")
+    high_is_bad = any(
+        token in metric
+        for token in (
+            "ratio",
+            "delta",
+            "gap",
+            "duration",
+            "count",
+            "hamming",
+            "under_100",
+        )
+    )
+    low_is_bad = any(
+        token in metric
+        for token in (
+            "fps",
+            "decode_ratio",
+            "laplacian",
+            "tenengrad",
+            "short_side",
+            "long_side",
+            "available_ratio",
+        )
+    )
+    if config_key.endswith(("black.mean_y_max", "over_dark.mean_y_max")):
+        operator = "<="
+    elif config_key.endswith("over_exposed.mean_y_min"):
+        operator = ">="
+    elif isinstance(metric, str) and leaf.endswith("_min"):
+        operator = ">="
+    elif leaf.endswith("_max"):
+        operator = "<="
+    elif high_is_bad:
+        operator = ">"
+    elif low_is_bad:
+        operator = "<"
+    else:
+        operator = "=="
+    unit = (
+        "ratio"
+        if "ratio" in metric
+        else "frame"
+        if "frame" in metric or "count" in metric
+        else "ms"
+        if metric.endswith("_ms")
+        else "sec"
+        if metric.endswith("_sec")
+        else "fps"
+        if "fps" in metric
+        else "pixel"
+        if any(token in metric for token in ("side", "width", "height", "px"))
+        else "boolean"
+        if leaf in {"enabled", "pts_monotonic_required"}
+        else "score"
+    )
+    output_status = "fail" if level == "fail" else "review" if level == "review" else "pass"
+    return metric, level, operator, unit, output_status
+
+
+def build_threshold_rule_rows(
+    run_root: Path,
+    sources: dict[str, SourceRead],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    config, config_source, config_path = load_precheck_rule_config(run_root)
+    code_defaults, code_default_path = load_precheck_code_defaults()
+
+    text_config = config.get("text_integrity")
+    text_config = text_config if isinstance(text_config, dict) else {}
+    required_fields = text_config.get("required_fields")
+    if isinstance(required_fields, list) and required_fields:
+        text_fields = [str(field) for field in required_fields]
+        text_source = config_source
+        text_path = config_path
+    else:
+        text_fields = inferred_text_fields(sources)
+        text_source = "producer_output_metadata" if text_fields else "unavailable"
+        text_path = str(sources["precheck_check_results"].path or "unavailable")
+    for field in text_fields or ["required_text_fields"]:
+        value = True if text_fields else "unresolved"
+        for operator in ("present", "nonempty"):
+            rows.append(
+                threshold_rule_row(
+                    parent_indicator="text",
+                    module="precheck",
+                    check_name="text_integrity",
+                    metric_or_field=field,
+                    rule_type="required_field",
+                    threshold_level="required",
+                    operator=operator,
+                    effective_value=value,
+                    unit="boolean",
+                    aggregation_scope="per_clip",
+                    output_status="fail",
+                    config_key=f"text_integrity.required_fields.{field}.{operator}",
+                    value_source=text_source,
+                    source_path=text_path,
+                    notes="Configured supplier text field must exist and be nonempty.",
+                )
+            )
+    rows.append(
+        threshold_rule_row(
+            parent_indicator="text",
+            module="weekly_report",
+            check_name="text_status_aggregation",
+            metric_or_field="text_check_status",
+            rule_type="aggregation_rule",
+            threshold_level="required",
+            operator="any_fail",
+            effective_value="fail",
+            unit="status",
+            aggregation_scope="per_clip",
+            output_status="fail",
+            config_key="weekly_policy.text_check_status",
+            value_source="weekly_policy",
+            source_path="tools/build_weekly_supplier_acceptance_report.py",
+            notes="Missing or unknown supplier text schema is not_ready/pending, not a fabricated pass.",
+        )
+    )
+
+    temporal_specs = {
+        "joint_angle_change_deg_max_threshold": ("joint_angle_change_deg_max", "deg"),
+        "rotation_delta_max_threshold": ("rotation_delta_max", "ratio"),
+        "joint_acceleration_m_s2_max_threshold": ("joint_acceleration_m_s2_max", "m/s^2"),
+        "joint_displacement_m_max_threshold": ("joint_displacement_m_max", "m"),
+    }
+    for key, (metric, unit) in temporal_specs.items():
+        value, value_source, source_path = precheck_effective_value(
+            section="skeleton_quality_score",
+            key=key,
+            run_config=config,
+            run_value_source=config_source,
+            run_source_path=config_path,
+            code_defaults=code_defaults,
+            code_default_path=code_default_path,
+        )
+        rows.append(
+            threshold_rule_row(
+                parent_indicator="abnormal_frame",
+                module="precheck",
+                check_name="keypoint_temporal",
+                metric_or_field=metric,
+                rule_type="numeric_threshold",
+                threshold_level="review",
+                operator=">",
+                effective_value=value,
+                unit=unit,
+                aggregation_scope="max_over_21_points_and_both_hands",
+                output_status="review",
+                config_key=f"skeleton_quality_score.{key}",
+                value_source=value_source,
+                source_path=source_path,
+                notes="Producer metric is a maximum, not an average or supplier quality score.",
+            )
+        )
+    for key, metric, operator, level, unit in (
+        ("hard_exceeded_metric_count", "exceeded_metric_count", ">=", "hard_fail", "metric_count"),
+        ("strong_acceleration_ratio", "joint_acceleration_m_s2_ratio", ">=", "hard_fail", "ratio"),
+        ("strong_displacement_ratio", "joint_displacement_m_ratio", ">=", "hard_fail", "ratio"),
+        ("candidate_gap_close_frames", "candidate_gap", "<=", "configured", "frame"),
+        ("candidate_min_seed_run_frames", "candidate_seed_run", ">=", "configured", "frame"),
+        ("candidate_pre_context_frames", "candidate_pre_context", "==", "configured", "frame"),
+        ("candidate_post_context_frames", "candidate_post_context", "==", "configured", "frame"),
+    ):
+        value, value_source, source_path = precheck_effective_value(
+            section="skeleton_quality_score",
+            key=key,
+            run_config=config,
+            run_value_source=config_source,
+            run_source_path=config_path,
+            code_defaults=code_defaults,
+            code_default_path=code_default_path,
+        )
+        rows.append(
+            threshold_rule_row(
+                parent_indicator="abnormal_frame",
+                module="precheck",
+                check_name="keypoint_temporal",
+                metric_or_field=metric,
+                rule_type="numeric_threshold" if level == "hard_fail" else "aggregation_rule",
+                threshold_level=level,
+                operator=operator,
+                effective_value=value,
+                unit=unit,
+                aggregation_scope="per_frame" if level == "hard_fail" else "per_window",
+                output_status="fail" if level == "hard_fail" else "review_window",
+                config_key=f"skeleton_quality_score.{key}",
+                value_source=value_source,
+                source_path=source_path,
+            )
+        )
+
+    allowed_missing, allowed_missing_source, allowed_missing_path = (
+        precheck_effective_value(
+            section="skeleton_quality_score",
+            key="allowed_missing_keypoints_per_hand",
+            run_config=config,
+            run_value_source=config_source,
+            run_source_path=config_path,
+            code_defaults=code_defaults,
+            code_default_path=code_default_path,
+        )
+    )
+    for metric, operator, value, config_key, rule_type in (
+        ("valid_keypoint_count", "==", 21, "acceptance_joint_names", "required_field"),
+        ("keypoint_coordinates", "all_finite", True, "finite_coordinate_rule", "finite_value_rule"),
+        ("missing_keypoint_count", "<=", allowed_missing, "skeleton_quality_score.allowed_missing_keypoints_per_hand", "numeric_threshold"),
+    ):
+        rows.append(
+            threshold_rule_row(
+                parent_indicator="skeleton_static",
+                module="precheck",
+                check_name="keypoint_presence",
+                metric_or_field=metric,
+                rule_type=rule_type,
+                threshold_level="required",
+                operator=operator,
+                effective_value=value,
+                unit="keypoint_count" if "count" in metric else "boolean",
+                aggregation_scope="per_frame_per_hand",
+                output_status="fail",
+                config_key=config_key,
+                value_source=(
+                    allowed_missing_source
+                    if metric == "missing_keypoint_count"
+                    else "code_default"
+                ),
+                source_path=(
+                    allowed_missing_path
+                    if metric == "missing_keypoint_count"
+                    else "precheck/checks/skeleton_quality_score.py"
+                ),
+                notes="Existence invalidity is separate from static morphology.",
+            )
+        )
+
+    morphology_metadata = first_morphology_threshold_metadata(sources)
+    morphology_config = config.get("keypoint_morphology")
+    morphology_config = morphology_config if isinstance(morphology_config, dict) else {}
+    morphology_source = config_source
+    morphology_path = config_path
+    if morphology_metadata is not None:
+        morphology_config = dict(morphology_metadata[0])
+        morphology_config.pop("sides", None)
+        morphology_source = "producer_output_metadata"
+        morphology_path = morphology_metadata[1]
+    morphology_specs = {
+        "duplicate_joint_distance_m": ("duplicate_joint_distance_m", "configured", "<=", "m"),
+        "min_palm_scale_m": ("palm_scale_m", "fail", "<", "m"),
+        "max_bone_length_ratio_spread_review": ("bone_length_ratio_spread", "review", ">=", "ratio"),
+        "max_bone_length_ratio_spread_fail": ("bone_length_ratio_spread", "fail", ">=", "ratio"),
+        "max_normalized_bone_length_review": ("normalized_bone_length_max", "review", ">=", "ratio"),
+        "max_normalized_bone_length_fail": ("normalized_bone_length_max", "fail", ">=", "ratio"),
+        "max_zero_length_bone_count_review": ("zero_length_bone_count", "review", ">=", "bone_count"),
+        "max_zero_length_bone_count_fail": ("zero_length_bone_count", "fail", ">=", "bone_count"),
+        "max_duplicate_joint_pair_count_review": ("duplicate_joint_pair_count", "review", ">=", "pair_count"),
+        "max_duplicate_joint_pair_count_fail": ("duplicate_joint_pair_count", "fail", ">=", "pair_count"),
+        "min_joint_angle_deg_review": ("joint_angle_min_deg", "review", "<=", "deg"),
+        "min_joint_angle_deg_fail": ("joint_angle_min_deg", "fail", "<=", "deg"),
+        "max_joint_angle_violation_fraction_review": ("joint_angle_violation_fraction", "review", ">=", "ratio"),
+        "max_joint_angle_violation_fraction_fail": ("joint_angle_violation_fraction", "fail", ">=", "ratio"),
+    }
+    for key, (metric, level, operator, unit) in morphology_specs.items():
+        if key in morphology_config:
+            value = morphology_config[key]
+            value_source = morphology_source
+            source_path = morphology_path
+        else:
+            value, value_source, source_path = precheck_effective_value(
+                section="keypoint_morphology",
+                key=key,
+                run_config=config,
+                run_value_source=config_source,
+                run_source_path=config_path,
+                code_defaults=code_defaults,
+                code_default_path=code_default_path,
+            )
+        rows.append(
+            threshold_rule_row(
+                parent_indicator="skeleton_static",
+                module="precheck",
+                check_name="keypoint_morphology",
+                metric_or_field=metric,
+                rule_type="numeric_threshold",
+                threshold_level=level,
+                operator=operator,
+                effective_value=value,
+                unit=unit,
+                aggregation_scope="per_frame_per_hand",
+                output_status="fail" if level == "fail" else "review" if level == "review" else "metric",
+                config_key=f"keypoint_morphology.{key}",
+                value_source=value_source,
+                source_path=source_path,
+                notes="Fixed threshold drives verdict; per-clip statistics are calibration evidence only.",
+            )
+        )
+    rows.extend(
+        [
+            threshold_rule_row(
+                parent_indicator="skeleton_static",
+                module="weekly_report",
+                check_name="skeleton_static_aggregation",
+                metric_or_field="missing_or_morphology_status",
+                rule_type="aggregation_rule",
+                threshold_level="fail",
+                operator="any_fail",
+                effective_value="missing fail OR morphology fail/review",
+                unit="status",
+                aggregation_scope="per_clip",
+                output_status="fail",
+                config_key="weekly_policy.skeleton_static_status",
+                value_source="weekly_policy",
+                source_path="tools/build_weekly_supplier_acceptance_report.py",
+            ),
+            threshold_rule_row(
+                parent_indicator="skeleton_static",
+                module="weekly_report",
+                check_name="skeleton_static_intervals",
+                metric_or_field="skeleton_static_fail_intervals",
+                rule_type="interval_rule",
+                threshold_level="official_v1",
+                operator="union",
+                effective_value="missing_intervals|morphology_fail_intervals",
+                unit="frame",
+                aggregation_scope="per_clip",
+                output_status="problem_frame",
+                config_key="weekly_policy.skeleton_static_interval_union",
+                value_source="weekly_policy",
+                source_path="tools/build_weekly_supplier_acceptance_report.py",
+            ),
+        ]
+    )
+
+    video_metadata = first_video_threshold_metadata(sources)
+    if video_metadata is None:
+        rows.append(
+            threshold_rule_row(
+                parent_indicator="video_quality",
+                module="video_quality",
+                check_name="video_quality_thresholds",
+                metric_or_field="producer_threshold_metadata",
+                rule_type="numeric_threshold",
+                threshold_level="configured",
+                operator="==",
+                effective_value="unresolved",
+                unit="unknown",
+                aggregation_scope="per_clip",
+                output_status="not_ready",
+                config_key="video_quality.thresholds",
+                value_source="unavailable",
+                source_path=str(sources["video_quality_results"].path or "unavailable"),
+                notes="No producer threshold metadata was available; no value was fabricated.",
+            )
+        )
+    else:
+        video_thresholds, video_path = video_metadata
+        for config_key, value in nested_scalar_items(video_thresholds):
+            metric, level, operator, unit, output_status = video_threshold_semantics(config_key)
+            rows.append(
+                threshold_rule_row(
+                    parent_indicator="video_quality",
+                    module="video_quality",
+                    check_name=config_key.split(".", 1)[0],
+                    metric_or_field=metric,
+                    rule_type="numeric_threshold" if isinstance(value, (int, float)) and not isinstance(value, bool) else "aggregation_rule",
+                    threshold_level=level,
+                    operator=operator,
+                    effective_value=value,
+                    unit=unit,
+                    aggregation_scope="per_frame" if config_key.startswith(("exposure.", "sharpness_global.", "freeze.")) else "per_clip",
+                    output_status=output_status,
+                    config_key=f"video_quality.{config_key}",
+                    value_source="producer_output_metadata",
+                    source_path=video_path,
+                )
+            )
+
+    sam3_defaults = [
+        ("keypoint_inside_ratio", "review", "<", 1.0, "ratio", "abnormal_inside_ratio_threshold"),
+        ("projected_in_image_ratio", "review", "<", 0.8, "ratio", "projected_in_image_ratio_threshold"),
+        ("keypoint_inside_ratio", "hard_fail", "<", 0.2, "ratio", "strong_containment_inside_ratio_threshold"),
+        ("keypoint_inside_ratio", "acceptable", ">=", 0.6, "ratio", "acceptable_inside_ratio_threshold"),
+        ("mask_area_ratio", "review", "<=", 0.0, "ratio", "mask_tiny_area_ratio_threshold"),
+        ("strong_fail_frame_count", "hard_fail", ">=", 3, "frame", "containment_fail_min_strong_frames"),
+        ("strong_fail_frame_ratio", "hard_fail", ">=", 0.6, "ratio", "containment_fail_strong_frame_ratio"),
+    ]
+    for metric, level, operator, value, unit, key in sam3_defaults:
+        rows.append(
+            threshold_rule_row(
+                parent_indicator="abnormal_frame",
+                module="sam3_containment",
+                check_name="keypoint_mask_containment",
+                metric_or_field=metric,
+                rule_type="numeric_threshold",
+                threshold_level=level,
+                operator=operator,
+                effective_value=value,
+                unit=unit,
+                aggregation_scope="per_frame" if "frame_count" not in metric and "frame_ratio" not in metric else "per_window",
+                output_status="fail" if level == "hard_fail" else "review",
+                config_key=f"sam3_keypoint_containment.{key}",
+                value_source="code_default",
+                source_path="tools/sam3_keypoint_containment.py::parse_args",
+            )
+        )
+    rows.append(
+        threshold_rule_row(
+            parent_indicator="abnormal_frame",
+            module="sam3_containment",
+            check_name="hand_object_mask_containment",
+            metric_or_field="minimum_valid_projected_keypoint_count",
+            rule_type="numeric_threshold",
+            threshold_level="required",
+            operator=">=",
+            effective_value="unresolved",
+            unit="keypoint_count",
+            aggregation_scope="per_frame",
+            output_status="review",
+            config_key="sam3_keypoint_containment.minimum_valid_projected_keypoint_count",
+            value_source="unavailable",
+            source_path="tools/sam3_keypoint_containment.py",
+            notes="No separate configured minimum was found in the current CLI/output contract.",
+        )
+    )
+
+    for check_name, level, metric, operator, value, output_status, notes in (
+        ("abnormal_v1", "official_v1", "unreviewed_sam3_interval", "union", "fail_interval", "fail", "Every submitted SAM3 interval not covered by manual review is counted as failed."),
+        ("abnormal_v1", "official_v1", "manual_true_positive_interval", "union", "affected_interval", "fail", "Only manually confirmed affected frames are added."),
+        ("abnormal_v1", "official_v1", "manual_false_positive_or_acceptable", "subtract_overlap", "reviewed_interval", "pass", "Reviewed false-positive and acceptable overlap is removed."),
+        ("abnormal_v2", "comparison_v2", "unreviewed_sam3_interval", "union", "review_interval", "review", "Unreviewed submitted SAM3 intervals remain review evidence."),
+        ("abnormal_v2", "comparison_v2", "manual_true_positive_interval", "union", "affected_interval", "fail", "Only manually confirmed affected frames are added."),
+        ("abnormal_v2", "comparison_v2", "manual_false_positive_or_acceptable", "subtract_overlap", "reviewed_interval", "pass", "Reviewed false-positive and acceptable overlap is removed."),
+    ):
+        rows.append(
+            threshold_rule_row(
+                parent_indicator="abnormal_frame",
+                module="weekly_report" if metric.startswith("unreviewed") else "manual_review",
+                check_name=check_name,
+                metric_or_field=metric,
+                rule_type="interval_rule",
+                threshold_level=level,
+                operator=operator,
+                effective_value=value,
+                unit="frame",
+                aggregation_scope="per_clip",
+                output_status=output_status,
+                config_key=f"weekly_policy.{check_name}.{metric}",
+                value_source="weekly_policy",
+                source_path="tools/build_weekly_supplier_acceptance_report.py",
+                notes=notes,
+            )
+        )
+
+    rows.extend(
+        [
+            threshold_rule_row(
+                parent_indicator="final_acceptance",
+                module="weekly_report",
+                check_name="acceptance_policy",
+                metric_or_field="top_level_fail_count",
+                rule_type="acceptance_rule",
+                threshold_level="official_v1",
+                operator=">=",
+                effective_value=1,
+                unit="indicator_count",
+                aggregation_scope="per_clip",
+                output_status="fail",
+                config_key="weekly_policy.official_v1.fail_indicator_count",
+                value_source="weekly_policy",
+                source_path="tools/build_weekly_supplier_acceptance_report.py",
+                notes="One fail among text, video_quality, skeleton_static, or abnormal_frame fails the clip.",
+            ),
+            threshold_rule_row(
+                parent_indicator="final_acceptance",
+                module="weekly_report",
+                check_name="acceptance_policy",
+                metric_or_field="required_module_readiness",
+                rule_type="acceptance_rule",
+                threshold_level="official_v1",
+                operator="any_fail",
+                effective_value="missing|unreadable|unmatched|not_run",
+                unit="status",
+                aggregation_scope="per_clip",
+                output_status="not_ready",
+                config_key="weekly_policy.official_v1.not_ready",
+                value_source="weekly_policy",
+                source_path="tools/build_weekly_supplier_acceptance_report.py",
+            ),
+            threshold_rule_row(
+                parent_indicator="final_acceptance",
+                module="weekly_report",
+                check_name="acceptance_policy",
+                metric_or_field="abnormal_frame_status_v2",
+                rule_type="acceptance_rule",
+                threshold_level="comparison_v2",
+                operator="any_fail",
+                effective_value="same four indicators with abnormal_v2",
+                unit="status",
+                aggregation_scope="per_clip",
+                output_status="fail|pass|not_ready",
+                config_key="weekly_policy.comparison_v2",
+                value_source="weekly_policy",
+                source_path="tools/build_weekly_supplier_acceptance_report.py",
+            ),
+            threshold_rule_row(
+                parent_indicator="supplier_evidence",
+                module="precheck",
+                check_name="quality_score",
+                metric_or_field="supplier_quality_signal",
+                rule_type="informational_only",
+                threshold_level="informational",
+                operator="==",
+                effective_value="low|provided_ok|not_provided",
+                unit="status",
+                aggregation_scope="per_clip",
+                output_status="note_only",
+                config_key="weekly_policy.supplier_quality_signal",
+                value_source="weekly_policy",
+                source_path="tools/build_weekly_supplier_acceptance_report.py",
+                notes="Supplier quality_hand evidence only; it does not determine skeleton_static_status or acceptance.",
+            ),
+        ]
+    )
+
+    key_fields = (
+        "module",
+        "check_name",
+        "metric_or_field",
+        "threshold_level",
+        "config_key",
+    )
+    seen: set[tuple[str, ...]] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in rows:
+        key = tuple(text(row[field]) for field in key_fields)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
 def write_workbook(
     path: Path,
     summary_rows: list[dict[str, Any]],
     xjgt_details: list[dict[str, Any]],
     deepreach_details: list[dict[str, Any]],
     events: list[dict[str, Any]],
+    manual_issue_rows: list[dict[str, Any]],
+    threshold_rule_rows: list[dict[str, Any]],
 ) -> None:
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -1070,8 +1886,138 @@ def write_workbook(
         HARD_ISSUE_COLUMNS,
         hard_issue_rows(events, xjgt_details),
     )
+    add_manual_threshold_sheet(
+        workbook,
+        manual_issue_rows,
+        threshold_rule_rows,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
+
+
+def add_manual_threshold_sheet(
+    workbook: Workbook,
+    manual_issue_rows: list[dict[str, Any]],
+    threshold_rule_rows: list[dict[str, Any]],
+) -> None:
+    sheet = workbook.create_sheet("人工问题与阈值")
+    max_columns = max(len(MANUAL_ISSUE_COLUMNS), len(THRESHOLD_RULE_COLUMNS))
+    section_fill = PatternFill("solid", fgColor="BDD7EE")
+    header_fill = PatternFill("solid", fgColor="D9EAF7")
+
+    manual_title_row = 1
+    sheet.cell(manual_title_row, 1, "人工确认问题类型统计")
+    sheet.merge_cells(
+        start_row=manual_title_row,
+        start_column=1,
+        end_row=manual_title_row,
+        end_column=max_columns,
+    )
+    sheet.cell(manual_title_row, 1).font = Font(bold=True, size=13)
+    sheet.cell(manual_title_row, 1).fill = section_fill
+    manual_header_row = manual_title_row + 1
+    for column_index, column in enumerate(MANUAL_ISSUE_COLUMNS, 1):
+        cell = sheet.cell(manual_header_row, column_index, column)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+    for row_index, row in enumerate(manual_issue_rows, manual_header_row + 1):
+        for column_index, column in enumerate(MANUAL_ISSUE_COLUMNS, 1):
+            sheet.cell(row_index, column_index, row.get(column, ""))
+
+    manual_last_row = manual_header_row + len(manual_issue_rows)
+    note_row = manual_last_row + 1
+    note = (
+        "人工复核采用高风险定向抽样，本表适合分析供应商问题构成，"
+        "不代表供应商全量数据的无偏问题率。"
+    )
+    sheet.cell(note_row, 1, note)
+    sheet.merge_cells(
+        start_row=note_row,
+        start_column=1,
+        end_row=note_row,
+        end_column=max_columns,
+    )
+    sheet.cell(note_row, 1).alignment = Alignment(wrap_text=True)
+    sheet.cell(note_row, 1).font = Font(italic=True)
+
+    threshold_title_row = note_row + 3
+    sheet.cell(threshold_title_row, 1, "本次验收生效阈值与规则")
+    sheet.merge_cells(
+        start_row=threshold_title_row,
+        start_column=1,
+        end_row=threshold_title_row,
+        end_column=max_columns,
+    )
+    sheet.cell(threshold_title_row, 1).font = Font(bold=True, size=13)
+    sheet.cell(threshold_title_row, 1).fill = section_fill
+    threshold_header_row = threshold_title_row + 1
+    for column_index, column in enumerate(THRESHOLD_RULE_COLUMNS, 1):
+        cell = sheet.cell(threshold_header_row, column_index, column)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+    for row_index, row in enumerate(
+        threshold_rule_rows, threshold_header_row + 1
+    ):
+        for column_index, column in enumerate(THRESHOLD_RULE_COLUMNS, 1):
+            cell = sheet.cell(row_index, column_index, row.get(column, ""))
+            if column in {"notes", "source_path"}:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    sheet.freeze_panes = f"A{manual_header_row + 1}"
+    table_style = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    if manual_issue_rows:
+        manual_table = Table(
+            displayName="ManualIssueStats",
+            ref=(
+                f"A{manual_header_row}:"
+                f"{get_column_letter(len(MANUAL_ISSUE_COLUMNS))}{manual_last_row}"
+            ),
+        )
+        manual_table.tableStyleInfo = table_style
+        sheet.add_table(manual_table)
+    if threshold_rule_rows:
+        threshold_table = Table(
+            displayName="EffectiveThresholdRules",
+            ref=(
+                f"A{threshold_header_row}:"
+                f"{get_column_letter(len(THRESHOLD_RULE_COLUMNS))}"
+                f"{threshold_header_row + len(threshold_rule_rows)}"
+            ),
+        )
+        threshold_table.tableStyleInfo = table_style
+        sheet.add_table(threshold_table)
+    sheet.sheet_view.showGridLines = False
+    percentage_columns = {
+        "confirmed_issue_clip_ratio_of_reviewed",
+        "confirmed_problem_frame_ratio_of_reviewed_frames",
+    }
+    for column_index, column in enumerate(MANUAL_ISSUE_COLUMNS, 1):
+        if column in percentage_columns:
+            for row_index in range(manual_header_row + 1, manual_last_row + 1):
+                sheet.cell(row_index, column_index).number_format = "0.0%"
+
+    for column_index in range(1, max_columns + 1):
+        header_values = [
+            sheet.cell(manual_header_row, column_index).value,
+            sheet.cell(threshold_header_row, column_index).value,
+        ]
+        width = max(len(str(value or "")) for value in header_values) + 2
+        if column_index in {
+            THRESHOLD_RULE_COLUMNS.index("source_path") + 1,
+            THRESHOLD_RULE_COLUMNS.index("notes") + 1,
+        }:
+            width = 42
+        sheet.column_dimensions[get_column_letter(column_index)].width = min(
+            max(width, 12), 42
+        )
 
 
 def detail_columns_for_rows(rows: list[dict[str, Any]]) -> list[str]:
@@ -1134,6 +2080,9 @@ def add_sheet(
         "problem_frame_ratio",
         "pass_clip_ratio",
         "fail_clip_ratio",
+        "problem_frame_ratio_v2",
+        "pass_clip_ratio_v2",
+        "fail_clip_ratio_v2",
         "coverage_ratio",
         "sample_coverage_ratio",
         "manual_review_coverage_ratio",
@@ -1144,8 +2093,11 @@ def add_sheet(
         "manual_problem_frame_ratio_of_clip",
         "manual_problem_ratio_of_reviewed",
         "abnormal_fail_frame_ratio",
+        "abnormal_fail_frame_ratio_v2",
         "auto_fail_precision_on_reviewed",
         "observed_ratio",
+        "confirmed_issue_clip_ratio_of_reviewed",
+        "confirmed_problem_frame_ratio_of_reviewed_frames",
     }
     for column in percentage_columns.intersection(columns):
         column_letter = get_column_letter(columns.index(column) + 1)
@@ -1229,7 +2181,7 @@ def map_window_rows(
     episode_asset: dict[int, str],
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     mapped: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {"intervals": [], "rows": []}
+        lambda: {"intervals": [], "auto_fail_intervals": [], "rows": []}
     )
     unmatched: set[str] = set()
     for row in rows:
@@ -1241,8 +2193,30 @@ def map_window_rows(
         interval = event_frame_interval(row)
         if interval is not None:
             mapped[asset_id]["intervals"].append(interval)
+            verdict = text(
+                first_value(
+                    row,
+                    ("auto_verdict", "source_verdict", "verdict", "status"),
+                )
+            ).lower()
+            if verdict in {"fail", "failed", "hard_fail", "suspect"}:
+                mapped[asset_id]["auto_fail_intervals"].append(interval)
         mapped[asset_id]["rows"].append(row)
     return dict(mapped), sorted(unmatched)
+
+
+def map_submitted_sam3_review_intervals(
+    rows: list[dict[str, Any]],
+    asset_ids: set[str],
+    episode_asset: dict[int, str],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    submitted = [
+        row
+        for row in rows
+        if text(row.get("module")).lower() == "sam3_containment"
+        and text(row.get("source_level")).lower() == "window"
+    ]
+    return map_window_rows(submitted, asset_ids, episode_asset)
 
 
 def map_video_quality_evidence(
@@ -1505,7 +2479,7 @@ def aggregate_manual_review(
             end = integer_or_none(row.get("affected_end_frame"))
         if start is not None and end is not None:
             reviewed[asset_id].append((start, end))
-        if text(row.get("manual_outcome")).lower() != "true_positive":
+        if not is_confirmed_manual_outcome(row):
             continue
         affected_start = integer_or_none(row.get("affected_start_frame"))
         affected_end = integer_or_none(row.get("affected_end_frame"))
@@ -1536,6 +2510,160 @@ def aggregate_manual_review(
     return output
 
 
+def is_confirmed_manual_outcome(row: dict[str, Any]) -> bool:
+    outcome = text(
+        first_value(row, ("manual_outcome", "algorithm_outcome", "label"))
+    ).lower()
+    return outcome in {"true_positive", "positive"}
+
+
+def manual_main_issue_by_asset(
+    labels: list[dict[str, Any]],
+) -> dict[str, str]:
+    grouped: dict[str, dict[str, list[tuple[int, int]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    counts: Counter[tuple[str, str]] = Counter()
+    for row in labels:
+        if not is_confirmed_manual_outcome(row):
+            continue
+        asset_id = normalize_asset_id(row.get("asset_id"))
+        issue_type = text(row.get("failure_mode")) or "unknown"
+        if not asset_id:
+            continue
+        counts[(asset_id, issue_type)] += 1
+        interval = manual_affected_interval(row)
+        if interval is not None:
+            grouped[asset_id][issue_type].append(interval)
+    output: dict[str, str] = {}
+    for asset_id, issues in grouped.items():
+        output[asset_id] = max(
+            issues,
+            key=lambda issue: (
+                interval_frame_count(issues[issue]),
+                counts[(asset_id, issue)],
+                issue,
+            ),
+        )
+    for asset_id, issue_type in counts:
+        output.setdefault(asset_id, issue_type)
+    return output
+
+
+def build_manual_issue_rows(
+    *,
+    supplier_name: str,
+    labels: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    reviewed_assets = {
+        normalize_asset_id(row.get("asset_id"))
+        for row in labels
+        if normalize_asset_id(row.get("asset_id"))
+    }
+    reviewed_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for row in labels:
+        asset_id = normalize_asset_id(row.get("asset_id"))
+        interval = manual_reviewed_interval(row)
+        if asset_id and interval is not None:
+            reviewed_intervals[asset_id].append(interval)
+    reviewed_frame_count = sum(
+        interval_frame_count(intervals)
+        for intervals in reviewed_intervals.values()
+    )
+
+    grouped_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    confirmed_assets: dict[str, set[str]] = defaultdict(set)
+    confirmed_intervals: dict[
+        str, dict[str, list[tuple[int, int]]]
+    ] = defaultdict(lambda: defaultdict(list))
+    for row in labels:
+        issue_type = text(row.get("failure_mode")) or "unknown"
+        grouped_rows[issue_type].append(row)
+        if not is_confirmed_manual_outcome(row):
+            continue
+        asset_id = normalize_asset_id(row.get("asset_id"))
+        if not asset_id:
+            continue
+        confirmed_assets[issue_type].add(asset_id)
+        interval = manual_affected_interval(row)
+        if interval is not None:
+            confirmed_intervals[issue_type][asset_id].append(interval)
+
+    output: list[dict[str, Any]] = []
+    for issue_type, rows in grouped_rows.items():
+        if not confirmed_assets[issue_type]:
+            continue
+        outcome_counts = Counter(
+            text(
+                first_value(
+                    row,
+                    ("manual_outcome", "algorithm_outcome", "label"),
+                )
+            ).lower()
+            for row in rows
+        )
+        confirmed_frames = sum(
+            interval_frame_count(intervals)
+            for intervals in confirmed_intervals[issue_type].values()
+        )
+        output.append(
+            {
+                "supplier_name": supplier_name,
+                "issue_type": issue_type,
+                "confirmed_issue_clip_count": len(
+                    confirmed_assets[issue_type]
+                ),
+                "confirmed_issue_clip_ratio_of_reviewed": safe_ratio(
+                    len(confirmed_assets[issue_type]), len(reviewed_assets)
+                ),
+                "confirmed_problem_frame_count": confirmed_frames,
+                "confirmed_problem_frame_ratio_of_reviewed_frames": safe_ratio(
+                    confirmed_frames, reviewed_frame_count
+                ),
+                "manual_label_count": len(rows),
+                "true_positive_count": outcome_counts["true_positive"]
+                + outcome_counts["positive"],
+                "false_positive_count": outcome_counts["false_positive"],
+                "acceptable_flagged_count": outcome_counts[
+                    "acceptable_flagged"
+                ],
+                "review_count": outcome_counts["review"],
+            }
+        )
+    return sorted(
+        output,
+        key=lambda row: (
+            -int(row["confirmed_problem_frame_count"]),
+            -int(row["confirmed_issue_clip_count"]),
+            text(row["issue_type"]),
+        ),
+    )
+
+
+def manual_reviewed_interval(
+    row: dict[str, Any],
+) -> tuple[int, int] | None:
+    start = integer_or_none(row.get("window_start_frame"))
+    end = integer_or_none(row.get("window_end_frame"))
+    if start is None or end is None:
+        return manual_affected_interval(row)
+    return (start, end)
+
+
+def manual_affected_interval(
+    row: dict[str, Any],
+) -> tuple[int, int] | None:
+    start = integer_or_none(
+        first_value(row, ("affected_start_frame", "start"))
+    )
+    end = integer_or_none(
+        first_value(row, ("affected_end_frame", "end"))
+    )
+    if start is None or end is None:
+        return None
+    return (start, end)
+
+
 def empty_manual_evidence(total_frames: int) -> dict[str, Any]:
     return {
         "manual_review_status": "not_reviewed",
@@ -1560,6 +2688,7 @@ def build_xjgt_detail(
     candidate_row: dict[str, Any],
     video_row: dict[str, Any],
     sam3_row: dict[str, Any],
+    submitted_sam3_row: dict[str, Any],
     manual_row: dict[str, Any],
     ledger_row: dict[str, Any],
     require_xjgt_text: bool,
@@ -1665,7 +2794,14 @@ def build_xjgt_detail(
         else "not_applicable"
     )
     auto_fail_intervals = clip_intervals(
-        sam3_row.get("auto_fail_intervals", []), total_frames
+        [
+            *candidate_row.get("auto_fail_intervals", []),
+            *sam3_row.get("auto_fail_intervals", []),
+        ],
+        total_frames,
+    )
+    submitted_sam3_intervals = clip_intervals(
+        submitted_sam3_row.get("intervals", []), total_frames
     )
     review_intervals = clip_intervals(
         [
@@ -1688,9 +2824,18 @@ def build_xjgt_detail(
     unreviewed_auto = subtract_intervals(
         auto_fail_intervals, reviewed_intervals
     )
-    abnormal_intervals = [*unreviewed_auto, *manual_intervals]
-    unresolved_review = subtract_intervals(
-        review_intervals, reviewed_intervals
+    unreviewed_submitted_sam3 = subtract_intervals(
+        submitted_sam3_intervals, reviewed_intervals
+    )
+    abnormal_intervals = [
+        *unreviewed_auto,
+        *manual_intervals,
+        *unreviewed_submitted_sam3,
+    ]
+    abnormal_intervals_v2 = [*unreviewed_auto, *manual_intervals]
+    unresolved_review_v2 = subtract_intervals(
+        [*review_intervals, *submitted_sam3_intervals],
+        reviewed_intervals,
     )
     auto_count = interval_frame_count(auto_fail_intervals)
     reviewed_auto_count = interval_frame_count(reviewed_auto)
@@ -1701,14 +2846,18 @@ def build_xjgt_detail(
         reviewed_auto_false_positive
     )
     unreviewed_auto_count = interval_frame_count(unreviewed_auto)
-    unresolved_review_count = interval_frame_count(unresolved_review)
+    unreviewed_submitted_count = interval_frame_count(
+        unreviewed_submitted_sam3
+    )
+    unresolved_review_count_v2 = interval_frame_count(unresolved_review_v2)
     abnormal_count = interval_frame_count(abnormal_intervals)
     abnormal_ratio = safe_ratio(abnormal_count, total_frames)
-    if abnormal_ratio >= 0.10:
+    abnormal_count_v2 = interval_frame_count(abnormal_intervals_v2)
+    abnormal_ratio_v2 = safe_ratio(abnormal_count_v2, total_frames)
+    if abnormal_count > 0:
         abnormal_frame_status = "fail"
     elif (
-        unresolved_review_count
-        or temporal_status == "not_run"
+        temporal_status == "not_run"
         or (
             manual_row["manual_review_status"] == "not_reviewed"
             and (
@@ -1720,13 +2869,37 @@ def build_xjgt_detail(
         abnormal_frame_status = "review"
     else:
         abnormal_frame_status = "pass"
+    if abnormal_count_v2 > 0:
+        abnormal_frame_status_v2 = "fail"
+    elif (
+        unresolved_review_count_v2
+        or temporal_status == "not_run"
+        or (
+            manual_row["manual_review_status"] == "not_reviewed"
+            and (
+                temporal_status == "review"
+                or sam3_status == "review"
+            )
+        )
+    ):
+        abnormal_frame_status_v2 = "review"
+    else:
+        abnormal_frame_status_v2 = "pass"
     abnormal_reason = (
+        "policy=v1_conservative; "
         f"abnormal_ratio={abnormal_ratio:.6f}; "
         f"manual_true_positive_frames={manual_row['manual_problem_frame_count']}; "
         f"auto_fail_frames={auto_count}; "
         f"reviewed_auto_fail_frames={reviewed_auto_count}; "
         f"unreviewed_auto_fail_frames={unreviewed_auto_count}; "
-        f"unresolved_review_frames={unresolved_review_count}"
+        f"unreviewed_submitted_sam3_frames={unreviewed_submitted_count}"
+    )
+    abnormal_reason_v2 = (
+        "policy=v2_review_first; "
+        f"abnormal_ratio={abnormal_ratio_v2:.6f}; "
+        f"manual_true_positive_frames={manual_row['manual_problem_frame_count']}; "
+        f"unreviewed_auto_fail_frames={unreviewed_auto_count}; "
+        f"unresolved_review_frames={unresolved_review_count_v2}"
     )
 
     video_status = text(video_row.get("status")) or "no_valid_output"
@@ -1738,31 +2911,42 @@ def build_xjgt_detail(
     )
     video_count = interval_frame_count(video_intervals)
     video_ratio = safe_ratio(video_count, total_frames)
-    unresolved = []
+    unresolved_base = []
     if video_status in {"no_valid_output", "not_run", "blocked"}:
-        unresolved.append(f"video_quality_status={video_status}")
-    if static_status in {"not_run", "blocked", "review"}:
-        unresolved.append(f"skeleton_static_status={static_status}")
+        unresolved_base.append(f"video_quality_status={video_status}")
+    if static_status in {"not_ready", "not_run", "blocked", "review"}:
+        unresolved_base.append(f"skeleton_static_status={static_status}")
+    if text_status in {"review", "not_run", "blocked", "no_valid_output"}:
+        unresolved_base.append(f"text_check_status={text_status}")
+    if frame_count_status == "unreadable":
+        unresolved_base.append("frame_count_status=unreadable")
+    unresolved = list(unresolved_base)
     if abnormal_frame_status == "review":
         unresolved.append("abnormal_frame_status=review")
-    elif unresolved_review_count:
-        unresolved.append(
-            f"unresolved_abnormal_review_frames={unresolved_review_count}"
+    unresolved_v2 = list(unresolved_base)
+    if unresolved_review_count_v2:
+        unresolved_v2.append(
+            f"abnormal_frame_unresolved_review_frames_v2={unresolved_review_count_v2}"
         )
-    if text_status in {"review", "not_run", "blocked", "no_valid_output"}:
-        unresolved.append(f"text_check_status={text_status}")
-    if frame_count_status == "unreadable":
-        unresolved.append("frame_count_status=unreadable")
-    required_outputs_ready = (
+    elif abnormal_frame_status_v2 == "review":
+        unresolved_v2.append("abnormal_frame_status_v2=review")
+    required_outputs_ready_base = (
         text_reason.startswith("mapped_text_integrity=")
         or text_status == "not_applicable"
     ) and frame_count_status != "unreadable" and all(
-        status not in {"not_run", "no_valid_output", "blocked"}
+        status not in {"not_ready", "not_run", "no_valid_output", "blocked"}
         for status in (
             video_status,
             static_status,
-            abnormal_frame_status,
         )
+    )
+    required_outputs_ready = required_outputs_ready_base and (
+        abnormal_frame_status
+        not in {"not_ready", "not_run", "no_valid_output", "blocked"}
+    )
+    required_outputs_ready_v2 = required_outputs_ready_base and (
+        abnormal_frame_status_v2
+        not in {"not_ready", "not_run", "no_valid_output", "blocked"}
     )
     acceptance_status, review_status, final_reason = (
         acceptance_and_review_status(
@@ -1772,6 +2956,16 @@ def build_xjgt_detail(
         abnormal_frame_status=abnormal_frame_status,
         required_outputs_ready=required_outputs_ready,
         unresolved=unresolved,
+        )
+    )
+    acceptance_status_v2, review_status_v2, final_reason_v2 = (
+        acceptance_and_review_status(
+            text_check_status=text_status,
+            video_quality_status=video_status,
+            skeleton_static_status=static_status,
+            abnormal_frame_status=abnormal_frame_status_v2,
+            required_outputs_ready=required_outputs_ready_v2,
+            unresolved=unresolved_v2,
         )
     )
     notes = [
@@ -1851,6 +3045,10 @@ def build_xjgt_detail(
             else ""
         ),
         "abnormal_status_reason": abnormal_reason,
+        "abnormal_fail_frame_count_v2": abnormal_count_v2,
+        "abnormal_fail_frame_ratio_v2": abnormal_ratio_v2,
+        "abnormal_frame_status_v2": abnormal_frame_status_v2,
+        "abnormal_status_reason_v2": abnormal_reason_v2,
         "fail_indicator_count": count_fail_indicators(
             text_check_status=text_status,
             video_quality_status=video_status,
@@ -1859,16 +3057,24 @@ def build_xjgt_detail(
         ),
         "acceptance_status": acceptance_status,
         "review_status": review_status,
+        "acceptance_status_v2": acceptance_status_v2,
+        "review_status_v2": review_status_v2,
         "mapped_precheck_checks": "|".join(mapped_checks),
         "missing_expected_checks": "|".join(missing_expected),
         "precheck_mapping_status": mapping_status,
         "final_status_reason": final_reason,
+        "final_status_reason_v2": final_reason_v2,
         "main_issue_type": first_issue(ledger_row.get("top_issue_types")),
         "notes": "; ".join(note for note in notes if note),
         "evidence_path": "|".join(str(path) for path in evidence_paths),
         "_problem_intervals": [
             *static_intervals,
             *abnormal_intervals,
+            *video_intervals,
+        ],
+        "_problem_intervals_v2": [
+            *static_intervals,
+            *abnormal_intervals_v2,
             *video_intervals,
         ],
     }
@@ -1939,7 +3145,7 @@ def acceptance_and_review_status(
         "not_ready"
         if not required_outputs_ready
         else "fail"
-        if len(failed) >= 2
+        if failed
         else "pass"
     )
     statuses = (
@@ -1976,6 +3182,9 @@ def supplier_summary_from_details(
     notes: str,
 ) -> dict[str, Any]:
     counts = Counter(text(row.get("acceptance_status")) for row in details)
+    counts_v2 = Counter(
+        text(row.get("acceptance_status_v2")) for row in details
+    )
     review_counts = Counter(text(row.get("review_status")) for row in details)
     manual_counts = Counter(
         text(row.get("manual_review_status")) for row in details
@@ -1989,7 +3198,12 @@ def supplier_summary_from_details(
         interval_frame_count(row.get("_problem_intervals", []))
         for row in details
     )
+    problem_frames_v2 = sum(
+        interval_frame_count(row.get("_problem_intervals_v2", []))
+        for row in details
+    )
     covered = counts["pass"] + counts["fail"]
+    covered_v2 = counts_v2["pass"] + counts_v2["fail"]
     return {
         "supplier_name": supplier_name,
         "sample_clip_count": sample_count,
@@ -1997,15 +3211,25 @@ def supplier_summary_from_details(
         "total_frame_count": total_frames,
         "problem_frame_count": problem_frames,
         "problem_frame_ratio": safe_ratio(problem_frames, total_frames),
-        "pass_clip_count": counts["pass"],
-        "fail_clip_count": counts["fail"],
+        "pass_clip_count": counts["pass"] if covered else "",
+        "fail_clip_count": counts["fail"] if covered else "",
         "review_clip_count": review_counts["review"],
         "blocked_clip_count": review_counts["blocked"],
         "not_run_clip_count": review_counts["not_run"],
         "coverage_ratio": safe_ratio(covered, sample_count),
         "sample_coverage_ratio": safe_ratio(sample_count, expected_clip_count),
-        "pass_clip_ratio": safe_ratio(counts["pass"], sample_count),
-        "fail_clip_ratio": safe_ratio(counts["fail"], sample_count),
+        "pass_clip_ratio": safe_ratio(counts["pass"], covered) if covered else "",
+        "fail_clip_ratio": safe_ratio(counts["fail"], covered) if covered else "",
+        "problem_frame_count_v2": problem_frames_v2,
+        "problem_frame_ratio_v2": safe_ratio(problem_frames_v2, total_frames),
+        "pass_clip_count_v2": counts_v2["pass"] if covered_v2 else "",
+        "pass_clip_ratio_v2": (
+            safe_ratio(counts_v2["pass"], covered_v2) if covered_v2 else ""
+        ),
+        "fail_clip_count_v2": counts_v2["fail"] if covered_v2 else "",
+        "fail_clip_ratio_v2": (
+            safe_ratio(counts_v2["fail"], covered_v2) if covered_v2 else ""
+        ),
         "manual_reviewed_clip_count": manual_counts["pass"] + manual_counts["fail"],
         "manual_review_coverage_ratio": safe_ratio(
             manual_counts["pass"] + manual_counts["fail"], sample_count
@@ -2322,15 +3546,15 @@ def skeleton_static_status_from_parts(
     if "fail" in statuses:
         return "fail"
     if "review" in statuses:
-        return "review"
+        return "fail"
     if statuses == ("pass", "pass"):
         return "pass"
     if any(
         status in {"not_run", "blocked", "no_valid_output", "source_missing", "unmatched"}
         for status in statuses
     ):
-        return "not_run"
-    return "review"
+        return "not_ready"
+    return "not_ready"
 
 
 def skeleton_static_status_reason(
@@ -2472,7 +3696,7 @@ def recompute_xjgt_final_status(
     )
     if expected_module_missing:
         return "not_ready"
-    return "fail" if fail_indicator_count >= 2 else "pass"
+    return "fail" if fail_indicator_count >= 1 else "pass"
 
 
 def event_frame_interval(
