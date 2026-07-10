@@ -29,77 +29,68 @@ LOGGER = logging.getLogger("build_weekly_supplier_acceptance_report")
 SUMMARY_COLUMNS = [
     "supplier_name",
     "sample_clip_count",
-    "expected_clip_count",
     "total_frame_count",
     "problem_frame_count",
-    "problem_frame_ratio",
     "pass_clip_count",
-    "fail_clip_count",
-    "review_clip_count",
-    "blocked_clip_count",
-    "not_run_clip_count",
-    "coverage_ratio",
-    "sample_coverage_ratio",
-    "pass_clip_ratio",
-    "fail_clip_ratio",
-    "manual_reviewed_clip_count",
-    "manual_review_coverage_ratio",
-    "manual_pass_clip_count",
-    "manual_fail_clip_count",
-    "manual_not_reviewed_clip_count",
-    "manual_confirmed_problem_frame_count",
-    "abnormal_pass_clip_count",
-    "abnormal_fail_clip_count",
-    "abnormal_review_clip_count",
-    "main_issue_type",
-    "modules_completed",
-    "blocked_modules",
-    "notes",
 ]
 
-XJGT_DETAIL_COLUMNS = [
+CORE_DETAIL_COLUMNS = [
     "asset_id",
     "total_frames",
-    "frame_count_status",
     "text_check_status",
-    "text_status_reason",
-    "skeleton_missing_status",
-    "skeleton_missing_fail_intervals",
-    "skeleton_missing_fail_frame_count",
-    "skeleton_missing_fail_frame_ratio",
-    "skeleton_morphology_status",
-    "skeleton_morphology_fail_intervals",
-    "skeleton_morphology_fail_frame_count",
-    "skeleton_morphology_fail_frame_ratio",
-    "skeleton_static_fail_frame_count",
-    "skeleton_static_fail_intervals",
-    "skeleton_static_fail_frame_ratio",
-    "skeleton_static_status",
-    "skeleton_static_status_reason",
-    "supplier_quality_signal",
     "video_quality_status",
+    "skeleton_static_status",
+    "abnormal_frame_status",
+    "fail_indicator_count",
+    "acceptance_status",
+    "review_status",
+]
+
+TEXT_DETAIL_COLUMNS = ["text_status_reason"]
+
+VIDEO_DETAIL_COLUMNS = [
     "video_quality_fail_frame_count",
     "video_quality_fail_frame_ratio",
+    "video_quality_status_reason",
+]
+
+SKELETON_DETAIL_COLUMNS = [
+    "skeleton_missing_status",
+    "skeleton_missing_fail_frame_count",
+    "skeleton_missing_fail_frame_ratio",
+    "skeleton_missing_fail_intervals",
+    "skeleton_morphology_status",
+    "skeleton_morphology_fail_frame_count",
+    "skeleton_morphology_fail_frame_ratio",
+    "skeleton_morphology_fail_intervals",
+    "skeleton_static_fail_frame_count",
+    "skeleton_static_fail_frame_ratio",
+    "skeleton_static_fail_intervals",
+    "skeleton_static_status_reason",
+    "supplier_quality_signal",
+]
+
+ABNORMAL_DETAIL_COLUMNS = [
     "temporal_status",
     "sam3_containment_status",
     "manual_review_status",
-    "temporal_sam3_manual_status",
-    "manual_problem_frame_count",
-    "manual_problem_frame_ratio_of_clip",
-    "manual_reviewed_frame_count",
-    "manual_problem_ratio_of_reviewed",
     "abnormal_fail_frame_count",
     "abnormal_fail_frame_ratio",
-    "abnormal_frame_status",
     "auto_fail_frame_count",
     "reviewed_auto_fail_frame_count",
     "reviewed_auto_fail_true_positive_frame_count",
     "reviewed_auto_fail_false_positive_frame_count",
     "unreviewed_auto_fail_frame_count",
     "auto_fail_precision_on_reviewed",
+    "manual_problem_frame_count",
+    "manual_problem_frame_ratio_of_clip",
+    "manual_reviewed_frame_count",
+    "manual_problem_ratio_of_reviewed",
     "abnormal_status_reason",
-    "fail_indicator_count",
-    "final_clip_status",
+]
+
+DIAGNOSTIC_DETAIL_COLUMNS = [
+    "frame_count_status",
     "mapped_precheck_checks",
     "missing_expected_checks",
     "precheck_mapping_status",
@@ -107,6 +98,15 @@ XJGT_DETAIL_COLUMNS = [
     "main_issue_type",
     "notes",
     "evidence_path",
+]
+
+XJGT_DETAIL_COLUMNS = [
+    *CORE_DETAIL_COLUMNS,
+    *TEXT_DETAIL_COLUMNS,
+    *VIDEO_DETAIL_COLUMNS,
+    *SKELETON_DETAIL_COLUMNS,
+    *ABNORMAL_DETAIL_COLUMNS,
+    *DIAGNOSTIC_DETAIL_COLUMNS,
 ]
 DETAIL_COLUMNS = XJGT_DETAIL_COLUMNS
 
@@ -400,6 +400,7 @@ def load_precheck_evidence(
             "missing_intervals": [],
             "morphology_intervals": [],
             "text_status": "not_applicable",
+            "text_atomic_statuses": {},
             "morphology_status": "not_run",
             "missing_status": "not_run",
             "supplier_quality_signal": "not_provided",
@@ -423,6 +424,14 @@ def load_precheck_evidence(
         record["checks"].add(check)
 
         if check == "text_integrity":
+            for metric_name, value in metrics.items():
+                if not metric_name.startswith(
+                    ("field_present_", "field_nonempty_")
+                ):
+                    continue
+                record["text_atomic_statuses"][
+                    f"text_{metric_name}_status"
+                ] = "pass" if truthy(value) else "fail"
             if truthy(row.get("flag")) or float_or_zero(metrics.get("missing_field_count")) > 0:
                 record["text_status"] = "fail"
             elif record["text_status"] != "fail":
@@ -770,10 +779,14 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
                 ),
                 "video_quality_fail_frame_count": 0,
                 "video_quality_fail_frame_ratio": 0.0,
+                "video_quality_status_reason": (
+                    "no_valid_video_quality_output"
+                    if not has_video_quality
+                    else "video_quality_output_requires_review"
+                ),
                 "temporal_status": "blocked",
                 "sam3_containment_status": "blocked",
                 "manual_review_status": "not_run",
-                "temporal_sam3_manual_status": "blocked",
                 "manual_problem_frame_count": 0,
                 "manual_problem_frame_ratio_of_clip": 0.0,
                 "manual_reviewed_frame_count": 0,
@@ -789,7 +802,8 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
                 "auto_fail_precision_on_reviewed": 0.0,
                 "abnormal_status_reason": "blocked:sam3_projection_mapping",
                 "fail_indicator_count": 0,
-                "final_clip_status": "blocked",
+                "acceptance_status": "not_ready",
+                "review_status": "blocked",
                 "mapped_precheck_checks": "",
                 "missing_expected_checks": "skeleton_quality_score|keypoint_morphology",
                 "precheck_mapping_status": "blocked",
@@ -805,8 +819,7 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
     modules_completed = ["manifest"] if manifest else []
     if has_video_quality:
         modules_completed.append("video_quality")
-    counts = Counter(row["final_clip_status"] for row in details)
-    covered_count = counts["pass"] + counts["fail"] + counts["review"]
+    review_counts = Counter(row["review_status"] for row in details)
     return {
         "summary": {
             "supplier_name": "DeepReach",
@@ -817,12 +830,12 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
             ),
             "problem_frame_count": 0,
             "problem_frame_ratio": 0.0,
-            "pass_clip_count": 0,
+            "pass_clip_count": "",
             "fail_clip_count": 0,
             "review_clip_count": 0,
-            "blocked_clip_count": counts["blocked"],
-            "not_run_clip_count": counts["not_run"],
-            "coverage_ratio": safe_ratio(covered_count, len(manifest)),
+            "blocked_clip_count": review_counts["blocked"],
+            "not_run_clip_count": review_counts["not_run"],
+            "coverage_ratio": 0.0,
             "sample_coverage_ratio": safe_ratio(len(manifest), 100),
             "pass_clip_ratio": 0.0,
             "fail_clip_ratio": 0.0,
@@ -857,7 +870,7 @@ def placeholder_supplier(index: int) -> dict[str, Any]:
         "total_frame_count": 0,
         "problem_frame_count": 0,
         "problem_frame_ratio": 0.0,
-        "pass_clip_count": 0,
+        "pass_clip_count": "",
         "fail_clip_count": 0,
         "review_clip_count": 0,
         "blocked_clip_count": 0,
@@ -1035,20 +1048,20 @@ def write_workbook(
     add_sheet(
         workbook,
         "星际归途",
-        XJGT_DETAIL_COLUMNS,
+        detail_columns_for_rows(xjgt_details),
         xjgt_details,
     )
     add_sheet(
         workbook,
         "DeepReach",
-        XJGT_DETAIL_COLUMNS,
+        detail_columns_for_rows(deepreach_details),
         deepreach_details,
     )
     for index in range(3, 6):
         add_sheet(
             workbook,
             f"供应商{index}",
-            XJGT_DETAIL_COLUMNS,
+            detail_columns_for_rows([]),
             [],
         )
     add_sheet(
@@ -1059,6 +1072,36 @@ def write_workbook(
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
+
+
+def detail_columns_for_rows(rows: list[dict[str, Any]]) -> list[str]:
+    text_atomic: list[str] = []
+    video_atomic: list[str] = []
+    for row in rows:
+        for key in row:
+            if (
+                key.startswith("text_field_")
+                and key.endswith("_status")
+                and key not in text_atomic
+            ):
+                text_atomic.append(key)
+            elif (
+                key.startswith("video_")
+                and key.endswith("_status")
+                and key != "video_quality_status"
+                and key not in video_atomic
+            ):
+                video_atomic.append(key)
+    return [
+        *CORE_DETAIL_COLUMNS,
+        *text_atomic,
+        *TEXT_DETAIL_COLUMNS,
+        *video_atomic,
+        *VIDEO_DETAIL_COLUMNS,
+        *SKELETON_DETAIL_COLUMNS,
+        *ABNORMAL_DETAIL_COLUMNS,
+        *DIAGNOSTIC_DETAIL_COLUMNS,
+    ]
 
 
 def add_sheet(
@@ -1172,6 +1215,7 @@ def empty_precheck_evidence() -> dict[str, Any]:
         "missing_intervals": [],
         "morphology_intervals": [],
         "text_status": "not_applicable",
+        "text_atomic_statuses": {},
         "supplier_quality_signal": "not_provided",
         "temporal_status": "not_run",
         "has_skeleton_quality": False,
@@ -1236,16 +1280,120 @@ def map_video_quality_evidence(
             status = raw_status
         else:
             status = "pass"
+        existing = mapped.get(asset_id, {})
+        atomic_statuses = dict(existing.get("atomic_statuses", {}))
+        atomic_statuses.update(video_quality_atomic_statuses(raw_row))
+        reason = text(row.get("reason")) or text(existing.get("reason"))
+        extracted_fail_intervals = extract_video_fail_intervals(raw_row)
         mapped[asset_id] = {
             "status": status,
             "raw_status": raw_status or "pass",
+            "reason": reason or f"video_quality_status={status}",
+            "atomic_statuses": atomic_statuses,
             "fail_intervals": (
-                extract_video_fail_intervals(raw_row)
+                extracted_fail_intervals
+                or existing.get("fail_intervals", [])
                 if status == "fail"
-                else []
+                else existing.get("fail_intervals", [])
             ),
         }
     return mapped, sorted(unmatched)
+
+
+def video_quality_atomic_statuses(row: dict[str, Any]) -> dict[str, str]:
+    video_quality = row.get("video_quality")
+    video_quality = video_quality if isinstance(video_quality, dict) else {}
+    metrics = video_quality.get("metrics")
+    metrics = metrics if isinstance(metrics, dict) else {}
+    qc_summary = row.get("qc_summary")
+    qc_summary = qc_summary if isinstance(qc_summary, dict) else {}
+    evaluation = video_quality.get("evaluation")
+    evaluation = evaluation if isinstance(evaluation, dict) else {}
+    fail_reasons = [
+        text(value)
+        for value in qc_summary.get("reasons", evaluation.get("reasons", []))
+    ]
+    warn_reasons = [
+        text(value)
+        for value in qc_summary.get(
+            "warn_reasons", evaluation.get("warn_reasons", [])
+        )
+    ]
+
+    exposure = metrics.get("exposure_metrics") or metrics.get("exposure")
+    exposure = exposure if isinstance(exposure, dict) else {}
+    sharpness = metrics.get("sharpness_global")
+    sharpness = sharpness if isinstance(sharpness, dict) else {}
+    freeze = metrics.get("freeze_metrics")
+    freeze = freeze if isinstance(freeze, dict) else {}
+    timeline = metrics.get("timeline_metrics")
+    timeline = timeline if isinstance(timeline, dict) else {}
+    alignment = metrics.get("hdf5_alignment")
+    if not isinstance(alignment, dict):
+        hdf5_text = row.get("hdf5_text_info")
+        hdf5_text = hdf5_text if isinstance(hdf5_text, dict) else {}
+        alignment = hdf5_text.get("alignment")
+    alignment = alignment if isinstance(alignment, dict) else {}
+
+    definitions = [
+        (
+            "video_black_screen_status",
+            "black_frame_ratio" in exposure
+            or "black_frame_count_estimate" in exposure,
+            ("black_frame_",),
+        ),
+        (
+            "video_underexposure_status",
+            "mean_over_dark_ratio" in exposure,
+            ("mean_over_dark_",),
+        ),
+        (
+            "video_overexposure_status",
+            "mean_over_exposed_ratio" in exposure,
+            ("mean_over_exposed_",),
+        ),
+        (
+            "video_blur_status",
+            bool(sharpness) or metrics.get("hand_roi_metrics") is not None,
+            ("laplacian_", "tenengrad_", "hand_roi_"),
+        ),
+        (
+            "video_freeze_stutter_status",
+            bool(freeze) or bool(timeline),
+            (
+                "frozen_",
+                "freeze_",
+                "max_consecutive_frozen_",
+                "drop_frame_",
+                "frame_interval_",
+                "max_frame_gap_",
+                "pts_monotonic_",
+            ),
+        ),
+        (
+            "video_frame_alignment_status",
+            bool(alignment),
+            ("hdf5_",),
+        ),
+    ]
+    statuses: dict[str, str] = {}
+    for column, available, prefixes in definitions:
+        if not available:
+            continue
+        if any(reason.startswith(prefixes) for reason in fail_reasons):
+            statuses[column] = "fail"
+        elif any(reason.startswith(prefixes) for reason in warn_reasons):
+            statuses[column] = "review"
+        else:
+            statuses[column] = "pass"
+    for key, value in row.items():
+        if (
+            key.startswith("video_")
+            and key.endswith("_status")
+            and key != "video_quality_status"
+        ):
+            statuses[key] = status_value(value)
+    return statuses
 
 
 def extract_video_fail_intervals(row: dict[str, Any]) -> list[tuple[int, int]]:
@@ -1582,6 +1730,9 @@ def build_xjgt_detail(
     )
 
     video_status = text(video_row.get("status")) or "no_valid_output"
+    video_reason = text(video_row.get("reason")) or (
+        f"video_quality_status={video_status}"
+    )
     video_intervals = clip_intervals(
         video_row.get("fail_intervals", []), total_frames
     )
@@ -1594,16 +1745,34 @@ def build_xjgt_detail(
         unresolved.append(f"skeleton_static_status={static_status}")
     if abnormal_frame_status == "review":
         unresolved.append("abnormal_frame_status=review")
+    elif unresolved_review_count:
+        unresolved.append(
+            f"unresolved_abnormal_review_frames={unresolved_review_count}"
+        )
     if text_status in {"review", "not_run", "blocked", "no_valid_output"}:
         unresolved.append(f"text_check_status={text_status}")
     if frame_count_status == "unreadable":
         unresolved.append("frame_count_status=unreadable")
-    final_status, final_reason = final_status_with_reason(
+    required_outputs_ready = (
+        text_reason.startswith("mapped_text_integrity=")
+        or text_status == "not_applicable"
+    ) and frame_count_status != "unreadable" and all(
+        status not in {"not_run", "no_valid_output", "blocked"}
+        for status in (
+            video_status,
+            static_status,
+            abnormal_frame_status,
+        )
+    )
+    acceptance_status, review_status, final_reason = (
+        acceptance_and_review_status(
         text_check_status=text_status,
         video_quality_status=video_status,
         skeleton_static_status=static_status,
         abnormal_frame_status=abnormal_frame_status,
+        required_outputs_ready=required_outputs_ready,
         unresolved=unresolved,
+        )
     )
     notes = [
         text(ledger_row.get("notes")),
@@ -1621,6 +1790,7 @@ def build_xjgt_detail(
         "total_frames": total_frames,
         "frame_count_status": frame_count_status,
         "text_check_status": text_status,
+        **precheck_row.get("text_atomic_statuses", {}),
         "text_status_reason": text_reason,
         "skeleton_missing_status": missing_status,
         "skeleton_missing_fail_intervals": format_intervals(missing_intervals),
@@ -1641,12 +1811,13 @@ def build_xjgt_detail(
         "skeleton_static_status_reason": static_reason,
         "supplier_quality_signal": quality_signal,
         "video_quality_status": video_status,
+        **video_row.get("atomic_statuses", {}),
         "video_quality_fail_frame_count": video_count,
         "video_quality_fail_frame_ratio": video_ratio,
+        "video_quality_status_reason": video_reason,
         "temporal_status": temporal_status,
         "sam3_containment_status": sam3_status,
         "manual_review_status": manual_row["manual_review_status"],
-        "temporal_sam3_manual_status": abnormal_frame_status,
         "manual_problem_frame_count": manual_row[
             "manual_problem_frame_count"
         ],
@@ -1686,7 +1857,8 @@ def build_xjgt_detail(
             skeleton_static_status=static_status,
             abnormal_frame_status=abnormal_frame_status,
         ),
-        "final_clip_status": final_status,
+        "acceptance_status": acceptance_status,
+        "review_status": review_status,
         "mapped_precheck_checks": "|".join(mapped_checks),
         "missing_expected_checks": "|".join(missing_expected),
         "precheck_mapping_status": mapping_status,
@@ -1744,14 +1916,15 @@ def resolve_xjgt_text_status(
     return "review", "text_integrity_expected_check_missing"
 
 
-def final_status_with_reason(
+def acceptance_and_review_status(
     *,
     text_check_status: str,
     video_quality_status: str,
     skeleton_static_status: str,
     abnormal_frame_status: str,
+    required_outputs_ready: bool,
     unresolved: list[str],
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     failed = [
         name
         for name, status in (
@@ -1762,19 +1935,34 @@ def final_status_with_reason(
         )
         if status == "fail"
     ]
-    if len(failed) >= 2:
-        return "fail", f"fail: fail_indicators={','.join(failed)}"
-    if unresolved:
-        return (
-            "review",
-            "review: fail_indicators="
-            f"{','.join(failed) or 'none'}; unresolved={','.join(unresolved)}",
-        )
-    return (
-        "pass",
-        "pass: fail_indicators="
-        f"{','.join(failed) or 'none'}; below_two_fail_threshold",
+    acceptance_status = (
+        "not_ready"
+        if not required_outputs_ready
+        else "fail"
+        if len(failed) >= 2
+        else "pass"
     )
+    statuses = (
+        text_check_status,
+        video_quality_status,
+        skeleton_static_status,
+        abnormal_frame_status,
+    )
+    if "blocked" in statuses:
+        review_status = "blocked"
+    elif not required_outputs_ready:
+        review_status = "not_run"
+    elif unresolved or "review" in statuses:
+        review_status = "review"
+    else:
+        review_status = "completed"
+    reason = (
+        f"acceptance_status={acceptance_status}; "
+        f"review_status={review_status}; "
+        f"fail_indicators={','.join(failed) or 'none'}; "
+        f"unresolved={','.join(unresolved) or 'none'}"
+    )
+    return acceptance_status, review_status, reason
 
 
 def supplier_summary_from_details(
@@ -1787,7 +1975,8 @@ def supplier_summary_from_details(
     blocked_modules: str,
     notes: str,
 ) -> dict[str, Any]:
-    counts = Counter(text(row.get("final_clip_status")) for row in details)
+    counts = Counter(text(row.get("acceptance_status")) for row in details)
+    review_counts = Counter(text(row.get("review_status")) for row in details)
     manual_counts = Counter(
         text(row.get("manual_review_status")) for row in details
     )
@@ -1800,7 +1989,7 @@ def supplier_summary_from_details(
         interval_frame_count(row.get("_problem_intervals", []))
         for row in details
     )
-    covered = counts["pass"] + counts["fail"] + counts["review"]
+    covered = counts["pass"] + counts["fail"]
     return {
         "supplier_name": supplier_name,
         "sample_clip_count": sample_count,
@@ -1810,9 +1999,9 @@ def supplier_summary_from_details(
         "problem_frame_ratio": safe_ratio(problem_frames, total_frames),
         "pass_clip_count": counts["pass"],
         "fail_clip_count": counts["fail"],
-        "review_clip_count": counts["review"],
-        "blocked_clip_count": counts["blocked"],
-        "not_run_clip_count": counts["not_run"],
+        "review_clip_count": review_counts["review"],
+        "blocked_clip_count": review_counts["blocked"],
+        "not_run_clip_count": review_counts["not_run"],
         "coverage_ratio": safe_ratio(covered, sample_count),
         "sample_coverage_ratio": safe_ratio(sample_count, expected_clip_count),
         "pass_clip_ratio": safe_ratio(counts["pass"], sample_count),
@@ -2281,11 +2470,9 @@ def recompute_xjgt_final_status(
         skeleton_static_status=skeleton_static_status,
         abnormal_frame_status=abnormal_frame_status,
     )
-    if fail_indicator_count >= 2:
-        return "fail"
-    if abnormal_frame_status == "review" or expected_module_missing:
-        return "review"
-    return "pass"
+    if expected_module_missing:
+        return "not_ready"
+    return "fail" if fail_indicator_count >= 2 else "pass"
 
 
 def event_frame_interval(
@@ -2324,8 +2511,11 @@ def print_sanity_checks(
         float(row["manual_problem_frame_ratio_of_clip"]) > 0
         for row in xjgt_details
     )
-    final_counts = dict(
-        sorted(Counter(row["final_clip_status"] for row in xjgt_details).items())
+    acceptance_counts = dict(
+        sorted(Counter(row["acceptance_status"] for row in xjgt_details).items())
+    )
+    review_counts = dict(
+        sorted(Counter(row["review_status"] for row in xjgt_details).items())
     )
     print(f"XJGT total_frame_count={total_frames} ok={total_frames > 0}")
     print(
@@ -2336,7 +2526,8 @@ def print_sanity_checks(
         "XJGT manual_problem_ratio_nonzero="
         f"{has_nonzero_manual_ratio}"
     )
-    print(f"XJGT final_clip_status counts={final_counts}")
+    print(f"XJGT acceptance_status counts={acceptance_counts}")
+    print(f"XJGT review_status counts={review_counts}")
     print(
         "DeepReach sample_clip_count="
         f"{deepreach_summary['sample_clip_count']} "

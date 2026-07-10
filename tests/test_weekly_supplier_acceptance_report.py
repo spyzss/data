@@ -10,18 +10,22 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from tools.build_weekly_supplier_acceptance_report import (
-    DETAIL_COLUMNS,
+    CORE_DETAIL_COLUMNS,
     HARD_ISSUE_COLUMNS,
     SUMMARY_COLUMNS,
+    acceptance_and_review_status,
     aggregate_manual_review,
     build_weekly_report,
     collect_input_audit,
     count_fail_indicators,
+    detail_columns_for_rows,
     main,
     normalize_asset_id,
     recompute_xjgt_final_status,
     resolve_xjgt_text_status,
     skeleton_static_status_from_parts,
+    supplier_summary_from_details,
+    video_quality_atomic_statuses,
 )
 
 
@@ -114,6 +118,59 @@ def _check_result(
         "metrics": json.dumps(metrics),
         "flag": flag,
         "reason": reason,
+    }
+
+
+def _text_metrics(*, text_en_valid: bool = True) -> dict[str, float]:
+    return {
+        "field_present_scene": 1.0,
+        "field_nonempty_scene": 1.0,
+        "field_present_task": 1.0,
+        "field_nonempty_task": 1.0,
+        "field_present_text_en": float(text_en_valid),
+        "field_nonempty_text_en": float(text_en_valid),
+        "missing_field_count": float(not text_en_valid),
+        "empty_field_count": 0.0,
+    }
+
+
+def _video_quality_result(asset_id: str, frame_count: int) -> dict[str, object]:
+    return {
+        "asset_id": asset_id,
+        "qc_summary": {
+            "status": "pass",
+            "passed": True,
+            "reasons": [],
+            "warn_reasons": [],
+        },
+        "hdf5_text_info": {"alignment": {"status": "matched"}},
+        "video_quality": {
+            "evaluation": {
+                "decision": "pass",
+                "passed": True,
+                "reasons": [],
+                "warn_reasons": [],
+            },
+            "metadata": {"frame_count": frame_count, "fps": 30.0},
+            "metrics": {
+                "exposure_metrics": {
+                    "black_frame_ratio": 0.0,
+                    "black_frame_count_estimate": 0,
+                    "mean_over_dark_ratio": 0.0,
+                    "mean_over_exposed_ratio": 0.0,
+                },
+                "sharpness_global": {
+                    "laplacian_p10": 120.0,
+                    "tenengrad_p10": 20.0,
+                },
+                "freeze_metrics": {
+                    "frozen_frame_ratio": 0.0,
+                    "frozen_intervals": [],
+                },
+                "timeline_metrics": {"drop_frame_ratio": 0.0},
+                "hdf5_alignment": {"status": "matched"},
+            },
+        },
     }
 
 
@@ -214,7 +271,7 @@ def _prepare_inputs(run_root: Path) -> None:
             0,
             "text_integrity",
             -1,
-            {"missing_field_count": 1.0},
+            _text_metrics(text_en_valid=False),
             True,
             "missing optional supplier text field",
         ),
@@ -268,7 +325,7 @@ def _prepare_inputs(run_root: Path) -> None:
             {"morphology_verdict": "pass"},
             False,
         ),
-        _check_result(1, "text_integrity", -1, {"missing_field_count": 0.0}, None),
+        _check_result(1, "text_integrity", -1, _text_metrics(), None),
         _check_result(
             1,
             "quality_score",
@@ -312,7 +369,7 @@ def _prepare_inputs(run_root: Path) -> None:
             {"morphology_verdict": "pass"},
             False,
         ),
-        _check_result(2, "text_integrity", -1, {"missing_field_count": 0.0}, None),
+        _check_result(2, "text_integrity", -1, _text_metrics(), None),
         _check_result(
             2,
             "skeleton_quality_score",
@@ -403,16 +460,12 @@ def _prepare_inputs(run_root: Path) -> None:
     (video_dir / "video_quality_results.json").write_text(
         json.dumps(
             [
-                {
-                    "asset_id": asset_id,
-                    "qc_summary": {"status": "pass", "passed": True},
-                    "video_quality": {
-                        "evaluation": {"decision": "pass", "passed": True},
-                        "metadata": {"frame_count": frame_count, "fps": 30.0},
-                        "metrics": {"freeze_metrics": {"frozen_intervals": []}},
-                    },
-                }
-                for asset_id, frame_count in (("1001", 100), ("1002", 200), ("1003", 0))
+                _video_quality_result(asset_id, frame_count)
+                for asset_id, frame_count in (
+                    ("1001", 100),
+                    ("1002", 200),
+                    ("1003", 0),
+                )
             ]
         ),
         encoding="utf-8",
@@ -581,8 +634,44 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "供应商5",
         "人工与难测问题统计",
     ]
+    assert [cell.value for cell in workbook["五供应商总览"][1]] == SUMMARY_COLUMNS
+    detail_headers = [cell.value for cell in workbook["星际归途"][1]]
+    assert detail_headers[:9] == CORE_DETAIL_COLUMNS
+    assert [
+        column
+        for column in detail_headers
+        if column.startswith("text_field_")
+    ] == [
+        "text_field_present_scene_status",
+        "text_field_nonempty_scene_status",
+        "text_field_present_task_status",
+        "text_field_nonempty_task_status",
+        "text_field_present_text_en_status",
+        "text_field_nonempty_text_en_status",
+    ]
+    assert [
+        column
+        for column in detail_headers
+        if column.startswith("video_")
+        and column.endswith("_status")
+        and column != "video_quality_status"
+    ] == [
+        "video_black_screen_status",
+        "video_underexposure_status",
+        "video_overexposure_status",
+        "video_blur_status",
+        "video_freeze_stutter_status",
+        "video_frame_alignment_status",
+    ]
+    assert "temporal_sam3_manual_status" not in detail_headers
+    assert detail_headers.index("skeleton_missing_status") < detail_headers.index(
+        "skeleton_morphology_status"
+    )
+    assert detail_headers.index("abnormal_frame_status") < detail_headers.index(
+        "temporal_status"
+    )
     rows = list(workbook["星际归途"].iter_rows(min_row=2, values_only=True))
-    columns = {name: index for index, name in enumerate(DETAIL_COLUMNS)}
+    columns = {name: index for index, name in enumerate(detail_headers)}
     assert {
         "skeleton_missing_fail_frame_count",
         "skeleton_missing_fail_frame_ratio",
@@ -634,7 +723,8 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1001"][columns["abnormal_fail_frame_ratio"]] == 0.1
     assert by_asset["1001"][columns["abnormal_frame_status"]] == "fail"
     assert by_asset["1001"][columns["fail_indicator_count"]] == 3
-    assert by_asset["1001"][columns["final_clip_status"]] == "fail"
+    assert by_asset["1001"][columns["acceptance_status"]] == "fail"
+    assert by_asset["1001"][columns["review_status"]] == "completed"
     assert "skeleton_static_status" in by_asset["1001"][columns["final_status_reason"]]
     assert "abnormal_frame_status" in by_asset["1001"][columns["final_status_reason"]]
     assert by_asset["1001"][columns["precheck_mapping_status"]] == "mapped"
@@ -656,7 +746,8 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1002"][columns["abnormal_frame_status"]] == "fail"
     assert by_asset["1002"][columns["fail_indicator_count"]] == 1
     # One failed indicator is not enough for final fail.
-    assert by_asset["1002"][columns["final_clip_status"]] == "pass"
+    assert by_asset["1002"][columns["acceptance_status"]] == "pass"
+    assert by_asset["1002"][columns["review_status"]] == "review"
     assert by_asset["1002"][columns["supplier_quality_signal"]] == "low"
     assert by_asset["1002"][columns["auto_fail_frame_count"]] == 30
     assert by_asset["1002"][columns["reviewed_auto_fail_frame_count"]] == 10
@@ -671,7 +762,7 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1002"][columns["unreviewed_auto_fail_frame_count"]] == 20
     assert by_asset["1002"][columns["auto_fail_precision_on_reviewed"]] == 0.0
     assert "unreviewed_auto_fail_frames=20" in by_asset["1002"][columns["abnormal_status_reason"]]
-    assert "below_two_fail_threshold" in by_asset["1002"][columns["final_status_reason"]]
+    assert "acceptance_status=pass" in by_asset["1002"][columns["final_status_reason"]]
 
     assert by_asset["1003"][columns["total_frames"]] == 0
     assert by_asset["1003"][columns["frame_count_status"]] == "unreadable"
@@ -683,7 +774,8 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert "morphology_status=not_run" in by_asset["1003"][columns["skeleton_static_status_reason"]]
     assert by_asset["1003"][columns["abnormal_frame_status"]] == "review"
     assert by_asset["1003"][columns["fail_indicator_count"]] == 0
-    assert by_asset["1003"][columns["final_clip_status"]] == "review"
+    assert by_asset["1003"][columns["acceptance_status"]] == "not_ready"
+    assert by_asset["1003"][columns["review_status"]] == "not_run"
     assert (
         by_asset["1003"][columns["supplier_quality_signal"]]
         == "not_provided"
@@ -698,39 +790,18 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
 
     with outputs.summary_csv.open(newline="", encoding="utf-8") as handle:
         summary = list(csv.DictReader(handle))
+    assert list(summary[0]) == SUMMARY_COLUMNS == [
+        "supplier_name",
+        "sample_clip_count",
+        "total_frame_count",
+        "problem_frame_count",
+        "pass_clip_count",
+    ]
     xjgt = summary[0]
     assert xjgt["sample_clip_count"] == "3"
     assert xjgt["total_frame_count"] == "300"
     assert xjgt["problem_frame_count"] == "50"
-    assert xjgt["problem_frame_ratio"] == str(50 / 300)
     assert xjgt["pass_clip_count"] == "1"
-    assert xjgt["fail_clip_count"] == "1"
-    assert xjgt["review_clip_count"] == "1"
-    assert xjgt["blocked_clip_count"] == "0"
-    assert xjgt["not_run_clip_count"] == "0"
-    assert xjgt["coverage_ratio"] == "1.0"
-    assert xjgt["sample_coverage_ratio"] == str(3 / 100)
-    assert xjgt["manual_reviewed_clip_count"] == "2"
-    assert xjgt["manual_review_coverage_ratio"] == str(2 / 3)
-    assert xjgt["manual_pass_clip_count"] == "1"
-    assert xjgt["manual_fail_clip_count"] == "1"
-    assert xjgt["manual_not_reviewed_clip_count"] == "1"
-    assert xjgt["manual_confirmed_problem_frame_count"] == "20"
-    assert xjgt["abnormal_pass_clip_count"] == "0"
-    assert xjgt["abnormal_fail_clip_count"] == "2"
-    assert xjgt["abnormal_review_clip_count"] == "1"
-    assert sum(
-        int(xjgt[name])
-        for name in (
-            "pass_clip_count",
-            "fail_clip_count",
-            "review_clip_count",
-            "blocked_clip_count",
-            "not_run_clip_count",
-        )
-    ) == int(xjgt["sample_clip_count"])
-    assert xjgt["pass_clip_ratio"] == str(1 / 3)
-    assert xjgt["fail_clip_ratio"] == str(1 / 3)
 
 
 def test_single_skeleton_static_indicator_does_not_fail_final_clip() -> None:
@@ -817,6 +888,29 @@ def test_xjgt_text_can_be_explicitly_skipped() -> None:
     ) == ("not_applicable", "text_integrity_skipped_by_cli")
 
 
+def test_text_atomic_columns_are_discovered_from_producer_metrics() -> None:
+    columns = detail_columns_for_rows(
+        [{"text_field_present_supplier_instruction_status": "pass"}]
+    )
+    assert "text_field_present_supplier_instruction_status" in columns
+
+
+def test_video_atomic_columns_only_use_available_metric_groups() -> None:
+    statuses = video_quality_atomic_statuses(
+        {
+            "qc_summary": {"reasons": [], "warn_reasons": []},
+            "video_quality": {
+                "metrics": {
+                    "exposure_metrics": {
+                        "black_frame_ratio": 0.0,
+                    }
+                }
+            },
+        }
+    )
+    assert statuses == {"video_black_screen_status": "pass"}
+
+
 def test_skeleton_static_status_preserves_subcheck_review_and_missing() -> None:
     assert skeleton_static_status_from_parts(
         missing_status="pass",
@@ -853,6 +947,81 @@ def test_fail_indicator_count_has_exactly_four_top_level_dimensions() -> None:
         skeleton_static_status="fail",
         abnormal_frame_status="pass",
     ) == 1
+
+
+def test_acceptance_and_review_status_are_independent() -> None:
+    acceptance, review, _reason = acceptance_and_review_status(
+        text_check_status="pass",
+        video_quality_status="pass",
+        skeleton_static_status="pass",
+        abnormal_frame_status="review",
+        required_outputs_ready=True,
+        unresolved=["abnormal_frame_status=review"],
+    )
+    assert acceptance == "pass"
+    assert review == "review"
+
+    acceptance, review, _reason = acceptance_and_review_status(
+        text_check_status="fail",
+        video_quality_status="fail",
+        skeleton_static_status="pass",
+        abnormal_frame_status="review",
+        required_outputs_ready=True,
+        unresolved=["abnormal_frame_status=review"],
+    )
+    assert acceptance == "fail"
+    assert review == "review"
+
+
+def test_review_workflow_does_not_reduce_acceptance_pass_count() -> None:
+    details = [
+        {
+            "asset_id": f"asset_{index:03d}",
+            "total_frames": 100,
+            "acceptance_status": "pass",
+            "review_status": "review" if index < 86 else "completed",
+            "manual_review_status": "not_reviewed",
+            "manual_problem_frame_count": 0,
+            "abnormal_frame_status": "review" if index < 86 else "pass",
+            "_problem_intervals": [],
+        }
+        for index in range(100)
+    ]
+    summary = supplier_summary_from_details(
+        supplier_name="XJGT",
+        expected_clip_count=100,
+        details=details,
+        main_issue_type="",
+        modules_completed="",
+        blocked_modules="",
+        notes="",
+    )
+    assert summary["pass_clip_count"] == 100
+    assert summary["review_clip_count"] == 86
+
+
+def test_problem_frame_count_uses_interval_union() -> None:
+    summary = supplier_summary_from_details(
+        supplier_name="XJGT",
+        expected_clip_count=1,
+        details=[
+            {
+                "asset_id": "1001",
+                "total_frames": 20,
+                "acceptance_status": "pass",
+                "review_status": "completed",
+                "manual_review_status": "pass",
+                "manual_problem_frame_count": 10,
+                "abnormal_frame_status": "pass",
+                "_problem_intervals": [(0, 9), (5, 14)],
+            }
+        ],
+        main_issue_type="",
+        modules_completed="",
+        blocked_modules="",
+        notes="",
+    )
+    assert summary["problem_frame_count"] == 15
 
 
 def test_single_abnormal_indicator_does_not_fail_final_clip() -> None:
@@ -918,7 +1087,8 @@ def test_deepreach_and_placeholders_remain_honest(
 
     workbook = load_workbook(outputs.workbook_xlsx, read_only=True)
     deepreach_rows = list(workbook["DeepReach"].iter_rows(min_row=2, values_only=True))
-    columns = {name: index for index, name in enumerate(DETAIL_COLUMNS)}
+    headers = [cell.value for cell in workbook["DeepReach"][1]]
+    columns = {name: index for index, name in enumerate(headers)}
     assert len(deepreach_rows) == 8
     assert {row[columns["text_check_status"]] for row in deepreach_rows} == {
         "pending_rule"
@@ -936,7 +1106,10 @@ def test_deepreach_and_placeholders_remain_honest(
         row[columns["supplier_quality_signal"]]
         for row in deepreach_rows
     } == {"not_provided"}
-    assert {row[columns["final_clip_status"]] for row in deepreach_rows} == {
+    assert {row[columns["acceptance_status"]] for row in deepreach_rows} == {
+        "not_ready"
+    }
+    assert {row[columns["review_status"]] for row in deepreach_rows} == {
         "blocked"
     }
     assert sum(row[columns["total_frames"]] for row in deepreach_rows) == sum(
@@ -949,13 +1122,10 @@ def test_deepreach_and_placeholders_remain_honest(
     with outputs.summary_csv.open(newline="", encoding="utf-8") as handle:
         summary = list(csv.DictReader(handle))
     assert summary[1]["sample_clip_count"] == "8"
-    assert summary[1]["blocked_clip_count"] == "8"
-    assert summary[1]["coverage_ratio"] == "0.0"
-    assert summary[1]["blocked_modules"] == "precheck|sam3"
-    assert "no_valid_output" in summary[1]["notes"]
+    assert summary[1]["pass_clip_count"] == ""
     for row in summary[2:]:
         assert row["sample_clip_count"] == "0"
-        assert row["blocked_modules"] == "missing_input"
+        assert row["pass_clip_count"] == ""
 
 
 def test_generation_prints_sanity_checks(
@@ -971,7 +1141,8 @@ def test_generation_prints_sanity_checks(
     assert "XJGT total_frame_count=300 ok=True" in output
     assert "XJGT problem_frame_count=50 ok=True" in output
     assert "XJGT manual_problem_ratio_nonzero=True" in output
-    assert "XJGT final_clip_status counts={'fail': 1, 'pass': 1, 'review': 1}" in output
+    assert "XJGT acceptance_status counts={'fail': 1, 'not_ready': 1, 'pass': 1}" in output
+    assert "XJGT review_status counts={'completed': 1, 'not_run': 1, 'review': 1}" in output
     assert "DeepReach sample_clip_count=8" in output
     assert "video_quality=no_valid_output" in output
 
