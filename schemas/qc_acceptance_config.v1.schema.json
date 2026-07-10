@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qc_acceptance_config.v1.schema.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "config_version",
+    "config_name",
+    "pipeline",
+    "modules"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "qc_acceptance_config_schema.v1"
+    },
+    "config_version": {
+      "type": "string",
+      "pattern": "^qc_acceptance_v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "config_name": {
+      "const": "acceptance_gate"
+    },
+    "pipeline": {
+      "type": "object",
+      "required": ["stop_on_fail", "modules"],
+      "properties": {
+        "stop_on_fail": {
+          "const": true
+        },
+        "modules": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "modules": {
+      "type": "object",
+      "required": ["video_quality", "manual_review"],
+      "properties": {
+        "video_quality": {
+          "type": "object",
+          "required": ["enabled", "rules"],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "rules": {
+              "type": "object",
+              "minProperties": 1
+            }
+          }
+        },
+        "manual_review": {
+          "type": "object",
+          "required": ["enabled", "selection_policy"],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "selection_policy": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

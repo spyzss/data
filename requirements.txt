@@ -17,6 +17,7 @@ opencv-python-headless>=4.10.0.84
 
 # Config management
 pyyaml>=6.0.0
+jsonschema>=4.23.0
 
 # HTTP clients
 requests>=2.31.0
