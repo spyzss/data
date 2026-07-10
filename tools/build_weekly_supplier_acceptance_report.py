@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import logging
+import re
 import subprocess
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -37,20 +38,14 @@ SUMMARY_COLUMNS = [
     "pass_clip_ratio",
     "fail_clip_count",
     "fail_clip_ratio",
-    "problem_frame_count_v2",
-    "problem_frame_ratio_v2",
-    "pass_clip_count_v2",
-    "pass_clip_ratio_v2",
-    "fail_clip_count_v2",
-    "fail_clip_ratio_v2",
 ]
 
 CORE_DETAIL_COLUMNS = [
     "asset_id",
     "total_frames",
     "text_check_status",
-    "video_quality_status",
     "skeleton_static_status",
+    "video_quality_status",
     "abnormal_frame_status",
     "fail_indicator_count",
     "acceptance_status",
@@ -103,6 +98,13 @@ ABNORMAL_DETAIL_COLUMNS = [
     "abnormal_fail_frame_count_v2",
     "abnormal_fail_frame_ratio_v2",
     "abnormal_status_reason_v2",
+    "submitted_review_interval_count",
+    "submitted_review_frame_count",
+    "reviewed_submitted_interval_count",
+    "unreviewed_submitted_interval_count",
+    "unreviewed_submitted_frame_count",
+    "abnormal_v1_unreviewed_as_fail_frame_count",
+    "abnormal_v2_unreviewed_as_review_frame_count",
 ]
 
 DIAGNOSTIC_DETAIL_COLUMNS = [
@@ -125,22 +127,6 @@ XJGT_DETAIL_COLUMNS = [
     *DIAGNOSTIC_DETAIL_COLUMNS,
 ]
 DETAIL_COLUMNS = XJGT_DETAIL_COLUMNS
-
-HARD_ISSUE_COLUMNS = [
-    "issue_type",
-    "current_detection_method",
-    "current_threshold",
-    "auto_decision_available",
-    "needs_manual_review",
-    "observed_count",
-    "observed_unit",
-    "denominator",
-    "denominator_definition",
-    "observed_ratio",
-    "source_module",
-    "why_hard",
-    "next_action",
-]
 
 MANUAL_ISSUE_COLUMNS = [
     "supplier_name",
@@ -181,7 +167,6 @@ SHEET_NAMES = [
     "供应商3",
     "供应商4",
     "供应商5",
-    "人工与难测问题统计",
     "人工问题与阈值",
 ]
 
@@ -240,6 +225,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "not_applicable."
         ),
     )
+    parser.add_argument("--xjgt-precheck-config", type=Path)
+    parser.add_argument("--xjgt-video-quality-config", type=Path)
+    parser.add_argument("--xjgt-sam3-config", type=Path)
+    parser.add_argument("--xjgt-weekly-policy-config", type=Path)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -258,6 +247,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_xjgt_text=(
             args.require_xjgt_text or not args.skip_xjgt_text
         ),
+        xjgt_precheck_config=args.xjgt_precheck_config,
+        xjgt_video_quality_config=args.xjgt_video_quality_config,
+        xjgt_sam3_config=args.xjgt_sam3_config,
+        xjgt_weekly_policy_config=args.xjgt_weekly_policy_config,
     )
     LOGGER.info("Wrote %s", outputs.workbook_xlsx)
     LOGGER.info("Wrote %s", outputs.summary_csv)
@@ -268,9 +261,20 @@ def build_weekly_report(
     run_root: Path,
     *,
     require_xjgt_text: bool = True,
+    xjgt_precheck_config: Path | None = None,
+    xjgt_video_quality_config: Path | None = None,
+    xjgt_sam3_config: Path | None = None,
+    xjgt_weekly_policy_config: Path | None = None,
 ) -> WeeklyOutputPaths:
     run_root.mkdir(parents=True, exist_ok=True)
-    xjgt = load_xjgt(run_root, require_xjgt_text=require_xjgt_text)
+    xjgt = load_xjgt(
+        run_root,
+        require_xjgt_text=require_xjgt_text,
+        precheck_config=xjgt_precheck_config,
+        video_quality_config=xjgt_video_quality_config,
+        sam3_config=xjgt_sam3_config,
+        weekly_policy_config=xjgt_weekly_policy_config,
+    )
     deepreach = load_deepreach(run_root)
     placeholders = [placeholder_supplier(index) for index in range(3, 6)]
     summary_rows = [xjgt["summary"], deepreach["summary"], *placeholders]
@@ -283,9 +287,9 @@ def build_weekly_report(
         summary_rows,
         xjgt["details"],
         deepreach["details"],
-        xjgt["issue_events"],
         xjgt["manual_issue_rows"],
         xjgt["threshold_rule_rows"],
+        xjgt["config_audit"],
     )
     print_sanity_checks(
         xjgt["summary"],
@@ -374,6 +378,12 @@ def load_xjgt_source_reads(run_root: Path) -> dict[str, SourceRead]:
                 / "video_review"
                 / "review_queue_with_clips.csv",
                 run_root / "xjgt" / "review" / "review_queue.csv",
+                run_root
+                / "xjgt"
+                / "manual_review"
+                / "review_queue_with_clips.csv",
+                run_root / "xjgt" / "manual_review" / "review_queue.csv",
+                run_root / "xjgt" / "review_queue.csv",
             ],
         ),
     }
@@ -636,12 +646,26 @@ def load_xjgt(
     run_root: Path,
     *,
     require_xjgt_text: bool = True,
+    precheck_config: Path | None = None,
+    video_quality_config: Path | None = None,
+    sam3_config: Path | None = None,
+    weekly_policy_config: Path | None = None,
 ) -> dict[str, Any]:
     manifest_path = run_root / "manifests" / "supplier_manifest_xjgt_100.csv"
     manifest = read_csv(manifest_path)
     asset_rows, episode_asset = manifest_asset_maps(manifest)
     asset_ids = set(asset_rows)
     sources = load_xjgt_source_reads(run_root)
+    config_paths = discover_xjgt_config_paths(
+        run_root,
+        precheck_config=precheck_config,
+        video_quality_config=video_quality_config,
+        sam3_config=sam3_config,
+        weekly_policy_config=weekly_policy_config,
+    )
+    run_config_rows, config_audit = build_run_config_inventory(
+        config_paths, sources
+    )
     precheck = load_precheck_evidence(manifest, sources)
     candidate_by_asset, candidate_unmatched = map_window_rows(
         sources["precheck_candidate_windows"].records,
@@ -661,8 +685,8 @@ def load_xjgt(
         asset_ids,
         episode_asset,
     )
-    submitted_sam3_by_asset, submitted_sam3_unmatched = (
-        map_submitted_sam3_review_intervals(
+    submitted_review_by_asset, submitted_review_unmatched = (
+        map_submitted_review_intervals(
             sources["manual_review_queue"].records,
             asset_ids,
             episode_asset,
@@ -725,7 +749,8 @@ def load_xjgt(
             candidate_row=candidate_by_asset.get(asset_id, {}),
             video_row=video_by_asset.get(asset_id, {}),
             sam3_row=sam3_by_asset.get(asset_id, {}),
-            submitted_sam3_row=submitted_sam3_by_asset.get(asset_id, {}),
+            submitted_review_row=submitted_review_by_asset.get(asset_id, {}),
+            submitted_review_source_status=sources["manual_review_queue"].status,
             manual_row=manual_by_asset.get(
                 asset_id,
                 empty_manual_evidence(
@@ -747,18 +772,13 @@ def load_xjgt(
         supplier_name="星际归途 / XJGT",
         labels=manual_labels,
     )
-    issue_events = build_weekly_issue_events(
-        manual_labels,
-        sources["sam3_window_summary"].records,
-        details,
-    )
     modules_completed = []
     if details and all(
         row["precheck_mapping_status"] == "mapped" for row in details
     ):
         modules_completed.append("precheck")
     if details and all(
-        row["video_quality_status"] != "no_valid_output"
+        row["video_quality_status"] in {"pass", "fail"}
         for row in details
     ):
         modules_completed.append("video_quality")
@@ -789,15 +809,53 @@ def load_xjgt(
             f"unmatched_candidate={len(candidate_unmatched)}; "
             f"unmatched_video={len(video_unmatched)}; "
             f"unmatched_sam3={len(sam3_unmatched)}"
-            f"; unmatched_submitted_sam3={len(submitted_sam3_unmatched)}"
+            f"; unmatched_submitted_review={len(submitted_review_unmatched)}"
         ),
+    )
+    threshold_rule_rows = build_threshold_rule_rows(
+        run_root,
+        sources,
+        config_paths=config_paths,
+        run_config_rows=run_config_rows,
+    )
+    exported_run_config_rows = sum(
+        row["value_source"] == "run_config" for row in threshold_rule_rows
+    )
+    config_audit["exported_run_config_row_count"] = exported_run_config_rows
+    if exported_run_config_rows != config_audit["actual_config_leaf_count"]:
+        config_audit["missing_config_keys"].append(
+            "run_config_row_reconciliation"
+        )
+        config_audit["config_reconciliation_status"] = "incomplete"
+    config_audit.update(
+        {
+            "submitted_review_source_path": str(
+                sources["manual_review_queue"].path or ""
+            ),
+            "submitted_review_source_status": sources[
+                "manual_review_queue"
+            ].status,
+            "code_default_row_count": sum(
+                row["value_source"] == "code_default"
+                for row in threshold_rule_rows
+            ),
+            "producer_metadata_row_count": sum(
+                row["value_source"] == "producer_output_metadata"
+                for row in threshold_rule_rows
+            ),
+            "unresolved_row_count": sum(
+                row["value_source"] == "unavailable"
+                or row["effective_value"] == "unresolved"
+                for row in threshold_rule_rows
+            ),
+        }
     )
     return {
         "summary": summary,
         "details": details,
-        "issue_events": issue_events,
         "manual_issue_rows": manual_issue_rows,
-        "threshold_rule_rows": build_threshold_rule_rows(run_root, sources),
+        "threshold_rule_rows": threshold_rule_rows,
+        "config_audit": config_audit,
     }
 
 
@@ -842,7 +900,7 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
                     if fallback_frames > 0
                     else "not_run"
                 ),
-                "text_check_status": "pending_rule",
+                "text_check_status": "not_ready",
                 "text_status_reason": "supplier_text_schema_not_defined",
                 "skeleton_missing_status": "blocked",
                 "skeleton_missing_fail_frame_count": 0,
@@ -852,15 +910,13 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
                 "skeleton_morphology_fail_frame_ratio": 0.0,
                 "skeleton_static_fail_frame_count": 0,
                 "skeleton_static_fail_frame_ratio": 0.0,
-                "skeleton_static_status": "blocked",
+                "skeleton_static_status": "not_ready",
                 "skeleton_static_status_reason": (
                     "missing_status=blocked; morphology_status=blocked; "
                     "skeleton_static_status=blocked"
                 ),
                 "supplier_quality_signal": "not_provided",
-                "video_quality_status": (
-                    "no_valid_output" if not has_video_quality else "review"
-                ),
+                "video_quality_status": "not_ready",
                 "video_quality_fail_frame_count": 0,
                 "video_quality_fail_frame_ratio": 0.0,
                 "video_quality_status_reason": (
@@ -877,8 +933,8 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
                 "manual_problem_ratio_of_reviewed": 0.0,
                 "abnormal_fail_frame_count": 0,
                 "abnormal_fail_frame_ratio": 0.0,
-                "abnormal_frame_status": "blocked",
-                "abnormal_frame_status_v2": "blocked",
+                "abnormal_frame_status": "not_ready",
+                "abnormal_frame_status_v2": "not_ready",
                 "auto_fail_frame_count": 0,
                 "reviewed_auto_fail_frame_count": 0,
                 "reviewed_auto_fail_true_positive_frame_count": 0,
@@ -889,6 +945,13 @@ def load_deepreach(run_root: Path) -> dict[str, Any]:
                 "abnormal_fail_frame_count_v2": 0,
                 "abnormal_fail_frame_ratio_v2": 0.0,
                 "abnormal_status_reason_v2": "blocked:sam3_projection_mapping",
+                "submitted_review_interval_count": 0,
+                "submitted_review_frame_count": 0,
+                "reviewed_submitted_interval_count": 0,
+                "unreviewed_submitted_interval_count": 0,
+                "unreviewed_submitted_frame_count": 0,
+                "abnormal_v1_unreviewed_as_fail_frame_count": 0,
+                "abnormal_v2_unreviewed_as_review_frame_count": 0,
                 "fail_indicator_count": 0,
                 "acceptance_status": "not_ready",
                 "review_status": "blocked",
@@ -985,146 +1048,6 @@ def placeholder_supplier(index: int) -> dict[str, Any]:
     }
 
 
-def hard_issue_rows(
-    events: list[dict[str, Any]],
-    details: list[dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    details = details or []
-    video_fail_count = sum(
-        1 for row in details if row.get("video_quality_status") == "fail"
-    )
-    definitions = [
-        (
-            "hand_out_of_frame",
-            "projection/border evidence + manual review",
-            "pending calibration",
-            "partial",
-            "yes",
-            "Finite keypoints do not prove visual presence.",
-            "Calibrate border and mask-truncation rules.",
-        ),
-        (
-            "severe_keypoint_offset",
-            "SAM3 containment + manual overlay",
-            "inside_ratio <= 0.2 is strong mismatch evidence",
-            "partial",
-            "yes",
-            "Occlusion and undersegmentation can look identical.",
-            "Calibrate with confirmed segments.",
-        ),
-        (
-            "skeleton_pose_hallucination",
-            "static morphology + manual overlay",
-            "config-driven morphology thresholds",
-            "partial",
-            "yes",
-            "A wrong pose may remain temporally stable.",
-            "Expand morphology calibration.",
-        ),
-        (
-            "visual_skeleton_presence_mismatch",
-            "projection/SAM3 + manual review",
-            "pending calibration",
-            "partial",
-            "yes",
-            "Visibility depends on framing and occlusion.",
-            "Add presence/truncation evidence.",
-        ),
-        (
-            "occlusion_or_mask_undersegmentation",
-            "SAM3 diagnostics",
-            "inside_ratio < 0.6 routes to review",
-            "no",
-            "yes",
-            "Keypoint-in-mask cannot diagnose mask completeness.",
-            "Retain manual arbitration.",
-        ),
-        (
-            "projection_review",
-            "3D-to-2D projection checks",
-            "projected_in_image_ratio < 0.8",
-            "no",
-            "yes",
-            "Calibration uncertainty can dominate.",
-            "Validate supplier calibration.",
-        ),
-        (
-            "video_quality_pending_colleague_thresholds",
-            "acceptance_pull/video_quality.py",
-            "pending colleague thresholds",
-            "pending",
-            "no",
-            "Threshold ownership is external to this report.",
-            "Consume finalized video_quality status.",
-        ),
-        (
-            "text_check_pending_rules",
-            "precheck text integrity",
-            "pending rules",
-            "no",
-            "yes",
-            "Acceptance semantics are not finalized.",
-            "Define required fields and fail rules.",
-        ),
-    ]
-    rows = []
-    for issue_type, method, threshold, automatic, manual, why, action in definitions:
-        source_module = (
-            "sam3_containment"
-            if issue_type
-            in {"occlusion_or_mask_undersegmentation", "projection_review"}
-            else "manual_review"
-        )
-        source_events = [
-            event
-            for event in events
-            if event.get("source_module") == source_module
-        ]
-        count = sum(
-            event.get("failure_mode") == issue_type
-            for event in source_events
-        )
-        unit = "window" if source_module == "sam3_containment" else "segment"
-        denominator = len(source_events)
-        denominator_definition = (
-            "SAM3 containment windows"
-            if source_module == "sam3_containment"
-            else "manual review segment rows"
-        )
-        if issue_type == "video_quality_pending_colleague_thresholds":
-            count = video_fail_count
-            unit = "clip"
-            denominator = len(details)
-            denominator_definition = "XJGT sampled clips"
-            source_module = "video_quality"
-        elif issue_type == "text_check_pending_rules":
-            count = sum(
-                row.get("text_check_status")
-                in {"pending_rule", "pending_required_rule"}
-                for row in details
-            )
-            unit = "clip"
-            denominator = len(details)
-            denominator_definition = "XJGT sampled clips"
-            source_module = "text_integrity"
-        rows.append({
-            "issue_type": issue_type,
-            "current_detection_method": method,
-            "current_threshold": threshold,
-            "auto_decision_available": automatic,
-            "needs_manual_review": manual,
-            "observed_count": count,
-            "observed_unit": unit,
-            "denominator": denominator,
-            "denominator_definition": denominator_definition,
-            "observed_ratio": safe_ratio(count, denominator),
-            "source_module": source_module,
-            "why_hard": why,
-            "next_action": action,
-        })
-    return rows
-
-
 def threshold_rule_row(
     *,
     parent_indicator: str,
@@ -1164,7 +1087,11 @@ def threshold_rule_row(
 
 def load_precheck_rule_config(
     run_root: Path,
+    actual_config_path: Path | None = None,
 ) -> tuple[dict[str, Any], str, str]:
+    if actual_config_path is not None:
+        loaded = read_config_mapping(actual_config_path)
+        return loaded, "run_config", str(actual_config_path)
     candidates = [
         run_root / "xjgt" / "precheck" / "precheck_config.yaml",
         run_root / "xjgt" / "precheck" / "config.yaml",
@@ -1174,10 +1101,8 @@ def load_precheck_rule_config(
         if not path.exists():
             continue
         try:
-            import yaml
-
-            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        except (OSError, ValueError, TypeError):
+            loaded = read_config_mapping(path)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             continue
         if isinstance(loaded, dict):
             return loaded, "run_config", str(path)
@@ -1194,6 +1119,365 @@ def load_precheck_rule_config(
         "code_default",
         str(default_path),
     )
+
+
+def read_config_mapping(path: Path) -> dict[str, Any]:
+    if path.suffix.lower() == ".json":
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        import yaml
+
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"config root must be an object: {path}")
+    return loaded
+
+
+def discover_single_config(
+    *,
+    explicit: Path | None,
+    preferred: list[Path],
+    glob_dir: Path,
+    glob_patterns: tuple[str, ...],
+    option_name: str,
+) -> Path | None:
+    if explicit is not None:
+        if not explicit.is_file():
+            raise ValueError(f"{option_name} does not exist: {explicit}")
+        return explicit.resolve()
+    for path in preferred:
+        if path.is_file():
+            return path.resolve()
+    matches = sorted(
+        {
+            path.resolve()
+            for pattern in glob_patterns
+            for path in glob_dir.glob(pattern)
+            if path.is_file()
+        }
+    )
+    if len(matches) > 1:
+        raise ValueError(
+            f"ambiguous config discovery for {option_name}: "
+            f"{', '.join(str(path) for path in matches)}"
+        )
+    return matches[0] if matches else None
+
+
+def logged_config_candidates(
+    run_root: Path,
+    log_name_tokens: tuple[str, ...],
+) -> list[Path]:
+    log_roots = [run_root / "xjgt" / "logs", run_root / "logs"]
+    pattern = re.compile(
+        r"(?:--config(?:=|\s+)|config(?:_path)?\s*[=:]\s*)"
+        r"[\"']?([^\s\"']+\.(?:yaml|yml|json))"
+    )
+    candidates: set[Path] = set()
+    for log_root in log_roots:
+        if not log_root.is_dir():
+            continue
+        for log_path in log_root.glob("*.log"):
+            normalized_name = log_path.name.lower().replace("-", "_")
+            if not any(token in normalized_name for token in log_name_tokens):
+                continue
+            try:
+                content = log_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for raw_path in pattern.findall(content):
+                path = Path(raw_path)
+                search = (
+                    [path]
+                    if path.is_absolute()
+                    else [
+                        Path.cwd() / path,
+                        Path(__file__).parents[1] / path,
+                        run_root / path,
+                        log_path.parent / path,
+                    ]
+                )
+                candidates.update(
+                    candidate.resolve()
+                    for candidate in search
+                    if candidate.is_file()
+                )
+    return sorted(candidates)
+
+
+def discover_xjgt_config_paths(
+    run_root: Path,
+    *,
+    precheck_config: Path | None,
+    video_quality_config: Path | None,
+    sam3_config: Path | None,
+    weekly_policy_config: Path | None,
+) -> dict[str, Path | None]:
+    xjgt = run_root / "xjgt"
+    logged_precheck = logged_config_candidates(run_root, ("precheck",))
+    logged_video = logged_config_candidates(
+        run_root, ("video_quality", "videoquality")
+    )
+    logged_weekly = logged_config_candidates(run_root, ("weekly", "report"))
+    for option_name, candidates in (
+        ("--xjgt-precheck-config", logged_precheck),
+        ("--xjgt-video-quality-config", logged_video),
+        ("--xjgt-weekly-policy-config", logged_weekly),
+    ):
+        if len(candidates) > 1:
+            raise ValueError(
+                f"ambiguous logged config paths for {option_name}: "
+                f"{', '.join(str(path) for path in candidates)}"
+            )
+    return {
+        "precheck": discover_single_config(
+            explicit=precheck_config,
+            preferred=[
+                xjgt / "precheck" / "precheck_config.yaml",
+                xjgt / "precheck" / "config.yaml",
+                xjgt / "precheck" / "run_config.yaml",
+                *logged_precheck,
+            ],
+            glob_dir=xjgt / "precheck",
+            glob_patterns=("*.yaml", "*.yml"),
+            option_name="--xjgt-precheck-config",
+        ),
+        "video_quality": discover_single_config(
+            explicit=video_quality_config,
+            preferred=[
+                xjgt / "video_quality" / "video_quality_config.yaml",
+                xjgt / "video_quality" / "config.yaml",
+                *logged_video,
+            ],
+            glob_dir=xjgt / "video_quality",
+            glob_patterns=("*.yaml", "*.yml"),
+            option_name="--xjgt-video-quality-config",
+        ),
+        "sam3_containment": discover_single_config(
+            explicit=sam3_config,
+            preferred=[
+                xjgt / "sam3_containment" / "sam3_config.yaml",
+                xjgt / "sam3_containment" / "config.yaml",
+                xjgt / "sam3_containment" / "run_manifest.json",
+            ],
+            glob_dir=xjgt / "sam3_containment",
+            glob_patterns=("*.yaml", "*.yml", "*config*.json", "run_manifest.json"),
+            option_name="--xjgt-sam3-config",
+        ),
+        "weekly_report": discover_single_config(
+            explicit=weekly_policy_config,
+            preferred=[
+                xjgt / "weekly_policy.yaml",
+                xjgt / "weekly_policy.json",
+                run_root / "weekly_policy.yaml",
+                *logged_weekly,
+            ],
+            glob_dir=xjgt,
+            glob_patterns=("*weekly*policy*.yaml", "*weekly*policy*.yml", "*weekly*policy*.json"),
+            option_name="--xjgt-weekly-policy-config",
+        ),
+    }
+
+
+def config_leaf_items(
+    value: Any,
+    prefix: str = "",
+) -> list[tuple[str, Any]]:
+    if isinstance(value, dict):
+        output: list[tuple[str, Any]] = []
+        for key, nested in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            output.extend(config_leaf_items(nested, path))
+        return output
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return [(prefix, [])]
+        output = []
+        for index, nested in enumerate(value):
+            path = f"{prefix}.{index}" if prefix else str(index)
+            output.extend(config_leaf_items(nested, path))
+        return output
+    return [(prefix, value)]
+
+
+def config_parent_and_check(module: str, config_key: str) -> tuple[str, str]:
+    parts = config_key.split(".")
+    if module == "precheck":
+        check = parts[1] if parts[0] == "checks" and len(parts) > 1 else parts[0]
+        if check == "text_integrity":
+            return "text", check
+        if check == "skeleton_quality_score" and any(
+            metric in config_key
+            for metric in (
+                "joint_angle_change",
+                "rotation_delta",
+                "joint_acceleration",
+                "joint_displacement",
+                "candidate_",
+                "strong_",
+                "hard_exceeded",
+            )
+        ):
+            return "abnormal_frame", "keypoint_temporal"
+        if check in {"keypoint_morphology", "keypoint_missing"} or any(
+            token in config_key for token in ("missing_keypoint", "valid_keypoint")
+        ):
+            return "skeleton_static", check
+        return "abnormal_frame", check
+    if module == "video_quality":
+        return "video_quality", parts[0]
+    if module == "sam3_containment":
+        return "abnormal_frame", "sam3_runtime_config"
+    return "final_acceptance", "weekly_policy_config"
+
+
+def config_metric_and_semantics(
+    module: str,
+    config_key: str,
+    value: Any,
+) -> tuple[str, str, str, str, str]:
+    leaf = config_key.rsplit(".", 1)[-1]
+    parent_leaf = config_key.rsplit(".", 2)[-2] if "." in config_key else leaf
+    metric = str(value) if parent_leaf == "required_fields" else leaf
+    threshold_tokens = (
+        "threshold",
+        "_min",
+        "_max",
+        "_pass",
+        "_warn",
+        "_fail",
+        "_review",
+        "ratio",
+    )
+    is_threshold = any(token in leaf for token in threshold_tokens)
+    rule_type = "numeric_threshold" if is_threshold else "config_parameter"
+    level = (
+        "fail"
+        if "fail" in leaf
+        else "review"
+        if "warn" in leaf or "review" in leaf
+        else "pass"
+        if "pass" in leaf
+        else "configured"
+    )
+    if not is_threshold:
+        return metric, rule_type, level, "==", "configured"
+    if module == "video_quality":
+        normalized_metric, level, operator, _unit, output = video_threshold_semantics(
+            config_key
+        )
+        return normalized_metric, rule_type, level, operator, output
+    operator = (
+        "<="
+        if "max" in leaf and "min" not in leaf
+        else ">="
+        if "min" in leaf
+        else ">="
+    )
+    normalized_metric = metric.removesuffix("_threshold")
+    if "keypoint_morphology" in config_key:
+        normalized_metric = {
+            "max_bone_length_ratio_spread_review": "bone_length_ratio_spread",
+            "max_bone_length_ratio_spread_fail": "bone_length_ratio_spread",
+            "max_normalized_bone_length_review": "normalized_bone_length_max",
+            "max_normalized_bone_length_fail": "normalized_bone_length_max",
+            "max_zero_length_bone_count_review": "zero_length_bone_count",
+            "max_zero_length_bone_count_fail": "zero_length_bone_count",
+            "max_duplicate_joint_pair_count_review": "duplicate_joint_pair_count",
+            "max_duplicate_joint_pair_count_fail": "duplicate_joint_pair_count",
+            "min_joint_angle_deg_review": "joint_angle_min_deg",
+            "min_joint_angle_deg_fail": "joint_angle_min_deg",
+            "max_joint_angle_violation_fraction_review": "joint_angle_violation_fraction",
+            "max_joint_angle_violation_fraction_fail": "joint_angle_violation_fraction",
+        }.get(leaf, normalized_metric)
+    return normalized_metric, rule_type, level, operator, level
+
+
+def config_unit(config_key: str, value: Any) -> str:
+    leaf = config_key.rsplit(".", 1)[-1]
+    if isinstance(value, bool):
+        return "boolean"
+    if "ratio" in leaf or "fraction" in leaf:
+        return "ratio"
+    if leaf.endswith("_deg") or "angle" in leaf and "degree" in leaf:
+        return "deg"
+    if leaf.endswith("_m_s2") or "acceleration_m_s2" in leaf:
+        return "m/s^2"
+    if leaf.endswith("_m") or "displacement_m" in leaf:
+        return "m"
+    if "frame" in leaf or "frames" in leaf:
+        return "frame"
+    if "fps" in leaf:
+        return "fps"
+    if leaf.endswith("_sec") or "seconds" in leaf:
+        return "sec"
+    return "text" if isinstance(value, str) else "scalar"
+
+
+def build_run_config_inventory(
+    config_paths: dict[str, Path | None],
+    sources: dict[str, SourceRead],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    missing: list[str] = []
+    discovered: list[str] = []
+    actual_leaf_count = 0
+    for module, path in config_paths.items():
+        source_path = str(path) if path is not None else ""
+        mapping: dict[str, Any] | None = (
+            read_config_mapping(path) if path is not None else None
+        )
+        if module == "video_quality" and mapping is None:
+            metadata = first_video_threshold_metadata(sources)
+            if metadata is not None:
+                mapping, source_path = metadata
+        if mapping is None:
+            missing.append(module)
+            continue
+        discovered.append(source_path)
+        leaves = config_leaf_items(mapping)
+        actual_leaf_count += len(leaves)
+        for config_key, value in leaves:
+            parent, check_name = config_parent_and_check(module, config_key)
+            metric, rule_type, level, operator, output = config_metric_and_semantics(
+                module, config_key, value
+            )
+            rows.append(
+                threshold_rule_row(
+                    parent_indicator=parent,
+                    module=module,
+                    check_name=check_name,
+                    metric_or_field=metric,
+                    rule_type=rule_type,
+                    threshold_level=level,
+                    operator=operator,
+                    effective_value=value,
+                    unit=config_unit(config_key, value),
+                    aggregation_scope="run_configuration",
+                    output_status=output,
+                    config_key=config_key,
+                    value_source="run_config",
+                    source_path=source_path,
+                    notes="Exact scalar leaf from the executed run configuration snapshot.",
+                )
+            )
+    exported = len(rows)
+    if exported != actual_leaf_count:
+        missing.append(
+            f"config_leaf_reconciliation:{actual_leaf_count - exported}"
+        )
+    audit = {
+        "actual_config_files_discovered": discovered,
+        "actual_config_leaf_count": actual_leaf_count,
+        "exported_run_config_row_count": exported,
+        "missing_config_keys": missing,
+        "config_reconciliation_status": (
+            "complete" if not missing and exported == actual_leaf_count else "incomplete"
+        ),
+    }
+    return rows, audit
 
 
 def load_precheck_code_defaults() -> tuple[dict[str, Any], str]:
@@ -1369,9 +1653,14 @@ def video_threshold_semantics(config_key: str) -> tuple[str, str, str, str, str]
 def build_threshold_rule_rows(
     run_root: Path,
     sources: dict[str, SourceRead],
+    *,
+    config_paths: dict[str, Path | None],
+    run_config_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    config, config_source, config_path = load_precheck_rule_config(run_root)
+    config, config_source, config_path = load_precheck_rule_config(
+        run_root, config_paths.get("precheck")
+    )
     code_defaults, code_default_path = load_precheck_code_defaults()
 
     text_config = config.get("text_integrity")
@@ -1379,8 +1668,8 @@ def build_threshold_rule_rows(
     required_fields = text_config.get("required_fields")
     if isinstance(required_fields, list) and required_fields:
         text_fields = [str(field) for field in required_fields]
-        text_source = config_source
-        text_path = config_path
+        text_source = "weekly_policy"
+        text_path = "tools/build_weekly_supplier_acceptance_report.py"
     else:
         text_fields = inferred_text_fields(sources)
         text_source = "producer_output_metadata" if text_fields else "unavailable"
@@ -1840,7 +2129,27 @@ def build_threshold_rule_rows(
     )
     seen: set[tuple[str, ...]] = set()
     deduped: list[dict[str, Any]] = []
-    for row in rows:
+    run_leaf_keys = {
+        (text(row["module"]), text(row["config_key"]).rsplit(".", 1)[-1])
+        for row in run_config_rows
+    }
+    candidates = [
+        *run_config_rows,
+        *[
+            row
+            for row in rows
+            if row["value_source"] != "run_config"
+            and not (
+                row["value_source"] == "code_default"
+                and (
+                    text(row["module"]),
+                    text(row["config_key"]).rsplit(".", 1)[-1],
+                )
+                in run_leaf_keys
+            )
+        ],
+    ]
+    for row in candidates:
         key = tuple(text(row[field]) for field in key_fields)
         if key in seen:
             continue
@@ -1854,9 +2163,9 @@ def write_workbook(
     summary_rows: list[dict[str, Any]],
     xjgt_details: list[dict[str, Any]],
     deepreach_details: list[dict[str, Any]],
-    events: list[dict[str, Any]],
     manual_issue_rows: list[dict[str, Any]],
     threshold_rule_rows: list[dict[str, Any]],
+    config_audit: dict[str, Any],
 ) -> None:
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -1880,16 +2189,11 @@ def write_workbook(
             detail_columns_for_rows([]),
             [],
         )
-    add_sheet(
-        workbook,
-        "人工与难测问题统计",
-        HARD_ISSUE_COLUMNS,
-        hard_issue_rows(events, xjgt_details),
-    )
     add_manual_threshold_sheet(
         workbook,
         manual_issue_rows,
         threshold_rule_rows,
+        config_audit,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
@@ -1899,6 +2203,7 @@ def add_manual_threshold_sheet(
     workbook: Workbook,
     manual_issue_rows: list[dict[str, Any]],
     threshold_rule_rows: list[dict[str, Any]],
+    config_audit: dict[str, Any],
 ) -> None:
     sheet = workbook.create_sheet("人工问题与阈值")
     max_columns = max(len(MANUAL_ISSUE_COLUMNS), len(THRESHOLD_RULE_COLUMNS))
@@ -1941,8 +2246,60 @@ def add_manual_threshold_sheet(
     sheet.cell(note_row, 1).alignment = Alignment(wrap_text=True)
     sheet.cell(note_row, 1).font = Font(italic=True)
 
-    threshold_title_row = note_row + 3
-    sheet.cell(threshold_title_row, 1, "本次验收生效阈值与规则")
+    config_title_row = note_row + 3
+    sheet.cell(config_title_row, 1, "运行配置核对")
+    sheet.merge_cells(
+        start_row=config_title_row,
+        start_column=1,
+        end_row=config_title_row,
+        end_column=max_columns,
+    )
+    sheet.cell(config_title_row, 1).font = Font(bold=True, size=13)
+    sheet.cell(config_title_row, 1).fill = section_fill
+    config_summary_rows = [
+        (
+            "actual config files discovered",
+            "\n".join(config_audit.get("actual_config_files_discovered", [])),
+        ),
+        ("actual_config_leaf_count", config_audit.get("actual_config_leaf_count", 0)),
+        (
+            "exported_run_config_row_count",
+            config_audit.get("exported_run_config_row_count", 0),
+        ),
+        ("code_default_row_count", config_audit.get("code_default_row_count", 0)),
+        (
+            "producer_metadata_row_count",
+            config_audit.get("producer_metadata_row_count", 0),
+        ),
+        ("unresolved_row_count", config_audit.get("unresolved_row_count", 0)),
+        (
+            "missing_config_keys",
+            "|".join(config_audit.get("missing_config_keys", [])),
+        ),
+        (
+            "submitted_review_source_path",
+            config_audit.get("submitted_review_source_path", ""),
+        ),
+        (
+            "submitted_review_source_status",
+            config_audit.get("submitted_review_source_status", "missing"),
+        ),
+        (
+            "config_reconciliation_status",
+            config_audit.get("config_reconciliation_status", "incomplete"),
+        ),
+    ]
+    for row_offset, (label, value) in enumerate(config_summary_rows, 1):
+        sheet.cell(config_title_row + row_offset, 1, label).font = Font(bold=True)
+        value_cell = sheet.cell(config_title_row + row_offset, 2, value)
+        value_cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    threshold_title_row = config_title_row + len(config_summary_rows) + 3
+    sheet.cell(
+        threshold_title_row,
+        1,
+        "本次验收完整配置、阈值与规则",
+    )
     sheet.merge_cells(
         start_row=threshold_title_row,
         start_column=1,
@@ -2205,18 +2562,44 @@ def map_window_rows(
     return dict(mapped), sorted(unmatched)
 
 
-def map_submitted_sam3_review_intervals(
+def map_submitted_review_intervals(
     rows: list[dict[str, Any]],
     asset_ids: set[str],
     episode_asset: dict[int, str],
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    submitted = [
-        row
-        for row in rows
-        if text(row.get("module")).lower() == "sam3_containment"
-        and text(row.get("source_level")).lower() == "window"
-    ]
+    submitted = [row for row in rows if is_submitted_temporal_or_sam3_row(row)]
     return map_window_rows(submitted, asset_ids, episode_asset)
+
+
+def is_submitted_temporal_or_sam3_row(row: dict[str, Any]) -> bool:
+    if text(row.get("source_level")).lower() != "window":
+        return False
+    module = text(first_value(row, ("module", "source_module"))).lower()
+    if module in {"precheck", "sam3_containment", "keypoint_temporal"}:
+        return True
+    issue = text(
+        first_value(
+            row,
+            ("suggested_issue_type", "issue_type", "failure_mode"),
+        )
+    ).lower()
+    if issue in {
+        "temporal_jump",
+        "strong_containment_mismatch",
+        "containment_fail",
+        "mixed_review",
+        "side_view_mask_undersegmentation",
+        "occlusion_or_mask_undersegmentation",
+        "projection_review",
+        "projection_ambiguous",
+        "severe_keypoint_offset",
+        "visual_skeleton_presence_mismatch",
+        "skeleton_pose_hallucination",
+        "hand_out_of_frame",
+    }:
+        return True
+    evidence = text(row.get("evidence_path")).lower()
+    return "candidate_windows" in evidence or "containment" in evidence
 
 
 def map_video_quality_evidence(
@@ -2688,7 +3071,8 @@ def build_xjgt_detail(
     candidate_row: dict[str, Any],
     video_row: dict[str, Any],
     sam3_row: dict[str, Any],
-    submitted_sam3_row: dict[str, Any],
+    submitted_review_row: dict[str, Any],
+    submitted_review_source_status: str,
     manual_row: dict[str, Any],
     ledger_row: dict[str, Any],
     require_xjgt_text: bool,
@@ -2800,15 +3184,8 @@ def build_xjgt_detail(
         ],
         total_frames,
     )
-    submitted_sam3_intervals = clip_intervals(
-        submitted_sam3_row.get("intervals", []), total_frames
-    )
-    review_intervals = clip_intervals(
-        [
-            *candidate_intervals,
-            *sam3_row.get("review_intervals", []),
-        ],
-        total_frames,
+    submitted_review_intervals = clip_intervals(
+        submitted_review_row.get("intervals", []), total_frames
     )
     reviewed_intervals = manual_row["reviewed_intervals"]
     manual_intervals = manual_row["problem_intervals"]
@@ -2824,19 +3201,19 @@ def build_xjgt_detail(
     unreviewed_auto = subtract_intervals(
         auto_fail_intervals, reviewed_intervals
     )
-    unreviewed_submitted_sam3 = subtract_intervals(
-        submitted_sam3_intervals, reviewed_intervals
+    reviewed_submitted = intersect_intervals(
+        submitted_review_intervals, reviewed_intervals
+    )
+    unreviewed_submitted = subtract_intervals(
+        submitted_review_intervals, reviewed_intervals
     )
     abnormal_intervals = [
         *unreviewed_auto,
         *manual_intervals,
-        *unreviewed_submitted_sam3,
+        *unreviewed_submitted,
     ]
     abnormal_intervals_v2 = [*unreviewed_auto, *manual_intervals]
-    unresolved_review_v2 = subtract_intervals(
-        [*review_intervals, *submitted_sam3_intervals],
-        reviewed_intervals,
-    )
+    unresolved_review_v2 = unreviewed_submitted
     auto_count = interval_frame_count(auto_fail_intervals)
     reviewed_auto_count = interval_frame_count(reviewed_auto)
     reviewed_auto_true_positive_count = interval_frame_count(
@@ -2846,42 +3223,34 @@ def build_xjgt_detail(
         reviewed_auto_false_positive
     )
     unreviewed_auto_count = interval_frame_count(unreviewed_auto)
-    unreviewed_submitted_count = interval_frame_count(
-        unreviewed_submitted_sam3
+    submitted_review_count = len(submitted_review_intervals)
+    submitted_review_frame_count = interval_frame_count(
+        submitted_review_intervals
     )
+    reviewed_submitted_count = len(reviewed_submitted)
+    unreviewed_submitted_interval_count = len(unreviewed_submitted)
+    unreviewed_submitted_count = interval_frame_count(unreviewed_submitted)
     unresolved_review_count_v2 = interval_frame_count(unresolved_review_v2)
     abnormal_count = interval_frame_count(abnormal_intervals)
     abnormal_ratio = safe_ratio(abnormal_count, total_frames)
     abnormal_count_v2 = interval_frame_count(abnormal_intervals_v2)
     abnormal_ratio_v2 = safe_ratio(abnormal_count_v2, total_frames)
-    if abnormal_count > 0:
+    abnormal_inputs_ready = (
+        submitted_review_source_status == "readable"
+        and temporal_status != "not_run"
+        and sam3_status != "not_run"
+    )
+    if not abnormal_inputs_ready:
+        abnormal_frame_status = "not_ready"
+    elif abnormal_count > 0:
         abnormal_frame_status = "fail"
-    elif (
-        temporal_status == "not_run"
-        or (
-            manual_row["manual_review_status"] == "not_reviewed"
-            and (
-                temporal_status == "review"
-                or sam3_status == "review"
-            )
-        )
-    ):
-        abnormal_frame_status = "review"
     else:
         abnormal_frame_status = "pass"
-    if abnormal_count_v2 > 0:
+    if not abnormal_inputs_ready:
+        abnormal_frame_status_v2 = "not_ready"
+    elif abnormal_count_v2 > 0:
         abnormal_frame_status_v2 = "fail"
-    elif (
-        unresolved_review_count_v2
-        or temporal_status == "not_run"
-        or (
-            manual_row["manual_review_status"] == "not_reviewed"
-            and (
-                temporal_status == "review"
-                or sam3_status == "review"
-            )
-        )
-    ):
+    elif unresolved_review_count_v2:
         abnormal_frame_status_v2 = "review"
     else:
         abnormal_frame_status_v2 = "pass"
@@ -2892,7 +3261,7 @@ def build_xjgt_detail(
         f"auto_fail_frames={auto_count}; "
         f"reviewed_auto_fail_frames={reviewed_auto_count}; "
         f"unreviewed_auto_fail_frames={unreviewed_auto_count}; "
-        f"unreviewed_submitted_sam3_frames={unreviewed_submitted_count}"
+        f"unreviewed_submitted_review_frames={unreviewed_submitted_count}"
     )
     abnormal_reason_v2 = (
         "policy=v2_review_first; "
@@ -2902,9 +3271,16 @@ def build_xjgt_detail(
         f"unresolved_review_frames={unresolved_review_count_v2}"
     )
 
-    video_status = text(video_row.get("status")) or "no_valid_output"
+    raw_video_status = text(video_row.get("status")) or "no_valid_output"
+    video_status = (
+        "fail"
+        if raw_video_status == "fail"
+        else "pass"
+        if raw_video_status in {"pass", "review", "warn", "warning"}
+        else "not_ready"
+    )
     video_reason = text(video_row.get("reason")) or (
-        f"video_quality_status={video_status}"
+        f"video_quality_status={raw_video_status}"
     )
     video_intervals = clip_intervals(
         video_row.get("fail_intervals", []), total_frames
@@ -2912,11 +3288,11 @@ def build_xjgt_detail(
     video_count = interval_frame_count(video_intervals)
     video_ratio = safe_ratio(video_count, total_frames)
     unresolved_base = []
-    if video_status in {"no_valid_output", "not_run", "blocked"}:
+    if video_status == "not_ready":
         unresolved_base.append(f"video_quality_status={video_status}")
     if static_status in {"not_ready", "not_run", "blocked", "review"}:
         unresolved_base.append(f"skeleton_static_status={static_status}")
-    if text_status in {"review", "not_run", "blocked", "no_valid_output"}:
+    if text_status == "not_ready":
         unresolved_base.append(f"text_check_status={text_status}")
     if frame_count_status == "unreadable":
         unresolved_base.append("frame_count_status=unreadable")
@@ -2934,7 +3310,7 @@ def build_xjgt_detail(
         text_reason.startswith("mapped_text_integrity=")
         or text_status == "not_applicable"
     ) and frame_count_status != "unreadable" and all(
-        status not in {"not_ready", "not_run", "no_valid_output", "blocked"}
+        status != "not_ready"
         for status in (
             video_status,
             static_status,
@@ -3049,6 +3425,19 @@ def build_xjgt_detail(
         "abnormal_fail_frame_ratio_v2": abnormal_ratio_v2,
         "abnormal_frame_status_v2": abnormal_frame_status_v2,
         "abnormal_status_reason_v2": abnormal_reason_v2,
+        "submitted_review_interval_count": submitted_review_count,
+        "submitted_review_frame_count": submitted_review_frame_count,
+        "reviewed_submitted_interval_count": reviewed_submitted_count,
+        "unreviewed_submitted_interval_count": (
+            unreviewed_submitted_interval_count
+        ),
+        "unreviewed_submitted_frame_count": unreviewed_submitted_count,
+        "abnormal_v1_unreviewed_as_fail_frame_count": (
+            unreviewed_submitted_count
+        ),
+        "abnormal_v2_unreviewed_as_review_frame_count": (
+            unreviewed_submitted_count
+        ),
         "fail_indicator_count": count_fail_indicators(
             text_check_status=text_status,
             video_quality_status=video_status,
@@ -3110,16 +3499,18 @@ def resolve_xjgt_text_status(
     if "text_integrity" in mapped_checks:
         status = status_value(observed_status)
         if status not in {"pass", "fail", "review"}:
-            status = "review"
+            status = "not_ready"
+        elif status == "review":
+            status = "not_ready"
         return status, f"mapped_text_integrity={status}"
     if source_status == "missing":
-        return "not_run", "text_integrity_source_missing"
+        return "not_ready", "text_integrity_source_missing"
     if source_status.startswith("unreadable"):
         detail = source_status.split(":", 1)[1] if ":" in source_status else "unknown"
-        return "review", f"text_integrity_source_unreadable:{detail}"
+        return "not_ready", f"text_integrity_source_unreadable:{detail}"
     if not mapped_checks:
-        return "review", "text_integrity_source_readable_asset_unmatched"
-    return "review", "text_integrity_expected_check_missing"
+        return "not_ready", "text_integrity_source_readable_asset_unmatched"
+    return "not_ready", "text_integrity_expected_check_missing"
 
 
 def acceptance_and_review_status(
@@ -3250,63 +3641,6 @@ def supplier_summary_from_details(
         "blocked_modules": blocked_modules,
         "notes": notes,
     }
-
-
-def build_weekly_issue_events(
-    manual_labels: list[dict[str, Any]],
-    sam3_rows: list[dict[str, Any]],
-    details: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    for row in manual_labels:
-        events.append(
-            {
-                "source_module": "manual_review",
-                "asset_id": normalize_asset_id(row.get("asset_id")),
-                "failure_mode": text(row.get("failure_mode")),
-                "manual_outcome": text(row.get("manual_outcome")),
-            }
-        )
-    for row in sam3_rows:
-        verdict = text(row.get("window_containment_verdict"))
-        events.append(
-            {
-                "source_module": "sam3_containment",
-                "asset_id": normalize_asset_id(row.get("asset_id")),
-                "failure_mode": {
-                    "mixed_review": "occlusion_or_mask_undersegmentation",
-                    "projection_review": "projection_review",
-                }.get(verdict, verdict),
-                "status": verdict,
-            }
-        )
-    for row in details:
-        events.append(
-            {
-                "source_module": "video_quality",
-                "asset_id": row["asset_id"],
-                "failure_mode": (
-                    "video_quality_pending_colleague_thresholds"
-                    if row["video_quality_status"] == "fail"
-                    else ""
-                ),
-                "status": row["video_quality_status"],
-            }
-        )
-        events.append(
-            {
-                "source_module": "text_integrity",
-                "asset_id": row["asset_id"],
-                "failure_mode": (
-                    "text_check_pending_rules"
-                    if row["text_check_status"]
-                    in {"pending_rule", "pending_required_rule"}
-                    else ""
-                ),
-                "status": row["text_check_status"],
-            }
-        )
-    return events
 
 
 def collect_input_audit(run_root: Path) -> dict[str, Any]:

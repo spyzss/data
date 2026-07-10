@@ -7,11 +7,11 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import yaml
 from openpyxl import load_workbook
 
 from tools.build_weekly_supplier_acceptance_report import (
     CORE_DETAIL_COLUMNS,
-    HARD_ISSUE_COLUMNS,
     MANUAL_ISSUE_COLUMNS,
     SUMMARY_COLUMNS,
     THRESHOLD_RULE_COLUMNS,
@@ -21,6 +21,7 @@ from tools.build_weekly_supplier_acceptance_report import (
     collect_input_audit,
     count_fail_indicators,
     detail_columns_for_rows,
+    load_xjgt,
     main,
     normalize_asset_id,
     recompute_xjgt_final_status,
@@ -69,6 +70,10 @@ def test_weekly_builder_cli_supports_script_and_module_invocation(
         assert completed.returncode == 0, completed.stderr
         assert "--audit-inputs" in completed.stdout
         assert "--skip-xjgt-text" in completed.stdout
+        assert "--xjgt-precheck-config" in completed.stdout
+        assert "--xjgt-video-quality-config" in completed.stdout
+        assert "--xjgt-sam3-config" in completed.stdout
+        assert "--xjgt-weekly-policy-config" in completed.stdout
 
     run_root = tmp_path / "acceptance_5x100"
     completed = subprocess.run(
@@ -103,6 +108,14 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 def _write_parquet(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_parquet(path, index=False)
+
+
+def _scalar_leaf_count(value: object) -> int:
+    if isinstance(value, dict):
+        return sum(_scalar_leaf_count(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_scalar_leaf_count(item) for item in value)
+    return 1
 
 
 def _check_result(
@@ -335,6 +348,35 @@ skeleton_quality_score:
   candidate_post_context_frames: 10
   reject_missing_keypoints: true
   allowed_missing_keypoints_per_hand: 0
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    video_config = run_root / "xjgt" / "video_quality" / "video_quality_config.yaml"
+    video_config.parent.mkdir(parents=True, exist_ok=True)
+    video_config.write_text(
+        """
+fps:
+  min_fps_pass: 24.0
+  min_fps_fail: 20.0
+exposure:
+  black:
+    mean_y_max: 10.0
+    ratio_pass: 0.01
+freeze:
+  enabled: true
+  frozen_frame_ratio_warn: 0.10
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    weekly_config = run_root / "xjgt" / "weekly_policy.yaml"
+    weekly_config.write_text(
+        """
+official_version: v1
+unreviewed_submitted_interval: fail
+comparison_version: v2
+top_level_fail_count: 1
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -614,6 +656,17 @@ skeleton_quality_score:
     )
     (sam3_dir / "frame_keypoint_containment.json").write_text("[]", encoding="utf-8")
     (sam3_dir / "clip_keypoint_containment.json").write_text("[]", encoding="utf-8")
+    (sam3_dir / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "candidate_window_mode": True,
+                "frames_per_window": 5,
+                "sample_fraction": 1.0,
+                "projected_in_image_ratio_threshold": 0.8,
+            }
+        ),
+        encoding="utf-8",
+    )
     _write_csv(
         run_root
         / "xjgt"
@@ -655,7 +708,7 @@ skeleton_quality_score:
             {
                 "review_id": "rq_1003_0_20",
                 "asset_id": "1003",
-                "module": "sam3_containment",
+                "module": "precheck",
                 "source_level": "window",
                 "window_start_frame": 0,
                 "window_end_frame": 20,
@@ -772,12 +825,35 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "供应商3",
         "供应商4",
         "供应商5",
-        "人工与难测问题统计",
         "人工问题与阈值",
     ]
     assert [cell.value for cell in workbook["五供应商总览"][1]] == SUMMARY_COLUMNS
     detail_headers = [cell.value for cell in workbook["星际归途"][1]]
     assert detail_headers[: len(CORE_DETAIL_COLUMNS)] == CORE_DETAIL_COLUMNS
+    assert detail_headers[:8] == [
+        "asset_id",
+        "total_frames",
+        "text_check_status",
+        "skeleton_static_status",
+        "video_quality_status",
+        "abnormal_frame_status",
+        "fail_indicator_count",
+        "acceptance_status",
+    ]
+    assert detail_headers[:12] == [
+        "asset_id",
+        "total_frames",
+        "text_check_status",
+        "skeleton_static_status",
+        "video_quality_status",
+        "abnormal_frame_status",
+        "fail_indicator_count",
+        "acceptance_status",
+        "abnormal_frame_status_v2",
+        "acceptance_status_v2",
+        "review_status_v2",
+        "text_field_present_scene_status",
+    ]
     assert [
         column
         for column in detail_headers
@@ -834,6 +910,13 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "unreviewed_auto_fail_frame_count",
         "auto_fail_precision_on_reviewed",
         "abnormal_status_reason",
+        "submitted_review_interval_count",
+        "submitted_review_frame_count",
+        "reviewed_submitted_interval_count",
+        "unreviewed_submitted_interval_count",
+        "unreviewed_submitted_frame_count",
+        "abnormal_v1_unreviewed_as_fail_frame_count",
+        "abnormal_v2_unreviewed_as_review_frame_count",
         "text_status_reason",
         "skeleton_static_status_reason",
         "mapped_precheck_checks",
@@ -842,6 +925,15 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "final_status_reason",
     } <= set(columns)
     by_asset = {row[columns["asset_id"]]: row for row in rows}
+    for status_column in (
+        "text_check_status",
+        "skeleton_static_status",
+        "video_quality_status",
+        "abnormal_frame_status",
+    ):
+        assert {
+            row[columns[status_column]] for row in rows
+        } <= {"pass", "fail"}
 
     assert by_asset["1001"][columns["total_frames"]] == 100
     assert by_asset["1001"][columns["frame_count_status"]] == "ok"
@@ -921,6 +1013,13 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert by_asset["1003"][columns["abnormal_frame_status_v2"]] == "review"
     assert by_asset["1003"][columns["acceptance_status_v2"]] == "pass"
     assert by_asset["1003"][columns["review_status_v2"]] == "review"
+    assert by_asset["1003"][columns["submitted_review_interval_count"]] == 1
+    assert by_asset["1003"][columns["submitted_review_frame_count"]] == 21
+    assert by_asset["1003"][columns["reviewed_submitted_interval_count"]] == 0
+    assert by_asset["1003"][columns["unreviewed_submitted_interval_count"]] == 1
+    assert by_asset["1003"][columns["unreviewed_submitted_frame_count"]] == 21
+    assert by_asset["1003"][columns["abnormal_v1_unreviewed_as_fail_frame_count"]] == 21
+    assert by_asset["1003"][columns["abnormal_v2_unreviewed_as_review_frame_count"]] == 21
     assert (
         by_asset["1003"][columns["supplier_quality_signal"]]
         == "not_provided"
@@ -942,12 +1041,6 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "pass_clip_ratio",
         "fail_clip_count",
         "fail_clip_ratio",
-        "problem_frame_count_v2",
-        "problem_frame_ratio_v2",
-        "pass_clip_count_v2",
-        "pass_clip_ratio_v2",
-        "fail_clip_count_v2",
-        "fail_clip_ratio_v2",
     ]
     xjgt = summary[0]
     assert xjgt["sample_clip_count"] == "3"
@@ -958,12 +1051,6 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
     assert xjgt["pass_clip_ratio"] == "0.0"
     assert xjgt["fail_clip_count"] == "3"
     assert xjgt["fail_clip_ratio"] == "1.0"
-    assert xjgt["problem_frame_count_v2"] == "50"
-    assert xjgt["problem_frame_ratio_v2"] == str(50 / 400)
-    assert xjgt["pass_clip_count_v2"] == "1"
-    assert xjgt["pass_clip_ratio_v2"] == str(1 / 3)
-    assert xjgt["fail_clip_count_v2"] == "2"
-    assert xjgt["fail_clip_ratio_v2"] == str(2 / 3)
 
     overview = workbook["五供应商总览"]
     overview_columns = {
@@ -973,9 +1060,6 @@ def test_xjgt_recomputes_frames_manual_ratio_and_final_status(
         "problem_frame_ratio",
         "pass_clip_ratio",
         "fail_clip_ratio",
-        "problem_frame_ratio_v2",
-        "pass_clip_ratio_v2",
-        "fail_clip_ratio_v2",
     ):
         assert overview.cell(2, overview_columns[column]).number_format == "0.0%"
 
@@ -998,16 +1082,19 @@ def test_final_sheet_combines_manual_issues_and_long_form_thresholds(
         for index, row in enumerate(values)
         if row and row[0] in {
             "人工确认问题类型统计",
-            "本次验收生效阈值与规则",
+            "运行配置核对",
+            "本次验收完整配置、阈值与规则",
         }
     }
     assert set(title_rows) == {
         "人工确认问题类型统计",
-        "本次验收生效阈值与规则",
+        "运行配置核对",
+        "本次验收完整配置、阈值与规则",
     }
 
     manual_title_row = title_rows["人工确认问题类型统计"]
-    threshold_title_row = title_rows["本次验收生效阈值与规则"]
+    config_title_row = title_rows["运行配置核对"]
+    threshold_title_row = title_rows["本次验收完整配置、阈值与规则"]
     manual_headers = list(values[manual_title_row][: len(MANUAL_ISSUE_COLUMNS)])
     threshold_headers = list(
         values[threshold_title_row][: len(THRESHOLD_RULE_COLUMNS)]
@@ -1018,7 +1105,7 @@ def test_final_sheet_combines_manual_issues_and_long_form_thresholds(
 
     manual_rows = [
         dict(zip(MANUAL_ISSUE_COLUMNS, row))
-        for row in values[manual_title_row + 1 : threshold_title_row - 2]
+        for row in values[manual_title_row + 1 : config_title_row - 2]
         if row[0] and row[0] != (
             "人工复核采用高风险定向抽样，本表适合分析供应商问题构成，"
             "不代表供应商全量数据的无偏问题率。"
@@ -1038,6 +1125,46 @@ def test_final_sheet_combines_manual_issues_and_long_form_thresholds(
         if row[0]
     ]
     assert threshold_rows
+    actual_config_paths = [
+        run_root / "xjgt" / "precheck" / "precheck_config.yaml",
+        run_root / "xjgt" / "video_quality" / "video_quality_config.yaml",
+        run_root / "xjgt" / "sam3_containment" / "run_manifest.json",
+        run_root / "xjgt" / "weekly_policy.yaml",
+    ]
+    expected_leaf_count = 0
+    for path in actual_config_paths:
+        if path.suffix == ".json":
+            config = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        expected_leaf_count += _scalar_leaf_count(config)
+    run_config_rows = [
+        row for row in threshold_rows if row["value_source"] == "run_config"
+    ]
+    assert len(run_config_rows) == expected_leaf_count
+    assert {
+        row["source_path"] for row in run_config_rows
+    } == {str(path) for path in actual_config_paths}
+    assert not any(
+        row["value_source"] == "run_config"
+        and row["source_path"].endswith("configs/precheck_example.yaml")
+        for row in threshold_rows
+    )
+    config_summary = {
+        values[index][0]: values[index][1]
+        for index in range(config_title_row, threshold_title_row - 1)
+        if values[index][0]
+    }
+    assert config_summary["actual_config_leaf_count"] == expected_leaf_count
+    assert config_summary["exported_run_config_row_count"] == expected_leaf_count
+    assert config_summary["missing_config_keys"] in (None, "")
+    assert config_summary["submitted_review_source_path"] == str(
+        run_root
+        / "xjgt"
+        / "video_review_full"
+        / "review_queue_with_clips.csv"
+    )
+    assert config_summary["submitted_review_source_status"] == "readable"
     temporal_metrics = {
         row["metric_or_field"]
         for row in threshold_rows
@@ -1118,6 +1245,41 @@ def test_final_sheet_combines_manual_issues_and_long_form_thresholds(
     assert len(keys) == len(set(keys))
 
 
+def test_video_output_threshold_snapshot_is_run_config_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_root = tmp_path / "acceptance_5x100"
+    _prepare_inputs(run_root)
+    _patch_frame_probe(monkeypatch)
+    (run_root / "xjgt" / "video_quality" / "video_quality_config.yaml").unlink()
+
+    xjgt = load_xjgt(run_root)
+
+    video_run_rows = [
+        row
+        for row in xjgt["threshold_rule_rows"]
+        if row["module"] == "video_quality"
+        and row["value_source"] == "run_config"
+    ]
+    assert video_run_rows
+    assert {
+        row["source_path"] for row in video_run_rows
+    } == {
+        str(
+            run_root
+            / "xjgt"
+            / "video_quality"
+            / "video_quality_results.json"
+        )
+        + "::video_quality.thresholds"
+    }
+    assert "video_quality" not in xjgt["config_audit"]["missing_config_keys"]
+    assert (
+        xjgt["config_audit"]["actual_config_leaf_count"]
+        == xjgt["config_audit"]["exported_run_config_row_count"]
+    )
+
+
 def test_single_skeleton_static_indicator_fails_final_clip() -> None:
     assert (
         recompute_xjgt_final_status(
@@ -1168,28 +1330,28 @@ def test_xjgt_text_mapping_reports_unresolved_source_states() -> None:
         observed_status="not_run",
         has_unmatched_source_rows=False,
         skip_xjgt_text=False,
-    ) == ("not_run", "text_integrity_source_missing")
+    ) == ("not_ready", "text_integrity_source_missing")
     assert resolve_xjgt_text_status(
         source_status="unreadable:ArrowInvalid",
         mapped_checks=set(),
         observed_status="not_run",
         has_unmatched_source_rows=False,
         skip_xjgt_text=False,
-    ) == ("review", "text_integrity_source_unreadable:ArrowInvalid")
+    ) == ("not_ready", "text_integrity_source_unreadable:ArrowInvalid")
     assert resolve_xjgt_text_status(
         source_status="readable",
         mapped_checks=set(),
         observed_status="not_run",
         has_unmatched_source_rows=True,
         skip_xjgt_text=False,
-    ) == ("review", "text_integrity_source_readable_asset_unmatched")
+    ) == ("not_ready", "text_integrity_source_readable_asset_unmatched")
     assert resolve_xjgt_text_status(
         source_status="readable",
         mapped_checks={"skeleton_quality_score"},
         observed_status="not_run",
         has_unmatched_source_rows=False,
         skip_xjgt_text=False,
-    ) == ("review", "text_integrity_expected_check_missing")
+    ) == ("not_ready", "text_integrity_expected_check_missing")
 
 
 def test_xjgt_text_can_be_explicitly_skipped() -> None:
@@ -1405,7 +1567,7 @@ def test_deepreach_and_placeholders_remain_honest(
     columns = {name: index for index, name in enumerate(headers)}
     assert len(deepreach_rows) == 8
     assert {row[columns["text_check_status"]] for row in deepreach_rows} == {
-        "pending_rule"
+        "not_ready"
     }
     assert {row[columns["skeleton_missing_status"]] for row in deepreach_rows} == {
         "blocked"
@@ -1414,7 +1576,7 @@ def test_deepreach_and_placeholders_remain_honest(
         "blocked"
     }
     assert {row[columns["video_quality_status"]] for row in deepreach_rows} == {
-        "no_valid_output"
+        "not_ready"
     }
     assert {
         row[columns["supplier_quality_signal"]]
@@ -1461,7 +1623,7 @@ def test_generation_prints_sanity_checks(
     assert "video_quality=no_valid_output" in output
 
 
-def test_hard_issue_sheet_contains_required_rows(
+def test_obsolete_hard_issue_sheet_is_removed(
     tmp_path: Path, monkeypatch
 ) -> None:
     run_root = tmp_path / "acceptance_5x100"
@@ -1471,57 +1633,23 @@ def test_hard_issue_sheet_contains_required_rows(
     outputs = build_weekly_report(run_root)
 
     workbook = load_workbook(outputs.workbook_xlsx, read_only=True)
-    assert [cell.value for cell in workbook["人工与难测问题统计"][1]] == HARD_ISSUE_COLUMNS
-    issue_types = {
-        row[0]
-        for row in workbook["人工与难测问题统计"].iter_rows(
-            min_row=2, values_only=True
-        )
-    }
-    assert issue_types == {
-        "hand_out_of_frame",
-        "severe_keypoint_offset",
-        "skeleton_pose_hallucination",
-        "visual_skeleton_presence_mismatch",
-        "occlusion_or_mask_undersegmentation",
-        "projection_review",
-        "video_quality_pending_colleague_thresholds",
-        "text_check_pending_rules",
-    }
+    assert "人工与难测问题统计" not in workbook.sheetnames
+    assert workbook.sheetnames.count("人工问题与阈值") == 1
 
 
-def test_issue_sheet_reconciles_video_quality_fail_clips(
+def test_overview_contains_only_official_v1_pass_fail_columns(
     tmp_path: Path, monkeypatch
 ) -> None:
     run_root = tmp_path / "acceptance_5x100"
     _prepare_inputs(run_root)
     _patch_frame_probe(monkeypatch)
-    _write_csv(
-        run_root / "xjgt" / "video_quality" / "video_quality_acceptance_summary.csv",
-        [
-            {"asset_id": "1001", "status": "pass", "passed": True},
-            {"asset_id": "1002", "status": "fail", "passed": False},
-            {"asset_id": "1003", "status": "pass", "passed": True},
-        ],
-    )
-
     outputs = build_weekly_report(run_root)
 
     workbook = load_workbook(outputs.workbook_xlsx, read_only=True)
-    columns = {name: index for index, name in enumerate(HARD_ISSUE_COLUMNS)}
-    rows = {
-        row[columns["issue_type"]]: row
-        for row in workbook["人工与难测问题统计"].iter_rows(
-            min_row=2, values_only=True
-        )
-    }
-    video_row = rows["video_quality_pending_colleague_thresholds"]
-    assert video_row[columns["observed_count"]] == 1
-    assert video_row[columns["observed_unit"]] == "clip"
-    assert video_row[columns["denominator"]] == 3
-    assert video_row[columns["denominator_definition"]] == "XJGT sampled clips"
-    assert video_row[columns["source_module"]] == "video_quality"
-    assert video_row[columns["observed_ratio"]] == 1 / 3
+    headers = [cell.value for cell in workbook["五供应商总览"][1]]
+    assert headers == SUMMARY_COLUMNS
+    assert not any("review" in header for header in headers)
+    assert not any(header.endswith("_v2") for header in headers)
 
 
 def test_asset_id_normalization_matches_numeric_and_file_stems() -> None:
