@@ -34,6 +34,14 @@ LOGGER = logging.getLogger("sam3_keypoint_containment")
 PROJECTION_MODES = ("direct", "camera_inverse", "camera_forward")
 
 
+def create_sam3_segmenter(
+    model_path: Path,
+    sam3_config: dict[str, Any],
+) -> SAM3Segmenter:
+    """Construct the sidecar's canonical SAM3 segmenter."""
+    return SAM3Segmenter(model_path, sam3_config)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -246,7 +254,7 @@ def main() -> None:
         )
 
     queries = [query.strip() for query in args.queries.split(",") if query.strip()]
-    segmenter = SAM3Segmenter(
+    segmenter = create_sam3_segmenter(
         args.sam3_model,
         {
             "confidence_threshold": args.confidence_threshold,
@@ -429,6 +437,145 @@ def main() -> None:
     LOGGER.info("Wrote results under %s", args.output_dir)
 
 
+def score_keypoints_against_masks(
+    *,
+    frame: np.ndarray,
+    pixels: np.ndarray,
+    joint_names: list[str],
+    masks: list[Any],
+    valid: np.ndarray | None = None,
+    abnormal_inside_ratio_threshold: float = 1.0,
+    projected_in_image_ratio_threshold: float = 0.8,
+    strong_inside_ratio_threshold: float = 0.2,
+    acceptable_inside_ratio_threshold: float = 0.6,
+    mask_tiny_area_ratio_threshold: float = 0.0,
+) -> tuple[dict[str, Any], np.ndarray | None, np.ndarray, np.ndarray]:
+    """Score already-projected 2D keypoints using the canonical mask rules."""
+    pixels = np.asarray(pixels, dtype=np.float64)
+    if pixels.shape != (len(joint_names), 2):
+        raise ValueError(
+            f"pixels must have shape ({len(joint_names)}, 2); got {pixels.shape}"
+        )
+    finite = np.isfinite(pixels).all(axis=1)
+    valid_points = finite if valid is None else np.asarray(valid, dtype=bool) & finite
+    if valid_points.shape != (len(joint_names),):
+        raise ValueError(
+            f"valid must have shape ({len(joint_names)},); got {valid_points.shape}"
+        )
+
+    union_mask = union_instance_masks(masks, frame.shape[:2])
+    rounded = np.zeros_like(pixels, dtype=np.int64)
+    rounded[valid_points] = np.rint(pixels[valid_points]).astype(np.int64)
+    inside = np.zeros(len(joint_names), dtype=bool)
+    if union_mask is not None:
+        in_bounds = (
+            valid_points
+            & (rounded[:, 0] >= 0)
+            & (rounded[:, 0] < frame.shape[1])
+            & (rounded[:, 1] >= 0)
+            & (rounded[:, 1] < frame.shape[0])
+        )
+        if bool(np.any(in_bounds)):
+            inside[in_bounds] = union_mask[
+                rounded[in_bounds, 1],
+                rounded[in_bounds, 0],
+            ]
+    else:
+        in_bounds = (
+            valid_points
+            & (pixels[:, 0] >= 0)
+            & (pixels[:, 0] < frame.shape[1])
+            & (pixels[:, 1] >= 0)
+            & (pixels[:, 1] < frame.shape[0])
+        )
+
+    total_expected = len(joint_names)
+    valid_count = int(np.sum(valid_points))
+    in_image_count = int(np.sum(in_bounds))
+    inside_count = int(np.sum(inside))
+    missing_from_mask_count = int(valid_count - inside_count)
+    expected_missing_from_mask_count = int(total_expected - inside_count)
+    valid_projected_inside_ratio = safe_ratio(inside_count, valid_count)
+    valid_projected_missing_ratio = safe_ratio(missing_from_mask_count, valid_count)
+    keypoint_inside_ratio = safe_ratio(inside_count, total_expected)
+    keypoint_missing_ratio = safe_ratio(
+        expected_missing_from_mask_count,
+        total_expected,
+    )
+    projected_keypoints_in_image_ratio = safe_ratio(
+        in_image_count,
+        total_expected,
+    )
+    abnormal_frame = (
+        keypoint_inside_ratio is not None
+        and keypoint_inside_ratio < abnormal_inside_ratio_threshold
+    )
+    mask_area = int(np.sum(union_mask)) if union_mask is not None else 0
+    mask_area_ratio = safe_ratio(mask_area, frame.shape[0] * frame.shape[1])
+    hand_mask_present = bool(union_mask is not None and mask_area > 0)
+    hand_mask_tiny = bool(
+        hand_mask_present
+        and mask_area_ratio is not None
+        and mask_area_ratio <= mask_tiny_area_ratio_threshold
+    )
+    containment_verdict, reason = classify_containment_frame(
+        projected_in_image_ratio=projected_keypoints_in_image_ratio,
+        inside_ratio=keypoint_inside_ratio,
+        hand_mask_present=hand_mask_present,
+        hand_mask_tiny=hand_mask_tiny,
+        projected_in_image_ratio_threshold=projected_in_image_ratio_threshold,
+        strong_inside_ratio_threshold=strong_inside_ratio_threshold,
+        acceptable_inside_ratio_threshold=acceptable_inside_ratio_threshold,
+    )
+    inside_indices = np.flatnonzero(inside).tolist()
+    missing_indices = np.flatnonzero(~inside).tolist()
+    valid_missing_indices = np.flatnonzero(valid_points & ~inside).tolist()
+    invalid_indices = np.flatnonzero(~valid_points).tolist()
+    metrics = {
+        "sampled_keypoints": total_expected,
+        "valid_projected_keypoints": valid_count,
+        "projected_keypoints_in_image": in_image_count,
+        "projected_keypoints_in_image_ratio": projected_keypoints_in_image_ratio,
+        "inside_keypoints": inside_count,
+        "missing_from_mask_keypoints": missing_from_mask_count,
+        "expected_missing_from_mask_keypoints": expected_missing_from_mask_count,
+        "inside_joint_names": [joint_names[index] for index in inside_indices],
+        "missing_from_mask_joint_names": [
+            joint_names[index] for index in valid_missing_indices
+        ],
+        "expected_missing_from_mask_joint_names": [
+            joint_names[index] for index in missing_indices
+        ],
+        "invalid_projected_joint_names": [
+            joint_names[index] for index in invalid_indices
+        ],
+        "keypoint_inside_ratio": keypoint_inside_ratio,
+        "keypoint_missing_ratio": keypoint_missing_ratio,
+        "valid_projected_inside_ratio": valid_projected_inside_ratio,
+        "valid_projected_missing_ratio": valid_projected_missing_ratio,
+        "abnormal_inside_ratio_threshold": abnormal_inside_ratio_threshold,
+        "abnormal_frame": abnormal_frame,
+        "projected_in_image_ratio_threshold": projected_in_image_ratio_threshold,
+        "strong_containment_inside_ratio_threshold": strong_inside_ratio_threshold,
+        "acceptable_inside_ratio_threshold": acceptable_inside_ratio_threshold,
+        "mask_tiny_area_ratio_threshold": mask_tiny_area_ratio_threshold,
+        "keypoints_inside_hand_mask_ratio": keypoint_inside_ratio,
+        "containment_verdict": containment_verdict,
+        "reason": reason,
+        "mask_instance_count": len(masks),
+        "mask_area": mask_area,
+        "mask_area_ratio": mask_area_ratio,
+        "hand_mask_present": hand_mask_present,
+        "hand_mask_area_ratio": mask_area_ratio,
+        "hand_mask_tiny": hand_mask_tiny,
+        "hand_mask_touches_border": bool(mask_touches_border(union_mask)),
+        "sam3_categories": sorted(
+            {str(getattr(mask, "category", "")) for mask in masks}
+        ),
+    }
+    return metrics, union_mask, valid_points, inside
+
+
 def process_clip(
     hdf5_path: Path,
     video_path: Path,
@@ -505,71 +652,24 @@ def process_clip(
     for frame_idx in sampled_frames:
         frame = first_frame if frame_idx == sampled_frames[0] else extract_frame(video_path, frame_idx)
         masks = segmenter.segment_frame(frame, queries, sam3_config)
-        union_mask = union_instance_masks(masks, frame.shape[:2])
         projected = project_frame_points(
             points[frame_idx],
             camera_transforms[frame_idx],
             intrinsics,
             resolved_projection_mode,
         )
-        valid = projected["valid"]
         pixels = projected["pixels"]
-
-        total_expected = len(joint_names)
-        valid_count = int(np.sum(valid))
-        inside = np.zeros(total_expected, dtype=bool)
-        if union_mask is not None and valid_count:
-            rounded = np.rint(pixels).astype(np.int64)
-            in_bounds = (
-                valid
-                & (rounded[:, 0] >= 0)
-                & (rounded[:, 0] < frame.shape[1])
-                & (rounded[:, 1] >= 0)
-                & (rounded[:, 1] < frame.shape[0])
-            )
-            inside[in_bounds] = union_mask[rounded[in_bounds, 1], rounded[in_bounds, 0]]
-        else:
-            in_bounds = (
-                valid
-                & (pixels[:, 0] >= 0)
-                & (pixels[:, 0] < frame.shape[1])
-                & (pixels[:, 1] >= 0)
-                & (pixels[:, 1] < frame.shape[0])
-            )
-
-        inside_indices = np.flatnonzero(inside).tolist()
-        missing_indices = np.flatnonzero(~inside).tolist()
-        valid_missing_indices = np.flatnonzero(valid & ~inside).tolist()
-        invalid_indices = np.flatnonzero(~valid).tolist()
-        inside_count = int(np.sum(inside))
-        in_image_count = int(np.sum(in_bounds))
-        missing_from_mask_count = int(valid_count - inside_count)
-        expected_missing_from_mask_count = int(total_expected - inside_count)
-        valid_projected_inside_ratio = safe_ratio(inside_count, valid_count)
-        valid_projected_missing_ratio = safe_ratio(missing_from_mask_count, valid_count)
-        keypoint_inside_ratio = safe_ratio(inside_count, total_expected)
-        keypoint_missing_ratio = safe_ratio(expected_missing_from_mask_count, total_expected)
-        projected_keypoints_in_image_ratio = safe_ratio(in_image_count, total_expected)
-        abnormal_frame = (
-            keypoint_inside_ratio is not None
-            and keypoint_inside_ratio < abnormal_inside_ratio_threshold
-        )
-        mask_area = int(np.sum(union_mask)) if union_mask is not None else 0
-        mask_area_ratio = safe_ratio(mask_area, frame.shape[0] * frame.shape[1])
-        hand_mask_present = bool(union_mask is not None and mask_area > 0)
-        hand_mask_tiny = bool(
-            hand_mask_present
-            and mask_area_ratio is not None
-            and mask_area_ratio <= mask_tiny_area_ratio_threshold
-        )
-        containment_verdict, reason = classify_containment_frame(
-            projected_in_image_ratio=projected_keypoints_in_image_ratio,
-            inside_ratio=keypoint_inside_ratio,
-            hand_mask_present=hand_mask_present,
-            hand_mask_tiny=hand_mask_tiny,
+        containment, union_mask, valid, inside = score_keypoints_against_masks(
+            frame=frame,
+            pixels=pixels,
+            joint_names=joint_names,
+            masks=masks,
+            valid=projected["valid"],
+            abnormal_inside_ratio_threshold=abnormal_inside_ratio_threshold,
             projected_in_image_ratio_threshold=projected_in_image_ratio_threshold,
             strong_inside_ratio_threshold=strong_inside_ratio_threshold,
             acceptable_inside_ratio_threshold=acceptable_inside_ratio_threshold,
+            mask_tiny_area_ratio_threshold=mask_tiny_area_ratio_threshold,
         )
         row = {
             "clip_id": clip_id_from_path(hdf5_path),
@@ -583,44 +683,7 @@ def process_clip(
             "image_width": int(frame.shape[1]),
             "image_height": int(frame.shape[0]),
             "hand_side": hand_side,
-            "sampled_keypoints": int(total_expected),
-            "valid_projected_keypoints": valid_count,
-            "projected_keypoints_in_image": in_image_count,
-            "projected_keypoints_in_image_ratio": projected_keypoints_in_image_ratio,
-            "inside_keypoints": inside_count,
-            "missing_from_mask_keypoints": missing_from_mask_count,
-            "expected_missing_from_mask_keypoints": expected_missing_from_mask_count,
-            "inside_joint_names": [joint_names[index] for index in inside_indices],
-            "missing_from_mask_joint_names": [
-                joint_names[index] for index in valid_missing_indices
-            ],
-            "expected_missing_from_mask_joint_names": [
-                joint_names[index] for index in missing_indices
-            ],
-            "invalid_projected_joint_names": [
-                joint_names[index] for index in invalid_indices
-            ],
-            "keypoint_inside_ratio": keypoint_inside_ratio,
-            "keypoint_missing_ratio": keypoint_missing_ratio,
-            "valid_projected_inside_ratio": valid_projected_inside_ratio,
-            "valid_projected_missing_ratio": valid_projected_missing_ratio,
-            "abnormal_inside_ratio_threshold": abnormal_inside_ratio_threshold,
-            "abnormal_frame": abnormal_frame,
-            "projected_in_image_ratio_threshold": projected_in_image_ratio_threshold,
-            "strong_containment_inside_ratio_threshold": strong_inside_ratio_threshold,
-            "acceptable_inside_ratio_threshold": acceptable_inside_ratio_threshold,
-            "mask_tiny_area_ratio_threshold": mask_tiny_area_ratio_threshold,
-            "keypoints_inside_hand_mask_ratio": keypoint_inside_ratio,
-            "containment_verdict": containment_verdict,
-            "reason": reason,
-            "mask_instance_count": len(masks),
-            "mask_area": mask_area,
-            "mask_area_ratio": mask_area_ratio,
-            "hand_mask_present": hand_mask_present,
-            "hand_mask_area_ratio": mask_area_ratio,
-            "hand_mask_tiny": hand_mask_tiny,
-            "hand_mask_touches_border": bool(mask_touches_border(union_mask)),
-            "sam3_categories": sorted({mask.category for mask in masks}),
+            **containment,
         }
         if candidate_window is not None:
             row.update(candidate_window_metadata(candidate_window))
@@ -645,14 +708,22 @@ def process_clip(
             row["overlay_path"] = str(overlay_path)
         frame_rows.append(row)
         totals["sampled_frames"] += 1
-        totals["total_expected_keypoints"] += total_expected
-        totals["valid_projected_keypoints"] += valid_count
-        totals["inside_keypoints"] += inside_count
-        totals["missing_from_mask_keypoints"] += missing_from_mask_count
-        totals["expected_missing_from_mask_keypoints"] += expected_missing_from_mask_count
-        totals["abnormal_frames"] += int(abnormal_frame)
-        totals["frames_with_mask"] += int(union_mask is not None and mask_area > 0)
-        totals["frames_without_mask"] += int(union_mask is None or mask_area == 0)
+        totals["total_expected_keypoints"] += containment["sampled_keypoints"]
+        totals["valid_projected_keypoints"] += containment[
+            "valid_projected_keypoints"
+        ]
+        totals["inside_keypoints"] += containment["inside_keypoints"]
+        totals["missing_from_mask_keypoints"] += containment[
+            "missing_from_mask_keypoints"
+        ]
+        totals["expected_missing_from_mask_keypoints"] += containment[
+            "expected_missing_from_mask_keypoints"
+        ]
+        totals["abnormal_frames"] += int(containment["abnormal_frame"])
+        totals["frames_with_mask"] += int(containment["hand_mask_present"])
+        totals["frames_without_mask"] += int(
+            not containment["hand_mask_present"]
+        )
         mode_counts[resolved_projection_mode] += 1
 
     ratios = [row["keypoint_inside_ratio"] for row in frame_rows]
@@ -1538,6 +1609,8 @@ def write_json(value: Any, path: Path) -> None:
 def json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return [json_safe(item) for item in value.tolist()]
     if isinstance(value, (list, tuple)):
         return [json_safe(item) for item in value]
     if isinstance(value, np.generic):
