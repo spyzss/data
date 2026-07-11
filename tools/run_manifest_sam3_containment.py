@@ -25,6 +25,7 @@ from tools.sam3_keypoint_containment import (  # noqa: E402
     json_safe,
     sample_candidate_window_frames,
     score_keypoints_against_masks,
+    write_combined_overlay_image,
     write_json,
     write_overlay_image,
 )
@@ -607,6 +608,7 @@ def run_manifest_sam3_containment(
                         mask_cache[mask_key] = (frame, masks)
                     frame, masks = mask_cache[mask_key]
                     source_row = source_data.iloc[source_frame_idx]
+                    combined_hands: dict[str, dict[str, Any]] = {}
                     for hand_side in item["hand_sides"]:
                         field_name = str(
                             manifest_row[f"{hand_side}_hand_2d_field"]
@@ -630,6 +632,12 @@ def run_manifest_sam3_containment(
                                 **FRAME_THRESHOLDS,
                             )
                         )
+                        combined_hands[hand_side] = {
+                            "pixels": pixels,
+                            "valid": valid,
+                            "inside": inside,
+                            "joint_names": joint_names,
+                        }
                         row = {
                             "clip_id": item["asset_id"],
                             "asset_id": item["asset_id"],
@@ -670,6 +678,56 @@ def run_manifest_sam3_containment(
                             )
                             row["overlay_path"] = str(overlay_path)
                         window_rows.append(row)
+                    if write_overlays:
+                        try:
+                            for hand_side in ("left", "right"):
+                                if hand_side in combined_hands:
+                                    continue
+                                field_name = str(
+                                    manifest_row[f"{hand_side}_hand_2d_field"]
+                                )
+                                if field_name not in source_data.columns:
+                                    raise ValueError(
+                                        "parquet missing JD 2D field for combined "
+                                        f"overlay: {field_name}"
+                                    )
+                                pixels = reshape_jdt_keypoints(
+                                    source_row[field_name],
+                                    field_name,
+                                    source_frame_idx,
+                                )
+                                joint_names = _joint_names(hand_side)
+                                _, _, valid, inside = score_keypoints_against_masks(
+                                    frame=frame,
+                                    pixels=pixels,
+                                    joint_names=joint_names,
+                                    masks=masks,
+                                    **FRAME_THRESHOLDS,
+                                )
+                                combined_hands[hand_side] = {
+                                    "pixels": pixels,
+                                    "valid": valid,
+                                    "inside": inside,
+                                    "joint_names": joint_names,
+                                }
+                            write_combined_overlay_image(
+                                frame=frame,
+                                hands=combined_hands,
+                                clip_id=(
+                                    f"{item['asset_id']}_window_"
+                                    f"{window['start_frame']}_{window['end_frame']}_"
+                                    "combined"
+                                ),
+                                frame_idx=source_frame_idx,
+                                output_dir=output_dir / "combined_overlays",
+                            )
+                        except Exception as exc:
+                            LOGGER.warning(
+                                "Combined overlay failed for %s frame %d: %s",
+                                item["asset_id"],
+                                source_frame_idx,
+                                exc,
+                            )
                 frame_rows.extend(window_rows)
                 summary["completed_window_count"] += 1
             except Exception as exc:

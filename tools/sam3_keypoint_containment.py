@@ -26,7 +26,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from annotation.segmentation.sam3 import SAM3Segmenter
-from qc_common.keypoints import acceptance_joint_names, project_points
+from qc_common.keypoints import (
+    acceptance_joint_names,
+    derive_finger_bones,
+    project_points,
+)
 
 LOGGER = logging.getLogger("sam3_keypoint_containment")
 
@@ -1496,6 +1500,122 @@ def write_overlay_image(
 
     output_path = output_dir / f"{clip_id}_frame_{int(frame_idx):06d}.png"
     image.convert("RGB").save(output_path)
+    return output_path
+
+
+def write_combined_overlay_image(
+    *,
+    frame: np.ndarray,
+    hands: dict[str, dict[str, Any]],
+    clip_id: str,
+    frame_idx: int,
+    output_dir: Path,
+) -> Path:
+    """Write a review overlay with both hands and side-consistent colors."""
+    import cv2
+
+    side_colors_rgb = {
+        "left": (40, 220, 90),
+        "right": (40, 130, 255),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_bgr = cv2.cvtColor(
+        np.asarray(frame, dtype=np.uint8),
+        cv2.COLOR_RGB2BGR,
+    )
+    height, width = image_bgr.shape[:2]
+
+    for hand_side in ("left", "right"):
+        hand = hands.get(hand_side)
+        if hand is None:
+            continue
+        pixels = np.asarray(hand["pixels"], dtype=np.float64)
+        valid = np.asarray(hand["valid"], dtype=bool)
+        inside = np.asarray(hand["inside"], dtype=bool)
+        joint_names = [str(name) for name in hand["joint_names"]]
+        color_rgb = side_colors_rgb[hand_side]
+        color_bgr = color_rgb[::-1]
+        index_by_name = {
+            joint_name: index for index, joint_name in enumerate(joint_names)
+        }
+
+        for parent, child in derive_finger_bones(joint_names):
+            parent_index = index_by_name[parent]
+            child_index = index_by_name[child]
+            if not valid[parent_index] or not valid[child_index]:
+                continue
+            endpoints = pixels[[parent_index, child_index]]
+            if not np.isfinite(endpoints).all():
+                continue
+            parent_xy = tuple(np.rint(endpoints[0]).astype(int))
+            child_xy = tuple(np.rint(endpoints[1]).astype(int))
+            cv2.line(
+                image_bgr,
+                parent_xy,
+                child_xy,
+                color_bgr,
+                2,
+                cv2.LINE_AA,
+            )
+
+        for index, (x_raw, y_raw) in enumerate(pixels):
+            if not valid[index] or not np.isfinite([x_raw, y_raw]).all():
+                continue
+            x = int(round(float(x_raw)))
+            y = int(round(float(y_raw)))
+            if x < 0 or x >= width or y < 0 or y >= height:
+                continue
+            cv2.circle(image_bgr, (x, y), 4, color_bgr, -1, cv2.LINE_AA)
+            outline_bgr = (0, 0, 0) if inside[index] else (45, 45, 255)
+            cv2.circle(image_bgr, (x, y), 5, outline_bgr, 1, cv2.LINE_AA)
+
+    # The SAM3 mask is shared across queried hands, so the combined view avoids
+    # assigning that union mask a misleading side-specific color.
+    legend_height = min(48, height)
+    legend_layer = image_bgr.copy()
+    cv2.rectangle(legend_layer, (0, 0), (width, legend_height), (0, 0, 0), -1)
+    image_bgr = cv2.addWeighted(legend_layer, 0.72, image_bgr, 0.28, 0.0)
+    cv2.putText(
+        image_bgr,
+        f"{clip_id} source_frame={int(frame_idx)}",
+        (7, 17),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    legend_items = (
+        ("LEFT=green", side_colors_rgb["left"], 7),
+        ("RIGHT=blue", side_colors_rgb["right"], 105),
+    )
+    for label, color_rgb, x in legend_items:
+        color_bgr = color_rgb[::-1]
+        cv2.rectangle(image_bgr, (x, 27), (x + 12, 39), color_bgr, -1)
+        cv2.putText(
+            image_bgr,
+            label,
+            (x + 17, 38),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.34,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    cv2.putText(
+        image_bgr,
+        "red ring=outside mask",
+        (220, 38),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.34,
+        (80, 80, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    output_path = output_dir / f"{clip_id}_frame_{int(frame_idx):06d}.png"
+    if not cv2.imwrite(str(output_path), image_bgr):
+        raise OSError(f"failed to write combined overlay: {output_path}")
     return output_path
 
 
