@@ -15,12 +15,8 @@ from tools.build_acceptance_ledger import (
     build_supplier_ledger,
     merge_intervals,
 )
-from tools.build_weekly_supplier_acceptance_report import (
-    CORE_DETAIL_COLUMNS,
-    detail_columns_for_rows,
-)
-
-
+import tools.build_acceptance_ledger as acceptance_ledger_module
+import tools.acceptance_ledger_weekly as weekly_ledger
 WEEKLY_SHEETS = [
     "五供应商总览",
     "星际归途",
@@ -28,8 +24,35 @@ WEEKLY_SHEETS = [
     "京东JDT",
     "供应商4",
     "供应商5",
-    "异常检测拆解",
     "人工问题与阈值",
+]
+
+WEEKLY_DETAIL_COLUMNS = [
+    "asset_id",
+    "total_frames",
+    "text_check_status",
+    "skeleton_static_status",
+    "video_quality_status",
+    "abnormal_frame_status",
+    "final_acceptance_status",
+    "precheck_window_count",
+    "precheck_fail_window_count",
+    "precheck_to_sam3_window_count",
+    "precheck_to_sam3_ratio",
+    "sam3_processed_window_count",
+    "sam3_fail_window_count",
+    "sam3_to_manual_window_count",
+    "sam3_to_manual_ratio",
+    "manual_submitted_window_count",
+    "manual_reviewed_window_count",
+    "manual_fail_window_count",
+    "manual_pass_window_count",
+    "manual_pending_window_count",
+    "manual_completion_ratio",
+    "final_fail_window_count",
+    "final_review_window_count",
+    "main_reason",
+    "evidence_path",
 ]
 
 REAL_WEEKLY_CONFIG = (
@@ -119,27 +142,209 @@ def test_real_xjgt_jdt_deepreach_weekly_config_loads() -> None:
         "/deepreach/video_quality/video_quality_results.json"
     )
     assert suppliers["deepreach"]["blocked"] is True
-    assert suppliers["deepreach"]["blocked_policy"] == "all_frames_review"
+    assert suppliers["deepreach"]["blocked_policy"] == "candidate_windows_review"
     assert suppliers["deepreach"]["blocker"].endswith(
         "/deepreach/blockers/sam3_containment_blocker.json"
     )
 
 
-def _canonical_weekly_header() -> list[str]:
-    return detail_columns_for_rows(
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({"manual_outcome": " true_positive "}, "fail"),
+        ({"manual_outcome": "positive"}, "fail"),
+        ({"acceptance_status": "rejected"}, "fail"),
+        ({"manual_outcome": "false_positive"}, "pass"),
+        ({"manual_outcome": "acceptable_flagged"}, "pass"),
+        ({"acceptance_status": "accepted"}, "pass"),
+        ({"manual_outcome": "review"}, "review"),
+    ],
+)
+def test_generic_and_weekly_manual_outcome_normalization_agree(
+    row: dict[str, str], expected: str
+) -> None:
+    assert acceptance_ledger_module.normalize_manual_outcome(row) == expected
+    assert weekly_ledger._manual_window_kind([row]) == expected
+
+
+def test_weekly_review_id_normalization_and_exact_window_fallback() -> None:
+    result = weekly_ledger._resolve_windows(
+        asset_id="asset",
+        total_frames=10,
+        precheck_row={"temporal_seen": True},
+        precheck_source_status="readable",
+        candidate_rows=[
+            {
+                "review_id": "candidate-a",
+                "asset_id": "asset",
+                "window_start_frame": 0,
+                "window_end_frame": 2,
+            },
+            {
+                "review_id": "candidate-b",
+                "asset_id": "asset",
+                "window_start_frame": 3,
+                "window_end_frame": 5,
+            },
+        ],
+        sam3_rows=[
+            {
+                "asset_id": "asset",
+                "window_start_frame": 0,
+                "window_end_frame": 2,
+                "window_containment_verdict": "mixed_review",
+            },
+            {
+                "asset_id": "asset",
+                "window_start_frame": 3,
+                "window_end_frame": 5,
+                "window_containment_verdict": "mixed_review",
+            },
+        ],
+        review_rows=[
+            {
+                "review_id": " 42 ",
+                "asset_id": "asset",
+                "window_start_frame": 0,
+                "window_end_frame": 2,
+            },
+            {
+                "review_id": "queue-b",
+                "asset_id": "asset",
+                "window_start_frame": 3,
+                "window_end_frame": 5,
+            },
+        ],
+        manual_rows=[
+            {
+                "review_id": 42,
+                "asset_id": "asset",
+                "window_start_frame": 0,
+                "window_end_frame": 2,
+                "manual_outcome": "false_positive",
+            },
+            {
+                "review_id": "manual-b",
+                "asset_id": "asset",
+                "window_start_frame": 3,
+                "window_end_frame": 5,
+                "manual_outcome": "true_positive",
+            },
+        ],
+        sam3_blocked=False,
+        blocker_reason="",
+    )
+
+    assert result["manual_submitted_window_count"] == 2
+    assert result["manual_reviewed_window_count"] == 2
+    assert result["manual_pending_window_count"] == 0
+    assert result["manual_pass_window_count"] == 1
+    assert result["manual_fail_window_count"] == 1
+    assert result["final_review_window_count"] == 0
+
+
+def test_manual_pending_is_sam3_arbitration_minus_completed_manual() -> None:
+    result = weekly_ledger._resolve_windows(
+        asset_id="asset",
+        total_frames=10,
+        precheck_row={"temporal_seen": True},
+        precheck_source_status="readable",
+        candidate_rows=[
+            {
+                "asset_id": "asset",
+                "window_start_frame": 1,
+                "window_end_frame": 4,
+            }
+        ],
+        sam3_rows=[
+            {
+                "asset_id": "asset",
+                "window_start_frame": 1,
+                "window_end_frame": 4,
+                "window_containment_verdict": "mixed_review",
+            }
+        ],
+        review_rows=[],
+        manual_rows=[],
+        sam3_blocked=False,
+        blocker_reason="",
+    )
+
+    assert result["sam3_to_manual_window_count"] == 1
+    assert result["manual_submitted_window_count"] == 0
+    assert result["manual_reviewed_window_count"] == 0
+    assert result["manual_pending_window_count"] == 1
+
+
+def test_incomplete_manual_row_remains_unresolved_in_generic_ledger(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "manifest.csv"
+    review_queue = tmp_path / "review_queue.csv"
+    manual_labels = tmp_path / "manual_labels.csv"
+    pd.DataFrame(
+        [{"asset_id": "asset", "start_frame": 0, "end_frame": 9}]
+    ).to_csv(manifest, index=False)
+    pd.DataFrame(
         [
             {
-                "text_field_present_task_status": "pass",
-                "text_field_nonempty_task_status": "pass",
-                "video_black_screen_status": "pass",
-                "video_underexposure_status": "pass",
-                "video_overexposure_status": "pass",
-                "video_blur_status": "pass",
-                "video_freeze_stutter_status": "pass",
-                "video_frame_alignment_status": "pass",
+                "review_id": "review-1",
+                "asset_id": "asset",
+                "window_start_frame": 2,
+                "window_end_frame": 4,
             }
         ]
+    ).to_csv(review_queue, index=False)
+    pd.DataFrame(
+        [
+            {
+                "review_id": "review-1",
+                "asset_id": "asset",
+                "window_start_frame": 2,
+                "window_end_frame": 4,
+                "manual_outcome": "review",
+            }
+        ]
+    ).to_csv(manual_labels, index=False)
+
+    result = build_supplier_ledger(
+        {
+            "supplier_id": "supplier",
+            "manifest": str(manifest),
+            "review_queue": str(review_queue),
+            "manual_labels": str(manual_labels),
+            "required_inputs": ["manifest"],
+        },
+        config_dir=tmp_path,
     )
+
+    assert result.asset_rows[0]["final_status"] == "review"
+    assert result.asset_rows[0]["unresolved_review_window_count"] == 1
+
+
+def test_missing_optional_morphology_does_not_block_skeleton() -> None:
+    status, reasons = weekly_ledger._skeleton_status(
+        source_status="readable",
+        precheck_row={
+            "checks": {"skeleton_quality_score", "keypoint_temporal"},
+            "missing_intervals": [],
+        },
+    )
+    assert status == "pass"
+    assert "optional keypoint_morphology not executed" in reasons
+
+
+def test_applicable_text_check_skipped_is_not_run() -> None:
+    status, _ = weekly_ledger._text_status(
+        config={"text_required": True},
+        source_status="readable",
+        precheck_row={"checks": {"skeleton_quality_score"}},
+    )
+    assert status == "not_run"
+
+
+def _canonical_weekly_header() -> list[str]:
+    return WEEKLY_DETAIL_COLUMNS
 
 
 def _write_weekly_template(tmp_path: Path) -> Path:
@@ -153,7 +358,6 @@ def _write_weekly_template(tmp_path: Path) -> Path:
         "供应商3",
         "供应商4",
         "供应商5",
-        "异常检测拆解",
         "人工问题与阈值",
     ]
     header = _canonical_weekly_header()
@@ -161,35 +365,18 @@ def _write_weekly_template(tmp_path: Path) -> Path:
     for name in old_names:
         sheet = workbook.create_sheet(name)
         if name in {"星际归途", "DeepReach", "供应商3", "供应商4", "供应商5"}:
+            sheet.append(["旧模板表头"])
             sheet.append(header)
             for cell in sheet[1]:
                 cell.fill = PatternFill("solid", fgColor="B4C6E7")
                 cell.font = Font(bold=True, color="1F1F1F")
                 cell.border = border
-            sheet.freeze_panes = "A2"
+            sheet.freeze_panes = "A3"
             sheet.auto_filter.ref = sheet.dimensions
             sheet.row_dimensions[1].height = 37
             sheet.column_dimensions["A"].width = 25
-    xjgt = workbook["星际归途"]
-    xjgt_row = {column: "" for column in header}
-    xjgt_row.update(
-        {
-            "asset_id": "xjgt-existing",
-            "total_frames": 10,
-            "text_check_status": "pass",
-            "skeleton_static_status": "pass",
-            "video_quality_status": "pass",
-            "abnormal_frame_status": "pass",
-            "fail_indicator_count": 0,
-            "acceptance_status": "pass",
-            "abnormal_frame_status_v2": "pass",
-            "acceptance_status_v2": "pass",
-            "review_status_v2": "completed",
-        }
-    )
-    xjgt.append([xjgt_row[column] for column in header])
-    workbook["供应商4"]["A2"] = "placeholder-four"
-    workbook["供应商5"]["A2"] = "placeholder-five"
+    workbook["供应商4"]["A3"] = "placeholder-four"
+    workbook["供应商5"]["A3"] = "placeholder-five"
     workbook["人工问题与阈值"]["A1"] = (
         "定向复核不是无偏全局召回率估计"
     )
@@ -197,25 +384,18 @@ def _write_weekly_template(tmp_path: Path) -> Path:
     return path
 
 
-def _write_weekly_supplier_inputs(tmp_path: Path) -> tuple[Path, Path]:
-    jdt_dir = tmp_path / "jdt"
-    jdt_dir.mkdir()
-    asset_ids = [f"jdt-{index:03d}" for index in range(100)]
-    pd.DataFrame(
-        [
-            {
-                "asset_id": asset_id,
-                "start_frame": 0,
-                "end_frame": 9,
-                "primary_video_path": f"/{asset_id}.mp4",
-            }
-            for asset_id in asset_ids
-        ]
-    ).to_csv(jdt_dir / "manifest.csv", index=False)
-    check_rows = []
+def _pass_check_rows(asset_ids: list[str]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
     for asset_id in asset_ids:
-        check_rows.extend(
+        rows.extend(
             [
+                {
+                    "asset_id": asset_id,
+                    "check": "text_integrity",
+                    "frame_idx": -1,
+                    "flag": False,
+                    "metrics": json.dumps({"missing_field_count": 0}),
+                },
                 {
                     "asset_id": asset_id,
                     "check": "skeleton_quality_score",
@@ -234,11 +414,56 @@ def _write_weekly_supplier_inputs(tmp_path: Path) -> tuple[Path, Path]:
                     "asset_id": asset_id,
                     "check": "keypoint_temporal",
                     "frame_idx": -1,
-                    "flag": False,
+                    "flag": None,
                     "metrics": "{}",
                 },
             ]
         )
+    return rows
+
+
+def _write_weekly_supplier_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
+    xjgt_dir = tmp_path / "xjgt"
+    xjgt_dir.mkdir()
+    pd.DataFrame(
+        [{"asset_id": "xjgt-000", "frame_count": 10}]
+    ).to_csv(xjgt_dir / "manifest.csv", index=False)
+    pd.DataFrame(_pass_check_rows(["xjgt-000"])).to_parquet(
+        xjgt_dir / "check_results.parquet", index=False
+    )
+    pd.DataFrame([{"asset_id": "xjgt-000", "status": "pass"}]).to_json(
+        xjgt_dir / "video_quality.json", orient="records"
+    )
+    xjgt_candidate = {
+        "review_id": "xjgt-review-0",
+        "asset_id": "xjgt-000",
+        "window_start_frame": 0,
+        "window_end_frame": 4,
+        "module": "precheck",
+        "source_verdict": "review",
+    }
+    pd.DataFrame([xjgt_candidate]).to_parquet(
+        xjgt_dir / "candidate_windows.parquet", index=False
+    )
+    pd.DataFrame([xjgt_candidate]).to_csv(
+        xjgt_dir / "review_queue.csv", index=False
+    )
+
+    jdt_dir = tmp_path / "jdt"
+    jdt_dir.mkdir()
+    asset_ids = [f"jdt-{index:03d}" for index in range(100)]
+    pd.DataFrame(
+        [
+            {
+                "asset_id": asset_id,
+                "start_frame": 0,
+                "end_frame": 9,
+                "primary_video_path": f"/{asset_id}.mp4",
+            }
+            for asset_id in asset_ids
+        ]
+    ).to_csv(jdt_dir / "manifest.csv", index=False)
+    check_rows = _pass_check_rows(asset_ids)
     pd.DataFrame(check_rows).to_parquet(jdt_dir / "check_results.parquet", index=False)
     pd.DataFrame(
         [{"asset_id": asset_id, "check_count": 3} for asset_id in asset_ids]
@@ -255,21 +480,25 @@ def _write_weekly_supplier_inputs(tmp_path: Path) -> tuple[Path, Path]:
             "source_level": "window",
             "module": "precheck",
         }
-        for index in range(3)
+        for index in range(12)
     ]
     pd.DataFrame(candidate_rows).to_parquet(
         jdt_dir / "candidate_windows.parquet", index=False
     )
-    pd.DataFrame(candidate_rows).to_csv(jdt_dir / "review_queue.csv", index=False)
+    pd.DataFrame(candidate_rows[:11]).to_csv(
+        jdt_dir / "review_queue.csv", index=False
+    )
     pd.DataFrame(
         [
             {
                 "asset_id": asset_ids[index],
                 "window_start_frame": 0,
                 "window_end_frame": 4,
-                "window_containment_verdict": "mixed_review",
+                "window_containment_verdict": (
+                    "mixed_review" if index < 11 else "containment_pass"
+                ),
             }
-            for index in range(3)
+            for index in range(12)
         ]
     ).to_parquet(jdt_dir / "sam3.parquet", index=False)
     pd.DataFrame(
@@ -282,6 +511,7 @@ def _write_weekly_supplier_inputs(tmp_path: Path) -> tuple[Path, Path]:
                 "affected_start_frame": 1,
                 "affected_end_frame": 2,
                 "manual_outcome": "true_positive",
+                "acceptance_status": "rejected",
                 "failure_mode": "severe_keypoint_offset",
             },
             {
@@ -289,11 +519,26 @@ def _write_weekly_supplier_inputs(tmp_path: Path) -> tuple[Path, Path]:
                 "asset_id": asset_ids[1],
                 "window_start_frame": 0,
                 "window_end_frame": 4,
-                "affected_start_frame": "",
-                "affected_end_frame": "",
-                "manual_outcome": "false_positive",
-                "failure_mode": "unknown",
+                "affected_start_frame": 1,
+                "affected_end_frame": 2,
+                "manual_outcome": "true_positive",
+                "acceptance_status": "rejected",
+                "failure_mode": "severe_keypoint_offset",
             },
+            *[
+                {
+                    "review_id": f"review-{index}",
+                    "asset_id": asset_ids[index],
+                    "window_start_frame": 0,
+                    "window_end_frame": 4,
+                    "affected_start_frame": "",
+                    "affected_end_frame": "",
+                    "manual_outcome": "false_positive",
+                    "acceptance_status": "accepted",
+                    "failure_mode": "unknown",
+                }
+                for index in range(2, 11)
+            ],
         ]
     ).to_csv(jdt_dir / "manual_labels.csv", index=False)
 
@@ -305,6 +550,45 @@ def _write_weekly_supplier_inputs(tmp_path: Path) -> tuple[Path, Path]:
             {"asset_id": "dr-001", "start_frame": 0, "end_frame": 19},
         ]
     ).to_csv(dr_dir / "manifest.csv", index=False)
+    dr_checks = _pass_check_rows(["dr-000", "dr-001"])
+    dr_checks.append(
+        {
+            "asset_id": "dr-001",
+            "check": "skeleton_quality_score",
+            "frame_idx": 3,
+            "flag": True,
+            "metrics": json.dumps(
+                {
+                    "keypoint_presence_invalid": 1,
+                    "valid_keypoint_count_left": 20,
+                    "missing_keypoint_count_left": 1,
+                    "valid_keypoint_count_right": 21,
+                    "missing_keypoint_count_right": 0,
+                }
+            ),
+        }
+    )
+    pd.DataFrame(dr_checks).to_parquet(
+        dr_dir / "check_results.parquet", index=False
+    )
+    pd.DataFrame(
+        [
+            {"asset_id": "dr-000", "status": "pass"},
+            {"asset_id": "dr-001", "status": "pass"},
+        ]
+    ).to_json(dr_dir / "video_quality.json", orient="records")
+    pd.DataFrame(
+        [
+            {
+                "review_id": "dr-review-0",
+                "asset_id": "dr-000",
+                "window_start_frame": 1,
+                "window_end_frame": 4,
+                "module": "precheck",
+                "source_verdict": "review",
+            }
+        ]
+    ).to_parquet(dr_dir / "candidate_windows.parquet", index=False)
     (dr_dir / "blocker.json").write_text(
         json.dumps(
             {
@@ -314,11 +598,11 @@ def _write_weekly_supplier_inputs(tmp_path: Path) -> tuple[Path, Path]:
         ),
         encoding="utf-8",
     )
-    return jdt_dir, dr_dir
+    return xjgt_dir, jdt_dir, dr_dir
 
 
 def _weekly_config(tmp_path: Path) -> Path:
-    jdt_dir, dr_dir = _write_weekly_supplier_inputs(tmp_path)
+    xjgt_dir, jdt_dir, dr_dir = _write_weekly_supplier_inputs(tmp_path)
     config = tmp_path / "weekly_ledger.yaml"
     config.write_text(
         yaml.safe_dump(
@@ -326,6 +610,19 @@ def _weekly_config(tmp_path: Path) -> Path:
                 "workbook_mode": "weekly_template",
                 "output_label": "weekly_test",
                 "suppliers": [
+                    {
+                        "supplier_id": "xjgt",
+                        "manifest": str(xjgt_dir / "manifest.csv"),
+                        "precheck_check_results": str(
+                            xjgt_dir / "check_results.parquet"
+                        ),
+                        "candidate_windows": str(
+                            xjgt_dir / "candidate_windows.parquet"
+                        ),
+                        "video_quality": str(xjgt_dir / "video_quality.json"),
+                        "review_queue": str(xjgt_dir / "review_queue.csv"),
+                        "text_required": True,
+                    },
                     {
                         "supplier_id": "jdt",
                         "manifest": str(jdt_dir / "manifest.csv"),
@@ -348,9 +645,16 @@ def _weekly_config(tmp_path: Path) -> Path:
                     {
                         "supplier_id": "deepreach",
                         "manifest": str(dr_dir / "manifest.csv"),
+                        "precheck_check_results": str(
+                            dr_dir / "check_results.parquet"
+                        ),
+                        "candidate_windows": str(
+                            dr_dir / "candidate_windows.parquet"
+                        ),
+                        "video_quality": str(dr_dir / "video_quality.json"),
                         "blocker": str(dr_dir / "blocker.json"),
                         "blocked": True,
-                        "blocked_policy": "all_frames_review",
+                        "blocked_policy": "candidate_windows_review",
                         "text_required": False,
                         "required_inputs": ["manifest"],
                     },
@@ -728,14 +1032,15 @@ def test_missing_required_manifest_raises_but_optional_modules_do_not(
     assert result.overview["pass_clip_count"] == 1
 
 
-def test_weekly_template_preserves_canonical_structure_and_maps_jdt_dr(
+def test_weekly_template_uses_concise_schema_and_correct_window_semantics(
     tmp_path: Path,
 ) -> None:
     template = _write_weekly_template(tmp_path)
     output = tmp_path / "weekly_output.xlsx"
+    config_path = _weekly_config(tmp_path)
 
     build_acceptance_ledger(
-        config_path=_weekly_config(tmp_path),
+        config_path=config_path,
         output_path=output,
         existing_workbook=template,
         overwrite=True,
@@ -746,31 +1051,33 @@ def test_weekly_template_preserves_canonical_structure_and_maps_jdt_dr(
     xjgt = workbook["星际归途"]
     jdt = workbook["京东JDT"]
     deepreach = workbook["DeepReach"]
-    canonical_header = [cell.value for cell in xjgt[1]]
+    canonical_header = [cell.value for cell in xjgt[2]]
     assert canonical_header == _canonical_weekly_header()
-    assert [cell.value for cell in jdt[1]] == canonical_header
-    assert [cell.value for cell in deepreach[1]] == canonical_header
-    assert jdt.max_row == 101
-    assert jdt.freeze_panes == xjgt.freeze_panes == "A2"
+    assert [cell.value for cell in jdt[2]] == canonical_header
+    assert [cell.value for cell in deepreach[2]] == canonical_header
+    assert [xjgt.cell(1, column).value for column in (1, 8, 12, 16, 22)] == [
+        "基础与四大项",
+        "Precheck",
+        "SAM3",
+        "人工复核",
+        "最终结果",
+    ]
+    assert jdt.max_row == 108
+    assert jdt.freeze_panes == xjgt.freeze_panes == "A3"
     assert jdt.row_dimensions[1].height == xjgt.row_dimensions[1].height
     assert jdt.column_dimensions["A"].width == xjgt.column_dimensions["A"].width
     assert jdt["A1"].fill.fgColor.rgb == xjgt["A1"].fill.fgColor.rgb
     assert jdt["A1"].font.bold == xjgt["A1"].font.bold
     assert jdt["A1"].border.bottom.style == xjgt["A1"].border.bottom.style
-    assert workbook["供应商4"]["A2"].value == "placeholder-four"
-    assert workbook["供应商5"]["A2"].value == "placeholder-five"
     assert "无偏全局召回率" in workbook["人工问题与阈值"]["A1"].value
 
     columns = {name: index for index, name in enumerate(canonical_header)}
     jdt_rows = {
         row[columns["asset_id"]]: row
-        for row in jdt.iter_rows(min_row=2, values_only=True)
+        for row in jdt.iter_rows(min_row=3, max_row=102, values_only=True)
     }
-    for asset_id, row in jdt_rows.items():
-        assert row[columns["text_check_status"]] in {
-            "pass",
-            "not_applicable",
-        }
+    for row in jdt_rows.values():
+        assert row[columns["text_check_status"]] == "not_applicable"
         assert row[columns["skeleton_static_status"]] == "pass"
         assert row[columns["video_quality_status"]] == "pass"
         assert row[columns["abnormal_frame_status"]] in {
@@ -778,30 +1085,50 @@ def test_weekly_template_preserves_canonical_structure_and_maps_jdt_dr(
             "fail",
             "review",
         }
-        assert row[columns["temporal_detected_frame_count"]] is not None
-        assert row[columns["sam3_detected_frame_count"]] is not None
-        assert row[columns["manual_true_positive_frame_count"]] is not None
 
-    assert jdt_rows["jdt-000"][columns["acceptance_status"]] == "fail"
-    assert jdt_rows["jdt-001"][columns["acceptance_status"]] == "pass"
-    assert jdt_rows["jdt-002"][columns["acceptance_status"]] == "review"
-    assert jdt_rows["jdt-002"][columns["abnormal_frame_status"]] == "review"
-    assert (
-        jdt_rows["jdt-002"][columns["unreviewed_submitted_interval_count"]]
-        == 1
+    assert jdt_rows["jdt-000"][columns["final_acceptance_status"]] == "fail"
+    assert jdt_rows["jdt-000"][columns["manual_fail_window_count"]] == 1
+    assert jdt_rows["jdt-001"][columns["final_acceptance_status"]] == "fail"
+    assert jdt_rows["jdt-001"][columns["manual_fail_window_count"]] == 1
+    assert jdt_rows["jdt-002"][columns["final_acceptance_status"]] == "pass"
+    assert jdt_rows["jdt-002"][columns["manual_pass_window_count"]] == 1
+    assert jdt_rows["jdt-011"][columns["final_acceptance_status"]] == "pass"
+    assert jdt_rows["jdt-011"][columns["sam3_processed_window_count"]] == 1
+    assert jdt_rows["jdt-011"][columns["sam3_to_manual_window_count"]] == 0
+    assert sum(row[columns["manual_submitted_window_count"]] for row in jdt_rows.values()) == 11
+    assert sum(row[columns["manual_reviewed_window_count"]] for row in jdt_rows.values()) == 11
+    assert sum(row[columns["manual_pending_window_count"]] for row in jdt_rows.values()) == 0
+    assert sum(row[columns["manual_pass_window_count"]] for row in jdt_rows.values()) == 9
+    assert sum(row[columns["manual_fail_window_count"]] for row in jdt_rows.values()) == 2
+    assert all(row[columns["abnormal_frame_status"]] != "review" for row in jdt_rows.values())
+    config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    jdt_config = next(
+        row for row in config_payload["suppliers"] if row["supplier_id"] == "jdt"
     )
+    jdt_details, _, _ = weekly_ledger._load_supplier_details(
+        jdt_config, config_dir=config_path.parent
+    )
+    assert sum(len(row["_unmatched_queue_review_ids"]) for row in jdt_details) == 0
+    assert sum(len(row["_unmatched_manual_review_ids"]) for row in jdt_details) == 0
 
-    dr_rows = list(deepreach.iter_rows(min_row=2, values_only=True))
-    assert len(dr_rows) == 2
-    assert all(
-        row[columns["sam3_containment_status"]] == "blocked"
-        for row in dr_rows
-    )
-    assert all(
-        row[columns["abnormal_frame_status"]] == "review" for row in dr_rows
-    )
-    assert all(row[columns["acceptance_status"]] == "review" for row in dr_rows)
-    assert all(row[columns["fail_indicator_count"]] == 0 for row in dr_rows)
+    xjgt_row = next(xjgt.iter_rows(min_row=3, values_only=True))
+    assert xjgt_row[columns["text_check_status"]] == "pass"
+    assert xjgt_row[columns["skeleton_static_status"]] == "pass"
+    assert xjgt_row[columns["video_quality_status"]] == "pass"
+    assert xjgt_row[columns["abnormal_frame_status"]] == "review"
+    assert xjgt_row[columns["final_acceptance_status"]] == "review"
+
+    dr_rows = {
+        row[columns["asset_id"]]: row
+        for row in deepreach.iter_rows(min_row=3, values_only=True)
+    }
+    assert dr_rows["dr-000"][columns["abnormal_frame_status"]] == "review"
+    assert dr_rows["dr-000"][columns["final_review_window_count"]] == 1
+    assert dr_rows["dr-000"][columns["final_acceptance_status"]] == "review"
+    assert dr_rows["dr-001"][columns["skeleton_static_status"]] == "fail"
+    assert dr_rows["dr-001"][columns["precheck_fail_window_count"]] == 1
+    assert dr_rows["dr-001"][columns["final_acceptance_status"]] == "fail"
+    assert "keypoint_morphology" not in dr_rows["dr-001"][columns["main_reason"]]
 
     overview = workbook["五供应商总览"]
     overview_rows = list(overview.iter_rows(values_only=True))
@@ -813,8 +1140,8 @@ def test_weekly_template_preserves_canonical_structure_and_maps_jdt_dr(
     jdt_summary = overview_by_name["京东JDT / JDT"]
     assert jdt_summary["sample_clip_count"] == 100
     assert jdt_summary["pass_clip_count"] == 98
-    assert jdt_summary["fail_clip_count"] == 1
-    assert jdt_summary["review_clip_count"] == 1
+    assert jdt_summary["fail_clip_count"] == 2
+    assert jdt_summary["review_clip_count"] == 0
     assert (
         jdt_summary["pass_clip_count"]
         + jdt_summary["fail_clip_count"]
@@ -823,20 +1150,48 @@ def test_weekly_template_preserves_canonical_structure_and_maps_jdt_dr(
     )
     assert overview_by_name["供应商4"]["sample_clip_count"] == 0
     assert overview_by_name["供应商5"]["sample_clip_count"] == 0
+    assert "异常检测拆解" not in workbook.sheetnames
+    assert jdt["K3"].number_format == "0.0%"
+    assert jdt["O3"].number_format == "0.0%"
+    assert jdt["U3"].number_format == "0.0%"
 
-    decomposition = workbook["异常检测拆解"]
-    decomposition_header = [cell.value for cell in decomposition[1]]
-    decomposition_rows = {
-        row[0]: row
-        for row in decomposition.iter_rows(min_row=2, values_only=True)
+    detail_counts = {
+        "星际归途": 1,
+        "DeepReach": 2,
+        "京东JDT": 100,
+        "供应商4": 0,
+        "供应商5": 0,
     }
-    jdt_decomposition = decomposition_rows["京东JDT / JDT"]
-    for column in (
-        "precheck_temporal_candidate_frame_count",
-        "sam3_processed_frame_count",
-        "manual_true_positive_frame_count",
-        "auto_union_hit_manual_tp_frame_count",
-        "abnormal_fail_frame_count",
-        "abnormal_review_frame_count",
-    ):
-        assert jdt_decomposition[decomposition_header.index(column)] is not None
+    for sheet_name, total in detail_counts.items():
+        sheet = workbook[sheet_name]
+        data_end = 2 + total
+        summary_header = data_end + 2
+        assert [sheet.cell(summary_header, column).value for column in range(1, 5)] == [
+            "module",
+            "pass_count",
+            "total_clip_count",
+            "pass_ratio",
+        ]
+        assert int(str(sheet.auto_filter.ref).split(":")[-1][1:]) == data_end
+        for offset, module in enumerate(
+            (
+                "text_check_status",
+                "skeleton_static_status",
+                "video_quality_status",
+                "abnormal_frame_status",
+            ),
+            1,
+        ):
+            values = [
+                str(sheet.cell(row, WEEKLY_DETAIL_COLUMNS.index(module) + 1).value or "")
+                .strip()
+                .lower()
+                for row in range(3, data_end + 1)
+            ]
+            assert sheet.cell(summary_header + offset, 1).value == module
+            assert sheet.cell(summary_header + offset, 2).value == values.count("pass")
+            assert sheet.cell(summary_header + offset, 3).value == total
+            assert sheet.cell(summary_header + offset, 4).value == (
+                values.count("pass") / total if total else 0
+            )
+            assert sheet.cell(summary_header + offset, 4).number_format == "0.0%"

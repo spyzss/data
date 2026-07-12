@@ -33,5 +33,5 @@ suppliers:
     video_quality: outputs/acceptance_5x100/deepreach/video_quality/video_quality_results.json
     blocker: outputs/acceptance_5x100/deepreach/blockers/sam3_containment_blocker.json
     blocked: true
-    blocked_policy: all_frames_review
+    blocked_policy: candidate_windows_review
     text_required: false

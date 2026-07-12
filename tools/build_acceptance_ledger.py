@@ -542,6 +542,8 @@ def _resolved_manual_keys(
     review_ids: set[str] = set()
     windows: set[tuple[str, int, int]] = set()
     for row in rows:
+        if normalize_manual_outcome(row) == "review":
+            continue
         review_id = str(row.get("review_id") or "").strip()
         if review_id:
             review_ids.add(review_id)
@@ -572,9 +574,7 @@ def _manual_fail_intervals(
 ) -> list[tuple[int, int]]:
     intervals: list[tuple[int, int]] = []
     for row in rows:
-        outcome = str(row.get("manual_outcome") or "").strip().lower()
-        status = str(row.get("acceptance_status") or "").strip().lower()
-        if outcome != "true_positive" and status != "rejected":
+        if normalize_manual_outcome(row) != "fail":
             continue
         start = _optional_int(row.get("affected_start_frame"))
         end = _optional_int(row.get("affected_end_frame"))
@@ -586,6 +586,23 @@ def _manual_fail_intervals(
         if clipped is not None:
             intervals.append(clipped)
     return merge_intervals(intervals)
+
+
+def normalize_manual_outcome(row: dict[str, Any]) -> str:
+    """Normalize completed manual decisions for every ledger presentation."""
+    outcome = str(row.get("manual_outcome") or "").strip().lower()
+    status = str(row.get("acceptance_status") or "").strip().lower()
+    if outcome in {"true_positive", "positive", "fail"} or status in {
+        "rejected",
+        "fail",
+    }:
+        return "fail"
+    if outcome in {"false_positive", "acceptable_flagged", "pass"} or status in {
+        "accepted",
+        "pass",
+    }:
+        return "pass"
+    return "review"
 
 
 def _window_intervals(
