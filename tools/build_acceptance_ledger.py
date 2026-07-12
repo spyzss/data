@@ -221,6 +221,7 @@ def build_supplier_ledger(
         config_dir=config_dir,
         required="blocker" in required_inputs,
         notes=notes,
+        note_if_unconfigured=False,
     )
     sam3_output_available = _configured_input_exists(
         supplier_config, "sam3_summary", config_dir
@@ -348,6 +349,20 @@ def build_acceptance_ledger(
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"output exists; pass --overwrite: {output_path}")
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if config.get("workbook_mode") == "weekly_template":
+        try:
+            from tools.acceptance_ledger_weekly import build_weekly_template_workbook
+        except ModuleNotFoundError as exc:  # Direct: python tools/<script>.py
+            if exc.name != "tools":
+                raise
+            from acceptance_ledger_weekly import build_weekly_template_workbook
+
+        return build_weekly_template_workbook(
+            config=config,
+            config_path=config_path,
+            output_path=output_path,
+            existing_workbook=existing_workbook,
+        )
     suppliers = config.get("suppliers")
     if not isinstance(suppliers, list) or not suppliers:
         raise ValueError("config suppliers must be a non-empty list")
@@ -405,12 +420,14 @@ def _load_configured_records(
     config_dir: Path,
     required: bool,
     notes: list[str],
+    note_if_unconfigured: bool = True,
 ) -> list[dict[str, Any]]:
     value = config.get(key)
     if not value:
         if required:
             raise FileNotFoundError(f"required input {key} is not configured")
-        notes.append(f"{key}=not_evaluated")
+        if note_if_unconfigured:
+            notes.append(f"{key}=not_evaluated")
         return []
     path = _resolve_input_path(value, config_dir)
     if not path.exists():
