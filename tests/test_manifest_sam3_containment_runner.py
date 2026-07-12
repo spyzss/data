@@ -289,6 +289,99 @@ def test_write_overlays_keeps_per_hand_and_adds_combined_review_images(
     assert all("combined_overlay_path" not in row for row in frame_rows)
 
 
+def test_default_overlay_mode_writes_combined_only_and_canonical_evidence_manifest(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_sam3_containment import run_manifest_sam3_containment
+
+    manifest, windows, _, _ = _write_inputs(tmp_path)
+    output_dir = tmp_path / "sam3"
+
+    run_manifest_sam3_containment(
+        manifest=manifest,
+        candidate_windows=windows,
+        supplier="jdt",
+        output_dir=output_dir,
+        frames_per_window=3,
+        sam3_model=None,
+        source_cache=FakeSourceCache(),
+        segmenter=FakeSegmenter(),
+    )
+
+    frame_rows = json.loads(
+        (output_dir / "frame_keypoint_containment.json").read_text()
+    )
+    assert {row["hand_side"] for row in frame_rows} == {"left", "right"}
+    assert all("overlay_path" not in row for row in frame_rows)
+    assert not (output_dir / "overlays").exists()
+    combined_paths = sorted((output_dir / "combined_overlays").glob("*.png"))
+    assert len(combined_paths) == 5
+
+    csv_rows = pd.read_csv(output_dir / "review_evidence_manifest.csv")
+    parquet_rows = pd.read_parquet(output_dir / "review_evidence_manifest.parquet")
+    expected_columns = {
+        "review_id",
+        "supplier_id",
+        "asset_id",
+        "window_start_frame",
+        "window_end_frame",
+        "frame_idx",
+        "source_module",
+        "evidence_type",
+        "hand_side",
+        "source_path",
+        "metadata_json",
+    }
+    assert set(csv_rows.columns) == expected_columns
+    assert list(parquet_rows.columns) == list(csv_rows.columns)
+    assert len(csv_rows) == 5
+    assert csv_rows["review_id"].fillna("").eq("").all()
+    assert csv_rows["supplier_id"].eq("jdt").all()
+    assert csv_rows["source_module"].eq("sam3_containment").all()
+    assert csv_rows["evidence_type"].eq("combined_overlay").all()
+    assert csv_rows["hand_side"].eq("both").all()
+    assert all(Path(path).exists() for path in csv_rows["source_path"])
+    run_config = json.loads((output_dir / "run_config.json").read_text())
+    assert run_config["overlay_mode"] == "combined"
+
+
+def test_overlay_mode_per_hand_keeps_metrics_without_combined_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.run_manifest_sam3_containment as runner
+
+    manifest, windows, _, _ = _write_inputs(tmp_path)
+    output_dir = tmp_path / "sam3"
+
+    def write_per_hand(**kwargs):
+        target = kwargs["output_dir"] / (
+            f"{kwargs['clip_id']}_{kwargs['frame_idx']:06d}.png"
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"png")
+        return target
+
+    monkeypatch.setattr(runner, "write_overlay_image", write_per_hand)
+    runner.run_manifest_sam3_containment(
+        manifest=manifest,
+        candidate_windows=windows,
+        supplier="jdt",
+        output_dir=output_dir,
+        sam3_model=None,
+        overlay_mode="per-hand",
+        source_cache=FakeSourceCache(),
+        segmenter=FakeSegmenter(),
+    )
+
+    rows = json.loads((output_dir / "frame_keypoint_containment.json").read_text())
+    assert {row["hand_side"] for row in rows} == {"left", "right"}
+    assert all(Path(row["overlay_path"]).exists() for row in rows)
+    assert not (output_dir / "combined_overlays").exists()
+    evidence = pd.read_csv(output_dir / "review_evidence_manifest.csv")
+    assert evidence.empty
+
+
 def test_left_only_window_combined_overlay_receives_both_hands(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

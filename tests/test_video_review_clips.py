@@ -10,14 +10,298 @@ from tools.build_video_review_clips import (
     HAND_JOINT_NAMES,
     VIDEO_MANUAL_LABEL_COLUMNS,
     apply_video_clip_policy,
+    apply_evidence_manifest,
     build_clip_rows,
     build_review_index_video_html,
     compute_clip_timing,
     estimate_sampled_frames,
     project_world_keypoints_to_image,
     render_sampled_frames,
+    read_evidence_manifest,
     sampled_frame_indices,
 )
+
+
+def _review_rows_for_evidence(tmp_path: Path) -> list[dict]:
+    manifest = pd.DataFrame(
+        [
+            {
+                "supplier_id": "jdt",
+                "asset_id": "jd-asset",
+                "video_path": str(tmp_path / "source.mp4"),
+                "fps": 30.0,
+                "frame_count": 100,
+            }
+        ]
+    )
+    review_queue = pd.DataFrame(
+        [
+            {
+                "review_id": "review-001",
+                "supplier_id": "jdt",
+                "asset_id": "jd-asset",
+                "window_start_frame": 10,
+                "window_end_frame": 20,
+            }
+        ]
+    )
+    return build_clip_rows(
+        manifest,
+        review_queue,
+        output_dir=tmp_path / "video_review",
+        padding_sec=0.0,
+    )
+
+
+def _write_evidence_images(tmp_path: Path, frames: list[int]) -> dict[int, Path]:
+    paths = {}
+    for frame_idx in frames:
+        path = tmp_path / "sam3" / f"frame_{frame_idx:06d}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"png")
+        paths[frame_idx] = path
+    return paths
+
+
+def test_evidence_manifest_csv_matches_review_id_and_sorts_numeric_frames(
+    tmp_path: Path,
+) -> None:
+    rows = _review_rows_for_evidence(tmp_path)
+    paths = _write_evidence_images(tmp_path, [10, 12, 20])
+    evidence_path = tmp_path / "review_evidence_manifest.csv"
+    pd.DataFrame(
+        [
+            {
+                "review_id": "review-001",
+                "frame_idx": frame_idx,
+                "source_module": "sam3_containment",
+                "evidence_type": "combined_overlay",
+                "hand_side": "both",
+                "source_path": str(paths[frame_idx]),
+                "metadata_json": json.dumps({"source_frame_idx": frame_idx}),
+            }
+            for frame_idx in [20, 10, 12]
+        ]
+    ).to_csv(evidence_path, index=False)
+
+    evidence = read_evidence_manifest(evidence_path)
+    apply_evidence_manifest(
+        rows,
+        evidence,
+        evidence_base_dir=evidence_path.parent,
+        output_dir=tmp_path / "video_review",
+        rendering_enabled=False,
+    )
+
+    sampled = json.loads(rows[0]["sampled_frames_json"])
+    assert [frame["frame_idx"] for frame in sampled] == [10, 12, 20]
+    assert all(frame["source_module"] == "sam3_containment" for frame in sampled)
+    assert all(frame["evidence_type"] == "combined_overlay" for frame in sampled)
+    assert all(frame["hand_side"] == "both" for frame in sampled)
+    assert sampled[0]["source_path"] == str(paths[10])
+    assert sampled[0]["display_frame_path"] == "../sam3/frame_000010.png"
+    assert rows[0]["sampled_frame_count"] == 3
+    assert rows[0]["evidence_source_mode"] == "manifest"
+    assert rows[0]["evidence_source_module"] == "sam3_containment"
+    assert rows[0]["evidence_type"] == "combined_overlay"
+    assert rows[0]["evidence_hand_side"] == "both"
+    html = build_review_index_video_html(rows)
+    assert "ArrowLeft" in html
+    assert "Accept whole window" in html
+    assert "Add rejected segment" in html
+
+
+def test_evidence_manifest_parquet_uses_composite_fallback(tmp_path: Path) -> None:
+    rows = _review_rows_for_evidence(tmp_path)
+    paths = _write_evidence_images(tmp_path, [11])
+    evidence_path = tmp_path / "review_evidence_manifest.parquet"
+    pd.DataFrame(
+        [
+            {
+                "review_id": "",
+                "supplier_id": "jdt",
+                "asset_id": "jd-asset",
+                "window_start_frame": 10,
+                "window_end_frame": 20,
+                "frame_idx": 11,
+                "source_module": "sam3_containment",
+                "evidence_type": "combined_overlay",
+                "hand_side": "both",
+                "source_path": str(paths[11]),
+                "metadata_json": "{}",
+            }
+        ]
+    ).to_parquet(evidence_path, index=False)
+
+    apply_evidence_manifest(
+        rows,
+        read_evidence_manifest(evidence_path),
+        evidence_base_dir=evidence_path.parent,
+        output_dir=tmp_path / "video_review",
+        rendering_enabled=False,
+    )
+
+    assert rows[0]["evidence_source_mode"] == "manifest"
+    assert json.loads(rows[0]["sampled_frames_json"])[0]["frame_idx"] == 11
+
+
+def test_exact_review_id_evidence_takes_priority_over_composite(tmp_path: Path) -> None:
+    rows = _review_rows_for_evidence(tmp_path)
+    paths = _write_evidence_images(tmp_path, [10, 11])
+    evidence = pd.DataFrame(
+        [
+            {
+                "review_id": "review-001",
+                "frame_idx": 10,
+                "source_path": str(paths[10]),
+            },
+            {
+                "review_id": "",
+                "supplier_id": "jdt",
+                "asset_id": "jd-asset",
+                "window_start_frame": 10,
+                "window_end_frame": 20,
+                "frame_idx": 11,
+                "source_path": str(paths[11]),
+            },
+        ]
+    )
+
+    apply_evidence_manifest(
+        rows,
+        evidence,
+        evidence_base_dir=tmp_path,
+        output_dir=tmp_path / "video_review",
+        rendering_enabled=False,
+    )
+
+    sampled = json.loads(rows[0]["sampled_frames_json"])
+    assert [frame["frame_idx"] for frame in sampled] == [10]
+
+
+def test_exact_duplicate_evidence_rows_are_deduplicated(tmp_path: Path) -> None:
+    rows = _review_rows_for_evidence(tmp_path)
+    paths = _write_evidence_images(tmp_path, [10])
+    evidence_row = {
+        "review_id": "review-001",
+        "frame_idx": 10,
+        "source_path": str(paths[10]),
+    }
+
+    apply_evidence_manifest(
+        rows,
+        pd.DataFrame([evidence_row, dict(evidence_row)]),
+        evidence_base_dir=tmp_path,
+        output_dir=tmp_path / "video_review",
+        rendering_enabled=False,
+    )
+
+    assert rows[0]["sampled_frame_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda row: row.update(frame_idx=21), "outside review window"),
+        (lambda row: row.update(source_path="missing.png"), "source_path does not exist"),
+    ],
+)
+def test_evidence_manifest_rejects_invalid_rows(tmp_path: Path, mutate, message: str) -> None:
+    rows = _review_rows_for_evidence(tmp_path)
+    paths = _write_evidence_images(tmp_path, [10])
+    evidence_row = {
+        "review_id": "review-001",
+        "frame_idx": 10,
+        "source_path": str(paths[10]),
+    }
+    mutate(evidence_row)
+
+    with pytest.raises(ValueError, match=message):
+        apply_evidence_manifest(
+            rows,
+            pd.DataFrame([evidence_row]),
+            evidence_base_dir=tmp_path,
+            output_dir=tmp_path / "video_review",
+            rendering_enabled=False,
+        )
+
+
+def test_evidence_manifest_rejects_ambiguous_and_conflicting_matches(
+    tmp_path: Path,
+) -> None:
+    rows = _review_rows_for_evidence(tmp_path)
+    duplicate = dict(rows[0])
+    rows.append(duplicate)
+    paths = _write_evidence_images(tmp_path, [10, 11])
+    exact = pd.DataFrame(
+        [{"review_id": "review-001", "frame_idx": 10, "source_path": str(paths[10])}]
+    )
+    with pytest.raises(ValueError, match="ambiguous review_id"):
+        apply_evidence_manifest(
+            rows,
+            exact,
+            evidence_base_dir=tmp_path,
+            output_dir=tmp_path / "video_review",
+            rendering_enabled=False,
+        )
+
+    rows = rows[:1]
+    conflict = pd.DataFrame(
+        [
+            {"review_id": "review-001", "frame_idx": 10, "source_path": str(paths[10])},
+            {"review_id": "review-001", "frame_idx": 10, "source_path": str(paths[11])},
+        ]
+    )
+    with pytest.raises(ValueError, match="conflicting source paths"):
+        apply_evidence_manifest(
+            rows,
+            conflict,
+            evidence_base_dir=tmp_path,
+            output_dir=tmp_path / "video_review",
+            rendering_enabled=False,
+        )
+
+
+def test_unmatched_evidence_row_requires_rendering_fallback(tmp_path: Path) -> None:
+    rows = _review_rows_for_evidence(tmp_path)
+    evidence = pd.DataFrame(columns=["frame_idx", "source_path"])
+
+    with pytest.raises(ValueError, match="no matched evidence"):
+        apply_evidence_manifest(
+            rows,
+            evidence,
+            evidence_base_dir=tmp_path,
+            output_dir=tmp_path / "video_review",
+            rendering_enabled=False,
+        )
+
+    apply_evidence_manifest(
+        rows,
+        evidence,
+        evidence_base_dir=tmp_path,
+        output_dir=tmp_path / "video_review",
+        rendering_enabled=True,
+    )
+    assert rows[0]["evidence_source_mode"] == "generated"
+
+
+def test_manifest_evidence_is_not_rerendered(tmp_path: Path) -> None:
+    rows = _review_rows_for_evidence(tmp_path)
+    paths = _write_evidence_images(tmp_path, [10])
+    apply_evidence_manifest(
+        rows,
+        pd.DataFrame(
+            [{"review_id": "review-001", "frame_idx": 10, "source_path": str(paths[10])}]
+        ),
+        evidence_base_dir=tmp_path,
+        output_dir=tmp_path / "video_review",
+        rendering_enabled=False,
+    )
+
+    render_sampled_frames(rows, overwrite=True, render_overlay=False)
+
+    assert rows[0]["sampled_frame_error"] == ""
+    assert paths[10].read_bytes() == b"png"
 
 
 def test_compute_clip_timing_for_frame_window_clamps_to_asset_duration() -> None:
