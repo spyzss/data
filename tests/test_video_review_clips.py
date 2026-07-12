@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from urllib.parse import urljoin
 
 import numpy as np
 import pandas as pd
@@ -716,19 +717,46 @@ def test_video_review_html_autosaves_and_loads_saved_progress() -> None:
 def test_video_review_html_contains_server_autosave_with_fallbacks() -> None:
     html = build_review_index_video_html([])
 
-    assert "const SERVER_SAVE_ENDPOINT='api/manual-review/save'" in html
-    assert "const SERVER_SAVE_ENDPOINT='/api/manual-review/save'" not in html
+    assert "new URL('./__manual_review_save__',window.location.href)" in html
+    assert "fetch(SERVER_SAVE_ENDPOINT" in html
+    assert "fetch('/" not in html
+    assert 'fetch("/' not in html
     assert "function buildManualLabelsCsv" in html
     assert "function buildProgressJson" in html
     assert "function saveToLocalStorage" in html
     assert "function saveToServer" in html
     assert "debouncedServerAutosave" in html
     assert "Saved locally" in html
-    assert "Saved to server at" in html
+    assert "Saved to server:" in html
     assert "Server save failed:" in html
     assert "Export manual_labels.csv" in html
     assert "Export progress JSON" in html
     assert "localStorage" in html
+
+
+@pytest.mark.parametrize("review_dir", ["video_review", "video_review_full"])
+def test_manual_review_save_endpoint_preserves_proxy_prefix(review_dir: str) -> None:
+    page_url = (
+        "https://gateway.example/dsw-id/ide/proxy/8899/"
+        f"{review_dir}/review_index_video.html"
+    )
+
+    resolved = urljoin(page_url, "./__manual_review_save__")
+
+    assert resolved == (
+        "https://gateway.example/dsw-id/ide/proxy/8899/"
+        f"{review_dir}/__manual_review_save__"
+    )
+
+
+def test_video_review_server_status_uses_response_rows_timestamp_and_error_message() -> None:
+    html = build_review_index_video_html([])
+
+    assert "manual_label_row_count" in html
+    assert "saved_at_utc" in html
+    assert "serverPayload.error" in html
+    assert "HTTP ${response.status}" in html
+    assert "Server save failed:" in html
 
 
 def test_video_review_html_has_explicit_cloud_save_button() -> None:
