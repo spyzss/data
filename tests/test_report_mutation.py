@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+import qc_common.report_mutation as report_mutation
+from qc_common.config import LoadedQcConfig
 from qc_common.contracts import EvidenceRef, Issue, ModuleResult
 from qc_common.report import StaleReportRevisionError
 from qc_common.report_mutation import (
@@ -18,11 +20,52 @@ from qc_pipeline.context import AssetContext
 from tests.qc_report_fixtures import make_asset_context, loaded_test_config
 
 
+def advance_to_module(
+    context: AssetContext,
+    *,
+    target_module: str,
+    profile: str = "acceptance",
+) -> tuple[LoadedQcConfig, int]:
+    config = loaded_test_config()
+    revision = 0
+    modules = config.pipeline_modules
+    target_index = modules.index(target_module)
+    for index, module in enumerate(modules[:target_index]):
+        next_module = modules[index + 1]
+        if module in {"semantic_consistency", "manual_review"}:
+            report = write_pipeline_transition(
+                context.report_path,
+                expected_revision=revision,
+                module=module,
+                state="running",
+                next_module=next_module,
+                stop_reason=None,
+                overall_decision=None,
+                now=f"2026-07-14T00:00:{revision:02d}Z",
+            )
+        else:
+            report = apply_module_result(
+                context.report_path,
+                context=context,
+                config=config,
+                profile=profile,
+                result=ModuleResult(module, "pass", {}, {}),
+                expected_revision=revision,
+                next_module=next_module,
+                now=f"2026-07-14T00:00:{revision:02d}Z",
+            )
+        revision = report["report_revision"]
+    return config, revision
+
+
 def test_module_rerun_replaces_only_owned_block_and_rebuilds_candidates(
     tmp_path: Path,
 ) -> None:
     context = make_asset_context(tmp_path, "a")
-    config = loaded_test_config()
+    config, revision = advance_to_module(
+        context,
+        target_module="keypoint_temporal",
+    )
     issue = Issue(
         "keypoint_temporal:jump:11111111111111111111",
         "jump",
@@ -45,7 +88,7 @@ def test_module_rerun_replaces_only_owned_block_and_rebuilds_candidates(
         result=ModuleResult(
             "keypoint_temporal", "warn", {}, {"run": 1}, (issue,)
         ),
-        expected_revision=0,
+        expected_revision=revision,
         next_module="video_quality",
         now="2026-07-14T00:00:00Z",
     )
@@ -57,7 +100,7 @@ def test_module_rerun_replaces_only_owned_block_and_rebuilds_candidates(
         config=config,
         profile="acceptance",
         result=ModuleResult("keypoint_temporal", "pass", {}, {"run": 2}),
-        expected_revision=1,
+        expected_revision=revision + 1,
         next_module="video_quality",
         now="2026-07-14T00:01:00Z",
     )
@@ -213,6 +256,125 @@ def test_module_order_error_never_changes_file(tmp_path: Path) -> None:
     assert context.report_path.read_bytes() == before
 
 
+def test_fresh_report_rejects_out_of_order_first_module(tmp_path: Path) -> None:
+    context = make_asset_context(tmp_path, "a")
+
+    with pytest.raises(ModuleOrderError, match="expected current module hdf5_text_info"):
+        apply_module_result(
+            context.report_path,
+            context=context,
+            config=loaded_test_config(),
+            profile="acceptance",
+            result=ModuleResult("keypoint_temporal", "pass", {}, {}),
+            expected_revision=0,
+            next_module="video_quality",
+            now="2026-07-14T00:00:00Z",
+        )
+
+    assert not context.report_path.exists()
+
+
+def test_invalid_issue_is_preflighted_before_owned_candidate_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = make_asset_context(tmp_path, "a")
+    invalid_issue = Issue(
+        "quality_hand:wrong-owner:11111111111111111111",
+        "wrong_owner",
+        "warn",
+        "quality_hand",
+        "wrong_owner",
+        "score",
+        0.5,
+        "<",
+        0.9,
+        "quality_hand.single_hand_low_quality",
+        True,
+    )
+    replacement_called = False
+    original = report_mutation._replace_owned_issues
+
+    def track_replacement(*args: object, **kwargs: object) -> None:
+        nonlocal replacement_called
+        replacement_called = True
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(report_mutation, "_replace_owned_issues", track_replacement)
+
+    with pytest.raises(ValueError, match="belongs to quality_hand, not hdf5_text_info"):
+        apply_module_result(
+            context.report_path,
+            context=context,
+            config=loaded_test_config(),
+            profile="acceptance",
+            result=ModuleResult(
+                "hdf5_text_info",
+                "warn",
+                {},
+                {},
+                (invalid_issue,),
+            ),
+            expected_revision=0,
+            next_module="quality_hand",
+            now="2026-07-14T00:00:00Z",
+        )
+
+    assert replacement_called is False
+    assert not context.report_path.exists()
+
+
+def test_unserializable_issue_is_preflighted_before_owned_candidate_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = make_asset_context(tmp_path, "a")
+    invalid_issue = Issue(
+        "hdf5_text_info:bad-context:11111111111111111111",
+        "bad_context",
+        "warn",
+        "hdf5_text_info",
+        "bad_context",
+        "field_count",
+        1,
+        ">",
+        0,
+        "hdf5_text.missing_required_field",
+        True,
+        {"not_json": tmp_path / "evidence.json"},
+    )
+    replacement_called = False
+    original = report_mutation._replace_owned_issues
+
+    def track_replacement(*args: object, **kwargs: object) -> None:
+        nonlocal replacement_called
+        replacement_called = True
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(report_mutation, "_replace_owned_issues", track_replacement)
+
+    with pytest.raises(ValueError, match="issue .* is not JSON serializable"):
+        apply_module_result(
+            context.report_path,
+            context=context,
+            config=loaded_test_config(),
+            profile="acceptance",
+            result=ModuleResult(
+                "hdf5_text_info",
+                "warn",
+                {},
+                {},
+                (invalid_issue,),
+            ),
+            expected_revision=0,
+            next_module="quality_hand",
+            now="2026-07-14T00:00:00Z",
+        )
+
+    assert replacement_called is False
+    assert not context.report_path.exists()
+
+
 def test_schema_failure_never_changes_file(tmp_path: Path) -> None:
     context = make_asset_context(tmp_path, "a")
     config = loaded_test_config()
@@ -248,14 +410,17 @@ def test_manual_semantic_extension_is_preserved_opaque_on_rerun(
     tmp_path: Path,
 ) -> None:
     context = make_asset_context(tmp_path, "a")
-    config = loaded_test_config()
+    config, revision = advance_to_module(
+        context,
+        target_module="keypoint_temporal",
+    )
     report = apply_module_result(
         context.report_path,
         context=context,
         config=config,
         profile="acceptance",
         result=ModuleResult("keypoint_temporal", "pass", {}, {}),
-        expected_revision=0,
+        expected_revision=revision,
         next_module="video_quality",
         now="2026-07-14T00:00:00Z",
     )
@@ -279,7 +444,7 @@ def test_manual_semantic_extension_is_preserved_opaque_on_rerun(
         config=config,
         profile="acceptance",
         result=ModuleResult("keypoint_temporal", "pass", {}, {"run": 2}),
-        expected_revision=1,
+        expected_revision=revision + 1,
         next_module="video_quality",
         now="2026-07-14T00:01:00Z",
     )
@@ -335,13 +500,18 @@ def test_profile_changes_exit_action_without_rewriting_machine_fail(
 
 def test_terminal_supplier_fail_remains_machine_fail(tmp_path: Path) -> None:
     context = make_asset_context(tmp_path, "a")
+    config, revision = advance_to_module(
+        context,
+        target_module="effective_duration",
+        profile="supplier_evaluation",
+    )
     report = apply_module_result(
         context.report_path,
         context=context,
-        config=loaded_test_config(),
+        config=config,
         profile="supplier_evaluation",
         result=ModuleResult("effective_duration", "fail", {}, {}),
-        expected_revision=0,
+        expected_revision=revision,
         next_module=None,
         now="2026-07-14T00:00:00Z",
     )

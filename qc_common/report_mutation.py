@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -104,16 +105,12 @@ def _assert_module_order(
     result_module: str,
     next_module: str | None,
     modules: tuple[str, ...],
-    existing: bool,
 ) -> None:
     configured_next = _expected_next_module(modules, result_module)
     if next_module != configured_next:
         raise ModuleOrderError(
             f"next_module for {result_module} must be {configured_next}, got {next_module}"
         )
-    if not existing:
-        return
-
     pipeline_state = report.get("pipeline_state")
     if not isinstance(pipeline_state, Mapping):
         raise ModuleOrderError("pipeline_state must be an object")
@@ -154,6 +151,7 @@ def _assert_evidence_path(context: AssetContext, evidence: EvidenceRef) -> None:
 def _module_block(
     result: ModuleResult,
     *,
+    evidence: list[dict[str, Any]],
     exit_state: str,
     continue_to_next: bool,
     next_module: str | None,
@@ -181,23 +179,12 @@ def _module_block(
         },
         "evaluation": copy.deepcopy(dict(result.evaluation)),
         "metrics": copy.deepcopy(dict(result.metrics)),
-        "evidence": [item.to_dict() for item in result.evidence],
+        "evidence": evidence,
         "runtime": copy.deepcopy(dict(result.runtime)),
     }
 
 
-def _replace_owned_issues(
-    report: dict[str, Any],
-    result: ModuleResult,
-) -> None:
-    existing_issues = report.get("issues", [])
-    if not isinstance(existing_issues, list):
-        raise ValueError("issues must be an array")
-    preserved = [
-        copy.deepcopy(issue)
-        for issue in existing_issues
-        if not isinstance(issue, Mapping) or issue.get("module") != result.module
-    ]
+def _preflight_owned_issues(result: ModuleResult) -> list[dict[str, Any]]:
     owned: list[dict[str, Any]] = []
     seen_issue_ids: set[str] = set()
     for issue in result.issues:
@@ -205,11 +192,53 @@ def _replace_owned_issues(
             raise ValueError(
                 f"issue {issue.issue_id} belongs to {issue.module}, not {result.module}"
             )
+        try:
+            payload = issue.to_dict()
+            json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"issue {issue.issue_id} is not JSON serializable: {exc}"
+            ) from exc
         if issue.issue_id in seen_issue_ids:
             continue
         seen_issue_ids.add(issue.issue_id)
-        owned.append(issue.to_dict())
-    report["issues"] = preserved + owned
+        owned.append(payload)
+    return owned
+
+
+def _preflight_evidence(
+    context: AssetContext,
+    result: ModuleResult,
+) -> list[dict[str, Any]]:
+    evidence_payload: list[dict[str, Any]] = []
+    for evidence in result.evidence:
+        _assert_evidence_path(context, evidence)
+        try:
+            payload = evidence.to_dict()
+            json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"evidence {evidence.evidence_id} is not JSON serializable: {exc}"
+            ) from exc
+        evidence_payload.append(payload)
+    return evidence_payload
+
+
+def _replace_owned_issues(
+    report: dict[str, Any],
+    *,
+    module: str,
+    owned: list[dict[str, Any]],
+) -> None:
+    existing_issues = report.get("issues", [])
+    if not isinstance(existing_issues, list):
+        raise ValueError("issues must be an array")
+    preserved = [
+        copy.deepcopy(issue)
+        for issue in existing_issues
+        if not isinstance(issue, Mapping) or issue.get("module") != module
+    ]
+    report["issues"] = preserved + copy.deepcopy(owned)
 
 
 def _rebuild_issue_collections(report: dict[str, Any]) -> None:
@@ -269,7 +298,6 @@ def apply_module_result(
     _assert_same_report_path(path, context)
     profile_config = config.execution_profile(profile)
     loaded = load_asset_qc_report(path)
-    existing = loaded is not None
     if loaded is None:
         report = initialize_v2_report(context, config, profile, now)
     elif loaded.get("schema_version") == "asset_qc_report.v1":
@@ -299,23 +327,33 @@ def apply_module_result(
         result_module=result.module,
         next_module=next_module,
         modules=config.pipeline_modules,
-        existing=existing,
     )
-    for evidence in result.evidence:
-        _assert_evidence_path(context, evidence)
-
-    report.pop(result.module, None)
-    _replace_owned_issues(report, result)
-
+    owned_issues = _preflight_owned_issues(result)
+    evidence = _preflight_evidence(context, result)
     hard_stop = result.verdict == "fail" and profile_config["fail_action"] == "stop"
     continue_to_next = not hard_stop
     exit_state = "continue" if continue_to_next else "stop_qc"
-    report[result.module] = _module_block(
+    module_block = _module_block(
         result,
+        evidence=evidence,
         exit_state=exit_state,
         continue_to_next=continue_to_next,
         next_module=next_module,
     )
+    try:
+        json.dumps(module_block, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"module result {result.module} is not JSON serializable: {exc}"
+        ) from exc
+
+    report.pop(result.module, None)
+    _replace_owned_issues(
+        report,
+        module=result.module,
+        owned=owned_issues,
+    )
+    report[result.module] = module_block
 
     _rebuild_issue_collections(report)
 
