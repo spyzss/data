@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import qc_pipeline.adapters.precheck as precheck_adapter
 from precheck.config import (
     CompositeFrameVerdictConfig,
     KeypointMissingConfig,
@@ -335,6 +336,47 @@ def test_presence_nonfinite_valid_count_maps_to_hard_fail(
     assert result.issues[0].rule_id == "keypoint_presence.nan_or_inf"
     assert result.issues[0].observed_value == serialized
     assert result.issues[0].context["hand_side"] == "left"
+
+
+@pytest.mark.parametrize(
+    ("invalid_value", "serialized"),
+    [(float("nan"), "nan"), (float("inf"), "inf")],
+)
+def test_presence_nonfinite_missing_ratio_maps_to_stable_hard_fail(
+    invalid_value: float,
+    serialized: str,
+) -> None:
+    rows = [
+        CheckResult(
+            "keypoint_missing",
+            0,
+            7,
+            {
+                "quality_low_left": 0.0,
+                "quality_low_right": 0.0,
+                "missing_fraction_in_10s_window_left": invalid_value,
+                "missing_fraction_in_10s_window_right": 0.0,
+            },
+            True,
+            "nonfinite rolling ratio",
+        )
+    ]
+    kwargs = {
+        "asset_id": "a",
+        "source_relative_path": "hdf5/a.h5",
+        "results": rows,
+        "config": loaded_test_config(),
+    }
+
+    result = adapt_keypoint_presence(**kwargs)
+    repeated = adapt_keypoint_presence(**kwargs)
+
+    assert result.verdict == "fail"
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_id == "keypoint_presence.nan_or_inf"
+    assert result.issues[0].observed_value == serialized
+    assert result.issues[0].context["hand_side"] == "left"
+    assert repeated.issues[0].issue_id == result.issues[0].issue_id
 
 
 def test_presence_missing_ratio_warn_becomes_manual_candidate() -> None:
@@ -698,6 +740,72 @@ def test_morphology_merges_only_contiguous_same_rule_and_side_frames() -> None:
     assert [evidence.evidence_id for evidence in repeated.evidence] == [
         evidence.evidence_id for evidence in result.evidence
     ]
+
+
+def test_morphology_does_not_merge_different_failure_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared_rule_id = precheck_adapter.MORPHOLOGY_REASON_TO_RULE[
+        "bone_length_ratio_spread"
+    ]
+    monkeypatch.setitem(
+        precheck_adapter.MORPHOLOGY_REASON_TO_RULE,
+        "joint_angle_min_deg",
+        shared_rule_id,
+    )
+    rows = [
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            10,
+            {
+                "morphology_verdict": "review",
+                "which_thresholds_exceeded": [
+                    "left:bone_length_ratio_spread_review"
+                ],
+                "left_bone_length_ratio_spread": 4.0,
+            },
+            None,
+            "spread review",
+        ),
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            11,
+            {
+                "morphology_verdict": "review",
+                "which_thresholds_exceeded": [
+                    "left:joint_angle_min_deg_review"
+                ],
+                "left_joint_angle_min_deg": 4.0,
+            },
+            None,
+            "angle review",
+        ),
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            -1,
+            {"morphology_verdict": "review", "num_frames": 2},
+            None,
+            "summary",
+        ),
+    ]
+
+    result = adapt_keypoint_morphology(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert len(result.issues) == 2
+    assert [issue.metric for issue in result.issues] == [
+        "bone_length_ratio_spread",
+        "joint_angle_min_deg",
+    ]
+    assert [issue.operator for issue in result.issues] == [">=", "<="]
+    assert [issue.boundary_value for issue in result.issues] == [3.0, 5.0]
 
 
 def test_morphology_does_not_infer_thresholds_from_reason_text() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import fields, replace
@@ -100,18 +101,7 @@ _MORPHOLOGY_THRESHOLD_PARAMETER = {
 }
 
 
-class _PresenceFailure(NamedTuple):
-    side: str
-    frame: int
-    severity: Verdict
-    rule: Mapping[str, Any]
-    metric: str
-    observed: Any
-    operator: str
-    boundary: Any
-
-
-class _MorphologyFailure(NamedTuple):
+class _NormalizedFailure(NamedTuple):
     side: str
     frame: int
     severity: Verdict
@@ -120,6 +110,9 @@ class _MorphologyFailure(NamedTuple):
     observed: Any
     operator: str
     boundary: Any
+
+
+_CompactedFailure = tuple[_NormalizedFailure, tuple[int, int]]
 
 
 def _worst(*verdicts: Verdict) -> Verdict:
@@ -479,6 +472,56 @@ def _contiguous_ranges(frames: Sequence[int]) -> tuple[tuple[int, int], ...]:
     return tuple((start, end) for start, end in ranges)
 
 
+def _compact_failures(
+    failures: Sequence[_NormalizedFailure],
+) -> tuple[_CompactedFailure, ...]:
+    """Compact adjacent normalized failures with identical issue semantics."""
+    def canonical(value: Any) -> str:
+        return json.dumps(
+            _json_safe_observed(value), sort_keys=True, separators=(",", ":")
+        )
+
+    grouped: dict[tuple[Any, ...], list[_NormalizedFailure]] = {}
+    for failure in failures:
+        compatibility = (
+            failure.side, failure.severity, failure.rule_id,
+            failure.metric, failure.operator, canonical(failure.boundary),
+        )
+        grouped.setdefault(compatibility, []).append(failure)
+
+    compacted: list[_CompactedFailure] = []
+    for compatible in grouped.values():
+        example = compatible[0]
+        ranges = _contiguous_ranges(tuple(item.frame for item in compatible))
+        for start_frame, end_frame in ranges:
+            observed = [
+                item.observed for item in compatible
+                if start_frame <= item.frame <= end_frame
+            ]
+            if example.operator in {"<", "<="}:
+                extreme: Any = min(observed)
+            elif example.operator in {">", ">="}:
+                extreme = max(observed)
+            else:
+                unique = {canonical(value): _json_safe_observed(value) for value in observed}
+                ordered = [unique[key] for key in sorted(unique)]
+                extreme = ordered[0] if len(ordered) == 1 else ordered
+            compacted.append(
+                (example._replace(frame=start_frame, observed=extreme), (start_frame, end_frame))
+            )
+
+    return tuple(
+        sorted(
+            compacted,
+            key=lambda item: (
+                item[1][0], item[1][1], item[0].side,
+                item[0].rule_id, item[0].severity, item[0].metric,
+                item[0].operator, repr(item[0].boundary),
+            ),
+        )
+    )
+
+
 def adapt_keypoint_presence(
     *,
     asset_id: str,
@@ -577,7 +620,7 @@ def adapt_keypoint_presence(
             if isinstance(count, Real):
                 observed["counts"].append(float(count))
             ratio = row.metrics.get(f"missing_fraction_in_10s_window_{side}")
-            if isinstance(ratio, Real) and math.isfinite(float(ratio)):
+            if isinstance(ratio, Real):
                 observed["ratios"].append(float(ratio))
             missing = row.metrics.get(f"missing_keypoint_count_{side}")
             observed["missing"] |= isinstance(missing, Real) and float(missing) > 0
@@ -585,7 +628,7 @@ def adapt_keypoint_presence(
                 row.metrics.get(f"quality_low_{side}", 0.0)
             )
 
-    selected: dict[tuple[str, int], _PresenceFailure] = {}
+    selected: dict[tuple[str, int], _NormalizedFailure] = {}
     for side in ("left", "right"):
         count_metric = f"valid_keypoint_count_{side}"
         ratio_metric = f"missing_fraction_in_10s_window_{side}"
@@ -626,44 +669,66 @@ def adapt_keypoint_presence(
             nonfinite_counts = [value for value in counts if not math.isfinite(value)]
             finite_frame_counts = [value for value in counts if math.isfinite(value)]
             count = min(finite_frame_counts, default=expected_count)
-            explicit_ratio = max(observed["ratios"], default=-math.inf)
+            nonfinite_ratios = [
+                value for value in observed["ratios"] if not math.isfinite(value)
+            ]
+            explicit_ratio = max(
+                (
+                    value
+                    for value in observed["ratios"]
+                    if math.isfinite(value)
+                ),
+                default=-math.inf,
+            )
             aggregate_ratio = (
                 side_invalid_ratio
                 if frame in side_detector_invalid_frames
                 else -math.inf
             )
             ratio = max(explicit_ratio, aggregate_ratio)
-            failure: _PresenceFailure | None = None
-            if nonfinite_counts and parameters["nan_or_inf_fail"]:
-                failure = _PresenceFailure(
-                    side, frame, "fail", nonfinite_rule, count_metric,
-                    _json_safe_observed(nonfinite_counts[0]), "is_finite", True,
+            failure: _NormalizedFailure | None = None
+            if (
+                nonfinite_counts or nonfinite_ratios
+            ) and parameters["nan_or_inf_fail"]:
+                metric = count_metric if nonfinite_counts else ratio_metric
+                invalid_value = (
+                    nonfinite_counts[0]
+                    if nonfinite_counts
+                    else nonfinite_ratios[0]
+                )
+                failure = _NormalizedFailure(
+                    side, frame, "fail", str(nonfinite_rule["rule_id"]), metric,
+                    _json_safe_observed(invalid_value), "is_finite", True,
                 )
             elif count < count_fail_boundary:
-                failure = _PresenceFailure(
-                    side, frame, "fail", count_rule, count_metric, count,
+                failure = _NormalizedFailure(
+                    side, frame, "fail", str(count_rule["rule_id"]), count_metric, count,
                     "<", count_fail_boundary,
                 )
             elif ratio >= ratio_fail_boundary:
                 metric = ratio_metric if explicit_ratio >= aggregate_ratio else f"invalid_frame_ratio_{side}"
-                failure = _PresenceFailure(
-                    side, frame, "fail", ratio_rule, metric, ratio,
+                failure = _NormalizedFailure(
+                    side, frame, "fail", str(ratio_rule["rule_id"]), metric, ratio,
                     ">=", ratio_fail_boundary,
                 )
             elif count < count_warn_boundary:
-                failure = _PresenceFailure(
-                    side, frame, "warn", count_rule, count_metric, count,
+                failure = _NormalizedFailure(
+                    side, frame, "warn", str(count_rule["rule_id"]), count_metric, count,
                     "<", count_warn_boundary,
                 )
             elif ratio >= ratio_warn_boundary:
                 metric = ratio_metric if explicit_ratio >= aggregate_ratio else f"invalid_frame_ratio_{side}"
-                failure = _PresenceFailure(
-                    side, frame, "warn", ratio_rule, metric, ratio,
+                failure = _NormalizedFailure(
+                    side, frame, "warn", str(ratio_rule["rule_id"]), metric, ratio,
                     ">=", ratio_warn_boundary,
                 )
             if failure is not None:
                 selected[(side, frame)] = failure
-            if observed["quality_low"] or observed["ratios"] and max(observed["ratios"]) >= ratio_warn_boundary:
+            if (
+                observed["quality_low"]
+                or nonfinite_ratios
+                or explicit_ratio >= ratio_warn_boundary
+            ):
                 invalid_frames_by_hand[side].add(frame)
         invalid_frames_by_hand[side].update(side_detector_invalid_frames)
 
@@ -679,64 +744,23 @@ def adapt_keypoint_presence(
         or (row.check == "keypoint_missing" and row.flag is True)
     )
 
-    grouped: dict[tuple[Any, ...], list[_PresenceFailure]] = {}
-    for failure in selected.values():
-        key = (
-            failure.side,
-            failure.severity,
-            str(failure.rule["rule_id"]),
-            failure.metric,
-            failure.operator,
-            str(failure.boundary),
+    issues = tuple(
+        _issue_from_row(
+            asset_id=asset_id,
+            module="keypoint_presence",
+            source_relative_path=source_relative_path,
+            rule_id=failure.rule_id,
+            row=rows[0],
+            severity=failure.severity,
+            needs_manual_review=failure.severity == "warn",
+            metric=failure.metric,
+            observed_value=failure.observed,
+            operator=failure.operator,
+            boundary_value=failure.boundary,
+            hand_side=failure.side,
+            frame_range=frame_range,
         )
-        grouped.setdefault(key, []).append(failure)
-
-    issues: list[Issue] = []
-    for compatible_failures in grouped.values():
-        example = compatible_failures[0]
-        by_frame = {failure.frame: failure for failure in compatible_failures}
-        for start_frame, end_frame in _contiguous_ranges(tuple(by_frame)):
-            observed_values = [
-                by_frame[frame].observed
-                for frame in range(start_frame, end_frame + 1)
-            ]
-            if example.operator == "<":
-                observed_value = min(observed_values)
-            elif example.operator == ">=":
-                observed_value = max(observed_values)
-            else:
-                unique_values = sorted(set(observed_values))
-                observed_value = (
-                    unique_values[0]
-                    if len(unique_values) == 1
-                    else unique_values
-                )
-            issues.append(
-                _issue_from_row(
-                    asset_id=asset_id,
-                    module="keypoint_presence",
-                    source_relative_path=source_relative_path,
-                    rule_id=str(example.rule["rule_id"]),
-                    row=rows[0],
-                    severity=example.severity,
-                    needs_manual_review=example.severity == "warn",
-                    metric=example.metric,
-                    observed_value=observed_value,
-                    operator=example.operator,
-                    boundary_value=example.boundary,
-                    hand_side=example.side,
-                    frame_range=(start_frame, end_frame),
-                )
-            )
-
-    issues.sort(
-        key=lambda issue: (
-            int(issue.context["start_frame"]),
-            int(issue.context["end_frame"]),
-            str(issue.context["hand_side"]),
-            issue.rule_id,
-            issue.severity,
-        )
+        for failure, frame_range in _compact_failures(tuple(selected.values()))
     )
     verdict = _worst("pass", *(issue.severity for issue in issues))
     return ModuleResult(
@@ -759,7 +783,7 @@ def adapt_keypoint_presence(
                 for side, side_frames in invalid_frames_by_hand.items()
             },
         },
-        issues=tuple(issues),
+        issues=issues,
     )
 
 
@@ -767,7 +791,7 @@ def _morphology_failure(
     row: CheckResult,
     token: Any,
     parameters: Mapping[str, Any],
-) -> _MorphologyFailure | None:
+) -> _NormalizedFailure | None:
     if not isinstance(token, str) or ":" not in token:
         return None
     side, reason = token.split(":", 1)
@@ -809,7 +833,7 @@ def _morphology_failure(
             operator = "<="
 
     severity: Verdict = "warn" if detector_verdict == "review" else "fail"
-    return _MorphologyFailure(
+    return _NormalizedFailure(
         side=side,
         frame=row.frame_idx,
         severity=severity,
@@ -858,65 +882,37 @@ def adapt_keypoint_morphology(
         for token in row.metrics.get("which_thresholds_exceeded", ())
         if (failure := _morphology_failure(row, token, parameters)) is not None
     ]
-    grouped: dict[tuple[str, Verdict, str], list[_MorphologyFailure]] = {}
-    for failure in failures:
-        grouped.setdefault(
-            (failure.side, failure.severity, failure.rule_id), []
-        ).append(failure)
-
     issue_evidence: list[tuple[Issue, EvidenceRef]] = []
-    for compatible_failures in grouped.values():
-        example = compatible_failures[0]
-        by_frame = {failure.frame: failure for failure in compatible_failures}
-        for start_frame, end_frame in _contiguous_ranges(tuple(by_frame)):
-            observed_values = [
-                by_frame[frame].observed
-                for frame in range(start_frame, end_frame + 1)
-            ]
-            observed_value = (
-                min(observed_values)
-                if example.operator in {"<", "<="}
-                else max(observed_values)
-            )
-            issue = _issue_from_row(
-                asset_id=asset_id,
-                module="keypoint_morphology",
-                rule_id=example.rule_id,
-                row=summary,
-                source_relative_path=source_relative_path,
-                severity=example.severity,
-                needs_manual_review=example.severity == "warn",
-                metric=example.metric,
-                observed_value=observed_value,
-                operator=example.operator,
-                boundary_value=example.boundary,
-                hand_side=example.side,
-                frame_range=(start_frame, end_frame),
-                evidence_kind="frame_metrics",
-            )
-            evidence_id = f"{issue.issue_id}:frame_metrics"
-            evidence = EvidenceRef(
-                evidence_id=evidence_id,
-                kind="frame_metrics",
-                path="check_results.json",
-                coordinate_system="source_inclusive",
-                start_frame=start_frame,
-                end_frame=end_frame,
-                hand_side=example.side,
-            )
-            issue_evidence.append(
-                (replace(issue, evidence_ids=(evidence_id,)), evidence)
-            )
-
-    issue_evidence.sort(
-        key=lambda pair: (
-            int(pair[0].context["start_frame"]),
-            int(pair[0].context["end_frame"]),
-            str(pair[0].context["hand_side"]),
-            pair[0].rule_id,
-            pair[0].severity,
+    for failure, frame_range in _compact_failures(failures):
+        issue = _issue_from_row(
+            asset_id=asset_id,
+            module="keypoint_morphology",
+            rule_id=failure.rule_id,
+            row=summary,
+            source_relative_path=source_relative_path,
+            severity=failure.severity,
+            needs_manual_review=failure.severity == "warn",
+            metric=failure.metric,
+            observed_value=failure.observed,
+            operator=failure.operator,
+            boundary_value=failure.boundary,
+            hand_side=failure.side,
+            frame_range=frame_range,
+            evidence_kind="frame_metrics",
         )
-    )
+        evidence_id = f"{issue.issue_id}:frame_metrics"
+        evidence = EvidenceRef(
+            evidence_id=evidence_id,
+            kind="frame_metrics",
+            path="check_results.json",
+            coordinate_system="source_inclusive",
+            start_frame=frame_range[0],
+            end_frame=frame_range[1],
+            hand_side=failure.side,
+        )
+        issue_evidence.append(
+            (replace(issue, evidence_ids=(evidence_id,)), evidence)
+        )
     return ModuleResult(
         module="keypoint_morphology",
         verdict=verdict,
