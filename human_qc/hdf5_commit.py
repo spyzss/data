@@ -98,6 +98,7 @@ __all__ = [
     "assert_only_dataset_changed",
     "commit_hdf5_replacement",
     "prepare_hdf5_replacement",
+    "prepared_replacement_from_record",
     "recover_hdf5_replacement",
 ]
 
@@ -216,11 +217,12 @@ def commit_hdf5_replacement(prepared: PreparedReplacement) -> None:
 def recover_hdf5_replacement(record: FinalizingRecord) -> RecoveryAction:
     """Classify an interrupted finalization without touching an unknown file.
 
-    ``RETRY_REPLACE`` is an instruction for the caller to invoke
-    :func:`commit_hdf5_replacement` with the durable record.  Recovery itself
-    remains read-only for the old-hash branch, which avoids an implicit write
-    in a status/check endpoint.  A successfully replaced source may have a
-    leftover valid staging file; that artifact is removed before returning
+    ``RETRY_REPLACE`` is an instruction for the caller to pass the durable
+    record through :func:`prepared_replacement_from_record` and then invoke
+    :func:`commit_hdf5_replacement`.  Recovery itself remains read-only for
+    the old-hash branch, which avoids an implicit write in a status/check
+    endpoint.  A successfully replaced source may have a leftover valid
+    staging file; that artifact is removed before returning
     ``MARK_REPORT_COMPLETED``.
     """
 
@@ -270,6 +272,53 @@ def recover_hdf5_replacement(record: FinalizingRecord) -> RecoveryAction:
         return RecoveryAction.REBUILD_STAGING
 
     return RecoveryAction.CONFLICT
+
+
+def prepared_replacement_from_record(
+    record: FinalizingRecord,
+) -> PreparedReplacement:
+    """Reconstruct an owned commit value from a durable finalizing record.
+
+    Recovery records intentionally do not serialize the private in-process
+    ownership marker used to prevent arbitrary ``PreparedReplacement`` values
+    from being committed.  This explicit, validating bridge is the only way
+    to attach that marker after a process restart.
+    """
+
+    if not isinstance(record, FinalizingRecord):
+        raise TypeError("record must be a FinalizingRecord")
+
+    source = Path(record.source_path)
+    staged = Path(record.staged_path)
+    if not _is_managed_staged_path(source, staged, record.transaction_id):
+        raise Hdf5CommitError(
+            "staged HDF5 path is not an owned prepare() namespace artifact"
+        )
+    if (
+        source.is_symlink()
+        or staged.is_symlink()
+        or not source.is_file()
+        or not staged.is_file()
+    ):
+        raise Hdf5CommitError("source or staged HDF5 file is missing or symlinked")
+    try:
+        if _sha256_file(source) != record.old_sha256:
+            raise Hdf5CommitError("source HDF5 hash changed before reconstruction")
+        if _sha256_file(staged) != record.new_sha256:
+            raise Hdf5CommitError("staged HDF5 hash is invalid")
+    except Hdf5CommitError:
+        raise
+    except Exception as exc:
+        raise Hdf5CommitError(f"unable to validate durable HDF5 staging: {exc}") from exc
+
+    return PreparedReplacement(
+        source_path=source,
+        staged_path=staged,
+        old_sha256=record.old_sha256,
+        new_sha256=record.new_sha256,
+        transaction_id=record.transaction_id,
+        _ownership=_StagingOwnership(staged, record.transaction_id),
+    )
 
 
 def assert_only_dataset_changed(

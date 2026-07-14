@@ -17,6 +17,7 @@ from human_qc.hdf5_commit import (
     assert_only_dataset_changed,
     commit_hdf5_replacement,
     prepare_hdf5_replacement,
+    prepared_replacement_from_record,
     recover_hdf5_replacement,
 )
 
@@ -263,6 +264,45 @@ def test_recovery_requests_replace_when_old_and_valid_staged_are_present(
 
     assert recover_hdf5_replacement(_prepared_record(prepared)) == RecoveryAction.RETRY_REPLACE
     assert source.read_bytes() != prepared.staged_path.read_bytes()
+
+
+def test_recovery_retry_can_reconstruct_prepared_and_commit_after_restart(
+    tmp_path: Path,
+) -> None:
+    source = write_complex_hdf5(tmp_path / "asset.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-restart")
+    record = _prepared_record(prepared)
+
+    assert recover_hdf5_replacement(record) == RecoveryAction.RETRY_REPLACE
+    reconstructed = prepared_replacement_from_record(record)
+
+    commit_hdf5_replacement(reconstructed)
+
+    assert _sha256(source) == record.new_sha256
+    assert not record.staged_path.exists()
+
+
+def test_reconstruction_rejects_foreign_stage_without_touching_it(
+    tmp_path: Path,
+) -> None:
+    source = write_complex_hdf5(tmp_path / "asset.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-reconstruct")
+    foreign = tmp_path / "foreign-reconstruct.hdf5"
+    foreign.write_bytes(prepared.staged_path.read_bytes())
+    prepared.staged_path.unlink()
+    before = foreign.read_bytes()
+    record = FinalizingRecord(
+        source_path=source,
+        staged_path=foreign,
+        old_sha256=prepared.old_sha256,
+        new_sha256=prepared.new_sha256,
+        transaction_id=prepared.transaction_id,
+    )
+
+    with pytest.raises(Hdf5CommitError, match="owned|staging|namespace"):
+        prepared_replacement_from_record(record)
+
+    assert foreign.read_bytes() == before
 
 
 def test_recovery_requests_rebuild_when_old_hash_has_no_staged_file(tmp_path: Path) -> None:
