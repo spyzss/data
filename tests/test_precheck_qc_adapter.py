@@ -18,6 +18,7 @@ from qc_common.types import CheckResult
 from qc_pipeline.adapters.precheck import (
     _contiguous_ranges,
     adapt_hdf5_text_info,
+    adapt_keypoint_morphology,
     adapt_keypoint_presence,
     adapt_quality_hand,
     precheck_config_from_unified,
@@ -544,6 +545,221 @@ def test_presence_does_not_infer_missing_keypoints_from_absent_quality_hand() ->
     assert result.verdict == "skipped"
     assert result.evaluation["reason"] == "source_signal_not_provided"
     assert result.issues == ()
+
+
+def test_morphology_review_maps_to_warn_with_frame_evidence() -> None:
+    rows = [
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            5,
+            {
+                "morphology_verdict": "review",
+                "which_thresholds_exceeded": [
+                    "left:bone_length_ratio_spread_review"
+                ],
+                "left_bone_length_ratio_spread": 4.0,
+            },
+            None,
+            "review",
+        ),
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            -1,
+            {"morphology_verdict": "review", "num_frames": 1},
+            None,
+            "summary",
+        ),
+    ]
+
+    result = adapt_keypoint_morphology(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "warn"
+    assert result.issues[0].rule_id == "keypoint_morphology.bone_length_ratio_spread"
+    assert result.issues[0].needs_manual_review is True
+    assert result.issues[0].observed_value == 4.0
+    assert result.issues[0].boundary_value == 3.0
+    assert result.issues[0].context == {
+        "coordinate_system": "source_inclusive",
+        "start_frame": 5,
+        "end_frame": 5,
+        "hand_side": "left",
+    }
+    assert len(result.evidence) == 1
+    assert result.evidence[0].kind == "frame_metrics"
+    assert result.evidence[0].path == "check_results.json"
+    assert result.evidence[0].coordinate_system == "source_inclusive"
+    assert result.evidence[0].start_frame == 5
+    assert result.evidence[0].end_frame == 5
+    assert result.evidence[0].hand_side == "left"
+    assert result.issues[0].evidence_ids == (result.evidence[0].evidence_id,)
+
+
+def test_morphology_fail_uses_configured_threshold_and_actual_metric_name() -> None:
+    rows = [
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            8,
+            {
+                "morphology_verdict": "fail",
+                "which_thresholds_exceeded": [
+                    "right:max_normalized_bone_length_fail"
+                ],
+                "right_normalized_bone_length_max": 6.5,
+            },
+            True,
+            "right:max_normalized_bone_length_fail",
+        ),
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            -1,
+            {"morphology_verdict": "fail", "num_frames": 1},
+            True,
+            "summary",
+        ),
+    ]
+
+    result = adapt_keypoint_morphology(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "fail"
+    assert result.issues[0].rule_id == (
+        "keypoint_morphology.max_normalized_bone_length"
+    )
+    assert result.issues[0].metric == "normalized_bone_length_max"
+    assert result.issues[0].observed_value == 6.5
+    assert result.issues[0].operator == ">="
+    assert result.issues[0].boundary_value == 6.0
+    assert result.issues[0].needs_manual_review is False
+    assert result.issues[0].context["hand_side"] == "right"
+
+
+def test_morphology_merges_only_contiguous_same_rule_and_side_frames() -> None:
+    rows = [
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            frame,
+            {
+                "morphology_verdict": "review",
+                "which_thresholds_exceeded": [
+                    "left:bone_length_ratio_spread_review"
+                ],
+                "left_bone_length_ratio_spread": value,
+            },
+            None,
+            "structured threshold",
+        )
+        for frame, value in ((12, 4.0), (10, 3.5), (11, 5.0), (15, 4.5))
+    ]
+    rows.append(
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            -1,
+            {"morphology_verdict": "review", "num_frames": 4},
+            None,
+            "summary",
+        )
+    )
+
+    kwargs = {
+        "asset_id": "a",
+        "source_relative_path": "hdf5/a.h5",
+        "results": rows,
+        "config": loaded_test_config(),
+    }
+    result = adapt_keypoint_morphology(**kwargs)
+
+    assert [
+        (issue.context["start_frame"], issue.context["end_frame"])
+        for issue in result.issues
+    ] == [(10, 12), (15, 15)]
+    assert [issue.observed_value for issue in result.issues] == [5.0, 4.5]
+    assert [
+        (evidence.start_frame, evidence.end_frame) for evidence in result.evidence
+    ] == [(10, 12), (15, 15)]
+    repeated = adapt_keypoint_morphology(**kwargs)
+    assert [issue.issue_id for issue in repeated.issues] == [
+        issue.issue_id for issue in result.issues
+    ]
+    assert [evidence.evidence_id for evidence in repeated.evidence] == [
+        evidence.evidence_id for evidence in result.evidence
+    ]
+
+
+def test_morphology_does_not_infer_thresholds_from_reason_text() -> None:
+    rows = [
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            5,
+            {
+                "morphology_verdict": "review",
+                "which_thresholds_exceeded": [],
+                "left_bone_length_ratio_spread": 4.0,
+            },
+            None,
+            "left:bone_length_ratio_spread_review",
+        ),
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            -1,
+            {"morphology_verdict": "review", "num_frames": 1},
+            None,
+            "summary",
+        ),
+    ]
+
+    result = adapt_keypoint_morphology(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "warn"
+    assert result.issues == ()
+    assert result.evidence == ()
+
+
+def test_morphology_not_applicable_is_skipped_not_pass() -> None:
+    rows = [
+        CheckResult(
+            "keypoint_morphology",
+            0,
+            -1,
+            {"morphology_verdict": "not_applicable", "num_frames": 2},
+            None,
+            "skipped_due_to_existence_invalid",
+        )
+    ]
+
+    result = adapt_keypoint_morphology(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "skipped"
+    assert result.evaluation["reason"] == "skipped_due_to_existence_invalid"
+    assert result.metrics == rows[0].metrics
+    assert result.issues == ()
+    assert result.evidence == ()
 
 
 def test_contiguous_ranges_sorts_deduplicates_and_preserves_gaps() -> None:

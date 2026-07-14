@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import fields
+from dataclasses import fields, replace
 from numbers import Real
 from pathlib import Path
 from typing import Any, NamedTuple, TypeVar, cast
@@ -20,7 +20,7 @@ from precheck.config import (
     TextIntegrityConfig,
 )
 from qc_common.config import LoadedQcConfig
-from qc_common.contracts import Issue, ModuleResult, Verdict, build_issue_id
+from qc_common.contracts import EvidenceRef, Issue, ModuleResult, Verdict, build_issue_id
 from qc_common.types import CheckResult
 
 
@@ -39,12 +39,83 @@ _PRECHECK_NAME_BY_MODULE = {
 }
 _ConfigType = TypeVar("_ConfigType")
 
+MORPHOLOGY_REASON_TO_RULE = {
+    "palm_scale_too_small": "keypoint_morphology.palm_scale_too_small",
+    "bone_length_ratio_spread": "keypoint_morphology.bone_length_ratio_spread",
+    "max_normalized_bone_length": (
+        "keypoint_morphology.max_normalized_bone_length"
+    ),
+    "zero_length_bone_count": "keypoint_morphology.zero_length_bone_count",
+    "duplicate_joint_pair_count": (
+        "keypoint_morphology.duplicate_joint_pair_count"
+    ),
+    "collapsed_finger_count": "keypoint_morphology.collapsed_finger_count",
+    "joint_angle_min_deg": "keypoint_morphology.joint_angle_min_deg",
+    "joint_angle_violation_fraction": (
+        "keypoint_morphology.joint_angle_violation_fraction"
+    ),
+}
+
+_MORPHOLOGY_OBSERVED_METRIC = {
+    "palm_scale_too_small": "palm_scale_m",
+    "bone_length_ratio_spread": "bone_length_ratio_spread",
+    "max_normalized_bone_length": "normalized_bone_length_max",
+    "zero_length_bone_count": "zero_length_bone_count",
+    "duplicate_joint_pair_count": "duplicate_joint_pair_count",
+    "collapsed_finger_count": "collapsed_finger_count",
+    "joint_angle_min_deg": "joint_angle_min_deg",
+    "joint_angle_violation_fraction": "joint_angle_violation_fraction",
+}
+
+_MORPHOLOGY_THRESHOLD_PARAMETER = {
+    ("palm_scale_too_small", "fail"): "min_palm_scale_m",
+    ("bone_length_ratio_spread", "review"): (
+        "max_bone_length_ratio_spread_review"
+    ),
+    ("bone_length_ratio_spread", "fail"): "max_bone_length_ratio_spread_fail",
+    ("max_normalized_bone_length", "review"): (
+        "max_normalized_bone_length_review"
+    ),
+    ("max_normalized_bone_length", "fail"): (
+        "max_normalized_bone_length_fail"
+    ),
+    ("zero_length_bone_count", "review"): (
+        "max_zero_length_bone_count_review"
+    ),
+    ("zero_length_bone_count", "fail"): "max_zero_length_bone_count_fail",
+    ("duplicate_joint_pair_count", "review"): (
+        "max_duplicate_joint_pair_count_review"
+    ),
+    ("duplicate_joint_pair_count", "fail"): (
+        "max_duplicate_joint_pair_count_fail"
+    ),
+    ("joint_angle_min_deg", "review"): "min_joint_angle_deg_review",
+    ("joint_angle_min_deg", "fail"): "min_joint_angle_deg_fail",
+    ("joint_angle_violation_fraction", "review"): (
+        "max_joint_angle_violation_fraction_review"
+    ),
+    ("joint_angle_violation_fraction", "fail"): (
+        "max_joint_angle_violation_fraction_fail"
+    ),
+}
+
 
 class _PresenceFailure(NamedTuple):
     side: str
     frame: int
     severity: Verdict
     rule: Mapping[str, Any]
+    metric: str
+    observed: Any
+    operator: str
+    boundary: Any
+
+
+class _MorphologyFailure(NamedTuple):
+    side: str
+    frame: int
+    severity: Verdict
+    rule_id: str
     metric: str
     observed: Any
     operator: str
@@ -692,6 +763,170 @@ def adapt_keypoint_presence(
     )
 
 
+def _morphology_failure(
+    row: CheckResult,
+    token: Any,
+    parameters: Mapping[str, Any],
+) -> _MorphologyFailure | None:
+    if not isinstance(token, str) or ":" not in token:
+        return None
+    side, reason = token.split(":", 1)
+    if side not in parameters["sides"]:
+        return None
+
+    if reason == "palm_scale_too_small":
+        rule_name = reason
+        detector_verdict = "fail"
+    elif reason.endswith("_review"):
+        rule_name = reason.removesuffix("_review")
+        detector_verdict = "review"
+    elif reason.endswith("_fail"):
+        rule_name = reason.removesuffix("_fail")
+        detector_verdict = "fail"
+    else:
+        return None
+
+    rule_id = MORPHOLOGY_REASON_TO_RULE.get(rule_name)
+    metric = _MORPHOLOGY_OBSERVED_METRIC.get(rule_name)
+    if rule_id is None or metric is None:
+        return None
+    observed_key = f"{side}_{metric}"
+    if observed_key not in row.metrics:
+        return None
+
+    if rule_name == "collapsed_finger_count":
+        operator = ">"
+        boundary = 0
+    else:
+        parameter_name = _MORPHOLOGY_THRESHOLD_PARAMETER.get(
+            (rule_name, detector_verdict)
+        )
+        if parameter_name is None:
+            return None
+        boundary = parameters[parameter_name]
+        operator = "<" if rule_name == "palm_scale_too_small" else ">="
+        if rule_name == "joint_angle_min_deg":
+            operator = "<="
+
+    severity: Verdict = "warn" if detector_verdict == "review" else "fail"
+    return _MorphologyFailure(
+        side=side,
+        frame=row.frame_idx,
+        severity=severity,
+        rule_id=rule_id,
+        metric=metric,
+        observed=row.metrics[observed_key],
+        operator=operator,
+        boundary=boundary,
+    )
+
+
+def adapt_keypoint_morphology(
+    *,
+    asset_id: str,
+    source_relative_path: str,
+    results: Sequence[CheckResult],
+    config: LoadedQcConfig,
+) -> ModuleResult:
+    """Adapt structured legacy morphology thresholds into frame-range issues."""
+    summary = _summary(results, "keypoint_morphology")
+    detector_verdict = summary.metrics.get("morphology_verdict")
+    verdict_by_detector = {
+        "pass": "pass",
+        "review": "warn",
+        "fail": "fail",
+        "not_applicable": "skipped",
+    }
+    if detector_verdict not in verdict_by_detector:
+        raise ValueError(
+            f"invalid keypoint_morphology summary verdict: {detector_verdict!r}"
+        )
+    verdict = cast(Verdict, verdict_by_detector[detector_verdict])
+    if verdict == "skipped":
+        return ModuleResult(
+            module="keypoint_morphology",
+            verdict="skipped",
+            evaluation={"decision": "skipped", "reason": summary.reason},
+            metrics=dict(summary.metrics),
+        )
+
+    parameters = config.module_parameters("keypoint_morphology")
+    failures = [
+        failure
+        for row in results
+        if row.check == "keypoint_morphology" and row.frame_idx >= 0
+        for token in row.metrics.get("which_thresholds_exceeded", ())
+        if (failure := _morphology_failure(row, token, parameters)) is not None
+    ]
+    grouped: dict[tuple[str, Verdict, str], list[_MorphologyFailure]] = {}
+    for failure in failures:
+        grouped.setdefault(
+            (failure.side, failure.severity, failure.rule_id), []
+        ).append(failure)
+
+    issue_evidence: list[tuple[Issue, EvidenceRef]] = []
+    for compatible_failures in grouped.values():
+        example = compatible_failures[0]
+        by_frame = {failure.frame: failure for failure in compatible_failures}
+        for start_frame, end_frame in _contiguous_ranges(tuple(by_frame)):
+            observed_values = [
+                by_frame[frame].observed
+                for frame in range(start_frame, end_frame + 1)
+            ]
+            observed_value = (
+                min(observed_values)
+                if example.operator in {"<", "<="}
+                else max(observed_values)
+            )
+            issue = _issue_from_row(
+                asset_id=asset_id,
+                module="keypoint_morphology",
+                rule_id=example.rule_id,
+                row=summary,
+                source_relative_path=source_relative_path,
+                severity=example.severity,
+                needs_manual_review=example.severity == "warn",
+                metric=example.metric,
+                observed_value=observed_value,
+                operator=example.operator,
+                boundary_value=example.boundary,
+                hand_side=example.side,
+                frame_range=(start_frame, end_frame),
+                evidence_kind="frame_metrics",
+            )
+            evidence_id = f"{issue.issue_id}:frame_metrics"
+            evidence = EvidenceRef(
+                evidence_id=evidence_id,
+                kind="frame_metrics",
+                path="check_results.json",
+                coordinate_system="source_inclusive",
+                start_frame=start_frame,
+                end_frame=end_frame,
+                hand_side=example.side,
+            )
+            issue_evidence.append(
+                (replace(issue, evidence_ids=(evidence_id,)), evidence)
+            )
+
+    issue_evidence.sort(
+        key=lambda pair: (
+            int(pair[0].context["start_frame"]),
+            int(pair[0].context["end_frame"]),
+            str(pair[0].context["hand_side"]),
+            pair[0].rule_id,
+            pair[0].severity,
+        )
+    )
+    return ModuleResult(
+        module="keypoint_morphology",
+        verdict=verdict,
+        evaluation={"decision": verdict, "reason": summary.reason},
+        metrics=dict(summary.metrics),
+        issues=tuple(issue for issue, _evidence in issue_evidence),
+        evidence=tuple(evidence for _issue, evidence in issue_evidence),
+    )
+
+
 def _config_from_parameters(
     cls: type[_ConfigType],
     parameters: Mapping[str, Any],
@@ -749,6 +984,7 @@ def precheck_config_from_unified(
 __all__ = [
     "_contiguous_ranges",
     "adapt_hdf5_text_info",
+    "adapt_keypoint_morphology",
     "adapt_keypoint_presence",
     "adapt_quality_hand",
     "precheck_config_from_unified",

@@ -170,6 +170,23 @@ def test_extreme_normalized_bone_length_and_spread_fail() -> None:
     assert "left:bone_length_ratio_spread_fail" in frame.reason
 
 
+def test_max_normalized_reason_token_uses_normalized_bone_length_max_metric() -> None:
+    clip = _clip()
+    _set_joint(
+        clip,
+        "leftLittleFingerTip",
+        np.asarray([0.030, 0.500, 0.0]),
+    )
+
+    frame, _summary = _run(clip)
+
+    assert "left:max_normalized_bone_length_fail" in frame.metrics[
+        "which_thresholds_exceeded"
+    ]
+    assert frame.metrics["left_normalized_bone_length_max"] >= 6.0
+    assert "left_max_normalized_bone_length" not in frame.metrics
+
+
 @pytest.mark.parametrize(
     ("angle_deg", "expected_verdict", "expected_reason"),
     [
