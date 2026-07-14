@@ -6,10 +6,10 @@
 
 ## 2. 语义校准服务
 
-- [ ] 2.1 为供应商 HDF5 实现统一 subtask 读取和规范化 adapter
-- [ ] 2.2 实现单一 pending edit 状态机、expected revision 校验以及确认/取消 API
+- [ ] 2.1 为供应商 HDF5 实现统一 subtask 读取和共享边界规范化 adapter，明确闭区间与内部半开区间转换
+- [ ] 2.2 实现只允许内部边界手柄拖动的双段联动 pending edit 状态机、expected revision 校验以及原子确认/取消 API
 - [ ] 2.3 实现临时 HDF5 写入、结构与内容校验、fsync 和无备份原子替换
-- [ ] 2.4 验证时间轴修改、文字修改、取消操作和写入失败时的计数与原文件安全性
+- [ ] 2.4 验证共享边界联动、两段 before/after、非法边界拒绝、单事务计数、文字修改、取消操作和写入失败时的原文件安全性
 
 ## 3. Warn 人工质检服务
 
@@ -21,9 +21,9 @@
 ## 4. 共用工作台
 
 - [ ] 4.1 建立共用资产导航、视频播放器、reviewer、revision 和保存错误外壳
-- [ ] 4.2 实现只显示视频/字幕/时间轴/subtask 编辑器的 SemanticCalibrationAdapter
+- [ ] 4.2 实现只显示视频/字幕/共享边界手柄/subtask 编辑器的 SemanticCalibrationAdapter，禁止整段平移并同时展示两段联动差异
 - [ ] 4.3 实现只显示问题片段/overlay、warn 原因和 Pass/Fail 的 WarnReviewAdapter
-- [ ] 4.4 在 pending edit 存在时锁定其他段落、模式切换、完成样本和下一资产操作
+- [ ] 4.4 在共享边界或文字 pending edit 存在时锁定其他边界、文字、模式切换、完成样本和下一资产操作
 - [ ] 4.5 实现问题窗口短片播放与 21 点骨骼 overlay 按需生成/缓存
 
 ## 5. Profile 路由与迁移
