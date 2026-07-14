@@ -219,7 +219,7 @@ def _review_row_from_issue(
         # synthetic IDs for sidecar rows only.
         "review_id": issue_id,
         "issue_id": issue_id,
-        "supplier_id": str(report.get("supplier_id") or "unknown"),
+        "supplier_id": _supplier_id(report),
         "asset_id": str(report.get("asset_id") or ""),
         "window_start_frame": _empty_if_none(start),
         "window_end_frame": _empty_if_none(end),
@@ -249,6 +249,24 @@ def _review_row_from_issue(
             )
         ),
     }
+
+
+def _supplier_id(report: Mapping[str, Any]) -> str:
+    value = report.get("supplier_id")
+    if value is not None:
+        supplier_id = str(value).strip()
+        if supplier_id:
+            return supplier_id
+    metadata = report.get("metadata")
+    if isinstance(metadata, Mapping):
+        for key in ("supplier_id", "supplier"):
+            value = metadata.get(key)
+            if value is None:
+                continue
+            supplier_id = str(value).strip()
+            if supplier_id:
+                return supplier_id
+    return "unknown"
 
 
 def _issue_metric_context(issue: Mapping[str, Any]) -> dict[str, Any]:

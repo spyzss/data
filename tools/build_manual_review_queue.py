@@ -223,7 +223,11 @@ def main() -> int:
             ),
         )
         selected_rows = assign_review_ids(selected_rows)
-        copy_selected_overlays(selected_rows, args.output_dir)
+        copy_selected_overlays(
+            selected_rows,
+            args.output_dir,
+            source_root=args.quality_archive.parent,
+        )
         _write_review_outputs(
             selected_rows,
             args.output_dir,
@@ -710,7 +714,12 @@ def assign_review_ids(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output
 
 
-def copy_selected_overlays(rows: list[dict[str, Any]], output_dir: Path) -> None:
+def copy_selected_overlays(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    source_root: Path | None = None,
+) -> None:
     overlay_output_dir = output_dir / "assets" / "overlays"
     used_names: Counter[str] = Counter()
     for row in rows:
@@ -719,6 +728,8 @@ def copy_selected_overlays(rows: list[dict[str, Any]], output_dir: Path) -> None
         if not overlay_path:
             continue
         source = Path(str(overlay_path))
+        if source_root is not None and not source.is_absolute():
+            source = source_root / source
         if not source.exists() or not source.is_file():
             continue
         overlay_output_dir.mkdir(parents=True, exist_ok=True)

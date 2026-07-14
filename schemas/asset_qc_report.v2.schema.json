@@ -19,6 +19,7 @@
   "properties": {
     "schema_version": {"const": "asset_qc_report.v2"},
     "asset_id": {"type": "string", "minLength": 1},
+    "supplier_id": {"type": "string", "minLength": 1},
     "report_revision": {"type": "integer", "minimum": 1},
     "qc_config": {"$ref": "#/$defs/qcConfig"},
     "execution": {"$ref": "#/$defs/execution"},

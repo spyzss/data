@@ -15,8 +15,13 @@
 当前 schema：
 
 ```text
-schemas/asset_qc_report.v1.schema.json
+schemas/asset_qc_report.v2.schema.json
 ```
+
+`asset_qc_report.v1` 仅作为历史报告输入保留。v2 canonical report 在顶层持久化
+`supplier_id`：初始化时优先读取 `AssetContext.metadata.supplier_id`、其次读取
+`metadata.supplier`，两者都缺失时写入 `"unknown"`。旧报告没有该字段时仍可读取，
+review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 
 当前代码已实现 `video_quality` 的写入合同；其余模块按
 `docs/PRD-qc-gated-json.md` 接入。
@@ -27,7 +32,7 @@ schemas/asset_qc_report.v1.schema.json
 
 ```json
 {
-  "schema_version": "asset_qc_report.v1",
+  "schema_version": "asset_qc_report.v2",
   "qc_config": {
     "schema_version": "qc_acceptance_config_schema.v1",
     "config_version": "qc_acceptance_v1.1.0",
@@ -36,13 +41,21 @@ schemas/asset_qc_report.v1.schema.json
     "config_hash": "sha256:<64 lowercase hex characters>"
   },
   "asset_id": "file-008",
+  "supplier_id": "supplier-a",
   "report_revision": 3,
+  "execution": {
+    "profile": "acceptance",
+    "started_at": null,
+    "updated_at": null
+  },
   "pipeline_state": {
     "status": "running",
     "last_completed_module": "video_quality",
-    "next_module": "sam3_containment"
+    "next_module": "sam3_containment",
+    "stop_reason": null
   },
   "overall_decision": null,
+  "runtime_errors": [],
   "issues": [
     {
       "issue_id": "video_quality:fps_below_pass:001",
@@ -126,9 +139,10 @@ schemas/asset_qc_report.v1.schema.json
 
 | 字段 | 规则 |
 |---|---|
-| `schema_version` | 固定为 `asset_qc_report.v1`。 |
+| `schema_version` | 固定为 `asset_qc_report.v2`。 |
 | `qc_config` | 本次 pipeline 初始化时锁定的统一配置引用。 |
 | `asset_id` | 资产唯一 ID，也是 JSON 文件名。 |
+| `supplier_id` | 供应商唯一 ID；canonical v2 初始化时由 `metadata.supplier_id` / `metadata.supplier` 写入，缺失时为 `unknown`。 |
 | `report_revision` | 每次成功写回加 1，用于防止旧结果覆盖新结果。 |
 | `pipeline_state` | 当前流程位置，不代表单个模块质量。 |
 | `overall_decision` | 只有流程停止或全部完成时才形成最终结论。 |

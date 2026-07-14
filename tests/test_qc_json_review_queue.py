@@ -15,7 +15,10 @@ from qc_reporting.projection import (
     project_quality_archive_review_rows,
     project_warn_review_rows,
 )
+from qc_common.report_mutation import initialize_v2_report
+from qc_pipeline.context import AssetContext
 from tests.qc_report_fixtures import make_v2_report
+from tests.qc_report_fixtures import loaded_test_config
 
 
 def warn_issue(
@@ -267,3 +270,120 @@ def test_quality_archive_cli_writes_warn_rows_without_pass_sampling(tmp_path: Pa
     assert queue["asset_id"].tolist() == ["warn"]
     assert "pass_sample" not in queue["auto_verdict"].tolist()
     assert pd.read_csv(output_dir / "manual_labels_template.csv")["review_id"].tolist() == ["w1"]
+
+
+def test_quality_archive_cli_resolves_overlay_paths_from_batch_root(
+    tmp_path: Path,
+) -> None:
+    batch_root = tmp_path / "batch"
+    archive = batch_root / "quality_archive"
+    overlay = batch_root / "evidence" / "temporal_jump_overlay.mp4"
+    overlay.parent.mkdir(parents=True)
+    overlay.write_bytes(b"batch-root-overlay")
+    write_report(
+        batch_root,
+        asset="warn",
+        issues=[warn_issue("w1")],
+        candidates=["w1"],
+        state="queued",
+    )
+    output_dir = batch_root / "review"
+    repo_root = Path(__file__).resolve().parents[1]
+    process_cwd = tmp_path / "process-cwd"
+    process_cwd.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "tools" / "build_manual_review_queue.py"),
+            "--quality-archive",
+            str(archive),
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=process_cwd,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0
+    queue = pd.read_csv(output_dir / "review_queue.csv")
+    assert queue.loc[0, "overlay_path"] == "evidence/temporal_jump_overlay.mp4"
+    assert queue.loc[0, "display_overlay_path"] == "assets/overlays/temporal_jump_overlay.mp4"
+    copied = output_dir / "assets" / "overlays" / "temporal_jump_overlay.mp4"
+    assert copied.read_bytes() == b"batch-root-overlay"
+    assert "assets/overlays/temporal_jump_overlay.mp4" in (
+        output_dir / "review_index.html"
+    ).read_text(encoding="utf-8")
+
+
+def test_initialize_report_persists_supplier_for_canonical_projection(
+    tmp_path: Path,
+) -> None:
+    context = AssetContext(
+        asset_id="asset-meta",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-meta.json",
+        source_files={},
+        metadata={"supplier_id": "supplier-from-metadata"},
+    )
+    report = initialize_v2_report(
+        context,
+        loaded_test_config(),
+        "acceptance",
+        "2026-07-15T00:00:00Z",
+    )
+    report.update(
+        {
+            "report_revision": 1,
+            "pipeline_state": {
+                "status": "completed",
+                "last_completed_module": "keypoint_temporal",
+                "next_module": None,
+                "stop_reason": None,
+            },
+            "overall_decision": "pass",
+            "issues": [warn_issue("w1")],
+            "manual_review": {
+                "required": True,
+                "state": "queued",
+                "candidate_issue_ids": ["w1"],
+                "failures_for_batch_stats_issue_ids": [],
+            },
+            "keypoint_temporal": {
+                "evidence": [
+                    {
+                        "evidence_id": "w1:evidence",
+                        "path": "evidence/temporal_jump.mp4",
+                    }
+                ]
+            },
+        }
+    )
+    context.report_path.parent.mkdir(parents=True, exist_ok=True)
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    loaded = json.loads(context.report_path.read_text(encoding="utf-8"))
+    rows = project_warn_review_rows(loaded)
+
+    assert loaded["supplier_id"] == "supplier-from-metadata"
+    assert rows[0]["supplier_id"] == "supplier-from-metadata"
+
+
+def test_projection_uses_metadata_supplier_fallback_for_legacy_report() -> None:
+    report = make_v2_report(status="completed", overall_decision="pass")
+    report["asset_id"] = "asset-legacy"
+    report["metadata"] = {"supplier": "supplier-from-report-metadata"}
+    issue = warn_issue("w1")
+    report["issues"] = [issue]
+    report["manual_review"] = {
+        "required": True,
+        "state": "queued",
+        "candidate_issue_ids": ["w1"],
+        "failures_for_batch_stats_issue_ids": [],
+    }
+
+    rows = project_warn_review_rows(report)
+
+    assert rows[0]["supplier_id"] == "supplier-from-report-metadata"

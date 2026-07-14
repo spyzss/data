@@ -26,6 +26,17 @@ class ConfigDriftError(RuntimeError):
     pass
 
 
+def _supplier_id_from_metadata(metadata: Mapping[str, Any]) -> str:
+    for key in ("supplier_id", "supplier"):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        supplier_id = str(value).strip()
+        if supplier_id:
+            return supplier_id
+    return "unknown"
+
+
 def initialize_v2_report(
     context: AssetContext,
     config: LoadedQcConfig,
@@ -37,6 +48,7 @@ def initialize_v2_report(
     return {
         "schema_version": "asset_qc_report.v2",
         "asset_id": context.asset_id,
+        "supplier_id": _supplier_id_from_metadata(context.metadata),
         "report_revision": 0,
         "qc_config": config.json_reference(),
         "execution": {
