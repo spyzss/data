@@ -6,6 +6,10 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from qc_common.config import load_qc_acceptance_config
+from qc_common.contracts import ModuleResult
+from qc_common.report_mutation import apply_module_result
+from qc_pipeline.context import AssetContext
 from tests.fixtures import solid_frame, write_test_video
 
 
@@ -18,6 +22,40 @@ def _result_rows(output_dir: Path) -> list[dict[str, object]]:
     return json.loads(
         (output_dir / "video_quality_results.json").read_text(encoding="utf-8")
     )
+
+
+def _advance_report_to_video(
+    batch_root: Path,
+    *,
+    asset_id: str,
+    video_path: Path,
+    source_range: tuple[int, int],
+    profile: str = "acceptance",
+) -> None:
+    config = load_qc_acceptance_config()
+    context = AssetContext(
+        asset_id=asset_id,
+        batch_root=batch_root,
+        report_path=batch_root / "quality_archive" / f"{asset_id}.json",
+        source_files={
+            "video": {"path": video_path.relative_to(batch_root).as_posix()}
+        },
+        source_range=source_range,
+    )
+    revision = 0
+    modules = config.pipeline_modules
+    for index, module in enumerate(modules[: modules.index("video_quality")]):
+        report = apply_module_result(
+            context.report_path,
+            context=context,
+            config=config,
+            profile=profile,
+            result=ModuleResult(module, "pass", {}, {}),
+            expected_revision=revision,
+            next_module=modules[index + 1],
+            now=f"2026-07-14T00:00:{index:02d}Z",
+        )
+        revision = report["report_revision"]
 
 
 @pytest.mark.parametrize("extension", [".parquet", ".jsonl"])
@@ -54,8 +92,19 @@ def test_manifest_video_quality_uses_inclusive_ranges_and_source_coordinates(
             }
         ],
     )
+    _advance_report_to_video(
+        tmp_path,
+        asset_id="logical-a",
+        video_path=video,
+        source_range=(2, 14),
+    )
 
-    run_manifest_video_quality(manifest, tmp_path / "quality")
+    summary = run_manifest_video_quality(
+        manifest,
+        tmp_path / "quality",
+        batch_root=tmp_path,
+        profile="acceptance",
+    )
 
     rows = _result_rows(tmp_path / "quality")
     assert len(rows) == 1
@@ -91,6 +140,142 @@ def test_manifest_video_quality_uses_inclusive_ranges_and_source_coordinates(
     )
     assert run_config["frame_range_semantics"] == "inclusive_source_frames"
     assert not list((tmp_path / "quality").glob("*.mp4"))
+    assert summary["completed_clip_count"] == 1
+    assert summary["qc_report_write_count"] == 1
+    assert summary["awaiting_pipeline_clip_count"] == 0
+    report = json.loads(
+        (tmp_path / "quality_archive" / "logical-a.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["schema_version"] == "asset_qc_report.v2"
+    assert report["video_quality"]["flow"]["result_gate"]["verdict"] in {
+        "pass",
+        "warn",
+        "fail",
+    }
+    assert report["video_quality"]["evidence"] == [
+        {
+            "evidence_id": report["video_quality"]["evidence"][0]["evidence_id"],
+            "kind": "source_video",
+            "path": "source.mp4",
+            "coordinate_system": "source_video_inclusive",
+            "start_frame": 2,
+            "end_frame": 13,
+            "hand_side": None,
+            "checksum": None,
+            "mime_type": "video/mp4",
+            "generator_version": "video_prefilter_v0.3.2",
+        }
+    ]
+
+
+def test_manifest_video_quality_fresh_run_records_pipeline_prerequisite(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_video_quality import main, run_manifest_video_quality
+
+    video = tmp_path / "source.mp4"
+    write_test_video(video, [solid_frame(90) for _ in range(4)], fps=10.0)
+    manifest = _write_manifest(
+        tmp_path / "manifest.csv",
+        [
+            {
+                "asset_id": "logical-a",
+                "primary_video_path": str(video),
+                "start_frame": 0,
+                "end_frame": 3,
+            }
+        ],
+    )
+
+    summary = run_manifest_video_quality(
+        manifest,
+        tmp_path / "quality",
+        batch_root=tmp_path,
+    )
+
+    assert summary["completed_clip_count"] == 1
+    assert summary["qc_report_write_count"] == 0
+    assert summary["awaiting_pipeline_clip_count"] == 1
+    assert not (tmp_path / "quality_archive" / "logical-a.json").exists()
+    prerequisites = json.loads(
+        (tmp_path / "quality" / "video_quality_prerequisites.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert prerequisites == [
+        {
+            "asset_id": "logical-a",
+            "condition": "awaiting_pipeline",
+            "current_next_module": None,
+            "required_module": "video_quality",
+            "report_path": "quality_archive/logical-a.json",
+            "source_range": {
+                "coordinate_system": "source_video_inclusive",
+                "start_frame": 0,
+                "end_frame": 3,
+            },
+        }
+    ]
+    assert main(
+        [
+            "--manifest",
+            str(manifest),
+            "--output-dir",
+            str(tmp_path / "quality"),
+            "--batch-root",
+            str(tmp_path),
+        ]
+    ) == 3
+
+
+def test_manifest_video_quality_supplier_profile_keeps_machine_verdict(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_video_quality import run_manifest_video_quality
+
+    video = tmp_path / "source.mp4"
+    write_test_video(video, [solid_frame(90) for _ in range(4)], fps=10.0)
+    manifest = _write_manifest(
+        tmp_path / "manifest.csv",
+        [
+            {
+                "asset_id": "logical-a",
+                "primary_video_path": str(video),
+                "start_frame": 0,
+                "end_frame": 3,
+            }
+        ],
+    )
+    _advance_report_to_video(
+        tmp_path,
+        asset_id="logical-a",
+        video_path=video,
+        source_range=(0, 4),
+        profile="supplier_evaluation",
+    )
+
+    summary = run_manifest_video_quality(
+        manifest,
+        tmp_path / "quality",
+        batch_root=tmp_path,
+        profile="supplier_evaluation",
+    )
+
+    assert summary["qc_report_write_count"] == 1
+    report = json.loads(
+        (tmp_path / "quality_archive" / "logical-a.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["video_quality"]["flow"]["result_gate"]["verdict"] == "fail"
+    assert report["video_quality"]["flow"]["exit_gate"] == {
+        "state": "continue",
+        "continue_to_next_module": True,
+        "next_module": "sam3_containment",
+    }
+    assert report["pipeline_state"]["status"] == "running"
 
 
 def test_manifest_video_quality_handles_repeated_source_ranges_independently(
@@ -129,6 +314,53 @@ def test_manifest_video_quality_handles_repeated_source_ranges_independently(
     assert rows["left-range"]["clip_frame_count"] == 3
     assert rows["right-range"]["decoded_frame_count"] == 4
     assert rows["right-range"]["clip_frame_count"] == 4
+
+
+def test_manifest_video_quality_rejects_source_drift_before_report_write(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_video_quality import run_manifest_video_quality
+
+    original = tmp_path / "original.mp4"
+    replacement = tmp_path / "replacement.mp4"
+    frames = [solid_frame(90) for _ in range(5)]
+    write_test_video(original, frames, fps=10.0)
+    write_test_video(replacement, frames, fps=10.0)
+    manifest = _write_manifest(
+        tmp_path / "manifest.csv",
+        [
+            {
+                "asset_id": "logical-a",
+                "primary_video_path": str(replacement),
+                "start_frame": 0,
+                "end_frame": 4,
+            }
+        ],
+    )
+    _advance_report_to_video(
+        tmp_path,
+        asset_id="logical-a",
+        video_path=original,
+        source_range=(0, 5),
+    )
+    report_path = tmp_path / "quality_archive" / "logical-a.json"
+    before = report_path.read_bytes()
+
+    summary = run_manifest_video_quality(
+        manifest,
+        tmp_path / "quality",
+        batch_root=tmp_path,
+    )
+
+    assert summary["failed_clip_count"] == 1
+    assert summary["qc_report_write_count"] == 0
+    assert report_path.read_bytes() == before
+    failures = json.loads(
+        (tmp_path / "quality" / "video_quality_failures.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "source_files.video.path mismatch" in failures[0]["error"]
 
 
 def test_manifest_video_quality_isolates_invalid_ranges(tmp_path: Path) -> None:
@@ -221,6 +453,12 @@ def test_manifest_video_quality_skips_completed_assets_unless_overwrite(
         ],
     )
     output_dir = tmp_path / "quality"
+    _advance_report_to_video(
+        tmp_path,
+        asset_id="clip-a",
+        video_path=video,
+        source_range=(0, 5),
+    )
     runner.run_manifest_video_quality(manifest, output_dir)
 
     calls = 0

@@ -20,6 +20,10 @@ from acceptance_pull.video_quality import (
     main,
     run_video_quality_check,
 )
+from qc_common.config import load_qc_acceptance_config
+from qc_common.contracts import ModuleResult
+from qc_common.report_mutation import apply_module_result
+from qc_pipeline.context import AssetContext
 from tests.fixtures import solid_frame, write_hand_keypoint_hdf5, write_quality_hdf5, write_test_video
 from tests.fixtures import write_quality_hdf5_with_text
 
@@ -46,6 +50,44 @@ def write_unified_video_config(tmp_path: Path, mutate: Callable[[dict[str, Any]]
     path = tmp_path / "qc_acceptance.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return path
+
+
+def advance_batch_report_to_video(
+    batch: Path,
+    asset_id: str,
+    *,
+    config_path: Path | None = None,
+) -> None:
+    config = load_qc_acceptance_config(config_path)
+    video_path = batch / "video" / f"{asset_id}_video.mp4"
+    hdf5_path = batch / "hdf5" / f"{asset_id}_hdf5.hdf5"
+    source_files: dict[str, Any] = {
+        "video": {"path": video_path.relative_to(batch).as_posix()}
+    }
+    if hdf5_path.exists():
+        source_files["hdf5"] = {
+            "path": hdf5_path.relative_to(batch).as_posix()
+        }
+    context = AssetContext(
+        asset_id=asset_id,
+        batch_root=batch,
+        report_path=batch / "quality_archive" / f"{asset_id}.json",
+        source_files=source_files,
+    )
+    revision = 0
+    modules = config.pipeline_modules
+    for index, module in enumerate(modules[: modules.index("video_quality")]):
+        report = apply_module_result(
+            context.report_path,
+            context=context,
+            config=config,
+            profile="acceptance",
+            result=ModuleResult(module, "pass", {}, {}),
+            expected_revision=revision,
+            next_module=modules[index + 1],
+            now=f"2026-07-14T00:00:{index:02d}Z",
+        )
+        revision = report["report_revision"]
 
 
 def test_default_video_quality_config_comes_from_unified_config() -> None:
@@ -871,6 +913,7 @@ def test_video_qc_has_no_hand_roi_surface(tmp_path: Path) -> None:
     video = video_dir / "408817_video.mp4"
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     write_quality_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", 3)
+    advance_batch_report_to_video(batch, "408817")
 
     assert run_video_quality_check(batch) == 0
     report = json.loads((batch / "quality_archive" / "408817.json").read_text(encoding="utf-8"))
@@ -882,6 +925,23 @@ def test_video_qc_has_no_hand_roi_surface(tmp_path: Path) -> None:
 
 
 
+def test_run_video_quality_check_does_not_bypass_pipeline_on_fresh_report(
+    tmp_path: Path,
+) -> None:
+    batch = tmp_path
+    video_dir = batch / "video"
+    video_dir.mkdir()
+    video = video_dir / "408817_video.mp4"
+    write_test_video(
+        video,
+        [textured_frame(0), textured_frame(10), textured_frame(20)],
+        fps=30.0,
+    )
+
+    assert run_video_quality_check(batch) == 3
+    assert not (batch / "quality_archive" / "408817.json").exists()
+
+
 def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tmp_path: Path) -> None:
     batch = tmp_path
     video_dir = batch / "video"
@@ -889,6 +949,7 @@ def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tm
     video = video_dir / "408817_video.mp4"
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     write_quality_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", 3)
+    advance_batch_report_to_video(batch, "408817")
 
     exit_code = run_video_quality_check(batch)
 
@@ -921,6 +982,7 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     video = video_dir / "408817_video.mp4"
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=30.0)
     write_quality_hdf5_with_text(batch / "hdf5" / "408817_hdf5.hdf5", 3)
+    advance_batch_report_to_video(batch, "408817")
 
     exit_code = run_video_quality_check(batch)
 
@@ -932,13 +994,13 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     assert report["schema_version"] == "asset_qc_report.v2"
     assert report["qc_config"]["config_version"] == "qc_acceptance_v2.0.0"
     assert report["asset_id"] == "408817"
-    assert report["report_revision"] == 1
+    assert report["report_revision"] == 6
     assert report["issues"] == []
     assert report["overall_decision"] is None
     assert report["source_files"]["video"]["path"] == "video/408817_video.mp4"
     assert report["source_files"]["hdf5"]["path"] == "hdf5/408817_hdf5.hdf5"
-    assert "hdf5_text_info" not in report
-    assert report["video_quality"]["metadata"]["frame_count"] == 3
+    assert report["hdf5_text_info"]["flow"]["result_gate"]["verdict"] == "pass"
+    assert report["video_quality"]["metrics"]["metadata"]["frame_count"] == 3
     assert report["video_quality"]["evaluation"] == {
         "decision": "pass",
         "reasons": [],
@@ -954,7 +1016,7 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     }
     assert "thresholds" not in report["video_quality"]
     assert "threshold_version" not in report["video_quality"]
-    assert report["video_quality"]["sampling"]["decoded_sample_count"] >= 1
+    assert report["video_quality"]["metrics"]["sampling"]["decoded_sample_count"] >= 1
     assert report["video_quality"]["metrics"]["video_basic"]["short_side"] == 720
     assert report["video_quality"]["metrics"]["exposure"]["mean_over_dark_ratio"] < 0.1
     assert report["video_quality"]["metrics"]["defect_metrics"] == {
@@ -977,7 +1039,7 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     assert freeze_metrics["frozen_interval_critical_window_count"] == 0
     assert freeze_metrics["ssim_min"] == 0.995
     assert freeze_metrics["phash_hamming_max"] == 4
-    assert report["reference_quality"]["mode"] == "none"
+    assert report["video_quality"]["metrics"]["reference_quality"]["mode"] == "none"
 
 
 def test_run_video_quality_check_records_warn_issue_values(tmp_path: Path) -> None:
@@ -987,6 +1049,7 @@ def test_run_video_quality_check_records_warn_issue_values(tmp_path: Path) -> No
     video = video_dir / "warn_video.mp4"
     write_test_video(video, [textured_frame(0), textured_frame(10), textured_frame(20)], fps=22.0)
     write_quality_hdf5(batch / "hdf5" / "warn_hdf5.hdf5", 3)
+    advance_batch_report_to_video(batch, "warn")
 
     assert run_video_quality_check(batch) == 0
     report = json.loads((batch / "quality_archive" / "warn.json").read_text(encoding="utf-8"))
@@ -1016,24 +1079,24 @@ def test_video_qc_preserves_existing_module_blocks_and_increments_revision(tmp_p
     write_test_video(video, [textured_frame(0), textured_frame(10)], fps=30.0)
     write_quality_hdf5(batch / "hdf5" / "408817_hdf5.hdf5", 2)
     archive = batch / "quality_archive"
-    archive.mkdir()
-    config = load_video_quality_config(None)
+    advance_batch_report_to_video(batch, "408817")
+    report_path = archive / "408817.json"
+    seeded = json.loads(report_path.read_text(encoding="utf-8"))
     existing = {
-        "schema_version": "asset_qc_report.v1",
-        "qc_config": config.qc_config_reference,
-        "asset_id": "408817",
-        "report_revision": 3,
         "hdf5_text_info": {"owner": "hdf5_text_info", "text_fields": {"task": "pick cup"}},
         "quality_hand": {"owner": "quality_hand", "metrics": {"score": 1.0}},
+        "future_extension": {"keep": True},
     }
-    (archive / "408817.json").write_text(json.dumps(existing), encoding="utf-8")
+    seeded.update(existing)
+    report_path.write_text(json.dumps(seeded), encoding="utf-8")
 
     assert run_video_quality_check(batch) == 0
     updated = json.loads((archive / "408817.json").read_text(encoding="utf-8"))
 
-    assert updated["report_revision"] == 4
+    assert updated["report_revision"] == 6
     assert updated["hdf5_text_info"] == existing["hdf5_text_info"]
     assert updated["quality_hand"] == existing["quality_hand"]
+    assert updated["future_extension"] == {"keep": True}
     assert updated["video_quality"]["flow"]["result_gate"]["verdict"] == "pass"
 
 
@@ -1042,6 +1105,7 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     video_dir = batch / "video"
     video_dir.mkdir()
     (video_dir / "bad_video.mp4").write_bytes(b"not a video")
+    advance_batch_report_to_video(batch, "bad")
 
     exit_code = run_video_quality_check(batch)
 
@@ -1051,11 +1115,11 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     assert report["pipeline_state"] == {
         "status": "stopped",
         "last_completed_module": "video_quality",
-        "next_module": "batch_statistics",
-        "stop_reason": None,
+        "next_module": None,
+        "stop_reason": "quality_fail:video_quality",
     }
     assert report["overall_decision"] == "fail"
-    assert report["manual_review"]["state"] == "skipped_due_to_fail"
+    assert report["manual_review"]["state"] == "not_evaluated"
     assert "cannot_open_video" in report["video_quality"]["evaluation"]["reasons"]
     detail = next(
         item
@@ -1069,7 +1133,7 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     assert report["video_quality"]["flow"]["exit_gate"] == {
         "state": "stop_qc",
         "continue_to_next_module": False,
-        "next_module": "batch_statistics",
+        "next_module": "sam3_containment",
     }
 
 
@@ -1083,9 +1147,10 @@ def test_video_quality_main_accepts_config_and_writes_quality_archive(tmp_path: 
         parameters["hdf5_alignment"]["mode"] = "warn"
 
     config = write_unified_video_config(tmp_path, mutate)
+    advance_batch_report_to_video(batch, "408817", config_path=config)
 
     exit_code = main(["--batch", str(batch), "--config", str(config)])
 
     assert exit_code == 0
     report = json.loads((batch / "quality_archive" / "408817.json").read_text(encoding="utf-8"))
-    assert report["video_quality"]["sampling"]["sample_count_configured"] == 2
+    assert report["video_quality"]["metrics"]["sampling"]["sample_count_configured"] == 2

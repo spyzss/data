@@ -27,6 +27,12 @@ from acceptance_pull.video_quality import (  # noqa: E402
     evaluate_video_quality,
     load_video_quality_config,
 )
+from qc_common.config import load_qc_acceptance_config  # noqa: E402
+from qc_common.report import load_asset_qc_report  # noqa: E402
+from qc_pipeline.adapters.video_quality import (  # noqa: E402
+    write_video_quality_result,
+)
+from qc_pipeline.context import AssetContext  # noqa: E402
 
 
 LOGGER = logging.getLogger(__name__)
@@ -165,7 +171,7 @@ def _write_json(path: Path, value: Any) -> None:
 def _result_record(
     validated: dict[str, Any],
     config: Any,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], VideoQualityResult]:
     start_frame = int(validated["start_frame"])
     end_frame = int(validated["end_frame"])
     analysis = analyze_video_frame_range(
@@ -184,10 +190,8 @@ def _result_record(
         reason="logical range alignment validated by manifest bounds",
     )
     evaluation = evaluate_video_quality(metrics, config, alignment=None)
-    report = asset_qc_result_to_json(
-        VideoQualityResult(metrics, alignment, evaluation),
-        config,
-    )
+    result = VideoQualityResult(metrics, alignment, evaluation)
+    report = asset_qc_result_to_json(result, config)
     report.update(
         {
             "asset_id": validated["asset_id"],
@@ -226,7 +230,110 @@ def _result_record(
         interval["source_end_frame"] = int(interval["end_frame"])
         interval["local_start_frame"] = int(interval["start_frame"]) - start_frame
         interval["local_end_frame"] = int(interval["end_frame"]) - start_frame
-    return _json_safe(report)
+    return _json_safe(report), result
+
+
+def _relative_path(path: Path, batch_root: Path) -> str | None:
+    try:
+        return path.resolve().relative_to(batch_root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _video_evidence_matches(
+    report: dict[str, Any] | None,
+    *,
+    source_path: str | None,
+    start_frame: int,
+    end_frame: int,
+) -> bool:
+    if report is None or source_path is None:
+        return False
+    module = report.get("video_quality")
+    if not isinstance(module, dict):
+        return False
+    flow = module.get("flow")
+    result_gate = flow.get("result_gate") if isinstance(flow, dict) else None
+    if not isinstance(result_gate, dict) or result_gate.get("verdict") not in {
+        "pass",
+        "warn",
+        "fail",
+        "skipped",
+    }:
+        return False
+    evidence = module.get("evidence")
+    return isinstance(evidence, list) and any(
+        isinstance(item, dict)
+        and item.get("kind") == "source_video"
+        and item.get("path") == source_path
+        and item.get("coordinate_system") == "source_video_inclusive"
+        and item.get("start_frame") == start_frame
+        and item.get("end_frame") == end_frame
+        for item in evidence
+    )
+
+
+def _video_write_is_ready(report: dict[str, Any] | None) -> bool:
+    if report is None:
+        return False
+    pipeline_state = report.get("pipeline_state")
+    if not isinstance(pipeline_state, dict):
+        return False
+    if pipeline_state.get("next_module") == "video_quality":
+        return True
+    if pipeline_state.get("last_completed_module") != "video_quality":
+        return False
+    module = report.get("video_quality")
+    if not isinstance(module, dict):
+        return False
+    flow = module.get("flow")
+    exit_gate = flow.get("exit_gate") if isinstance(flow, dict) else None
+    return isinstance(exit_gate, dict)
+
+
+def _assert_report_source_path(
+    report: dict[str, Any],
+    *,
+    source_name: str,
+    expected_path: str,
+) -> None:
+    source_files = report.get("source_files")
+    recorded = source_files.get(source_name) if isinstance(source_files, dict) else None
+    recorded_path = recorded.get("path") if isinstance(recorded, dict) else None
+    if recorded_path != expected_path:
+        raise ValueError(
+            f"source_files.{source_name}.path mismatch: "
+            f"{recorded_path!r} != {expected_path!r}"
+        )
+
+
+def _prerequisite_record(
+    *,
+    asset_id: str,
+    report: dict[str, Any] | None,
+    report_path: Path,
+    batch_root: Path,
+    start_frame: int,
+    end_frame: int,
+) -> dict[str, Any]:
+    pipeline_state = report.get("pipeline_state") if report is not None else None
+    current_next = (
+        pipeline_state.get("next_module")
+        if isinstance(pipeline_state, dict)
+        else None
+    )
+    return {
+        "asset_id": asset_id,
+        "condition": "awaiting_pipeline",
+        "current_next_module": current_next,
+        "required_module": "video_quality",
+        "report_path": report_path.relative_to(batch_root).as_posix(),
+        "source_range": {
+            "coordinate_system": "source_video_inclusive",
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+        },
+    }
 
 
 def _summary_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -267,6 +374,9 @@ def run_manifest_video_quality(
     overwrite: bool = False,
     dry_run: bool = False,
     log_level: str = "INFO",
+    batch_root: Path | None = None,
+    profile: str = "acceptance",
+    config_path: Path | None = None,
 ) -> dict[str, Any]:
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
@@ -279,21 +389,23 @@ def run_manifest_video_quality(
         rows = rows[:max_clips]
 
     output_dir = Path(output_dir)
+    batch_root = Path(batch_root) if batch_root is not None else output_dir.parent
     results_path = output_dir / "video_quality_results.json"
     existing = [] if dry_run else _read_existing_results(results_path)
-    existing_by_asset = {
-        str(row.get("asset_id")): row for row in existing if row.get("asset_id")
-    }
-    config = load_video_quality_config(None)
+    loaded_config = load_qc_acceptance_config(config_path)
+    loaded_config.execution_profile(profile)
+    config = load_video_quality_config(config_path)
+    modules = loaded_config.pipeline_modules
+    video_index = modules.index("video_quality")
+    next_module = modules[video_index + 1]
     new_records: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    prerequisites: list[dict[str, Any]] = []
     skipped = 0
     validated_count = 0
+    qc_report_writes = 0
     for row_index, row in enumerate(rows):
         asset_id = _text(row.get(asset_id_column)) or f"row-{row_index}"
-        if not overwrite and asset_id in existing_by_asset:
-            skipped += 1
-            continue
         try:
             validated = _validated_row(
                 row,
@@ -304,8 +416,80 @@ def run_manifest_video_quality(
                 hdf5_column=hdf5_column,
             )
             validated_count += 1
-            if not dry_run:
-                new_records.append(_result_record(validated, config))
+            start_frame = int(validated["start_frame"])
+            end_frame = int(validated["end_frame"])
+            report_path = batch_root / "quality_archive" / f"{asset_id}.json"
+            report = load_asset_qc_report(report_path)
+            relative_video_path = _relative_path(validated["video_path"], batch_root)
+            if (
+                not overwrite
+                and _video_evidence_matches(
+                    report,
+                    source_path=relative_video_path,
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                )
+            ):
+                skipped += 1
+                continue
+            if dry_run:
+                continue
+            record, result = _result_record(validated, config)
+            new_records.append(record)
+            if not _video_write_is_ready(report):
+                prerequisites.append(
+                    _prerequisite_record(
+                        asset_id=asset_id,
+                        report=report,
+                        report_path=report_path,
+                        batch_root=batch_root,
+                        start_frame=start_frame,
+                        end_frame=end_frame,
+                    )
+                )
+                continue
+            assert report is not None
+            if relative_video_path is None:
+                raise ValueError(
+                    f"source video is outside batch root: {validated['video_path']}"
+                )
+            _assert_report_source_path(
+                report,
+                source_name="video",
+                expected_path=relative_video_path,
+            )
+            source_files: dict[str, Any] = {
+                "video": {"path": relative_video_path}
+            }
+            hdf5_path = validated["hdf5_path"]
+            if hdf5_path is not None:
+                relative_hdf5_path = _relative_path(hdf5_path, batch_root)
+                if relative_hdf5_path is None:
+                    raise ValueError(
+                        f"HDF5 is outside batch root: {hdf5_path}"
+                    )
+                _assert_report_source_path(
+                    report,
+                    source_name="hdf5",
+                    expected_path=relative_hdf5_path,
+                )
+                source_files["hdf5"] = {"path": relative_hdf5_path}
+            context = AssetContext(
+                asset_id=asset_id,
+                batch_root=batch_root,
+                report_path=report_path,
+                source_files=source_files,
+                source_range=(start_frame, end_frame + 1),
+            )
+            write_video_quality_result(
+                context=context,
+                result=result,
+                config=loaded_config,
+                profile=profile,
+                expected_revision=int(report.get("report_revision", 0)),
+                next_module=next_module,
+            )
+            qc_report_writes += 1
         except Exception as exc:
             LOGGER.error("Manifest row %d (%s) failed: %s", row_index, asset_id, exc)
             failures.append(
@@ -326,21 +510,20 @@ def run_manifest_video_quality(
         "completed_clip_count": len(new_records),
         "failed_clip_count": len(failures),
         "skipped_clip_count": skipped,
+        "qc_report_write_count": qc_report_writes,
+        "awaiting_pipeline_clip_count": len(prerequisites),
         "dry_run": dry_run,
     }
     if dry_run:
         return summary
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    if overwrite:
-        replaced_assets = {str(row["asset_id"]) for row in new_records}
-        retained = [
-            row
-            for row in existing
-            if str(row.get("asset_id")) not in replaced_assets
-        ]
-    else:
-        retained = existing
+    replaced_assets = {str(row["asset_id"]) for row in new_records}
+    retained = [
+        row
+        for row in existing
+        if str(row.get("asset_id")) not in replaced_assets
+    ]
     combined = [*retained, *new_records]
     _write_json(results_path, combined)
     pd.DataFrame([_parquet_safe(row) for row in combined]).to_parquet(
@@ -352,9 +535,13 @@ def run_manifest_video_quality(
         index=False,
     )
     _write_json(output_dir / "video_quality_failures.json", failures)
+    _write_json(output_dir / "video_quality_prerequisites.json", prerequisites)
     run_config = {
         "manifest": str(manifest),
         "output_dir": str(output_dir),
+        "batch_root": str(batch_root),
+        "profile": profile,
+        "qc_config": loaded_config.json_reference(),
         "asset_id_column": asset_id_column,
         "video_column": video_column,
         "start_frame_column": start_frame_column,
@@ -375,6 +562,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--batch-root", required=True, type=Path)
+    parser.add_argument("--profile", default="acceptance")
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--asset-id-column", default="asset_id")
     parser.add_argument("--video-column", default="primary_video_path")
     parser.add_argument("--start-frame-column", default="start_frame")
@@ -401,9 +591,16 @@ def main(argv: list[str] | None = None) -> int:
         overwrite=args.overwrite,
         dry_run=args.dry_run,
         log_level=args.log_level,
+        batch_root=args.batch_root,
+        profile=args.profile,
+        config_path=args.config,
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
-    return 0 if not summary["failed_clip_count"] else 2
+    if summary["failed_clip_count"]:
+        return 2
+    if summary["awaiting_pipeline_clip_count"]:
+        return 3
+    return 0
 
 
 if __name__ == "__main__":

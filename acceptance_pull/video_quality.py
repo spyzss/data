@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
+import logging
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
@@ -13,14 +13,18 @@ from typing import Any
 import cv2
 import h5py
 import numpy as np
-from qc_common.config import load_qc_acceptance_config
-from qc_common.report import load_asset_qc_report, write_asset_qc_report
+from qc_common.config import LoadedQcConfig, load_qc_acceptance_config
+from qc_common.report import load_asset_qc_report
+from qc_pipeline.context import AssetContext
 
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi"}
 LAPLACIAN_LOW_DETAIL_THRESHOLD = 100.0
 DARK_PIXEL_Y_THRESHOLD = 20
 OVER_EXPOSED_PIXEL_Y_THRESHOLD = 245
+LOGGER = logging.getLogger(__name__)
+
+
 class AlignmentMode(StrEnum):
     IGNORE = "ignore"
     WARN = "warn"
@@ -2328,84 +2332,119 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
     }
 
 
-def _merge_video_quality_report(
-    existing: dict[str, Any] | None,
-    generated: dict[str, Any],
-) -> dict[str, Any]:
-    if existing is None:
-        return generated
-
-    if existing.get("asset_id") not in {None, generated["asset_id"]}:
-        raise ValueError(
-            f"asset_id mismatch: existing={existing.get('asset_id')} generated={generated['asset_id']}"
-        )
-    existing_config = existing.get("qc_config")
-    if existing_config is not None and existing_config != generated["qc_config"]:
-        raise ValueError("existing asset report uses a different qc_config")
-
-    merged = copy.deepcopy(existing)
-    preserved_issues = [
-        issue
-        for issue in merged.get("issues", [])
-        if isinstance(issue, dict) and issue.get("module") != "video_quality"
-    ]
-    generated_issues = list(generated["issues"])
-    existing_manual = merged.get("manual_review", {})
-    if not isinstance(existing_manual, dict):
-        raise ValueError("manual_review must be an object")
-
-    merged.update(
-        {
-            key: copy.deepcopy(value)
-            for key, value in generated.items()
-            if key not in {"source_files", "issues", "manual_review", "report_revision"}
-        }
+def _video_report_ready(report: dict[str, Any] | None) -> bool:
+    if report is None:
+        return False
+    pipeline_state = report.get("pipeline_state")
+    if not isinstance(pipeline_state, dict):
+        return False
+    if pipeline_state.get("next_module") == "video_quality":
+        return True
+    return (
+        pipeline_state.get("last_completed_module") == "video_quality"
+        and isinstance(report.get("video_quality"), dict)
     )
-    source_files = copy.deepcopy(existing.get("source_files", {}))
-    if not isinstance(source_files, dict):
-        raise ValueError("source_files must be an object")
-    source_files.update(copy.deepcopy(generated["source_files"]))
-    merged["source_files"] = source_files
-    merged["issues"] = preserved_issues + generated_issues
 
-    manual_review = copy.deepcopy(existing_manual)
-    manual_review.update(copy.deepcopy(generated["manual_review"]))
-    for field_name in ("candidate_issue_ids", "failures_for_batch_stats_issue_ids"):
-        preserved_ids = [
-            issue_id
-            for issue_id in existing_manual.get(field_name, [])
-            if not str(issue_id).startswith("video_quality:")
-        ]
-        manual_review[field_name] = preserved_ids + list(generated["manual_review"][field_name])
-    merged["manual_review"] = manual_review
-    merged["report_revision"] = int(existing.get("report_revision", 0)) + 1
-    return merged
+
+def _relative_batch_path(path: Path, batch_dir: Path) -> str:
+    try:
+        return path.resolve().relative_to(batch_dir.resolve()).as_posix()
+    except ValueError:
+        raise ValueError(f"source path is outside batch root: {path}") from None
+
+
+def _assert_report_source_path(
+    report: dict[str, Any],
+    *,
+    source_name: str,
+    expected_path: str,
+) -> None:
+    source_files = report.get("source_files")
+    recorded = source_files.get(source_name) if isinstance(source_files, dict) else None
+    recorded_path = recorded.get("path") if isinstance(recorded, dict) else None
+    if recorded_path != expected_path:
+        raise ValueError(
+            f"source_files.{source_name}.path mismatch: "
+            f"{recorded_path!r} != {expected_path!r}"
+        )
 
 
 def write_per_asset_qc_json_reports(
-    quality_archive_dir: Path,
+    batch_dir: Path,
     results: list[VideoQualityResult],
-    config: VideoQualityConfig,
-) -> None:
-    quality_archive_dir.mkdir(parents=True, exist_ok=True)
+    config: LoadedQcConfig,
+    *,
+    profile: str = "acceptance",
+) -> int:
+    from qc_pipeline.adapters.video_quality import write_video_quality_result
+
+    modules = config.pipeline_modules
+    video_index = modules.index("video_quality")
+    next_module = modules[video_index + 1]
+    awaiting_pipeline = 0
     for result in results:
-        path = quality_archive_dir / f"{result.metrics.asset_id}.json"
+        path = batch_dir / "quality_archive" / f"{result.metrics.asset_id}.json"
         existing = load_asset_qc_report(path)
-        expected_revision = 0 if existing is None else int(existing.get("report_revision", 0))
-        generated = asset_qc_result_to_json(result, config)
-        report = _merge_video_quality_report(existing, generated)
-        write_asset_qc_report(
-            path,
-            report,
-            expected_revision=expected_revision,
-            profile="acceptance",
+        if not _video_report_ready(existing):
+            awaiting_pipeline += 1
+            current_next = None
+            if existing is not None and isinstance(existing.get("pipeline_state"), dict):
+                current_next = existing["pipeline_state"].get("next_module")
+            LOGGER.warning(
+                "Skipping QC report write for %s: video_quality awaits pipeline "
+                "state (current next_module=%r)",
+                result.metrics.asset_id,
+                current_next,
+            )
+            continue
+        assert existing is not None
+        relative_video_path = _relative_batch_path(result.metrics.path, batch_dir)
+        _assert_report_source_path(
+            existing,
+            source_name="video",
+            expected_path=relative_video_path,
         )
+        source_files: dict[str, Any] = {
+            "video": {"path": relative_video_path}
+        }
+        if (
+            result.alignment.hdf5_path is not None
+            and result.alignment.hdf5_path.is_file()
+        ):
+            relative_hdf5_path = _relative_batch_path(
+                result.alignment.hdf5_path,
+                batch_dir,
+            )
+            _assert_report_source_path(
+                existing,
+                source_name="hdf5",
+                expected_path=relative_hdf5_path,
+            )
+            source_files["hdf5"] = {
+                "path": relative_hdf5_path
+            }
+        context = AssetContext(
+            asset_id=result.metrics.asset_id,
+            batch_root=batch_dir,
+            report_path=path,
+            source_files=source_files,
+        )
+        write_video_quality_result(
+            context=context,
+            result=result,
+            config=config,
+            profile=profile,
+            expected_revision=int(existing.get("report_revision", 0)),
+            next_module=next_module,
+        )
+    return awaiting_pipeline
 
 
 def run_video_quality_check(
     batch_dir: Path,
     config_path: Path | None = None,
 ) -> int:
+    loaded_config = load_qc_acceptance_config(config_path)
     config = load_video_quality_config(config_path)
     video_paths = discover_batch_videos(batch_dir)
     results: list[VideoQualityResult] = []
@@ -2417,7 +2456,14 @@ def run_video_quality_check(
         evaluation = evaluate_video_quality(metrics, config, alignment)
         results.append(VideoQualityResult(metrics, alignment, evaluation))
 
-    write_per_asset_qc_json_reports(batch_dir / "quality_archive", results, config)
+    awaiting_pipeline = write_per_asset_qc_json_reports(
+        batch_dir,
+        results,
+        loaded_config,
+        profile="acceptance",
+    )
+    if awaiting_pipeline:
+        return 3
     return 0 if all(result.evaluation.passed for result in results) else 2
 
 
