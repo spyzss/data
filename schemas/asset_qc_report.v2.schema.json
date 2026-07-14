@@ -96,6 +96,39 @@
           "overall_decision": {"type": "null"}
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "pipeline_state": {
+            "properties": {
+              "status": {"const": "stopped"}
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "overall_decision": {"const": "fail"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "runtime_errors": {"minItems": 1}
+        }
+      },
+      "then": {
+        "properties": {
+          "pipeline_state": {
+            "properties": {
+              "status": {"const": "error"}
+            }
+          },
+          "overall_decision": {"type": "null"}
+        }
+      }
     }
   ],
   "$defs": {

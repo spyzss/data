@@ -2394,7 +2394,12 @@ def write_per_asset_qc_json_reports(
         expected_revision = 0 if existing is None else int(existing.get("report_revision", 0))
         generated = asset_qc_result_to_json(result, config)
         report = _merge_video_quality_report(existing, generated)
-        write_asset_qc_report(path, report, expected_revision=expected_revision)
+        write_asset_qc_report(
+            path,
+            report,
+            expected_revision=expected_revision,
+            profile="acceptance",
+        )
 
 
 def run_video_quality_check(

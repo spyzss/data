@@ -27,6 +27,43 @@ def test_error_cannot_be_quality_fail() -> None:
         validate_asset_qc_report(report)
 
 
+def test_stopped_v2_report_requires_fail_decision() -> None:
+    validate_asset_qc_report(make_v2_report(status="stopped", overall_decision="fail"))
+
+
+@pytest.mark.parametrize("decision", [None, "pass"])
+def test_stopped_v2_report_rejects_non_fail_decision(decision: str | None) -> None:
+    report = make_v2_report(status="stopped", overall_decision=decision)
+    with pytest.raises(ValueError, match="overall_decision"):
+        validate_asset_qc_report(report)
+
+
+def test_runtime_error_v2_report_uses_error_state_and_null_decision() -> None:
+    report = make_v2_report(status="error", overall_decision=None)
+    report["runtime_errors"] = [{"module": "video_quality", "message": "decoder crashed"}]
+
+    validate_asset_qc_report(report)
+
+
+@pytest.mark.parametrize(
+    ("status", "decision", "error_path"),
+    [
+        ("running", None, "pipeline_state.status"),
+        ("completed", "pass", "overall_decision"),
+    ],
+)
+def test_runtime_errors_reject_non_error_pipeline_outcomes(
+    status: str,
+    decision: str | None,
+    error_path: str,
+) -> None:
+    report = make_v2_report(status=status, overall_decision=decision)
+    report["runtime_errors"] = [{"module": "video_quality", "message": "decoder crashed"}]
+
+    with pytest.raises(ValueError, match=error_path):
+        validate_asset_qc_report(report)
+
+
 @pytest.mark.parametrize("decision", ["pass", "fail"])
 def test_completed_v2_report_requires_quality_decision(decision: str) -> None:
     validate_asset_qc_report(make_v2_report(status="completed", overall_decision=decision))
@@ -166,7 +203,7 @@ def test_v2_schema_keeps_registered_and_unknown_module_blocks_open() -> None:
     validate_asset_qc_report(report)
 
 
-def test_write_promotes_v1_report_with_config_v2_reference(tmp_path: Path) -> None:
+def test_write_promotes_v1_report_with_explicit_acceptance_profile(tmp_path: Path) -> None:
     path = tmp_path / "report.json"
     report = make_v1_video_report()
     report["qc_config"] = {
@@ -177,10 +214,51 @@ def test_write_promotes_v1_report_with_config_v2_reference(tmp_path: Path) -> No
         "config_hash": "sha256:" + "3" * 64,
     }
 
-    write_asset_qc_report(path, report, expected_revision=0)
+    write_asset_qc_report(path, report, expected_revision=0, profile="acceptance")
 
     written = json.loads(path.read_text(encoding="utf-8"))
     assert report["schema_version"] == "asset_qc_report.v1"
     assert written["schema_version"] == "asset_qc_report.v2"
     assert written["qc_config"] == report["qc_config"]
+    assert written["execution"]["profile"] == "acceptance"
+    validate_asset_qc_report(written)
+
+
+def test_write_rejects_config_v2_promotion_without_profile(tmp_path: Path) -> None:
+    path = tmp_path / "report.json"
+    report = make_v1_video_report()
+    report["qc_config"] = {
+        "schema_version": "qc_acceptance_config_schema.v2",
+        "config_version": "qc_acceptance_v2.0.0",
+        "config_name": "acceptance_gate",
+        "config_path": "configs/qc_acceptance.yaml",
+        "config_hash": "sha256:" + "4" * 64,
+    }
+
+    with pytest.raises(ValueError, match="profile is required"):
+        write_asset_qc_report(path, report, expected_revision=0)
+
+    assert not path.exists()
+
+
+def test_write_persists_explicit_supplier_evaluation_profile(tmp_path: Path) -> None:
+    path = tmp_path / "report.json"
+    report = make_v1_video_report()
+    report["qc_config"] = {
+        "schema_version": "qc_acceptance_config_schema.v2",
+        "config_version": "qc_acceptance_v2.0.0",
+        "config_name": "acceptance_gate",
+        "config_path": "configs/qc_acceptance.yaml",
+        "config_hash": "sha256:" + "5" * 64,
+    }
+
+    write_asset_qc_report(
+        path,
+        report,
+        expected_revision=0,
+        profile="supplier_evaluation",
+    )
+
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["execution"]["profile"] == "supplier_evaluation"
     validate_asset_qc_report(written)

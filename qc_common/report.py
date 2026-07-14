@@ -37,7 +37,13 @@ def load_asset_qc_report(
     )
 
 
-def write_asset_qc_report(path: Path, report: dict[str, Any], expected_revision: int) -> None:
+def write_asset_qc_report(
+    path: Path,
+    report: dict[str, Any],
+    expected_revision: int,
+    *,
+    profile: str | None = None,
+) -> None:
     current = load_asset_qc_report(path)
     current_revision = 0 if current is None else int(current.get("report_revision", 0))
     if current_revision != expected_revision:
@@ -50,9 +56,12 @@ def write_asset_qc_report(path: Path, report: dict[str, Any], expected_revision:
         and isinstance(config_reference, Mapping)
         and config_reference.get("schema_version") == "qc_acceptance_config_schema.v2"
     ):
+        if profile is None:
+            raise ValueError("profile is required to promote an asset QC report v1 with Config v2")
         report_to_write = migrate_v1_to_v2(
             report,
             config_reference=config_reference,
+            profile=profile,
         )
 
     next_revision = int(report_to_write.get("report_revision", 0))
