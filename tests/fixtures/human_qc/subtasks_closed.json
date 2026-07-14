@@ -1,0 +1,57 @@
+{
+  "id": "617856",
+  "scene": "商场",
+  "task": "购买红枣",
+  "fps": 30.0,
+  "frame_count": 195,
+  "annotations": [
+    {
+      "start_frame": 0,
+      "end_frame": 50,
+      "start_time_sec": 0.0,
+      "end_time_sec": 1.666,
+      "subtask_cn": "从红枣堆取一颗红枣",
+      "subtask_en": "Pick one red date from the pile",
+      "verb": "take",
+      "object": "red date",
+      "target": "plastic bag",
+      "hand": "right",
+      "phase": "take",
+      "evidence_frames": [0, 25, 50],
+      "confidence": 1.0,
+      "status": "human_calibrated"
+    },
+    {
+      "start_frame": 51,
+      "end_frame": 122,
+      "start_time_sec": 1.7,
+      "end_time_sec": 4.066,
+      "subtask_cn": "将红枣放入袋中",
+      "subtask_en": "Put the red date into the bag",
+      "verb": "put",
+      "object": "red date",
+      "target": "plastic bag",
+      "hand": "both",
+      "phase": "release",
+      "evidence_frames": [51, 86, 122],
+      "confidence": 0.99,
+      "status": "human_calibrated"
+    },
+    {
+      "start_frame": 123,
+      "end_frame": 194,
+      "start_time_sec": 4.1,
+      "end_time_sec": 6.466,
+      "subtask_cn": "继续抓取红枣",
+      "subtask_en": "Continue picking up red dates",
+      "verb": "take",
+      "object": "red date",
+      "target": "plastic bag",
+      "hand": "left",
+      "phase": "repeat",
+      "evidence_frames": [123, 158, 194],
+      "confidence": 0.98,
+      "status": "human_calibrated"
+    }
+  ]
+}
