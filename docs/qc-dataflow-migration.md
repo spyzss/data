@@ -147,3 +147,97 @@ candidate-window、SAM3、video 或 manual sidecar 只能通过显式
 禁止：用 sidecar/ledger/旧 CSV 覆盖 master verdict；把 v1 内容直接复制回 v2；
 降低 revision；跳过 CAS、evidence 相对路径或 schema 校验；把 runtime error 当作
 quality pass/fail；把 `supplier_evaluation` 的机器 fail 改成 warn/pass。
+
+## 8. 三条可执行迁移路径
+
+下面的命令以批次根目录为例。迁移前先冻结写入；所有输出目录都可以删除并重建，
+`quality_archive` 中的报告字节和 revision 则必须保留。`shasum` 的结果和配置快照
+一起归档，作为迁移前后的审计证据。
+
+### 8.1 正常升级：v1 只读输入，首次 module 写回 v2
+
+```bash
+set -eu
+BATCH_ROOT=sampled/XJGT_20260616
+ARCHIVE="$BATCH_ROOT/quality_archive"
+SNAPSHOT="$BATCH_ROOT/migration_snapshot/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$SNAPSHOT"
+
+# 1) 停止旧 runner，并保存配置快照、hash 和 master JSON 备份
+cp -p configs/qc_acceptance.yaml "$SNAPSHOT/qc_acceptance.yaml"
+cp -p configs/qc_acceptance/qc_acceptance_v2.0.0.yaml "$SNAPSHOT/qc_acceptance_v2.0.0.yaml"
+shasum -a 256 "$SNAPSHOT"/*.yaml > "$SNAPSHOT/config.sha256"
+find "$ARCHIVE" -type f -name '*.json' -exec shasum -a 256 {} \; \
+  | sort > "$SNAPSHOT/quality_archive.before.sha256"
+tar -czf "$SNAPSHOT/quality_archive.before.tgz" -C "$BATCH_ROOT" quality_archive
+
+# 2) 由受控 runner 对每个 v1 report 调用 migrate_v1_to_v2()，再用预期
+#    report_revision 做 CAS 写回；不得原地重序列化 v1 文件或拼接 sidecar verdict。
+# 3) 校验 v2 schema/config 后再运行正式 projection 和统计入口。
+python tools/build_qc_json_projection.py \
+  --quality-archive "$ARCHIVE" \
+  --output-dir "$BATCH_ROOT/qc_projection" \
+  --formats csv parquet xlsx markdown
+```
+
+迁移 runner 必须记录每个 `asset_id` 的旧 revision、新 revision、配置 hash 和
+写回结果；CAS 冲突只记录 error 并重试读取，不覆盖并发更新。迁移完成后再次运行
+`find ... | shasum`，确认未迁移资产与 `quality_archive.before.sha256` 一致。
+
+### 8.2 只读验证：只生成 projection/reconciliation
+
+该路径不调用任何 report mutation，也不创建 v2 master。适用于先评估旧 sidecar
+与当前 JSON 的差异：
+
+```bash
+set -eu
+BATCH_ROOT=sampled/XJGT_20260616
+ARCHIVE="$BATCH_ROOT/quality_archive"
+OUT="$BATCH_ROOT/migration_readonly"
+python tools/build_qc_json_projection.py \
+  --quality-archive "$ARCHIVE" \
+  --output-dir "$OUT/projection" \
+  --formats csv markdown \
+  --legacy-reconciliation-candidate-windows "$BATCH_ROOT/candidate_windows.json" \
+  --legacy-reconciliation-sam3-window-summary "$BATCH_ROOT/sam3_window_summary.json" \
+  --legacy-reconciliation-video-quality "$BATCH_ROOT/video_quality_results.json" \
+  --legacy-reconciliation-issue-events "$BATCH_ROOT/issue_events.json"
+```
+
+或者在 Python 只读工具中调用
+`reconcile_legacy_outputs(quality_archive=ARCHIVE, legacy_inputs=[...])`；返回值仅
+包含差异，并将 `authoritative_source` 标为 `asset_qc_json`。`reconciliation.csv`、
+projection 表和 cache 都不参与 verdict 统计，也不能反向写入报告。
+
+### 8.3 回滚：停 v2 writer，恢复旧 runner 但保留 v2 master
+
+```bash
+set -eu
+BATCH_ROOT=sampled/XJGT_20260616
+ARCHIVE="$BATCH_ROOT/quality_archive"
+ROLLBACK="$BATCH_ROOT/migration_snapshot/rollback-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$ROLLBACK"
+
+# 1) 先停 v2 writer；保留当前 v2 master、revision 和 hash
+find "$ARCHIVE" -type f -name '*.json' -exec shasum -a 256 {} \; \
+  | sort > "$ROLLBACK/quality_archive.v2.sha256"
+tar -czf "$ROLLBACK/quality_archive.v2.tgz" -C "$BATCH_ROOT" quality_archive
+
+# 2) 旧 runner 只允许生成 sidecar，禁止写入或覆盖 quality_archive/*.json
+rm -rf "$BATCH_ROOT/qc_projection" "$BATCH_ROOT/qc_cache"
+python tools/build_qc_json_projection.py \
+  --quality-archive "$ARCHIVE" \
+  --output-dir "$BATCH_ROOT/qc_projection.rollback" \
+  --formats csv markdown
+
+# 3) 恢复验证：master JSON 的 hash 必须仍与回滚前相同
+find "$ARCHIVE" -type f -name '*.json' -exec shasum -a 256 {} \; \
+  | sort > "$ROLLBACK/quality_archive.after.sha256"
+cmp "$ROLLBACK/quality_archive.v2.sha256" "$ROLLBACK/quality_archive.after.sha256"
+```
+
+如确需从备份恢复，先将当前目录改名，再解包
+`quality_archive.v2.tgz`，最后重新执行上面的 `cmp` 和
+`python tools/build_qc_json_projection.py` 验证。旧 runner 产生的旧报表、CSV、ledger
+或 sidecar 只能作为 reconciliation evidence；无论回滚还是重试，都不得覆盖已经
+存在的 v2 master JSON、降低 `report_revision` 或替换其 `overall_decision`。
