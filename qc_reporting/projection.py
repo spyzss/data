@@ -103,6 +103,7 @@ def project_quality_archive(quality_archive: Path) -> BatchProjection:
             {
                 "path": str(path),
                 "report_path": str(path),
+                "json_path": str(path),
                 "asset_id": asset_row["asset_id"],
                 "profile": asset_row["profile"],
                 "report_revision": asset_row["report_revision"],
@@ -288,6 +289,7 @@ def _project_issue_row(
         "issue_type": str(issue.get("issue_type") or ""),
         "machine_severity": machine_severity,
         "machine_verdict": machine_severity,
+        "severity": machine_severity,
         "human_verdict": human_verdict,
         "effective_verdict": effective_verdict,
         "needs_manual_review": issue.get("needs_manual_review"),
@@ -352,6 +354,7 @@ def _project_execution_row(
         "state": state,
         "duration_sec": duration_sec,
         "duration_ms": duration_ms,
+        "duration": duration_sec,
         "continued_after_fail": bool(
             runtime_map.get("continued_after_fail")
             or block_map.get("continued_after_fail")
