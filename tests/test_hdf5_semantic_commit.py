@@ -273,6 +273,123 @@ def test_recovery_requests_rebuild_when_old_hash_has_no_staged_file(tmp_path: Pa
     assert recover_hdf5_replacement(_prepared_record(prepared)) == RecoveryAction.REBUILD_STAGING
 
 
+def test_recovery_requests_rebuild_when_managed_staged_hash_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    source = write_complex_hdf5(tmp_path / "asset.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-corrupt")
+    prepared.staged_path.write_bytes(prepared.staged_path.read_bytes() + b"corrupt")
+
+    assert recover_hdf5_replacement(_prepared_record(prepared)) == RecoveryAction.REBUILD_STAGING
+
+
+def test_recovery_does_not_touch_foreign_stage_on_old_hash_conflict(tmp_path: Path) -> None:
+    source = write_complex_hdf5(tmp_path / "asset.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-foreign")
+    foreign = tmp_path / "foreign-stage.bin"
+    foreign.write_bytes(prepared.staged_path.read_bytes())
+    prepared.staged_path.unlink()
+    before = foreign.read_bytes()
+    record = FinalizingRecord(
+        source_path=source,
+        staged_path=foreign,
+        old_sha256=prepared.old_sha256,
+        new_sha256=prepared.new_sha256,
+        transaction_id=prepared.transaction_id,
+    )
+
+    assert recover_hdf5_replacement(record) == RecoveryAction.CONFLICT
+    assert foreign.read_bytes() == before
+
+
+def test_recovery_does_not_remove_unmanaged_file_when_current_is_new(
+    tmp_path: Path,
+) -> None:
+    source = write_complex_hdf5(tmp_path / "asset.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-unmanaged")
+    os.replace(prepared.staged_path, source)
+    foreign = tmp_path / "foreign-stage.bin"
+    foreign.write_bytes(source.read_bytes())
+    before = foreign.read_bytes()
+    record = _prepared_record(prepared)
+    record = FinalizingRecord(
+        source_path=record.source_path,
+        staged_path=foreign,
+        old_sha256=record.old_sha256,
+        new_sha256=record.new_sha256,
+        transaction_id=record.transaction_id,
+    )
+
+    assert recover_hdf5_replacement(record) == RecoveryAction.MARK_REPORT_COMPLETED
+    assert foreign.read_bytes() == before
+
+
+def test_commit_rejects_manually_crafted_same_directory_stage(tmp_path: Path) -> None:
+    source = write_complex_hdf5(tmp_path / "asset.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-owned")
+    foreign = tmp_path / "arbitrary-stage.hdf5"
+    foreign.write_bytes(prepared.staged_path.read_bytes())
+    crafted = PreparedReplacement(
+        source_path=source,
+        staged_path=foreign,
+        old_sha256=prepared.old_sha256,
+        new_sha256=prepared.new_sha256,
+        transaction_id=prepared.transaction_id,
+    )
+    before_source = source.read_bytes()
+    before_foreign = foreign.read_bytes()
+
+    with pytest.raises(Hdf5CommitError, match="owned|staging"):
+        commit_hdf5_replacement(crafted)
+
+    assert source.read_bytes() == before_source
+    assert foreign.read_bytes() == before_foreign
+    prepared.staged_path.unlink()
+
+
+def test_assert_only_dataset_changed_rejects_attribute_dtype_drift(tmp_path: Path) -> None:
+    before = write_complex_hdf5(tmp_path / "before.hdf5")
+    after = tmp_path / "after.hdf5"
+    after.write_bytes(before.read_bytes())
+    with h5py.File(after, "r+") as handle:
+        handle[DATASET_PATH].attrs["revision"] = np.float64(3.0)
+
+    with pytest.raises(Hdf5CommitError, match="attribute"):
+        assert_only_dataset_changed(before, after, DATASET_PATH)
+
+
+def test_assert_only_dataset_changed_rejects_added_soft_link(tmp_path: Path) -> None:
+    before = write_complex_hdf5(tmp_path / "before.hdf5")
+    after = tmp_path / "after.hdf5"
+    after.write_bytes(before.read_bytes())
+    with h5py.File(after, "r+") as handle:
+        handle["dangling_review_link"] = h5py.SoftLink("/missing/target")
+
+    with pytest.raises(Hdf5CommitError, match="link|path"):
+        assert_only_dataset_changed(before, after, DATASET_PATH)
+
+
+def test_commit_parent_directory_fsync_failure_keeps_published_new_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_complex_hdf5(tmp_path / "asset.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-dir-fsync")
+    expected_new = prepared.staged_path.read_bytes()
+    import human_qc.hdf5_commit as module
+
+    monkeypatch.setattr(
+        module,
+        "_fsync_directory",
+        lambda *_: (_ for _ in ()).throw(OSError("directory fsync injected")),
+    )
+
+    with pytest.raises(Hdf5CommitError, match="fsync|commit"):
+        commit_hdf5_replacement(prepared)
+
+    assert source.read_bytes() == expected_new
+    assert not prepared.staged_path.exists()
+
+
 def test_recovery_reports_conflict_for_unknown_current_hash(tmp_path: Path) -> None:
     source = write_complex_hdf5(tmp_path / "asset.hdf5")
     prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-conflict")

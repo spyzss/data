@@ -10,7 +10,7 @@ cannot partially update it.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import json
@@ -58,6 +58,9 @@ class PreparedReplacement:
     old_sha256: str
     new_sha256: str
     transaction_id: str
+    _ownership: "_StagingOwnership | None" = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path))
@@ -77,6 +80,14 @@ class FinalizingRecord:
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path))
         object.__setattr__(self, "staged_path", Path(self.staged_path))
+
+
+@dataclass(frozen=True)
+class _StagingOwnership:
+    """In-process proof that a staged path came from ``prepare``."""
+
+    path: Path
+    transaction_id: str
 
 
 __all__ = [
@@ -147,12 +158,13 @@ def prepare_hdf5_replacement(
             old_sha256=old_sha256,
             new_sha256=new_sha256,
             transaction_id=transaction_id,
+            _ownership=_StagingOwnership(staged, transaction_id),
         )
     except Hdf5CommitError:
-        _unlink_staged(staged, source)
+        _unlink_staged(staged, source, transaction_id=transaction_id)
         raise
     except Exception as exc:
-        _unlink_staged(staged, source)
+        _unlink_staged(staged, source, transaction_id=transaction_id)
         raise Hdf5CommitError(
             f"failed to prepare HDF5 replacement for {source}: {exc}"
         ) from exc
@@ -167,8 +179,10 @@ def commit_hdf5_replacement(prepared: PreparedReplacement) -> None:
     source = Path(prepared.source_path)
     staged = Path(prepared.staged_path)
     try:
-        if source.parent != staged.parent:
-            raise Hdf5CommitError("source and staged HDF5 files must share a directory")
+        if not _is_owned_prepared(prepared):
+            raise Hdf5CommitError(
+                "staged HDF5 path is not an owned prepare() artifact"
+            )
         if (
             not source.is_file()
             or not staged.is_file()
@@ -192,10 +206,10 @@ def commit_hdf5_replacement(prepared: PreparedReplacement) -> None:
             raise Hdf5CommitError("source HDF5 hash differs after replace")
         _fsync_directory(source.parent)
     except Hdf5CommitError:
-        _unlink_staged(staged, source)
+        _unlink_owned_prepared(prepared)
         raise
     except Exception as exc:
-        _unlink_staged(staged, source)
+        _unlink_owned_prepared(prepared)
         raise Hdf5CommitError(f"failed to commit HDF5 replacement: {exc}") from exc
 
 
@@ -224,10 +238,14 @@ def recover_hdf5_replacement(record: FinalizingRecord) -> RecoveryAction:
         return RecoveryAction.CONFLICT
 
     if current_sha256 == record.new_sha256:
-        if staged.is_file():
+        if _is_managed_staged_path(source, staged, record.transaction_id) and staged.is_file():
             try:
                 if _sha256_file(staged) == record.new_sha256:
-                    _unlink_staged(staged, source)
+                    _unlink_staged(
+                        staged,
+                        source,
+                        transaction_id=record.transaction_id,
+                    )
             except OSError:
                 # The source is already the committed new bytes; failure to
                 # clean an ancillary staging file must not downgrade recovery.
@@ -235,17 +253,21 @@ def recover_hdf5_replacement(record: FinalizingRecord) -> RecoveryAction:
         return RecoveryAction.MARK_REPORT_COMPLETED
 
     if current_sha256 == record.old_sha256:
-        if not staged.is_file() or staged.is_symlink() or source.is_symlink():
-            return RecoveryAction.REBUILD_STAGING
-        if source.parent != staged.parent:
+        if staged.is_symlink():
             return RecoveryAction.CONFLICT
+        if not staged.exists():
+            return RecoveryAction.REBUILD_STAGING
+        if not _is_managed_staged_path(source, staged, record.transaction_id):
+            return RecoveryAction.CONFLICT
+        if not staged.is_file() or source.is_symlink():
+            return RecoveryAction.REBUILD_STAGING
         try:
             staged_sha256 = _sha256_file(staged)
         except OSError:
-            return RecoveryAction.CONFLICT
+            return RecoveryAction.REBUILD_STAGING
         if staged_sha256 == record.new_sha256:
             return RecoveryAction.RETRY_REPLACE
-        return RecoveryAction.CONFLICT
+        return RecoveryAction.REBUILD_STAGING
 
     return RecoveryAction.CONFLICT
 
@@ -269,6 +291,8 @@ def assert_only_dataset_changed(
         with h5py.File(before_path, "r") as left, h5py.File(after_path, "r") as right:
             left_objects = _collect_objects(left)
             right_objects = _collect_objects(right)
+            left_links = _collect_links(left)
+            right_links = _collect_links(right)
 
             if allowed_dataset_path not in right_objects:
                 raise Hdf5CommitError(
@@ -343,6 +367,12 @@ def assert_only_dataset_changed(
                         raise Hdf5CommitError(
                             f"non-target dataset content changed at {path}"
                         )
+
+            _assert_links_unchanged(
+                left_links,
+                right_links,
+                allowed_dataset_path=allowed_dataset_path,
+            )
     except Hdf5CommitError:
         raise
     except Exception as exc:
@@ -418,7 +448,7 @@ def _assign_scalar_json(dataset: h5py.Dataset, serialized: bytes, path: str) -> 
 
 
 def _make_staged_path(source: Path, transaction_id: str) -> Path:
-    safe_id = _SAFE_TRANSACTION_ID.sub("_", transaction_id).strip(".") or "tx"
+    safe_id = _safe_transaction_id(transaction_id)
     prefix = f".{source.name}.human-qc-{safe_id}-"
     fd, name = tempfile.mkstemp(prefix=prefix, dir=source.parent)
     staged = Path(name)
@@ -465,12 +495,69 @@ def _unlink_quiet(path: Path | None) -> None:
         pass
 
 
-def _unlink_staged(staged: Path | None, source: Path) -> None:
-    """Remove a staging artifact without ever unlinking the source itself."""
+def _safe_transaction_id(transaction_id: str) -> str:
+    return _SAFE_TRANSACTION_ID.sub("_", transaction_id).strip(".") or "tx"
 
-    if staged is None or Path(staged) == Path(source):
+
+def _is_managed_staged_path(
+    source: Path, staged: Path, transaction_id: str
+) -> bool:
+    """Recognize a temp path belonging to this source/transaction namespace."""
+
+    source = Path(source)
+    staged = Path(staged)
+    if source.parent != staged.parent or source == staged:
+        return False
+    if staged.is_symlink():
+        return False
+    safe_id = _safe_transaction_id(transaction_id) if transaction_id else ""
+    prefix = f".{source.name}.human-qc-"
+    if safe_id:
+        prefix += f"{safe_id}-"
+    if not staged.name.startswith(prefix):
+        return False
+    return bool(staged.name[len(prefix) :])
+
+
+def _is_owned_prepared(prepared: PreparedReplacement) -> bool:
+    ownership = prepared._ownership
+    if not isinstance(ownership, _StagingOwnership):
+        return False
+    if ownership.path != Path(prepared.staged_path):
+        return False
+    if ownership.transaction_id != prepared.transaction_id:
+        return False
+    return _is_managed_staged_path(
+        Path(prepared.source_path),
+        Path(prepared.staged_path),
+        prepared.transaction_id,
+    )
+
+
+def _unlink_staged(
+    staged: Path | None,
+    source: Path,
+    *,
+    transaction_id: str,
+) -> None:
+    """Remove only a managed staging artifact, never source/foreign files."""
+
+    if staged is None:
         return
-    _unlink_quiet(Path(staged))
+    staged = Path(staged)
+    if not _is_managed_staged_path(Path(source), staged, transaction_id):
+        return
+    _unlink_quiet(staged)
+
+
+def _unlink_owned_prepared(prepared: PreparedReplacement) -> None:
+    if not _is_owned_prepared(prepared):
+        return
+    _unlink_staged(
+        Path(prepared.staged_path),
+        Path(prepared.source_path),
+        transaction_id=prepared.transaction_id,
+    )
 
 
 def _collect_objects(handle: h5py.File) -> dict[str, h5py.Group | h5py.Dataset]:
@@ -483,6 +570,54 @@ def _collect_objects(handle: h5py.File) -> dict[str, h5py.Group | h5py.Dataset]:
     return objects
 
 
+def _collect_links(handle: h5py.File) -> dict[str, tuple[object, ...]]:
+    links: dict[str, tuple[object, ...]] = {}
+
+    def visit(name: str, link: object) -> None:
+        links["/" + name] = _link_descriptor(link)
+
+    # ``visititems_links`` includes dangling soft/external links and hard
+    # links separately from their targets, which is required for a strict
+    # path-level diff.
+    handle.visititems_links(visit)
+    return links
+
+
+def _link_descriptor(link: object) -> tuple[object, ...]:
+    if isinstance(link, h5py.HardLink):
+        return ("hard",)
+    if isinstance(link, h5py.SoftLink):
+        return ("soft", link.path)
+    if isinstance(link, h5py.ExternalLink):
+        return ("external", link.filename, link.path)
+    return (type(link).__name__, repr(link))
+
+
+def _assert_links_unchanged(
+    before: dict[str, tuple[object, ...]],
+    after: dict[str, tuple[object, ...]],
+    *,
+    allowed_dataset_path: str,
+) -> None:
+    all_paths = set(before) | set(after)
+    for path in sorted(all_paths):
+        old = before.get(path)
+        new = after.get(path)
+        if old is None:
+            # Creating a missing target also creates a hard link for the
+            # target and, when needed, hard links for ancestor groups.  No
+            # soft/external link can be part of that sanctioned change.
+            if (
+                path == allowed_dataset_path or _is_target_ancestor(path, allowed_dataset_path)
+            ) and new is not None and new[0] == "hard":
+                continue
+            raise Hdf5CommitError(f"HDF5 link/path added at {path}")
+        if new is None:
+            raise Hdf5CommitError(f"HDF5 link/path removed at {path}")
+        if old != new:
+            raise Hdf5CommitError(f"HDF5 link changed at {path}")
+
+
 def _is_target_ancestor(path: str, target: str) -> bool:
     return target.startswith(path.rstrip("/") + "/")
 
@@ -490,7 +625,21 @@ def _is_target_ancestor(path: str, target: str) -> bool:
 def _attrs_equal(left: h5py.AttributeManager, right: h5py.AttributeManager) -> bool:
     if set(left.keys()) != set(right.keys()):
         return False
-    return all(_data_equal(left[key], right[key]) for key in left.keys())
+    for key in left.keys():
+        left_value = left[key]
+        right_value = right[key]
+        if _attribute_dtype_shape(left_value) != _attribute_dtype_shape(right_value):
+            return False
+        if not _data_equal(left_value, right_value):
+            return False
+    return True
+
+
+def _attribute_dtype_shape(value: object) -> tuple[object, tuple[int, ...]]:
+    if isinstance(value, h5py.Empty):
+        return ("empty", np.dtype(value.dtype)), ()
+    array = np.asarray(value)
+    return array.dtype, tuple(array.shape)
 
 
 def _data_equal(left: object, right: object) -> bool:
