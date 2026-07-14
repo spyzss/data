@@ -165,12 +165,42 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--legacy-reconciliation-precheck-clip-aggregates", "--precheck-clip-aggregates", dest="legacy_precheck_clip_aggregates", type=Path)
     parser.add_argument("--legacy-reconciliation-precheck-candidate-windows", "--precheck-candidate-windows", dest="legacy_precheck_candidate_windows", type=Path)
     parser.add_argument("--legacy-reconciliation-video-quality-results", "--video-quality-results", dest="legacy_video_quality_results", type=Path)
-    parser.add_argument("--video-quality-summary", type=Path)
-    parser.add_argument("--sam3-window-summary", type=Path)
-    parser.add_argument("--sam3-clip-summary", type=Path)
-    parser.add_argument("--sam3-frame-results", type=Path)
-    parser.add_argument("--manual-review-labels", type=Path)
-    parser.add_argument("--manual-review-csv", type=Path)
+    parser.add_argument(
+        "--video-quality-summary",
+        "--legacy-reconciliation-video-quality-summary",
+        dest="video_quality_summary",
+        type=Path,
+    )
+    parser.add_argument(
+        "--sam3-window-summary",
+        "--legacy-reconciliation-sam3-window-summary",
+        dest="sam3_window_summary",
+        type=Path,
+    )
+    parser.add_argument(
+        "--sam3-clip-summary",
+        "--legacy-reconciliation-sam3-clip-summary",
+        dest="sam3_clip_summary",
+        type=Path,
+    )
+    parser.add_argument(
+        "--sam3-frame-results",
+        "--legacy-reconciliation-sam3-frame-results",
+        dest="sam3_frame_results",
+        type=Path,
+    )
+    parser.add_argument(
+        "--manual-review-labels",
+        "--legacy-reconciliation-manual-review-labels",
+        dest="manual_review_labels",
+        type=Path,
+    )
+    parser.add_argument(
+        "--manual-review-csv",
+        "--legacy-reconciliation-manual-review-csv",
+        dest="manual_review_csv",
+        type=Path,
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
@@ -183,19 +213,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     if args.quality_archive is not None:
-        from tools.build_qc_json_projection import run_projection_cli
-
-        projected = run_projection_cli(
-            args.quality_archive,
-            args.output_dir,
-            formats=("csv", "parquet", "xlsx", "markdown"),
-            legacy_candidate_windows=args.legacy_precheck_candidate_windows,
-            legacy_sam3_window_summary=args.sam3_window_summary,
-            legacy_video_quality=args.legacy_video_quality_results,
-            legacy_issue_events=args.manual_review_labels,
+        outputs = build_acceptance_outputs(
+            quality_archive=args.quality_archive,
+            output_dir=args.output_dir,
+            manifest=args.legacy_manifest,
+            precheck_check_results=args.legacy_precheck_check_results,
+            precheck_clip_aggregates=args.legacy_precheck_clip_aggregates,
+            precheck_candidate_windows=args.legacy_precheck_candidate_windows,
+            video_quality_results=args.legacy_video_quality_results,
+            sam3_window_summary=args.sam3_window_summary,
+            manual_review_labels=args.manual_review_labels,
+            video_quality_summary=args.video_quality_summary,
+            sam3_clip_summary=args.sam3_clip_summary,
+            sam3_frame_results=args.sam3_frame_results,
+            manual_review_csv=args.manual_review_csv,
         )
-        LOGGER.info("Wrote %s", projected.get("xlsx", args.output_dir / "qc_projection.xlsx"))
-        LOGGER.info("Wrote %s", projected.get("asset_csv", args.output_dir / "assets.csv"))
+        for path in (
+            outputs.asset_ledger_csv,
+            outputs.issue_events_csv,
+            outputs.workbook_xlsx,
+            outputs.summary_json,
+        ):
+            LOGGER.info("Wrote %s", path)
         return 0
     required_legacy = {
         "--manifest": args.legacy_manifest,
@@ -259,10 +298,19 @@ def build_acceptance_outputs(
             quality_archive,
             output_dir,
             formats=("csv", "parquet", "xlsx", "markdown"),
-            legacy_candidate_windows=precheck_candidate_windows,
-            legacy_sam3_window_summary=sam3_window_summary,
-            legacy_video_quality=video_quality_results,
-            legacy_issue_events=manual_review_labels,
+            legacy_sidecars={
+                "manifest": manifest,
+                "precheck_check_results": precheck_check_results,
+                "precheck_clip_aggregates": precheck_clip_aggregates,
+                "precheck_candidate_windows": precheck_candidate_windows,
+                "sam3_window_summary": sam3_window_summary,
+                "video_quality_results": video_quality_results,
+                "manual_review_labels": manual_review_labels,
+                "video_quality_summary": video_quality_summary,
+                "sam3_clip_summary": sam3_clip_summary,
+                "sam3_frame_results": sam3_frame_results,
+                "manual_review_csv": manual_review_csv,
+            },
         )
         outputs = OutputPaths(
             asset_ledger_csv=output_dir / "xjgt_100_asset_ledger.csv",

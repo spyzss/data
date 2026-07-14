@@ -25,6 +25,15 @@ from qc_reporting.projection import BatchProjection, project_quality_archive
 
 LOGGER = logging.getLogger("build_qc_json_projection")
 SUPPORTED_FORMATS = ("csv", "parquet", "xlsx", "markdown")
+RECONCILIATION_COLUMNS = (
+    "source",
+    "legacy_path",
+    "legacy_row_index",
+    "asset_id",
+    "legacy_verdict",
+    "qc_json_verdict",
+    "difference_type",
+)
 _TABLE_ROWS = {
     "asset": "asset_rows",
     "issue": "issue_rows",
@@ -356,6 +365,8 @@ def build_reconciliation_rows(
 ) -> list[dict[str, Any]]:
     """Compare legacy sidecar evidence to QC JSON without changing verdicts."""
 
+    sidecars = _normalize_legacy_sidecars(sidecars)
+
     assets = {
         str(row.get("asset_id")): row
         for row in projection.asset_rows
@@ -407,8 +418,38 @@ def write_reconciliation_only(
     """Write sidecar differences as evidence-only CSV."""
 
     rows = build_reconciliation_rows(projection, sidecars)
-    frame = _dataframe(rows)
+    frame = _dataframe(rows, columns=RECONCILIATION_COLUMNS)
     return _write_csv(frame, Path(output_path))
+
+
+def _normalize_legacy_sidecars(
+    sidecars: Mapping[str, Path | None],
+) -> dict[str, Path | None]:
+    """Validate and normalize a source-name to legacy path mapping.
+
+    ``None`` is retained as an explicit omitted input so callers can build a
+    mapping directly from optional CLI arguments.  Every non-empty source is
+    preserved; unsupported file types are rejected later by
+    :func:`_read_legacy_records` instead of being silently ignored.
+    """
+
+    if not isinstance(sidecars, Mapping):
+        raise TypeError("legacy_sidecars must be a mapping of source names to paths")
+    normalized: dict[str, Path | None] = {}
+    for raw_source, raw_path in sidecars.items():
+        source = str(raw_source).strip() if isinstance(raw_source, str) else ""
+        if not source:
+            raise ValueError("legacy reconciliation source names must be non-empty strings")
+        if raw_path is None:
+            normalized[source] = None
+            continue
+        try:
+            normalized[source] = Path(raw_path)
+        except TypeError as exc:
+            raise TypeError(
+                f"legacy reconciliation path for {source!r} must be path-like or None"
+            ) from exc
+    return normalized
 
 
 def run_projection_cli(
@@ -416,6 +457,7 @@ def run_projection_cli(
     output_dir: Path,
     *,
     formats: Iterable[str] = SUPPORTED_FORMATS,
+    legacy_sidecars: Mapping[str, Path | None] | None = None,
     legacy_candidate_windows: Path | None = None,
     legacy_sam3_window_summary: Path | None = None,
     legacy_video_quality: Path | None = None,
@@ -424,12 +466,22 @@ def run_projection_cli(
     projection = project_quality_archive(Path(quality_archive))
     statistics = aggregate_projection(projection)
     paths = write_projection_outputs(projection, statistics, Path(output_dir), formats)
-    sidecars = {
+    sidecars = _normalize_legacy_sidecars(legacy_sidecars or {})
+    compatibility_sidecars = {
         "candidate_windows": legacy_candidate_windows,
         "sam3_window_summary": legacy_sam3_window_summary,
         "video_quality": legacy_video_quality,
         "issue_events": legacy_issue_events,
     }
+    for source, raw_path in compatibility_sidecars.items():
+        if raw_path is None:
+            continue
+        path = Path(raw_path)
+        if source in sidecars and sidecars[source] != path:
+            raise ValueError(
+                f"legacy reconciliation source {source!r} was supplied with conflicting paths"
+            )
+        sidecars[source] = path
     if any(path is not None for path in sidecars.values()):
         paths["reconciliation_csv"] = write_reconciliation_only(
             projection,
@@ -484,6 +536,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "RECONCILIATION_COLUMNS",
     "build_reconciliation_rows",
     "main",
     "parse_args",

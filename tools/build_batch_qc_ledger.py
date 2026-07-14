@@ -71,7 +71,12 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--quality-archive", required=True, type=Path)
-    parser.add_argument("--supplier-sample-manifest", type=Path)
+    parser.add_argument(
+        "--supplier-sample-manifest",
+        "--legacy-reconciliation-manifest",
+        dest="supplier_sample_manifest",
+        type=Path,
+    )
     parser.add_argument("--legacy-reconciliation-precheck-clip-aggregates", "--precheck-clip-aggregates", dest="legacy_reconciliation_precheck_clip_aggregates", type=Path)
     parser.add_argument("--legacy-reconciliation-candidate-windows", "--precheck-candidate-windows", dest="legacy_reconciliation_candidate_windows", type=Path)
     parser.add_argument("--legacy-reconciliation-sam3-window-summary", "--sam3-window-summary", dest="legacy_reconciliation_sam3_window_summary", type=Path)
@@ -105,10 +110,14 @@ def main() -> int:
         args.quality_archive,
         args.output_dir,
         formats=args.formats,
-        legacy_candidate_windows=args.legacy_reconciliation_candidate_windows,
-        legacy_sam3_window_summary=args.legacy_reconciliation_sam3_window_summary,
-        legacy_video_quality=args.legacy_reconciliation_video_quality_results,
-        legacy_issue_events=args.legacy_reconciliation_manual_review_labels,
+        legacy_sidecars={
+            "manifest": args.supplier_sample_manifest,
+            "precheck_clip_aggregates": args.legacy_reconciliation_precheck_clip_aggregates,
+            "precheck_candidate_windows": args.legacy_reconciliation_candidate_windows,
+            "sam3_window_summary": args.legacy_reconciliation_sam3_window_summary,
+            "video_quality_results": args.legacy_reconciliation_video_quality_results,
+            "manual_review_labels": args.legacy_reconciliation_manual_review_labels,
+        },
     )
     aliases = {
         "asset_csv": "batch_qc_ledger.csv",

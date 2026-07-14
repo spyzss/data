@@ -2,13 +2,16 @@ import csv
 import json
 from pathlib import Path
 
+import pandas as pd
 from openpyxl import load_workbook
 
 from tools.build_xjgt_acceptance_report import (
     ASSET_LEDGER_COLUMNS,
     ISSUE_EVENT_COLUMNS,
     build_acceptance_outputs,
+    main,
 )
+from tests.test_qc_reporting_projection import _write_report
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -204,6 +207,77 @@ def test_final_policy_and_output_schemas(tmp_path: Path) -> None:
     assert manual_event["start_frame"] == "20"
     assert manual_event["end_frame"] == "40"
     assert manual_event["failure_mode"] == "severe_keypoint_offset"
+
+
+def test_formal_cli_uses_xjgt_wrapper_and_stable_output_names(tmp_path: Path) -> None:
+    archive = tmp_path / "quality_archive"
+    _write_report(archive, "asset-a", "acceptance", "pass", issues=[])
+    output_dir = tmp_path / "formal"
+
+    assert (
+        main(
+            [
+                "--quality-archive",
+                str(archive),
+                "--output-dir",
+                str(output_dir),
+            ]
+        )
+        == 0
+    )
+
+    assert (output_dir / "xjgt_100_asset_ledger.csv").exists()
+    assert (output_dir / "xjgt_100_issue_events.csv").exists()
+    assert (output_dir / "xjgt_100_acceptance_report.xlsx").exists()
+    assert (output_dir / "xjgt_100_summary.json").exists()
+
+
+def test_formal_xjgt_cli_reconciles_all_legacy_sidecars(tmp_path: Path) -> None:
+    archive = tmp_path / "quality_archive"
+    _write_report(archive, "asset-a", "acceptance", "pass", issues=[])
+    output_dir = tmp_path / "formal"
+    sidecars = {
+        "manifest": "manifest.json",
+        "precheck_check_results": "check.json",
+        "precheck_clip_aggregates": "clip.json",
+        "precheck_candidate_windows": "candidate.json",
+        "video_quality_results": "video.json",
+        "sam3_window_summary": "sam3.json",
+        "manual_review_labels": "manual.json",
+        "video_quality_summary": "video-summary.json",
+        "sam3_clip_summary": "sam3-clip.json",
+        "sam3_frame_results": "sam3-frame.json",
+        "manual_review_csv": "manual.csv",
+    }
+    options = {
+        "manifest": "--legacy-reconciliation-manifest",
+        "precheck_check_results": "--legacy-reconciliation-precheck-check-results",
+        "precheck_clip_aggregates": "--legacy-reconciliation-precheck-clip-aggregates",
+        "precheck_candidate_windows": "--legacy-reconciliation-precheck-candidate-windows",
+        "video_quality_results": "--legacy-reconciliation-video-quality-results",
+        "sam3_window_summary": "--legacy-reconciliation-sam3-window-summary",
+        "manual_review_labels": "--legacy-reconciliation-manual-review-labels",
+        "video_quality_summary": "--legacy-reconciliation-video-quality-summary",
+        "sam3_clip_summary": "--legacy-reconciliation-sam3-clip-summary",
+        "sam3_frame_results": "--legacy-reconciliation-sam3-frame-results",
+        "manual_review_csv": "--legacy-reconciliation-manual-review-csv",
+    }
+    args = ["--quality-archive", str(archive), "--output-dir", str(output_dir)]
+    for source, name in sidecars.items():
+        path = tmp_path / name
+        if path.suffix == ".csv":
+            path.write_text("asset_id,verdict\nasset-a,pass\n", encoding="utf-8")
+        else:
+            path.write_text(
+                json.dumps([{"asset_id": "asset-a", "verdict": "pass"}]),
+                encoding="utf-8",
+            )
+        args.extend([options[source], str(path)])
+
+    assert main(args) == 0
+    reconciliation = pd.read_csv(output_dir / "reconciliation.csv")
+    assert set(reconciliation["source"]) == set(sidecars)
+    assert (output_dir / "xjgt_100_acceptance_report.xlsx").exists()
 
 
 def test_workbook_and_summary_contain_required_sections(tmp_path: Path) -> None:

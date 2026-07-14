@@ -344,13 +344,12 @@ def build_supplier_ledger(
 
 def build_acceptance_ledger(
     *,
-    config_path: Path,
+    config_path: Path | None,
     output_path: Path,
     overwrite: bool = False,
     existing_workbook: Path | None = None,
     quality_archive: Path | None = None,
 ) -> Path:
-    config_path = Path(config_path)
     output_path = Path(output_path)
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"output exists; pass --overwrite: {output_path}")
@@ -371,6 +370,11 @@ def build_acceptance_ledger(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(projected_xlsx, output_path)
         return output_path
+    if config_path is None:
+        raise ValueError(
+            "config_path is required when quality_archive is not provided"
+        )
+    config_path = Path(config_path)
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if config.get("workbook_mode") == "weekly_template":
         try:
