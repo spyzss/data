@@ -8,6 +8,7 @@ import csv
 import json
 import logging
 import re
+import shutil
 import subprocess
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -284,6 +285,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=Path("outputs/acceptance_5x100"),
     )
     parser.add_argument(
+        "--quality-archive",
+        type=Path,
+        help="Canonical QC JSON archive used for formal weekly verdicts.",
+    )
+    parser.add_argument("--legacy-reconciliation-candidate-windows", type=Path)
+    parser.add_argument("--legacy-reconciliation-sam3-window-summary", type=Path)
+    parser.add_argument("--legacy-reconciliation-video-quality", type=Path)
+    parser.add_argument("--legacy-reconciliation-issue-events", type=Path)
+    parser.add_argument(
         "--audit-inputs",
         action="store_true",
         help="Inspect candidate input schemas and mapping coverage without writing outputs.",
@@ -318,6 +328,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.audit_inputs:
         print(json.dumps(collect_input_audit(args.run_root), indent=2, ensure_ascii=False))
         return 0
+    if args.quality_archive is None:
+        raise SystemExit("--quality-archive is required unless --audit-inputs is used")
+    from tools.build_qc_json_projection import run_projection_cli
+
+    projected = run_projection_cli(
+        args.quality_archive,
+        args.run_root,
+        formats=("csv", "parquet", "xlsx", "markdown"),
+        legacy_candidate_windows=args.legacy_reconciliation_candidate_windows,
+        legacy_sam3_window_summary=args.legacy_reconciliation_sam3_window_summary,
+        legacy_video_quality=args.legacy_reconciliation_video_quality,
+        legacy_issue_events=args.legacy_reconciliation_issue_events,
+    )
+    LOGGER.info("Wrote %s", projected.get("xlsx", args.run_root / "qc_projection.xlsx"))
+    LOGGER.info("Wrote %s", projected.get("asset_csv", args.run_root / "assets.csv"))
+    return 0
     outputs = build_weekly_report(
         args.run_root,
         require_xjgt_text=(
@@ -341,8 +367,34 @@ def build_weekly_report(
     xjgt_video_quality_config: Path | None = None,
     xjgt_sam3_config: Path | None = None,
     xjgt_weekly_policy_config: Path | None = None,
+    quality_archive: Path | None = None,
+    legacy_reconciliation_candidate_windows: Path | None = None,
+    legacy_reconciliation_sam3_window_summary: Path | None = None,
+    legacy_reconciliation_video_quality: Path | None = None,
+    legacy_reconciliation_issue_events: Path | None = None,
 ) -> WeeklyOutputPaths:
     run_root.mkdir(parents=True, exist_ok=True)
+    if quality_archive is not None:
+        from tools.build_qc_json_projection import run_projection_cli
+
+        projected = run_projection_cli(
+            quality_archive,
+            run_root,
+            formats=("csv", "parquet", "xlsx", "markdown"),
+            legacy_candidate_windows=legacy_reconciliation_candidate_windows,
+            legacy_sam3_window_summary=legacy_reconciliation_sam3_window_summary,
+            legacy_video_quality=legacy_reconciliation_video_quality,
+            legacy_issue_events=legacy_reconciliation_issue_events,
+        )
+        summary_csv = run_root / "weekly_supplier_summary.csv"
+        asset_csv = projected.get("asset_csv")
+        if asset_csv is None:
+            raise RuntimeError("QC projection did not produce an asset CSV")
+        shutil.copyfile(asset_csv, summary_csv)
+        workbook_xlsx = projected.get("xlsx")
+        if workbook_xlsx is None:
+            raise RuntimeError("QC projection did not produce an XLSX output")
+        return WeeklyOutputPaths(workbook_xlsx, summary_csv)
     xjgt = load_xjgt(
         run_root,
         require_xjgt_text=require_xjgt_text,

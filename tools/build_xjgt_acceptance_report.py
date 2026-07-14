@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import logging
+import shutil
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,16 +159,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build the final XJGT asset ledger, issue events, summary, and Excel report."
     )
-    parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--precheck-check-results", type=Path)
-    parser.add_argument("--precheck-clip-aggregates", required=True, type=Path)
-    parser.add_argument("--precheck-candidate-windows", required=True, type=Path)
-    parser.add_argument("--video-quality-results", required=True, type=Path)
+    parser.add_argument("--quality-archive", type=Path)
+    parser.add_argument("--legacy-reconciliation-manifest", "--manifest", dest="legacy_manifest", type=Path)
+    parser.add_argument("--legacy-reconciliation-precheck-check-results", "--precheck-check-results", dest="legacy_precheck_check_results", type=Path)
+    parser.add_argument("--legacy-reconciliation-precheck-clip-aggregates", "--precheck-clip-aggregates", dest="legacy_precheck_clip_aggregates", type=Path)
+    parser.add_argument("--legacy-reconciliation-precheck-candidate-windows", "--precheck-candidate-windows", dest="legacy_precheck_candidate_windows", type=Path)
+    parser.add_argument("--legacy-reconciliation-video-quality-results", "--video-quality-results", dest="legacy_video_quality_results", type=Path)
     parser.add_argument("--video-quality-summary", type=Path)
-    parser.add_argument("--sam3-window-summary", required=True, type=Path)
+    parser.add_argument("--sam3-window-summary", type=Path)
     parser.add_argument("--sam3-clip-summary", type=Path)
     parser.add_argument("--sam3-frame-results", type=Path)
-    parser.add_argument("--manual-review-labels", required=True, type=Path)
+    parser.add_argument("--manual-review-labels", type=Path)
     parser.add_argument("--manual-review-csv", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--log-level", default="INFO")
@@ -180,15 +182,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    if args.quality_archive is not None:
+        from tools.build_qc_json_projection import run_projection_cli
+
+        projected = run_projection_cli(
+            args.quality_archive,
+            args.output_dir,
+            formats=("csv", "parquet", "xlsx", "markdown"),
+            legacy_candidate_windows=args.legacy_precheck_candidate_windows,
+            legacy_sam3_window_summary=args.sam3_window_summary,
+            legacy_video_quality=args.legacy_video_quality_results,
+            legacy_issue_events=args.manual_review_labels,
+        )
+        LOGGER.info("Wrote %s", projected.get("xlsx", args.output_dir / "qc_projection.xlsx"))
+        LOGGER.info("Wrote %s", projected.get("asset_csv", args.output_dir / "assets.csv"))
+        return 0
+    required_legacy = {
+        "--manifest": args.legacy_manifest,
+        "--precheck-clip-aggregates": args.legacy_precheck_clip_aggregates,
+        "--precheck-candidate-windows": args.legacy_precheck_candidate_windows,
+        "--video-quality-results": args.legacy_video_quality_results,
+        "--sam3-window-summary": args.sam3_window_summary,
+        "--manual-review-labels": args.manual_review_labels,
+    }
+    missing = [name for name, value in required_legacy.items() if value is None]
+    if missing:
+        raise SystemExit(
+            "--quality-archive is required for formal output; missing legacy arguments: "
+            + ", ".join(missing)
+        )
     outputs = build_acceptance_outputs(
-        manifest=args.manifest,
-        precheck_clip_aggregates=args.precheck_clip_aggregates,
-        precheck_candidate_windows=args.precheck_candidate_windows,
-        video_quality_results=args.video_quality_results,
+        manifest=args.legacy_manifest,
+        precheck_clip_aggregates=args.legacy_precheck_clip_aggregates,
+        precheck_candidate_windows=args.legacy_precheck_candidate_windows,
+        video_quality_results=args.legacy_video_quality_results,
         sam3_window_summary=args.sam3_window_summary,
         manual_review_labels=args.manual_review_labels,
         output_dir=args.output_dir,
-        precheck_check_results=args.precheck_check_results,
+        precheck_check_results=args.legacy_precheck_check_results,
         video_quality_summary=args.video_quality_summary,
         sam3_clip_summary=args.sam3_clip_summary,
         sam3_frame_results=args.sam3_frame_results,
@@ -206,20 +237,61 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def build_acceptance_outputs(
     *,
-    manifest: Path,
-    precheck_clip_aggregates: Path,
-    precheck_candidate_windows: Path,
-    video_quality_results: Path,
-    sam3_window_summary: Path,
-    manual_review_labels: Path,
+    manifest: Path | None = None,
+    precheck_clip_aggregates: Path | None = None,
+    precheck_candidate_windows: Path | None = None,
+    video_quality_results: Path | None = None,
+    sam3_window_summary: Path | None = None,
+    manual_review_labels: Path | None = None,
     output_dir: Path,
     precheck_check_results: Path | None = None,
     video_quality_summary: Path | None = None,
     sam3_clip_summary: Path | None = None,
     sam3_frame_results: Path | None = None,
     manual_review_csv: Path | None = None,
+    quality_archive: Path | None = None,
 ) -> OutputPaths:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if quality_archive is not None:
+        from tools.build_qc_json_projection import run_projection_cli
+
+        projected = run_projection_cli(
+            quality_archive,
+            output_dir,
+            formats=("csv", "parquet", "xlsx", "markdown"),
+            legacy_candidate_windows=precheck_candidate_windows,
+            legacy_sam3_window_summary=sam3_window_summary,
+            legacy_video_quality=video_quality_results,
+            legacy_issue_events=manual_review_labels,
+        )
+        outputs = OutputPaths(
+            asset_ledger_csv=output_dir / "xjgt_100_asset_ledger.csv",
+            issue_events_csv=output_dir / "xjgt_100_issue_events.csv",
+            workbook_xlsx=output_dir / "xjgt_100_acceptance_report.xlsx",
+            summary_json=output_dir / "xjgt_100_summary.json",
+        )
+        if projected.get("asset_csv") is not None:
+            shutil.copyfile(projected["asset_csv"], outputs.asset_ledger_csv)
+        if projected.get("issue_csv") is not None:
+            shutil.copyfile(projected["issue_csv"], outputs.issue_events_csv)
+        if projected.get("xlsx") is not None:
+            shutil.copyfile(projected["xlsx"], outputs.workbook_xlsx)
+        if projected.get("statistics_json") is not None:
+            shutil.copyfile(projected["statistics_json"], outputs.summary_json)
+        return outputs
+    required_inputs = {
+        "manifest": manifest,
+        "precheck_clip_aggregates": precheck_clip_aggregates,
+        "precheck_candidate_windows": precheck_candidate_windows,
+        "video_quality_results": video_quality_results,
+        "sam3_window_summary": sam3_window_summary,
+        "manual_review_labels": manual_review_labels,
+    }
+    missing_inputs = [name for name, value in required_inputs.items() if value is None]
+    if missing_inputs:
+        raise TypeError(
+            "legacy XJGT output requires inputs: " + ", ".join(missing_inputs)
+        )
     manifest_rows = read_records(manifest)
     assets, episode_to_asset = manifest_assets(manifest_rows)
     events: list[dict[str, Any]] = []

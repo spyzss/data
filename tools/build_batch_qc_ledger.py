@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import re
+import shutil
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -69,13 +70,20 @@ def parse_args() -> argparse.Namespace:
             "and optional manual-review outputs."
         )
     )
-    parser.add_argument("--supplier-sample-manifest", required=True, type=Path)
-    parser.add_argument("--precheck-clip-aggregates", type=Path)
-    parser.add_argument("--precheck-candidate-windows", type=Path)
-    parser.add_argument("--sam3-window-summary", type=Path)
-    parser.add_argument("--video-quality-results", type=Path)
-    parser.add_argument("--manual-review-labels", type=Path)
+    parser.add_argument("--quality-archive", required=True, type=Path)
+    parser.add_argument("--supplier-sample-manifest", type=Path)
+    parser.add_argument("--legacy-reconciliation-precheck-clip-aggregates", "--precheck-clip-aggregates", dest="legacy_reconciliation_precheck_clip_aggregates", type=Path)
+    parser.add_argument("--legacy-reconciliation-candidate-windows", "--precheck-candidate-windows", dest="legacy_reconciliation_candidate_windows", type=Path)
+    parser.add_argument("--legacy-reconciliation-sam3-window-summary", "--sam3-window-summary", dest="legacy_reconciliation_sam3_window_summary", type=Path)
+    parser.add_argument("--legacy-reconciliation-video-quality-results", "--video-quality-results", dest="legacy_reconciliation_video_quality_results", type=Path)
+    parser.add_argument("--legacy-reconciliation-manual-review-labels", "--manual-review-labels", dest="legacy_reconciliation_manual_review_labels", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--formats",
+        nargs="+",
+        choices=("csv", "parquet", "xlsx", "markdown"),
+        default=["csv", "parquet", "xlsx", "markdown"],
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -87,6 +95,32 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Formal batch outputs are projections of the canonical QC JSON reports.
+    # Legacy detector artifacts are accepted only as reconciliation evidence;
+    # they are never fed into the verdict reducer below.
+    from tools.build_qc_json_projection import run_projection_cli
+
+    paths = run_projection_cli(
+        args.quality_archive,
+        args.output_dir,
+        formats=args.formats,
+        legacy_candidate_windows=args.legacy_reconciliation_candidate_windows,
+        legacy_sam3_window_summary=args.legacy_reconciliation_sam3_window_summary,
+        legacy_video_quality=args.legacy_reconciliation_video_quality_results,
+        legacy_issue_events=args.legacy_reconciliation_manual_review_labels,
+    )
+    aliases = {
+        "asset_csv": "batch_qc_ledger.csv",
+        "asset_parquet": "batch_qc_ledger.parquet",
+        "issue_csv": "issue_events.csv",
+        "markdown": "batch_report.md",
+    }
+    for key, filename in aliases.items():
+        source = paths.get(key)
+        if source is not None and source.exists():
+            shutil.copyfile(source, args.output_dir / filename)
+    return 0
 
     assets, episode_to_asset = load_manifest(args.supplier_sample_manifest)
     events: list[dict[str, Any]] = []

@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -78,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build an XLSX acceptance ledger from supplier module outputs."
     )
+    parser.add_argument("--quality-archive", required=True, type=Path)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--existing-workbook", type=Path)
@@ -97,6 +99,7 @@ def main() -> int:
         output_path=args.output,
         existing_workbook=args.existing_workbook,
         overwrite=args.overwrite,
+        quality_archive=args.quality_archive,
     )
     LOGGER.info("Wrote %s", output)
     return 0
@@ -343,11 +346,29 @@ def build_acceptance_ledger(
     output_path: Path,
     overwrite: bool = False,
     existing_workbook: Path | None = None,
+    quality_archive: Path | None = None,
 ) -> Path:
     config_path = Path(config_path)
     output_path = Path(output_path)
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"output exists; pass --overwrite: {output_path}")
+    if quality_archive is not None:
+        # The unified QC JSON projection is the formal ledger.  Keep the
+        # historical function/API usable for callers that omit this argument,
+        # but never let legacy supplier inputs override a canonical verdict.
+        from tools.build_qc_json_projection import run_projection_cli
+
+        paths = run_projection_cli(
+            Path(quality_archive),
+            output_path.parent,
+            formats=("csv", "parquet", "xlsx", "markdown"),
+        )
+        projected_xlsx = paths.get("xlsx")
+        if projected_xlsx is None:
+            raise RuntimeError("QC projection did not produce an XLSX output")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(projected_xlsx, output_path)
+        return output_path
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if config.get("workbook_mode") == "weekly_template":
         try:
