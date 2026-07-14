@@ -6,13 +6,19 @@ does not mutate reports or re-run any detector.
 """
 
 from .projection import (
+    BatchProjection,
     iter_asset_reports,
+    project_quality_archive,
     project_quality_archive_review_rows,
     project_warn_review_rows,
 )
+from .aggregate import aggregate_projection
 
 __all__ = [
+    "BatchProjection",
+    "aggregate_projection",
     "iter_asset_reports",
+    "project_quality_archive",
     "project_quality_archive_review_rows",
     "project_warn_review_rows",
 ]
