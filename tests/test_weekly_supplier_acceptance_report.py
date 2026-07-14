@@ -38,6 +38,7 @@ from tools.build_weekly_supplier_acceptance_report import (
     threshold_rule_row,
     video_quality_atomic_statuses,
 )
+from tests.test_qc_reporting_projection import _write_report
 
 
 def _abnormal_source_fixture(*, include_blind: bool = True):
@@ -2570,3 +2571,50 @@ def test_audit_mode_is_read_only(
     assert "mapped_weekly_fields" in output
     assert not (run_root / "weekly_supplier_acceptance_report.xlsx").exists()
     assert not (run_root / "weekly_supplier_summary.csv").exists()
+
+
+def test_formal_archive_helper_preserves_weekly_alias_outputs(tmp_path: Path) -> None:
+    archive = tmp_path / "quality_archive"
+    _write_report(archive, "asset-a", "acceptance", "pass", issues=[])
+    run_root = tmp_path / "acceptance_5x100"
+
+    outputs = build_weekly_report(run_root, quality_archive=archive)
+
+    summary_alias = run_root / "weekly_supplier_summary.csv"
+    workbook_alias = run_root / "weekly_supplier_acceptance_report.xlsx"
+    assert outputs.summary_csv == summary_alias
+    assert outputs.workbook_xlsx == workbook_alias
+    assert summary_alias.exists()
+    assert workbook_alias.exists()
+    assert (run_root / "assets.csv").exists()
+    assert (run_root / "issues.csv").exists()
+    assert (run_root / "executions.csv").exists()
+    assert (run_root / "qc_projection.xlsx").exists()
+    assert pd.read_csv(summary_alias).equals(pd.read_csv(run_root / "assets.csv"))
+    assert load_workbook(workbook_alias, read_only=True).sheetnames == [
+        "Summary",
+        "Assets",
+        "Issues",
+        "Execution",
+        "Data_Dictionary",
+    ]
+
+
+def test_formal_archive_cli_preserves_weekly_alias_outputs(tmp_path: Path) -> None:
+    archive = tmp_path / "quality_archive"
+    _write_report(archive, "asset-a", "acceptance", "pass", issues=[])
+    run_root = tmp_path / "acceptance_5x100"
+
+    assert (
+        main(
+            [
+                "--quality-archive",
+                str(archive),
+                "--run-root",
+                str(run_root),
+            ]
+        )
+        == 0
+    )
+    assert (run_root / "weekly_supplier_summary.csv").exists()
+    assert (run_root / "weekly_supplier_acceptance_report.xlsx").exists()

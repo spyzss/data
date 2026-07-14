@@ -330,19 +330,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.quality_archive is None:
         raise SystemExit("--quality-archive is required unless --audit-inputs is used")
-    from tools.build_qc_json_projection import run_projection_cli
-
-    projected = run_projection_cli(
-        args.quality_archive,
+    outputs = build_weekly_report(
         args.run_root,
-        formats=("csv", "parquet", "xlsx", "markdown"),
-        legacy_candidate_windows=args.legacy_reconciliation_candidate_windows,
-        legacy_sam3_window_summary=args.legacy_reconciliation_sam3_window_summary,
-        legacy_video_quality=args.legacy_reconciliation_video_quality,
-        legacy_issue_events=args.legacy_reconciliation_issue_events,
+        quality_archive=args.quality_archive,
+        legacy_reconciliation_candidate_windows=args.legacy_reconciliation_candidate_windows,
+        legacy_reconciliation_sam3_window_summary=args.legacy_reconciliation_sam3_window_summary,
+        legacy_reconciliation_video_quality=args.legacy_reconciliation_video_quality,
+        legacy_reconciliation_issue_events=args.legacy_reconciliation_issue_events,
     )
-    LOGGER.info("Wrote %s", projected.get("xlsx", args.run_root / "qc_projection.xlsx"))
-    LOGGER.info("Wrote %s", projected.get("asset_csv", args.run_root / "assets.csv"))
+    LOGGER.info("Wrote %s", outputs.workbook_xlsx)
+    LOGGER.info("Wrote %s", outputs.summary_csv)
     return 0
     outputs = build_weekly_report(
         args.run_root,
@@ -394,7 +391,9 @@ def build_weekly_report(
         workbook_xlsx = projected.get("xlsx")
         if workbook_xlsx is None:
             raise RuntimeError("QC projection did not produce an XLSX output")
-        return WeeklyOutputPaths(workbook_xlsx, summary_csv)
+        workbook_alias = run_root / "weekly_supplier_acceptance_report.xlsx"
+        shutil.copyfile(workbook_xlsx, workbook_alias)
+        return WeeklyOutputPaths(workbook_alias, summary_csv)
     xjgt = load_xjgt(
         run_root,
         require_xjgt_text=require_xjgt_text,
