@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -148,6 +149,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--review-queue", required=True, type=Path)
+    parser.add_argument(
+        "--evidence-manifest",
+        type=Path,
+        help="Optional CSV/Parquet manifest of pre-generated sampled-frame evidence.",
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--padding-sec", type=float, default=1.0)
     parser.add_argument("--max-items", type=int)
@@ -183,6 +189,14 @@ def main() -> int:
         max_frames_per_window=args.max_frames_per_window,
         only_review_ids=parse_review_ids(args.only_review_ids),
     )
+    if args.evidence_manifest is not None:
+        apply_evidence_manifest(
+            rows,
+            read_evidence_manifest(args.evidence_manifest),
+            evidence_base_dir=args.evidence_manifest.parent,
+            output_dir=args.output_dir,
+            rendering_enabled=args.render_overlay,
+        )
     if args.dry_run:
         sys.stdout.write(json.dumps(estimate_sampled_frames(rows), indent=2, sort_keys=True) + "\n")
         return 0
@@ -209,6 +223,8 @@ def main() -> int:
 
 def read_manifest(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
+    if "video_path" not in df.columns and "primary_video_path" in df.columns:
+        df["video_path"] = df["primary_video_path"]
     required = {"supplier_id", "asset_id", "video_path"}
     missing = sorted(required - set(df.columns))
     if missing:
@@ -225,12 +241,238 @@ def read_review_queue(path: Path) -> pd.DataFrame:
     return normalize_dataframe(df)
 
 
+def read_evidence_manifest(path: Path) -> pd.DataFrame:
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        df = pd.read_csv(path)
+    elif suffix == ".parquet":
+        df = pd.read_parquet(path)
+    else:
+        raise ValueError(
+            f"unsupported evidence manifest format {suffix!r}; use CSV or Parquet"
+        )
+    required = {"frame_idx", "source_path"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"evidence manifest missing required columns: {missing}")
+    return normalize_dataframe(df)
+
+
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df.where(pd.notna(df), "")
 
 
 def parse_review_ids(value: str) -> set[str]:
     return {item.strip() for item in str(value or "").split(",") if item.strip()}
+
+
+def apply_evidence_manifest(
+    rows: list[dict[str, Any]],
+    evidence_df: pd.DataFrame,
+    *,
+    evidence_base_dir: Path,
+    output_dir: Path,
+    rendering_enabled: bool,
+) -> None:
+    """Attach canonical pre-generated evidence to existing review rows."""
+    evidence_df = normalize_dataframe(evidence_df.copy())
+    missing = sorted({"frame_idx", "source_path"} - set(evidence_df.columns))
+    if missing:
+        raise ValueError(f"evidence manifest missing required columns: {missing}")
+
+    review_ids: dict[str, list[int]] = {}
+    composite_keys: dict[tuple[str, str, int, int], list[int]] = {}
+    for row_index, row in enumerate(rows):
+        review_id = str(row.get("review_id") or "").strip()
+        if review_id:
+            review_ids.setdefault(review_id, []).append(row_index)
+        composite = _review_composite_key(row)
+        if composite is not None:
+            composite_keys.setdefault(composite, []).append(row_index)
+
+    exact_evidence: dict[int, list[dict[str, Any]]] = {}
+    fallback_evidence: dict[int, list[dict[str, Any]]] = {}
+    for evidence_index, raw in enumerate(evidence_df.to_dict(orient="records")):
+        evidence = {str(key): value for key, value in raw.items()}
+        evidence_review_id = str(evidence.get("review_id") or "").strip()
+        if evidence_review_id:
+            targets = review_ids.get(evidence_review_id, [])
+            if len(targets) > 1:
+                raise ValueError(
+                    f"ambiguous review_id {evidence_review_id!r}: matches {len(targets)} review rows"
+                )
+            if not targets:
+                continue
+            exact_evidence.setdefault(targets[0], []).append(evidence)
+            continue
+
+        composite = _evidence_composite_key(evidence, evidence_index)
+        targets = composite_keys.get(composite, [])
+        if len(targets) > 1:
+            raise ValueError(
+                f"ambiguous composite evidence key {composite!r}: "
+                f"matches {len(targets)} review rows"
+            )
+        if not targets:
+            continue
+        fallback_evidence.setdefault(targets[0], []).append(evidence)
+
+    for row_index, row in enumerate(rows):
+        matched = exact_evidence.get(row_index) or fallback_evidence.get(row_index) or []
+        if not matched:
+            if not rendering_enabled:
+                raise ValueError(
+                    f"review_id {row.get('review_id')!r} has no matched evidence "
+                    "and generated rendering is disabled"
+                )
+            row["evidence_source_mode"] = "generated"
+            continue
+        _apply_matched_evidence(
+            row,
+            matched,
+            evidence_base_dir=Path(evidence_base_dir),
+            output_dir=Path(output_dir),
+        )
+
+
+def _review_composite_key(row: dict[str, Any]) -> tuple[str, str, int, int] | None:
+    start = _strict_int_or_none(row.get("window_start_frame"))
+    end = _strict_int_or_none(row.get("window_end_frame"))
+    if start is None or end is None:
+        return None
+    return (
+        str(row.get("supplier_id") or "").strip(),
+        str(row.get("asset_id") or "").strip(),
+        start,
+        end,
+    )
+
+
+def _evidence_composite_key(
+    row: dict[str, Any], evidence_index: int
+) -> tuple[str, str, int, int]:
+    missing = [
+        key
+        for key in (
+            "supplier_id",
+            "asset_id",
+            "window_start_frame",
+            "window_end_frame",
+        )
+        if row.get(key) in (None, "")
+    ]
+    if missing:
+        raise ValueError(
+            f"evidence row {evidence_index} has empty review_id and missing composite fields: {missing}"
+        )
+    start = _strict_int(row.get("window_start_frame"), "window_start_frame")
+    end = _strict_int(row.get("window_end_frame"), "window_end_frame")
+    return (
+        str(row.get("supplier_id")).strip(),
+        str(row.get("asset_id")).strip(),
+        start,
+        end,
+    )
+
+
+def _apply_matched_evidence(
+    row: dict[str, Any],
+    evidence_rows: list[dict[str, Any]],
+    *,
+    evidence_base_dir: Path,
+    output_dir: Path,
+) -> None:
+    window_start = _strict_int(row.get("window_start_frame"), "window_start_frame")
+    window_end = _strict_int(row.get("window_end_frame"), "window_end_frame")
+    by_frame: dict[int, tuple[Path, dict[str, Any]]] = {}
+    for evidence in evidence_rows:
+        frame_idx = _strict_int(evidence.get("frame_idx"), "frame_idx")
+        if not window_start <= frame_idx <= window_end:
+            raise ValueError(
+                f"evidence frame_idx {frame_idx} outside review window "
+                f"{window_start}..{window_end} for {row.get('review_id')!r}"
+            )
+        source_value = str(evidence.get("source_path") or "").strip()
+        if not source_value:
+            raise ValueError(f"evidence frame {frame_idx} has empty source_path")
+        source_path = Path(source_value).expanduser()
+        if not source_path.is_absolute():
+            source_path = evidence_base_dir / source_path
+        source_path = source_path.resolve()
+        if not source_path.exists():
+            raise ValueError(f"evidence source_path does not exist: {source_path}")
+        previous = by_frame.get(frame_idx)
+        if previous is not None:
+            if previous[0] != source_path:
+                raise ValueError(
+                    f"evidence frame {frame_idx} has conflicting source paths: "
+                    f"{previous[0]} and {source_path}"
+                )
+            continue
+        by_frame[frame_idx] = (source_path, evidence)
+
+    sampled_frames = []
+    for sampled_index, frame_idx in enumerate(sorted(by_frame), start=1):
+        source_path, evidence = by_frame[frame_idx]
+        sampled_frames.append(
+            {
+                "sampled_index": sampled_index,
+                "frame_idx": frame_idx,
+                "display_frame_path": _browser_relative_path(source_path, output_dir),
+                "frame_path": str(source_path),
+                "source_path": str(source_path),
+                "source_module": str(evidence.get("source_module") or ""),
+                "evidence_type": str(evidence.get("evidence_type") or ""),
+                "hand_side": str(evidence.get("hand_side") or ""),
+                "metadata_json": _metadata_json(evidence.get("metadata_json")),
+            }
+        )
+    row["sampled_frame_count"] = len(sampled_frames)
+    row["sampled_frames_json"] = json.dumps(sampled_frames, ensure_ascii=False)
+    row["sampled_frame_error"] = ""
+    row["evidence_source_mode"] = "manifest"
+    row["evidence_source_module"] = _joined_evidence_value(
+        sampled_frames, "source_module"
+    )
+    row["evidence_type"] = _joined_evidence_value(sampled_frames, "evidence_type")
+    row["evidence_hand_side"] = _joined_evidence_value(sampled_frames, "hand_side")
+
+
+def _strict_int(value: Any, name: str) -> int:
+    parsed = _strict_int_or_none(value)
+    if parsed is None:
+        raise ValueError(f"invalid integer {name}: {value!r}")
+    return parsed
+
+
+def _strict_int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number) or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _browser_relative_path(source_path: Path, output_dir: Path) -> str:
+    return Path(os.path.relpath(source_path, Path(output_dir).resolve())).as_posix()
+
+
+def _metadata_json(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(json_safe(value), ensure_ascii=False, sort_keys=True)
+
+
+def _joined_evidence_value(rows: list[dict[str, Any]], key: str) -> str:
+    values = sorted({str(row.get(key) or "") for row in rows if row.get(key)})
+    return "|".join(values)
 
 
 def build_clip_rows(
@@ -317,6 +559,10 @@ def build_clip_rows(
         output["sampled_frame_count"] = len(sampled_frame_rows)
         output["sampled_frames_json"] = json.dumps(sampled_frame_rows, ensure_ascii=False)
         output["sampled_frame_error"] = ""
+        output["evidence_source_mode"] = "generated"
+        output["evidence_source_module"] = ""
+        output["evidence_type"] = ""
+        output["evidence_hand_side"] = ""
         rows.append(output)
     return rows
 
@@ -448,11 +694,13 @@ def render_sampled_frames(
 ) -> None:
     if cv2 is None:
         for row in rows:
-            if parse_sampled_frames(row):
+            if row.get("evidence_source_mode") != "manifest" and parse_sampled_frames(row):
                 row["sampled_frame_error"] = "opencv_not_installed"
         return
     jpeg_quality = min(max(int(jpeg_quality), 1), 100)
     for row in rows:
+        if row.get("evidence_source_mode") == "manifest":
+            continue
         frame_rows = parse_sampled_frames(row)
         if not frame_rows:
             continue
@@ -802,7 +1050,7 @@ def build_review_index_video_html(rows: list[dict[str, Any]]) -> str:
         f"const ENUMS = {enum_json};\n"
         f"const MANUAL_COLUMNS = {manual_columns_json};\n"
         f"const STORAGE_KEY='{storage_key}';\n"
-        "const SERVER_SAVE_ENDPOINT='api/manual-review/save';\n"
+        "const SERVER_SAVE_ENDPOINT=new URL('./__manual_review_save__',window.location.href);\n"
         "let segmentsByReviewId = {};\n"
         "let restoreInProgress = false;\n"
         "let serverAutosaveTimer = null;\n"
@@ -861,7 +1109,7 @@ def build_review_index_video_html(rows: list[dict[str, Any]]) -> str:
         "function exportManualLabelsCsv(){if(!validateAllSegments()){setStatus('Cannot export manual_labels.csv: fix invalid affected frame ranges first'); return;} const csv=buildManualLabelsCsv(); const blob=new Blob([csv],{type:'text/csv;charset=utf-8'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='manual_labels.csv'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); setStatus('Exported manual_labels.csv');}\n"
         "function saveToLocalStorage(options={}){const progress=buildProgressJson(); localStorage.setItem(STORAGE_KEY,JSON.stringify(progress)); if(!options.silent){setStatus(`Saved at ${formatTimestamp(new Date())}: saved ${REVIEW_ROWS.length} review items, ${countSegmentRows(progress)} segment rows`);} else if(!options.quietStatus){setStatus('Saved locally');} return progress;}\n"
         "function saveProgress(options={}){return saveToLocalStorage(options);}\n"
-        "async function saveToServer(source='autosave'){try{if(!validateAllSegments()){setStatus('Server save skipped: fix invalid affected frame ranges first'); return false;} const progress=buildProgressJson(); const payload={run_label:runLabel(),reviewer:globalReviewer(),manual_labels_csv:buildManualLabelsCsv(),progress_json:progress,source:source}; const response=await fetch(SERVER_SAVE_ENDPOINT,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); if(!response.ok){throw new Error(`HTTP ${response.status}`);} await response.json().catch(()=>({})); const now=formatTimestamp(new Date()).slice(11); setStatus(`Saved to server at ${now}`); return true;}catch(error){const message=String(error && error.message ? error.message : error).slice(0,120); setStatus(`Server save failed: ${message}`); return false;}}\n"
+        "async function saveToServer(source='autosave'){try{if(!validateAllSegments()){setStatus('Server save skipped: fix invalid affected frame ranges first'); return false;} const progress=buildProgressJson(); const payload={run_label:runLabel(),reviewer:globalReviewer(),manual_labels_csv:buildManualLabelsCsv(),progress_json:progress,source:source,source_page:window.location.href,schema_version:'manual_review_progress.v2',review_item_count:REVIEW_ROWS.length}; const response=await fetch(SERVER_SAVE_ENDPOINT,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); let serverPayload={}; try{serverPayload=await response.json();}catch(_error){serverPayload={};} if(!response.ok){throw new Error(`HTTP ${response.status}: ${serverPayload.error || response.statusText || 'save_failed'}`);} const rowCount=serverPayload.manual_label_row_count ?? countSegmentRows(progress); const savedAt=serverPayload.saved_at_utc || formatTimestamp(new Date()); setStatus(`Saved to server: ${rowCount} rows at ${savedAt}`); return true;}catch(error){const message=String(error && error.message ? error.message : error).slice(0,180); setStatus(`Server save failed: ${message}`); return false;}}\n"
         "function debouncedServerAutosave(){clearTimeout(serverAutosaveTimer); serverAutosaveTimer=setTimeout(()=>saveToServer('autosave'),1000);}\n"
         "function autosaveProgress(){if(restoreInProgress) return; saveToLocalStorage({silent:true}); debouncedServerAutosave();}\n"
         "function refreshRestoredUi(){REVIEW_ROWS.forEach((_row,rowIndex)=>{renderSegments(rowIndex); updateSampledFrame(rowIndex);}); validateAllSegments();}\n"

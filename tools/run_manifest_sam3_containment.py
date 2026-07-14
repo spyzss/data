@@ -25,6 +25,7 @@ from tools.sam3_keypoint_containment import (  # noqa: E402
     json_safe,
     sample_candidate_window_frames,
     score_keypoints_against_masks,
+    write_combined_overlay_image,
     write_json,
     write_overlay_image,
 )
@@ -55,7 +56,23 @@ OUTPUT_FILENAMES = (
     "window_keypoint_containment_summary.parquet",
     "failures.json",
     "run_config.json",
+    "review_evidence_manifest.csv",
+    "review_evidence_manifest.parquet",
 )
+EVIDENCE_MANIFEST_COLUMNS = (
+    "review_id",
+    "supplier_id",
+    "asset_id",
+    "window_start_frame",
+    "window_end_frame",
+    "frame_idx",
+    "source_module",
+    "evidence_type",
+    "hand_side",
+    "source_path",
+    "metadata_json",
+)
+OVERLAY_MODES = ("combined", "per-hand", "both", "none")
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,7 +91,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-clips", type=int, default=None)
     parser.add_argument("--sam3-model", type=Path, default=None)
     parser.add_argument("--queries", default=DEFAULT_QUERIES)
-    parser.add_argument("--write-overlays", action="store_true")
+    parser.add_argument(
+        "--overlay-mode",
+        choices=OVERLAY_MODES,
+        default=None,
+        help="Overlay output policy (default: combined).",
+    )
+    parser.add_argument(
+        "--write-overlays",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Backward-compatible alias for --overlay-mode both.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--log-level", default="INFO")
@@ -456,6 +485,32 @@ def _write_record_outputs(
     )
 
 
+def _write_evidence_outputs(rows: list[dict[str, Any]], output_dir: Path) -> None:
+    frame = pd.DataFrame(
+        [json_safe(row) for row in rows],
+        columns=EVIDENCE_MANIFEST_COLUMNS,
+    )
+    frame.to_csv(output_dir / "review_evidence_manifest.csv", index=False)
+    frame.to_parquet(output_dir / "review_evidence_manifest.parquet", index=False)
+
+
+def resolve_overlay_mode(
+    overlay_mode: str | None,
+    write_overlays: bool | None,
+) -> str:
+    if overlay_mode is not None:
+        if overlay_mode not in OVERLAY_MODES:
+            raise ValueError(
+                f"invalid overlay_mode {overlay_mode!r}; expected one of {OVERLAY_MODES}"
+            )
+        return overlay_mode
+    if write_overlays is True:
+        return "both"
+    if write_overlays is False:
+        return "none"
+    return "combined"
+
+
 def _augment_window_summaries(
     summaries: list[dict[str, Any]],
     frame_rows: list[dict[str, Any]],
@@ -503,7 +558,8 @@ def run_manifest_sam3_containment(
     max_clips: int | None = None,
     sam3_model: Path | None = None,
     queries: list[str] | None = None,
-    write_overlays: bool = False,
+    overlay_mode: str | None = None,
+    write_overlays: bool | None = None,
     overwrite: bool = False,
     dry_run: bool = False,
     source_cache: Any | None = None,
@@ -516,6 +572,9 @@ def run_manifest_sam3_containment(
     for name, value in (("max_windows", max_windows), ("max_clips", max_clips)):
         if value is not None and value < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be >= 1")
+    effective_overlay_mode = resolve_overlay_mode(overlay_mode, write_overlays)
+    write_per_hand_overlays = effective_overlay_mode in {"per-hand", "both"}
+    write_combined_overlays = effective_overlay_mode in {"combined", "both"}
 
     manifest = Path(manifest)
     candidate_windows = Path(candidate_windows)
@@ -576,6 +635,7 @@ def run_manifest_sam3_containment(
     cache = source_cache or ManifestSourceCache()
     mask_cache: dict[tuple[Path, int], tuple[np.ndarray, list[Any]]] = {}
     frame_rows: list[dict[str, Any]] = []
+    evidence_rows: list[dict[str, Any]] = []
     overlay_dir = output_dir / "overlays"
     try:
         for item in prepared:
@@ -607,6 +667,7 @@ def run_manifest_sam3_containment(
                         mask_cache[mask_key] = (frame, masks)
                     frame, masks = mask_cache[mask_key]
                     source_row = source_data.iloc[source_frame_idx]
+                    combined_hands: dict[str, dict[str, Any]] = {}
                     for hand_side in item["hand_sides"]:
                         field_name = str(
                             manifest_row[f"{hand_side}_hand_2d_field"]
@@ -630,6 +691,12 @@ def run_manifest_sam3_containment(
                                 **FRAME_THRESHOLDS,
                             )
                         )
+                        combined_hands[hand_side] = {
+                            "pixels": pixels,
+                            "valid": valid,
+                            "inside": inside,
+                            "joint_names": joint_names,
+                        }
                         row = {
                             "clip_id": item["asset_id"],
                             "asset_id": item["asset_id"],
@@ -652,7 +719,7 @@ def run_manifest_sam3_containment(
                             **containment,
                             **candidate_window_metadata(window),
                         }
-                        if write_overlays:
+                        if write_per_hand_overlays:
                             overlay_path = write_overlay_image(
                                 frame=frame,
                                 mask=union_mask,
@@ -670,6 +737,92 @@ def run_manifest_sam3_containment(
                             )
                             row["overlay_path"] = str(overlay_path)
                         window_rows.append(row)
+                    if write_combined_overlays:
+                        try:
+                            for hand_side in ("left", "right"):
+                                if hand_side in combined_hands:
+                                    continue
+                                field_name = str(
+                                    manifest_row[f"{hand_side}_hand_2d_field"]
+                                )
+                                if field_name not in source_data.columns:
+                                    raise ValueError(
+                                        "parquet missing JD 2D field for combined "
+                                        f"overlay: {field_name}"
+                                    )
+                                pixels = reshape_jdt_keypoints(
+                                    source_row[field_name],
+                                    field_name,
+                                    source_frame_idx,
+                                )
+                                joint_names = _joint_names(hand_side)
+                                _, _, valid, inside = score_keypoints_against_masks(
+                                    frame=frame,
+                                    pixels=pixels,
+                                    joint_names=joint_names,
+                                    masks=masks,
+                                    **FRAME_THRESHOLDS,
+                                )
+                                combined_hands[hand_side] = {
+                                    "pixels": pixels,
+                                    "valid": valid,
+                                    "inside": inside,
+                                    "joint_names": joint_names,
+                                }
+                            combined_overlay_path = write_combined_overlay_image(
+                                frame=frame,
+                                hands=combined_hands,
+                                clip_id=(
+                                    f"{item['asset_id']}_window_"
+                                    f"{window['start_frame']}_{window['end_frame']}_"
+                                    "combined"
+                                ),
+                                frame_idx=source_frame_idx,
+                                output_dir=output_dir / "combined_overlays",
+                            )
+                            evidence_rows.append(
+                                {
+                                    "review_id": "",
+                                    "supplier_id": str(
+                                        manifest_row.get("supplier_id") or supplier
+                                    ),
+                                    "asset_id": item["asset_id"],
+                                    "window_start_frame": window["start_frame"],
+                                    "window_end_frame": window["end_frame"],
+                                    "frame_idx": source_frame_idx,
+                                    "source_module": "sam3_containment",
+                                    "evidence_type": "combined_overlay",
+                                    "hand_side": "both",
+                                    "source_path": str(
+                                        Path(combined_overlay_path).resolve()
+                                    ),
+                                    "metadata_json": json.dumps(
+                                        json_safe(
+                                            {
+                                                "candidate_hand_side": window.get(
+                                                    "hand_side", "both"
+                                                ),
+                                                "clip_start_frame": manifest_row[
+                                                    "start_frame"
+                                                ],
+                                                "clip_end_frame": manifest_row[
+                                                    "end_frame"
+                                                ],
+                                                "source_frame_idx": source_frame_idx,
+                                                "coordinate_space": "source",
+                                            }
+                                        ),
+                                        sort_keys=True,
+                                    ),
+                                }
+                            )
+                        except Exception as exc:
+                            LOGGER.warning(
+                                "Combined overlay failed for %s frame %d: %s",
+                                item["asset_id"],
+                                source_frame_idx,
+                                exc,
+                            )
                 frame_rows.extend(window_rows)
                 summary["completed_window_count"] += 1
             except Exception as exc:
@@ -706,6 +859,7 @@ def run_manifest_sam3_containment(
         json_path=output_dir / "window_keypoint_containment_summary.json",
         parquet_path=output_dir / "window_keypoint_containment_summary.parquet",
     )
+    _write_evidence_outputs(evidence_rows, output_dir)
     write_json(failures, output_dir / "failures.json")
     run_config = {
         "manifest": str(manifest),
@@ -718,7 +872,10 @@ def run_manifest_sam3_containment(
         "max_clips": max_clips,
         "sam3_model": str(sam3_model) if sam3_model is not None else None,
         "queries": query_list,
-        "write_overlays": write_overlays,
+        "overlay_mode": effective_overlay_mode,
+        "write_overlays": effective_overlay_mode != "none",
+        "write_per_hand_overlays": write_per_hand_overlays,
+        "write_combined_overlays": write_combined_overlays,
         "frame_thresholds": FRAME_THRESHOLDS,
         "window_thresholds": WINDOW_THRESHOLDS,
         "abnormal_inside_ratio_threshold": FRAME_THRESHOLDS[
@@ -766,6 +923,7 @@ def main() -> None:
         max_clips=args.max_clips,
         sam3_model=args.sam3_model,
         queries=[query.strip() for query in args.queries.split(",") if query.strip()],
+        overlay_mode=args.overlay_mode,
         write_overlays=args.write_overlays,
         overwrite=args.overwrite,
         dry_run=args.dry_run,
