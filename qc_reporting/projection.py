@@ -326,7 +326,11 @@ def _empty_if_none(value: Any) -> Any:
 def _path_value(value: Any) -> str:
     if value is None:
         return ""
-    return str(value)
+    text = str(value)
+    path = Path(text)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"evidence path must be relative to batch root: {text}")
+    return text
 
 
 def _bool_or_none(value: Any) -> bool | None:
