@@ -28,6 +28,12 @@ from qc_pipeline.context import AssetContext
 
 
 _COORDINATE_SYSTEM = "source_video_inclusive"
+ReadinessCondition = Literal[
+    "ready_to_write",
+    "already_completed",
+    "awaiting_pipeline",
+    "invalid_report",
+]
 _READINESS_CONDITIONS = frozenset(
     {
         "ready_to_write",
@@ -42,12 +48,7 @@ _READINESS_CONDITIONS = frozenset(
 class VideoQualityReportReadiness:
     """Canonical readiness result shared by both video-quality runners."""
 
-    condition: Literal[
-        "ready_to_write",
-        "already_completed",
-        "awaiting_pipeline",
-        "invalid_report",
-    ]
+    condition: ReadinessCondition
     reason: str
     current_next_module: str | None
 
@@ -65,12 +66,7 @@ class VideoQualityReportReadiness:
 
 
 def _readiness(
-    condition: Literal[
-        "ready_to_write",
-        "already_completed",
-        "awaiting_pipeline",
-        "invalid_report",
-    ],
+    condition: ReadinessCondition,
     reason: str,
     current_next_module: str | None,
 ) -> VideoQualityReportReadiness:
@@ -81,21 +77,60 @@ def _readiness(
     )
 
 
-def _valid_exit_gate(module: Mapping[str, Any]) -> bool:
+def _completed_flow_error(
+    report: Mapping[str, Any],
+    module: Mapping[str, Any],
+    configured_successor: str,
+) -> str | None:
     flow = module.get("flow")
+    result_gate = flow.get("result_gate") if isinstance(flow, Mapping) else None
     exit_gate = flow.get("exit_gate") if isinstance(flow, Mapping) else None
-    if not isinstance(exit_gate, Mapping):
-        return False
+    evaluation = module.get("evaluation")
+    if not isinstance(result_gate, Mapping) or not isinstance(exit_gate, Mapping):
+        return "video_quality_exit_gate_invalid"
+    verdict = result_gate.get("verdict")
+    valid_verdict = verdict in {"pass", "warn", "fail", "skipped"}
+    result_consistent = (
+        valid_verdict
+        and result_gate.get("has_fail") is (verdict == "fail")
+        and result_gate.get("has_warn") is (verdict == "warn")
+        and isinstance(evaluation, Mapping)
+        and evaluation.get("decision") == verdict
+    )
     state = exit_gate.get("state")
     continue_to_next = exit_gate.get("continue_to_next_module")
-    next_module = exit_gate.get("next_module")
-    if state not in {"continue", "stop_qc"}:
-        return False
-    if not isinstance(continue_to_next, bool):
-        return False
-    if next_module is not None and not isinstance(next_module, str):
-        return False
-    return (state == "continue") == continue_to_next
+    exit_next = exit_gate.get("next_module")
+    if state == "continue":
+        valid_exit = continue_to_next is True and exit_next == configured_successor
+    elif state == "stop_qc":
+        valid_exit = (
+            continue_to_next is False
+            and exit_next is None
+            and verdict == "fail"
+        )
+    else:
+        valid_exit = False
+    if not result_consistent or not valid_exit:
+        return "video_quality_exit_gate_invalid"
+
+    pipeline = report.get("pipeline_state")
+    if not isinstance(pipeline, Mapping):
+        return "video_quality_pipeline_state_invalid"
+    if state == "continue":
+        valid_pipeline = (
+            pipeline.get("status") == "running"
+            and pipeline.get("next_module") == configured_successor
+            and pipeline.get("stop_reason") is None
+            and report.get("overall_decision") is None
+        )
+    else:
+        valid_pipeline = (
+            pipeline.get("status") == "stopped"
+            and pipeline.get("next_module") is None
+            and pipeline.get("stop_reason") == "quality_fail:video_quality"
+            and report.get("overall_decision") == "fail"
+        )
+    return None if valid_pipeline else "video_quality_pipeline_state_invalid"
 
 
 def _matching_source_evidence(
@@ -123,8 +158,11 @@ def inspect_video_quality_report(
     asset_id: str,
     source_video_path: str,
     source_range: tuple[int, int] | None,
+    configured_successor: str,
 ) -> VideoQualityReportReadiness:
     """Classify whether a report can accept or already contains this result."""
+    if not configured_successor:
+        raise ValueError("video_quality must have a configured successor")
     if source_range is None:
         start_frame = end_frame = None
     else:
@@ -169,10 +207,15 @@ def inspect_video_quality_report(
                 "video_quality_block_invalid",
                 current_next,
             )
-        if not _valid_exit_gate(module):
+        flow_error = _completed_flow_error(
+            report,
+            module,
+            configured_successor,
+        )
+        if flow_error is not None:
             return _readiness(
                 "invalid_report",
-                "video_quality_exit_gate_invalid",
+                flow_error,
                 current_next,
             )
         if not _matching_source_evidence(
@@ -194,6 +237,17 @@ def inspect_video_quality_report(
             )
 
     if current_next == "video_quality":
+        ready_state = (
+            pipeline_state.get("status") == "running"
+            and pipeline_state.get("stop_reason") is None
+            and report.get("overall_decision") is None
+        )
+        if not ready_state:
+            return _readiness(
+                "invalid_report",
+                "video_quality_pipeline_state_invalid",
+                current_next,
+            )
         return _readiness(
             "ready_to_write",
             "pipeline_ready_for_video_quality",

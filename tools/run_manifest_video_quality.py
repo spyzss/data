@@ -368,6 +368,7 @@ def run_manifest_video_quality(
                 asset_id=asset_id,
                 source_video_path=relative_video_path or "",
                 source_range=(start_frame, end_frame + 1),
+                configured_successor=next_module,
             )
             if readiness.reason == "source_video_path_mismatch":
                 raise ValueError(
@@ -378,14 +379,17 @@ def run_manifest_video_quality(
                 raise ValueError(
                     f"asset_id mismatch: report does not match {asset_id!r}"
                 )
-            if readiness.condition == "already_completed":
+            if readiness.condition == "already_completed" and not overwrite:
                 skipped += 1
                 continue
             if dry_run:
                 continue
             record, result = _result_record(validated, config)
             new_records.append(record)
-            if readiness.condition != "ready_to_write":
+            if readiness.condition not in {
+                "ready_to_write",
+                "already_completed",
+            }:
                 prerequisites.append(
                     _prerequisite_record(
                         asset_id=asset_id,

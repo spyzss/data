@@ -114,21 +114,42 @@ def _assert_module_order(
     pipeline_state = report.get("pipeline_state")
     if not isinstance(pipeline_state, Mapping):
         raise ModuleOrderError("pipeline_state must be an object")
+    pipeline_status = pipeline_state.get("status")
     current_next = pipeline_state.get("next_module")
     last_completed = pipeline_state.get("last_completed_module")
     if current_next == result_module:
         return
 
     block = report.get(result_module)
+    exit_state: Any = None
+    continue_to_next: Any = None
     recorded_next: Any = None
     if isinstance(block, Mapping):
         flow = block.get("flow")
         if isinstance(flow, Mapping):
             exit_gate = flow.get("exit_gate")
             if isinstance(exit_gate, Mapping):
+                exit_state = exit_gate.get("state")
+                continue_to_next = exit_gate.get("continue_to_next_module")
                 recorded_next = exit_gate.get("next_module")
-    if last_completed == result_module and recorded_next == next_module:
-        return
+    if last_completed == result_module:
+        continuing_status = "completed" if next_module is None else "running"
+        continuing_rerun = (
+            exit_state == "continue"
+            and continue_to_next is True
+            and recorded_next == next_module
+            and current_next == next_module
+            and pipeline_status == continuing_status
+        )
+        stopped_rerun = (
+            exit_state == "stop_qc"
+            and continue_to_next is False
+            and recorded_next is None
+            and current_next is None
+            and pipeline_status == "stopped"
+        )
+        if continuing_rerun or stopped_rerun:
+            return
 
     raise ModuleOrderError(
         f"expected current module {current_next}, got {result_module}"
@@ -338,7 +359,7 @@ def apply_module_result(
         evidence=evidence,
         exit_state=exit_state,
         continue_to_next=continue_to_next,
-        next_module=next_module,
+        next_module=None if hard_stop else next_module,
     )
     try:
         json.dumps(module_block, ensure_ascii=False, allow_nan=False)

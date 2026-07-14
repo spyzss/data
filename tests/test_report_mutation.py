@@ -484,10 +484,11 @@ def test_profile_changes_exit_action_without_rewriting_machine_fail(
     assert stopped["hdf5_text_info"]["flow"]["exit_gate"] == {
         "state": "stop_qc",
         "continue_to_next_module": False,
-        "next_module": "quality_hand",
+        "next_module": None,
     }
     assert stopped["pipeline_state"]["status"] == "stopped"
     assert stopped["overall_decision"] == "fail"
+    validate_asset_qc_report(stopped)
     assert continued["hdf5_text_info"]["flow"]["result_gate"]["verdict"] == "fail"
     assert continued["hdf5_text_info"]["flow"]["exit_gate"] == {
         "state": "continue",
@@ -496,6 +497,43 @@ def test_profile_changes_exit_action_without_rewriting_machine_fail(
     }
     assert continued["pipeline_state"]["status"] == "running"
     assert continued["overall_decision"] is None
+    validate_asset_qc_report(continued)
+
+
+def test_inconsistent_stopped_module_rerun_keeps_report_unchanged(
+    tmp_path: Path,
+) -> None:
+    context = make_asset_context(tmp_path, "a")
+    config = loaded_test_config()
+    stopped = apply_module_result(
+        context.report_path,
+        context=context,
+        config=config,
+        profile="acceptance",
+        result=ModuleResult("hdf5_text_info", "fail", {}, {}),
+        expected_revision=0,
+        next_module="quality_hand",
+        now="2026-07-14T00:00:00Z",
+    )
+    stopped["pipeline_state"].update(
+        {"status": "running", "next_module": "quality_hand"}
+    )
+    context.report_path.write_text(json.dumps(stopped), encoding="utf-8")
+    before = context.report_path.read_bytes()
+
+    with pytest.raises(ModuleOrderError):
+        apply_module_result(
+            context.report_path,
+            context=context,
+            config=config,
+            profile="acceptance",
+            result=ModuleResult("hdf5_text_info", "fail", {}, {}),
+            expected_revision=1,
+            next_module="quality_hand",
+            now="2026-07-14T00:01:00Z",
+        )
+
+    assert context.report_path.read_bytes() == before
 
 
 def test_terminal_supplier_fail_remains_machine_fail(tmp_path: Path) -> None:

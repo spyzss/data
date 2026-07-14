@@ -66,6 +66,48 @@ def _advance_report_to_video(
         revision = report["report_revision"]
 
 
+def _completed_manifest_video_report(
+    tmp_path: Path,
+    *,
+    profile: str,
+) -> tuple[Path, Path, Path]:
+    from tools.run_manifest_video_quality import run_manifest_video_quality
+
+    video = tmp_path / "source.mp4"
+    write_test_video(video, [solid_frame(90) for _ in range(5)], fps=10.0)
+    manifest = _write_manifest(
+        tmp_path / "manifest.csv",
+        [
+            {
+                "asset_id": "logical-a",
+                "primary_video_path": str(video),
+                "start_frame": 0,
+                "end_frame": 4,
+            }
+        ],
+    )
+    _advance_report_to_video(
+        tmp_path,
+        asset_id="logical-a",
+        video_path=video,
+        source_range=(0, 5),
+        profile=profile,
+    )
+    output_dir = tmp_path / "quality"
+    summary = run_manifest_video_quality(
+        manifest,
+        output_dir,
+        batch_root=tmp_path,
+        profile=profile,
+    )
+    assert summary["qc_report_write_count"] == 1
+    return (
+        manifest,
+        output_dir,
+        tmp_path / "quality_archive" / "logical-a.json",
+    )
+
+
 @pytest.mark.parametrize("extension", [".parquet", ".jsonl"])
 def test_manifest_video_quality_reads_supported_manifest_formats(
     tmp_path: Path, extension: str
@@ -361,6 +403,7 @@ def test_manifest_video_rejects_completed_block_without_valid_exit_gate(
         manifest,
         output_dir,
         batch_root=tmp_path,
+        overwrite=True,
     )
 
     assert summary["skipped_clip_count"] == 0
@@ -416,6 +459,7 @@ def test_manifest_video_rejects_completed_source_range_mismatch(
         second_manifest,
         output_dir,
         batch_root=tmp_path,
+        overwrite=True,
     )
 
     assert summary["qc_report_write_count"] == 0
@@ -424,6 +468,122 @@ def test_manifest_video_rejects_completed_source_range_mismatch(
     prerequisite = _prerequisite_rows(output_dir)[0]
     assert prerequisite["condition"] == "invalid_report"
     assert prerequisite["reason"] == "video_quality_source_range_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("null_successor", "video_quality_exit_gate_invalid"),
+        ("wrong_successor", "video_quality_exit_gate_invalid"),
+        ("exit_pipeline_mismatch", "video_quality_pipeline_state_invalid"),
+        ("invalid_continue_state", "video_quality_pipeline_state_invalid"),
+        ("invalid_stop_state", "video_quality_exit_gate_invalid"),
+    ],
+)
+def test_manifest_video_rejects_inconsistent_completed_flow(
+    tmp_path: Path,
+    case: str,
+    reason: str,
+) -> None:
+    from tools.run_manifest_video_quality import run_manifest_video_quality
+
+    manifest, output_dir, report_path = _completed_manifest_video_report(
+        tmp_path,
+        profile="supplier_evaluation",
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    exit_gate = report["video_quality"]["flow"]["exit_gate"]
+    if case == "null_successor":
+        exit_gate["next_module"] = None
+    elif case == "wrong_successor":
+        exit_gate["next_module"] = "semantic_consistency"
+    elif case == "exit_pipeline_mismatch":
+        report["pipeline_state"]["next_module"] = "semantic_consistency"
+    elif case == "invalid_continue_state":
+        report["pipeline_state"].update(
+            {
+                "status": "stopped",
+                "next_module": None,
+                "stop_reason": "quality_fail:video_quality",
+            }
+        )
+        report["overall_decision"] = "fail"
+    else:
+        exit_gate.update(
+            {
+                "state": "stop_qc",
+                "continue_to_next_module": False,
+                "next_module": None,
+            }
+        )
+        result_gate = report["video_quality"]["flow"]["result_gate"]
+        result_gate.update(
+            {"verdict": "pass", "has_fail": False, "has_warn": False}
+        )
+        report["video_quality"]["evaluation"]["decision"] = "pass"
+        report["pipeline_state"].update(
+            {
+                "status": "stopped",
+                "next_module": None,
+                "stop_reason": "quality_fail:video_quality",
+            }
+        )
+        report["overall_decision"] = "fail"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    before = report_path.read_bytes()
+
+    summary = run_manifest_video_quality(
+        manifest,
+        output_dir,
+        batch_root=tmp_path,
+        profile="supplier_evaluation",
+    )
+
+    assert summary["skipped_clip_count"] == 0
+    assert summary["qc_report_write_count"] == 0
+    assert summary["awaiting_pipeline_clip_count"] == 1
+    assert report_path.read_bytes() == before
+    prerequisite = _prerequisite_rows(output_dir)[0]
+    assert prerequisite["condition"] == "invalid_report"
+    assert prerequisite["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("profile", "exit_state", "pipeline_status", "exit_next"),
+    [
+        ("supplier_evaluation", "continue", "running", "sam3_containment"),
+        ("acceptance", "stop_qc", "stopped", None),
+    ],
+)
+def test_manifest_video_skips_consistent_completed_outcomes(
+    tmp_path: Path,
+    profile: str,
+    exit_state: str,
+    pipeline_status: str,
+    exit_next: str | None,
+) -> None:
+    from tools.run_manifest_video_quality import run_manifest_video_quality
+
+    manifest, output_dir, report_path = _completed_manifest_video_report(
+        tmp_path,
+        profile=profile,
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["video_quality"]["flow"]["exit_gate"]["state"] == exit_state
+    assert report["video_quality"]["flow"]["exit_gate"]["next_module"] == exit_next
+    assert report["pipeline_state"]["status"] == pipeline_status
+    before = report_path.read_bytes()
+
+    summary = run_manifest_video_quality(
+        manifest,
+        output_dir,
+        batch_root=tmp_path,
+        profile=profile,
+    )
+
+    assert summary["skipped_clip_count"] == 1
+    assert summary["qc_report_write_count"] == 0
+    assert report_path.read_bytes() == before
 
 
 def test_manifest_video_quality_rejects_source_drift_before_report_write(
@@ -544,7 +704,7 @@ def test_manifest_video_quality_dry_run_writes_no_producer_outputs(
     assert not (output_dir / "run_config.json").exists()
 
 
-def test_manifest_video_quality_skips_valid_completed_asset_even_with_overwrite(
+def test_manifest_video_quality_overwrites_only_valid_completed_asset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import tools.run_manifest_video_quality as runner
@@ -570,6 +730,12 @@ def test_manifest_video_quality_skips_valid_completed_asset_even_with_overwrite(
         source_range=(0, 5),
     )
     runner.run_manifest_video_quality(manifest, output_dir)
+    report_path = tmp_path / "quality_archive" / "clip-a.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    revision = report["report_revision"]
+    report["video_quality"]["review_marker"] = "replace"
+    report["hdf5_text_info"]["review_marker"] = "keep"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
 
     calls = 0
     original = runner.analyze_video_frame_range
@@ -589,5 +755,10 @@ def test_manifest_video_quality_skips_valid_completed_asset_even_with_overwrite(
         output_dir,
         overwrite=True,
     )
-    assert calls == 0
-    assert overwritten["skipped_clip_count"] == 1
+    assert calls == 1
+    assert overwritten["skipped_clip_count"] == 0
+    assert overwritten["qc_report_write_count"] == 1
+    updated = json.loads(report_path.read_text(encoding="utf-8"))
+    assert updated["report_revision"] == revision + 1
+    assert "review_marker" not in updated["video_quality"]
+    assert updated["hdf5_text_info"]["review_marker"] == "keep"

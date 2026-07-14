@@ -2360,6 +2360,7 @@ def write_per_asset_qc_json_reports(
     config: LoadedQcConfig,
     *,
     profile: str = "acceptance",
+    overwrite: bool = False,
 ) -> int:
     from qc_pipeline.adapters.video_quality import (
         inspect_video_quality_report,
@@ -2384,10 +2385,11 @@ def write_per_asset_qc_json_reports(
             asset_id=result.metrics.asset_id,
             source_video_path=relative_video_path,
             source_range=source_range,
+            configured_successor=next_module,
         )
-        if readiness.condition == "already_completed":
+        if readiness.condition == "already_completed" and not overwrite:
             continue
-        if readiness.condition != "ready_to_write":
+        if readiness.condition not in {"ready_to_write", "already_completed"}:
             awaiting_pipeline += 1
             LOGGER.warning(
                 "Skipping QC report write for %s: video_quality_prerequisite=%s",
@@ -2434,6 +2436,8 @@ def write_per_asset_qc_json_reports(
 def run_video_quality_check(
     batch_dir: Path,
     config_path: Path | None = None,
+    *,
+    overwrite: bool = False,
 ) -> int:
     loaded_config = load_qc_acceptance_config(config_path)
     config = load_video_quality_config(config_path)
@@ -2452,6 +2456,7 @@ def run_video_quality_check(
         results,
         loaded_config,
         profile="acceptance",
+        overwrite=overwrite,
     )
     if awaiting_pipeline:
         return 3
@@ -3093,5 +3098,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", required=True, type=Path)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
-    return run_video_quality_check(args.batch, args.config)
+    return run_video_quality_check(
+        args.batch,
+        args.config,
+        overwrite=args.overwrite,
+    )

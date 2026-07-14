@@ -239,8 +239,9 @@ module.thresholds
 
 - `pass`：`continue_to_next_module=true`。
 - `warn`：生成 issue，追加到人工候选，继续下一模块。
-- `fail`：`state=stop_qc`、`continue_to_next_module=false`、
-  `next_module=batch_statistics`。
+- `fail` 且当前 profile 要求停止：`state=stop_qc`、
+  `continue_to_next_module=false`、`next_module=null`；顶层
+  `pipeline_state.status=stopped` 且 `pipeline_state.next_module=null`。
 - 下游只读取上游 `exit_gate` 或顶层 `pipeline_state`，不解析自然语言原因。
 - 上游已 fail 时，后续高成本模块不得运行。
 

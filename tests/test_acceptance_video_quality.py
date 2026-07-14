@@ -966,7 +966,7 @@ def test_batch_video_rejects_completed_block_without_valid_exit_gate(
     before = report_path.read_bytes()
 
     with caplog.at_level("WARNING"):
-        exit_code = run_video_quality_check(tmp_path)
+        exit_code = run_video_quality_check(tmp_path, overwrite=True)
 
     assert exit_code == 3
     assert report_path.read_bytes() == before
@@ -985,7 +985,7 @@ def test_batch_video_rejects_completed_source_range_mismatch(
     before = report_path.read_bytes()
 
     with caplog.at_level("WARNING"):
-        exit_code = run_video_quality_check(tmp_path)
+        exit_code = run_video_quality_check(tmp_path, overwrite=True)
 
     assert exit_code == 3
     assert report_path.read_bytes() == before
@@ -993,12 +993,98 @@ def test_batch_video_rejects_completed_source_range_mismatch(
     assert '"reason": "video_quality_source_range_mismatch"' in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("null_successor", "video_quality_exit_gate_invalid"),
+        ("wrong_successor", "video_quality_exit_gate_invalid"),
+        ("exit_pipeline_mismatch", "video_quality_pipeline_state_invalid"),
+        ("invalid_continue_state", "video_quality_pipeline_state_invalid"),
+        ("invalid_stop_state", "video_quality_exit_gate_invalid"),
+    ],
+)
+def test_batch_video_rejects_inconsistent_completed_flow(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+    reason: str,
+) -> None:
+    report_path = _completed_batch_video_report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    exit_gate = report["video_quality"]["flow"]["exit_gate"]
+    if case == "null_successor":
+        exit_gate["next_module"] = None
+    elif case == "wrong_successor":
+        exit_gate["next_module"] = "semantic_consistency"
+    elif case == "exit_pipeline_mismatch":
+        report["pipeline_state"]["next_module"] = "semantic_consistency"
+    elif case == "invalid_continue_state":
+        report["pipeline_state"].update(
+            {
+                "status": "stopped",
+                "next_module": None,
+                "stop_reason": "quality_fail:video_quality",
+            }
+        )
+        report["overall_decision"] = "fail"
+    else:
+        exit_gate.update(
+            {
+                "state": "stop_qc",
+                "continue_to_next_module": False,
+                "next_module": None,
+            }
+        )
+        report["pipeline_state"].update(
+            {
+                "status": "stopped",
+                "next_module": None,
+                "stop_reason": "quality_fail:video_quality",
+            }
+        )
+        report["overall_decision"] = "fail"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    before = report_path.read_bytes()
+
+    with caplog.at_level("WARNING"):
+        exit_code = run_video_quality_check(tmp_path)
+
+    assert exit_code == 3
+    assert report_path.read_bytes() == before
+    assert f'"reason": "{reason}"' in caplog.text
+
+
 def test_batch_video_skips_valid_completed_block(tmp_path: Path) -> None:
     report_path = _completed_batch_video_report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["video_quality"]["flow"]["exit_gate"] == {
+        "state": "continue",
+        "continue_to_next_module": True,
+        "next_module": "sam3_containment",
+    }
+    assert report["pipeline_state"]["status"] == "running"
     before = report_path.read_bytes()
 
     assert run_video_quality_check(tmp_path) == 0
     assert report_path.read_bytes() == before
+
+
+def test_batch_video_overwrite_reruns_only_valid_completed_block(
+    tmp_path: Path,
+) -> None:
+    report_path = _completed_batch_video_report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    revision = report["report_revision"]
+    report["video_quality"]["review_marker"] = "replace"
+    report["hdf5_text_info"]["review_marker"] = "keep"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    assert run_video_quality_check(tmp_path, overwrite=True) == 0
+
+    overwritten = json.loads(report_path.read_text(encoding="utf-8"))
+    assert overwritten["report_revision"] == revision + 1
+    assert "review_marker" not in overwritten["video_quality"]
+    assert overwritten["hdf5_text_info"]["review_marker"] == "keep"
 
 
 def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tmp_path: Path) -> None:
@@ -1192,8 +1278,11 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     assert report["video_quality"]["flow"]["exit_gate"] == {
         "state": "stop_qc",
         "continue_to_next_module": False,
-        "next_module": "sam3_containment",
+        "next_module": None,
     }
+    before = (batch / "quality_archive" / "bad.json").read_bytes()
+    assert run_video_quality_check(batch) == 2
+    assert (batch / "quality_archive" / "bad.json").read_bytes() == before
 
 
 def test_video_quality_main_accepts_config_and_writes_quality_archive(tmp_path: Path) -> None:
