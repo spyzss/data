@@ -6,9 +6,9 @@
 
 ## 2. 已合入自动模块适配
 
-- [ ] 2.1 将 text integrity 与 quality_hand 结果适配为 `hdf5_text_info` 和 `quality_hand` module block
-- [ ] 2.2 将 keypoint missing/skeleton quality 适配为 `keypoint_presence` module block 和稳定帧区间 issue
-- [ ] 2.3 将 keypoint morphology 适配为 `keypoint_morphology` module block、metrics 和 evidence
+- [x] 2.1 将 text integrity 与 quality_hand 结果适配为 `hdf5_text_info` 和 `quality_hand` module block
+- [x] 2.2 将 keypoint missing/skeleton quality 适配为 `keypoint_presence` module block 和稳定帧区间 issue
+- [x] 2.3 将 keypoint morphology 适配为 `keypoint_morphology` module block、metrics 和 evidence
 - [ ] 2.4 将 keypoint temporal/candidate windows 适配为 `keypoint_temporal` module block 和人工候选 issue
 - [ ] 2.5 统一 batch 视频与 manifest range 视频路径，使两者通过同一 `video_quality` 报告 mutation 写回
 - [ ] 2.6 将 SAM3 window summary、overlay 和 containment 结果适配为 `sam3_containment` module block 和 evidence 引用

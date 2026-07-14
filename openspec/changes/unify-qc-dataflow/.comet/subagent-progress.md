@@ -11,3 +11,13 @@
 - OpenSpec checkoff: 1.1, 1.2, 1.3 complete
 - Current phase: checkoff
 - Review: Thorough combined Task 3–4 approved after fix round 1; no open findings
+- Task 5: implemented (`8865f82`), focused/regression green, full suite `413 passed, 1 skipped`; awaiting Task 5–7 combined review
+- Task 6: implemented with concern (`5721967`), focused `26 passed`, smoke `20 passed`, full suite `423 passed, 1 skipped`; production delta ~320 lines, maintainability review required
+- Task 7: implemented (`7170bc9`), focused `18 passed`, relevant `105 passed`, full suite `429 passed, 1 skipped`; combined review requires fixes
+- Fix round 1: committed `359fd59`, focused `33 passed`, relevant `34 passed`, full suite `432 passed, 1 skipped`; production file net -4 lines
+- Task 5: complete (`8865f82`)
+- Task 6: complete (`5721967`, fix `359fd59`)
+- Task 7: complete (`7170bc9`)
+- OpenSpec checkoff: 1.1–1.3 and 2.1–2.3 complete
+- Current phase: checkoff
+- Review: Thorough combined Task 5–7 approved after fix round 1; no open findings

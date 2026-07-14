@@ -547,7 +547,7 @@ git commit -m "feat(qc): add revision aware report mutation"
 - Produces: `adapt_quality_hand(*, asset_id: str, source_relative_path: str, results: Sequence[CheckResult], config: LoadedQcConfig) -> ModuleResult`。
 - Produces: `precheck_config_from_unified(config: LoadedQcConfig, *, module_names: Sequence[str], output_dir: Path) -> PrecheckConfig`，把 v2 parameters 逐字段注入现有检查类。
 
-- [ ] **Step 1: 添加 pass/fail/warn golden 映射测试**
+- [x] **Step 1: 添加 pass/fail/warn golden 映射测试**
 
 ```python
 # tests/test_precheck_qc_adapter.py
@@ -570,13 +570,13 @@ def test_quality_hand_single_side_low_maps_to_warn() -> None:
     assert result.issues[0].context["start_frame"] == 3
 ```
 
-- [ ] **Step 2: 运行测试并确认 adapter 缺失**
+- [x] **Step 2: 运行测试并确认 adapter 缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_precheck_qc_adapter.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_pipeline'`。
 
-- [ ] **Step 3: 实现两个确定性 adapter**
+- [x] **Step 3: 实现两个确定性 adapter**
 
 ```python
 def _worst(*verdicts: Verdict) -> Verdict:
@@ -595,13 +595,13 @@ def adapt_hdf5_text_info(*, asset_id, source_relative_path, results, config):
 
 `tools/run_manifest_precheck._configured_precheck()` 必须停止读取本地默认阈值作为正式来源，改为调用 `precheck_config_from_unified()`；原 `--config-path` 只保留为遗留算法回归模式，并与正式 `--qc-config` 互斥。测试逐字段断言 quality、presence、morphology、temporal 的 runtime config 等于 v2 Config parameters。
 
-- [ ] **Step 4: 运行 adapter 与原检查回归**
+- [x] **Step 4: 运行 adapter 与原检查回归**
 
 Run: `.venv/bin/python -m pytest tests/test_precheck_qc_adapter.py tests/test_qc_modules_smoke.py -q`
 
 Expected: PASS；原 CheckResult 行为不变，adapter 只解释输出。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_pipeline/__init__.py qc_pipeline/adapters/__init__.py qc_pipeline/adapters/precheck.py tools/run_manifest_precheck.py tests/test_precheck_qc_adapter.py
@@ -619,7 +619,7 @@ git commit -m "feat(qc): adapt text and hand quality modules"
 - Produces: `adapt_keypoint_presence(*, asset_id, source_relative_path, results, config) -> ModuleResult`。
 - Produces: `_contiguous_ranges(frames: Sequence[int]) -> tuple[tuple[int, int], ...]`，闭区间合并。
 
-- [ ] **Step 1: 添加 NaN/Inf、连续缺失和稳定 ID 测试**
+- [x] **Step 1: 添加 NaN/Inf、连续缺失和稳定 ID 测试**
 
 ```python
 def test_presence_merges_contiguous_invalid_frames_into_one_issue() -> None:
@@ -631,13 +631,13 @@ def test_presence_merges_contiguous_invalid_frames_into_one_issue() -> None:
     assert adapt_keypoint_presence(asset_id="a", source_relative_path="hdf5/a.h5", results=rows, config=loaded_test_config()).issues[0].issue_id == result.issues[0].issue_id
 ```
 
-- [ ] **Step 2: 运行单测并确认函数缺失**
+- [x] **Step 2: 运行单测并确认函数缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_precheck_qc_adapter.py::test_presence_merges_contiguous_invalid_frames_into_one_issue -q`
 
 Expected: FAIL，包含 `cannot import name 'adapt_keypoint_presence'`。
 
-- [ ] **Step 3: 实现 presence 规则映射与区间压缩**
+- [x] **Step 3: 实现 presence 规则映射与区间压缩**
 
 ```python
 def _contiguous_ranges(frames):
@@ -658,13 +658,13 @@ def adapt_keypoint_presence(*, asset_id, source_relative_path, results, config):
 
 `evaluation` 保存 `checked_frame_count`、`invalid_frame_count`、`invalid_frame_ratio`；`metrics` 保存左右手最小有效点数和连续区间。缺少整个 keypoint 字段使用 `keypoint_presence.missing_keypoint_field` fail；单纯没有供应商 `quality_hand` 不得被当作 keypoint 缺失。
 
-- [ ] **Step 4: 运行 presence 与 manifest 坐标回归**
+- [x] **Step 4: 运行 presence 与 manifest 坐标回归**
 
 Run: `.venv/bin/python -m pytest tests/test_precheck_qc_adapter.py tests/test_manifest_precheck_runner.py::test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows -q`
 
 Expected: PASS；issue 使用 source-inclusive 坐标，区间不重复偏移。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_pipeline/adapters/precheck.py tests/test_precheck_qc_adapter.py
@@ -682,7 +682,7 @@ git commit -m "feat(qc): adapt keypoint presence results"
 - Consumes: `keypoint_morphology` frame/summary rows，summary 的 `morphology_verdict` 为 `pass|review|fail|not_applicable`。
 - Produces: `adapt_keypoint_morphology(*, asset_id, source_relative_path, results, config) -> ModuleResult`。
 
-- [ ] **Step 1: 添加 review→warn、fail 和 not_applicable 测试**
+- [x] **Step 1: 添加 review→warn、fail 和 not_applicable 测试**
 
 ```python
 def test_morphology_review_maps_to_warn_with_frame_evidence() -> None:
@@ -697,13 +697,13 @@ def test_morphology_not_applicable_is_skipped_not_pass() -> None:
     assert adapt_keypoint_morphology(asset_id="a", source_relative_path="hdf5/a.h5", results=rows, config=loaded_test_config()).verdict == "skipped"
 ```
 
-- [ ] **Step 2: 运行单测并确认 morphology adapter 缺失**
+- [x] **Step 2: 运行单测并确认 morphology adapter 缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_precheck_qc_adapter.py -k morphology -q`
 
 Expected: FAIL，包含 `cannot import name 'adapt_keypoint_morphology'`。
 
-- [ ] **Step 3: 实现规则名解析和 evidence**
+- [x] **Step 3: 实现规则名解析和 evidence**
 
 ```python
 MORPHOLOGY_REASON_TO_RULE = {
@@ -720,13 +720,13 @@ MORPHOLOGY_REASON_TO_RULE = {
 
 解析 `left:<metric>_review`、`right:<metric>_fail` 时剥离 side 与 verdict 后缀；同 rule/side 的连续 frame 合并。review 生成 warn 且 `needs_manual_review=True`，fail 生成 hard fail；`EvidenceRef.kind="frame_metrics"`、path 指向相对化 `check_results.json`，并记录 source-inclusive start/end/hand。
 
-- [ ] **Step 4: 运行 morphology adapter 与算法回归**
+- [x] **Step 4: 运行 morphology adapter 与算法回归**
 
 Run: `.venv/bin/python -m pytest tests/test_precheck_qc_adapter.py -k morphology tests/test_keypoint_morphology.py -q`
 
 Expected: PASS；现有形态指标与阈值数值不变。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_pipeline/adapters/precheck.py tests/test_precheck_qc_adapter.py tests/test_keypoint_morphology.py
