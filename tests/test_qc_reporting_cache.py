@@ -72,6 +72,46 @@ def test_cache_corruption_or_missing_table_returns_none(tmp_path: Path) -> None:
     assert load_projection_cache(cache_dir, manifest) is None
 
 
+def test_projection_manifest_tampering_returns_none(tmp_path: Path) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    write_projection_cache(projection, cache_dir)
+    manifest = build_source_manifest(archive)
+
+    projection_manifest = json.loads(
+        (cache_dir / "projection_source_manifest.json").read_text(encoding="utf-8")
+    )
+    projection_manifest[0]["asset_id"] = "tampered"
+    (cache_dir / "projection_source_manifest.json").write_text(
+        json.dumps(projection_manifest), encoding="utf-8"
+    )
+
+    assert load_projection_cache(cache_dir, manifest) is None
+
+
+def test_malformed_source_manifest_entries_return_none_even_for_empty_expected(
+    tmp_path: Path,
+) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    write_projection_cache(projection, cache_dir)
+
+    (cache_dir / "source_reports.json").write_text("[1]", encoding="utf-8")
+    assert load_projection_cache(cache_dir, ()) is None
+
+
+def test_empty_archive_cache_round_trip(tmp_path: Path) -> None:
+    archive = tmp_path / "quality_archive"
+    archive.mkdir()
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    write_projection_cache(projection, cache_dir)
+
+    assert load_projection_cache(cache_dir, build_source_manifest(archive)) == projection
+
+
 def test_cli_rebuilds_missing_or_stale_cache_from_json(tmp_path: Path) -> None:
     archive = _make_archive(tmp_path)
     cache_dir = tmp_path / "cache"
@@ -85,7 +125,6 @@ def test_cli_rebuilds_missing_or_stale_cache_from_json(tmp_path: Path) -> None:
     run_projection_cli(archive, second_output, formats=("csv",), cache_dir=cache_dir)
 
     assert (cache_dir / "assets.parquet").is_file()
-    assert pd.read_csv(first_output / "assets.csv").to_dict("records") == pd.read_csv(
-        second_output / "assets.csv"
-    ).to_dict("records")
-
+    assert pd.read_csv(first_output / "assets.csv").equals(
+        pd.read_csv(second_output / "assets.csv")
+    )

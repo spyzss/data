@@ -35,6 +35,8 @@ _TABLE_ROWS = {
 _JSON_MARKER = "__qc_cache_json__:"
 _MANIFEST_FILE = "source_reports.json"
 _PROJECTION_MANIFEST_FILE = "projection_source_manifest.json"
+_PROJECTION_MANIFEST_HASH_FILE = "projection_source_manifest.sha256"
+_SOURCE_MANIFEST_FIELDS = ("relative_path", "asset_id", "revision", "sha256")
 
 
 def _json_safe(value: Any) -> Any:
@@ -208,34 +210,79 @@ def write_projection_cache(projection: BatchProjection, cache_dir: Path) -> None
     source_manifest: list[dict[str, Any]] = []
     for source in projection.source_manifest:
         if not isinstance(source, Mapping):
-            continue
+            raise ValueError("projection source manifest entries must be mappings")
         path_value = source.get("path") or source.get("report_path") or source.get("json_path")
-        if not path_value:
-            continue
-        path = Path(str(path_value))
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            asset_id = str(payload.get("asset_id") or source.get("asset_id") or "")
-            revision = int(payload.get("report_revision", source.get("report_revision", 0)))
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-            # If a caller provides a projection with a non-file source
-            # manifest, retain its identity fields where possible.  The CLI
-            # path always has canonical files and therefore takes the branch
-            # above.
-            asset_id = str(source.get("asset_id") or "")
-            revision = int(source.get("report_revision", source.get("revision", 0)) or 0)
-            digest = str(source.get("sha256") or "")
+        if path_value:
+            path = Path(str(path_value))
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                asset_id = str(payload.get("asset_id") or source.get("asset_id") or "")
+                revision = int(
+                    payload.get("report_revision", source.get("report_revision", 0))
+                )
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                AttributeError,
+                TypeError,
+                ValueError,
+            ):
+                # If a caller provides a projection with a non-file source
+                # manifest, retain its identity fields where possible.  The
+                # CLI path always has canonical files and therefore takes the
+                # branch above.
+                asset_id = str(source.get("asset_id") or "")
+                revision = int(source.get("report_revision", source.get("revision", 0)) or 0)
+                digest = str(source.get("sha256") or "")
+            relative_path = str(source.get("relative_path") or path.name)
+        else:
+            # A projection assembled by another caller may already carry the
+            # canonical source manifest fields rather than absolute paths.
+            # Preserve those fields instead of silently writing an empty,
+            # unverifiable cache.
+            missing = [field for field in _SOURCE_MANIFEST_FIELDS if field not in source]
+            if missing:
+                raise ValueError(
+                    "projection source manifest entry is missing: " + ", ".join(missing)
+                )
+            relative_path = str(source["relative_path"])
+            asset_id = str(source["asset_id"])
+            revision = int(source["revision"])
+            digest = str(source["sha256"])
         source_manifest.append(
             {
-                "relative_path": str(source.get("relative_path") or path.name),
+                "relative_path": relative_path,
                 "asset_id": asset_id,
                 "revision": revision,
                 "sha256": digest,
             }
         )
     source_manifest.sort(key=lambda row: str(row["relative_path"]))
+    _validate_source_manifest(source_manifest)
 
+    # Write the projection identity first and the source manifest last.  The
+    # source manifest is the generation barrier: a reader either sees the
+    # previous source generation or the complete new generation, never a
+    # source manifest paired with partially replaced tables.
+    projection_manifest_bytes = (
+        json.dumps(
+            [dict(row) for row in projection.source_manifest],
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    _write_atomic_bytes(
+        cache_root / _PROJECTION_MANIFEST_FILE,
+        projection_manifest_bytes,
+    )
+    _write_atomic_bytes(
+        cache_root / _PROJECTION_MANIFEST_HASH_FILE,
+        (hashlib.sha256(projection_manifest_bytes).hexdigest() + "\n").encode("ascii"),
+    )
     for table, attr in _TABLE_ROWS.items():
         _write_parquet_atomic(_frame_from_rows(getattr(projection, attr)), cache_root / CACHE_FILES[table])
     manifest = json.dumps(
@@ -248,32 +295,117 @@ def write_projection_cache(projection: BatchProjection, cache_dir: Path) -> None
         cache_root / _MANIFEST_FILE,
         manifest.encode("utf-8"),
     )
-    _write_atomic_bytes(
-        cache_root / _PROJECTION_MANIFEST_FILE,
-        (
-            json.dumps(
-                [dict(row) for row in projection.source_manifest],
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
+
+
+def _validate_source_manifest(entries: Sequence[Mapping[str, Any]]) -> None:
+    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+        raise ValueError("cache source manifest must be an array")
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"cache source manifest entry {index} must be an object")
+        missing = [field for field in _SOURCE_MANIFEST_FIELDS if field not in entry]
+        if missing:
+            raise ValueError(
+                f"cache source manifest entry {index} missing: {', '.join(missing)}"
             )
-            + "\n"
-        ).encode("utf-8"),
-    )
+        if not isinstance(entry["relative_path"], str) or not entry["relative_path"]:
+            raise ValueError(f"cache source manifest entry {index} has invalid relative_path")
+        if Path(entry["relative_path"]).is_absolute():
+            raise ValueError(f"cache source manifest entry {index} path must be relative")
+        if not isinstance(entry["asset_id"], str) or not entry["asset_id"]:
+            raise ValueError(f"cache source manifest entry {index} has invalid asset_id")
+        if isinstance(entry["revision"], bool):
+            raise ValueError(f"cache source manifest entry {index} has invalid revision")
+        try:
+            int(entry["revision"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"cache source manifest entry {index} has invalid revision") from exc
+        digest = entry["sha256"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != hashlib.sha256().digest_size * 2
+            or any(char not in "0123456789abcdefABCDEF" for char in digest)
+        ):
+            raise ValueError(f"cache source manifest entry {index} has invalid sha256")
 
 
 def _read_manifest(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes)):
         raise ValueError("cache manifest must be an array")
-    return [dict(row) for row in payload if isinstance(row, Mapping)]
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(payload):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"cache manifest entry {index} must be an object")
+        rows.append(dict(row))
+    _validate_source_manifest(rows)
+    return rows
 
 
 def _read_projection_manifest(path: Path) -> tuple[dict[str, Any], ...]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes)):
         raise ValueError("projection source manifest must be an array")
-    return tuple(dict(row) for row in payload if isinstance(row, Mapping))
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(payload):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"projection source manifest entry {index} must be an object")
+        rows.append(dict(row))
+    return tuple(rows)
+
+
+def _read_projection_manifest_with_integrity(
+    cache_root: Path,
+) -> tuple[dict[str, Any], ...]:
+    manifest_path = cache_root / _PROJECTION_MANIFEST_FILE
+    manifest_bytes = manifest_path.read_bytes()
+    expected_digest = (cache_root / _PROJECTION_MANIFEST_HASH_FILE).read_text(
+        encoding="ascii"
+    ).strip()
+    actual_digest = hashlib.sha256(manifest_bytes).hexdigest()
+    if expected_digest != actual_digest:
+        raise ValueError("projection source manifest integrity check failed")
+    return _read_projection_manifest(manifest_path)
+
+
+def _projection_manifest_matches_source(
+    projection_manifest: Sequence[Mapping[str, Any]],
+    source_manifest: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Cross-check projection identities against source generation fields."""
+
+    if len(projection_manifest) != len(source_manifest):
+        return False
+    source_by_path = {str(row["relative_path"]): row for row in source_manifest}
+    if len(source_by_path) != len(source_manifest):
+        return False
+    matched: set[str] = set()
+    for row in projection_manifest:
+        path_value = row.get("relative_path") or row.get("path") or row.get("report_path") or row.get("json_path")
+        asset_id = row.get("asset_id")
+        if path_value in {None, ""} or asset_id in {None, ""}:
+            return False
+        path_text = Path(str(path_value)).as_posix()
+        candidates = [
+            relative
+            for relative in source_by_path
+            if path_text == relative or path_text.endswith("/" + relative)
+        ]
+        if len(candidates) != 1:
+            return False
+        relative = candidates[0]
+        expected = source_by_path[relative]
+        if relative in matched or str(asset_id) != str(expected["asset_id"]):
+            return False
+        raw_revision = row.get("report_revision", row.get("revision", 0))
+        try:
+            revision = int(raw_revision)
+        except (TypeError, ValueError):
+            return False
+        if revision != int(expected["revision"]):
+            return False
+        matched.add(relative)
+    return len(matched) == len(source_by_path)
 
 
 def _read_projection_table(path: Path) -> tuple[dict[str, Any], ...]:
@@ -299,13 +431,14 @@ def load_projection_cache(
     try:
         source_manifest = _read_manifest(cache_root / _MANIFEST_FILE)
         expected = [dict(row) for row in expected_manifest]
+        _validate_source_manifest(expected)
         if source_manifest != expected:
             return None
         if not all((cache_root / filename).is_file() for filename in CACHE_FILES.values()):
             return None
-        projection_manifest = _read_projection_manifest(
-            cache_root / _PROJECTION_MANIFEST_FILE
-        )
+        projection_manifest = _read_projection_manifest_with_integrity(cache_root)
+        if not _projection_manifest_matches_source(projection_manifest, source_manifest):
+            return None
         rows = {
             table: _read_projection_table(cache_root / filename)
             for table, filename in CACHE_FILES.items()

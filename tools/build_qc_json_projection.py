@@ -178,10 +178,7 @@ def _write_parquet(df: pd.DataFrame, path: Path) -> Path:
 
 def _write_csv(df: pd.DataFrame, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Use a stable textual null marker so repeated projections compare
-    # byte-for-byte after a CSV round-trip (pandas otherwise materializes an
-    # empty field as a fresh NaN on every read, making record equality false).
-    df.to_csv(path, index=False, na_rep="<NULL>")
+    df.to_csv(path, index=False)
     return path
 
 
