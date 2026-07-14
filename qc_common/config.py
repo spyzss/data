@@ -4,7 +4,7 @@ import copy
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -33,6 +33,26 @@ class LoadedQcConfig:
     def config_name(self) -> str:
         return str(self.raw["config_name"])
 
+    @property
+    def pipeline_modules(self) -> tuple[str, ...]:
+        return tuple(str(name) for name in self.raw["pipeline"]["modules"])
+
+    @property
+    def default_profile(self) -> str:
+        return str(self.raw["pipeline"]["default_profile"])
+
+    def execution_profile(self, name: str) -> dict[str, str]:
+        try:
+            return copy.deepcopy(self.raw["execution_profiles"][name])
+        except KeyError as exc:
+            raise ValueError(f"unknown execution profile: {name}") from exc
+
+    def module_config(self, name: str) -> dict[str, Any]:
+        try:
+            return copy.deepcopy(self.raw["modules"][name])
+        except KeyError as exc:
+            raise ValueError(f"unknown pipeline module: {name}") from exc
+
     def module_parameters(self, module_name: str) -> dict[str, Any]:
         module = self.raw["modules"][module_name]
         parameters = module.get("parameters")
@@ -59,6 +79,14 @@ class LoadedQcConfig:
             "config_hash": self.sha256,
         }
 
+    def assert_same_reference(self, reference: Mapping[str, str]) -> None:
+        expected = self.json_reference()
+        for key in ("schema_version", "config_version", "config_hash"):
+            if reference.get(key) != expected[key]:
+                raise ValueError(
+                    f"QC config drift at {key}: {reference.get(key)} != {expected[key]}"
+                )
+
 
 def load_qc_acceptance_config(path: Path | None = None) -> LoadedQcConfig:
     resolved = (path or _repo_root() / "configs" / "qc_acceptance.yaml").resolve()
@@ -67,6 +95,18 @@ def load_qc_acceptance_config(path: Path | None = None) -> LoadedQcConfig:
     if not isinstance(raw, dict) or "schema_version" not in raw:
         raise ValueError("expected unified qc_acceptance config")
     validate_qc_config(raw)
+
+    if path is None:
+        snapshot = (
+            _repo_root()
+            / "configs"
+            / "qc_acceptance"
+            / f"{raw['config_version']}.yaml"
+        )
+        if not snapshot.is_file() or snapshot.read_bytes() != payload:
+            raise ValueError(
+                f"active QC config does not match immutable snapshot: {snapshot.name}"
+            )
 
     modules = raw["modules"]
     missing_modules = [name for name in raw["pipeline"]["modules"] if name not in modules]
@@ -82,10 +122,29 @@ def load_qc_acceptance_config(path: Path | None = None) -> LoadedQcConfig:
             if not isinstance(rule, dict):
                 raise ValueError(f"module {module_name} rule must be a mapping")
             rule_id = rule.get("rule_id")
+            if not isinstance(rule_id, str) or not rule_id.strip():
+                raise ValueError(f"module {module_name} rule must have non-empty rule_id")
             if rule_id in seen_rule_ids:
                 raise ValueError(f"duplicate rule_id: {rule_id}")
-            if rule_id is not None:
-                seen_rule_ids.add(str(rule_id))
+            seen_rule_ids.add(rule_id)
+
+    if raw["schema_version"] == "qc_acceptance_config_schema.v2":
+        profiles = raw["execution_profiles"]
+        default_profile = raw["pipeline"]["default_profile"]
+        if default_profile not in profiles:
+            raise ValueError(f"unknown default execution profile: {default_profile}")
+
+        for module_name, module in modules.items():
+            if module["enabled"]:
+                has_implementation = bool(str(module.get("implementation", "")).strip())
+                is_external = module.get("execution_kind") == "external"
+                if has_implementation == is_external:
+                    raise ValueError(
+                        f"enabled module {module_name} must define exactly one of implementation "
+                        "or execution_kind: external"
+                    )
+            elif not str(module.get("disabled_reason", "")).strip():
+                raise ValueError(f"disabled module {module_name} must define disabled_reason")
 
     return LoadedQcConfig(
         path=resolved,

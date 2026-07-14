@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qc_acceptance_config.v2.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "config_version",
+    "config_name",
+    "execution_profiles",
+    "pipeline",
+    "modules"
+  ],
+  "properties": {
+    "schema_version": {"const": "qc_acceptance_config_schema.v2"},
+    "config_version": {
+      "type": "string",
+      "pattern": "^qc_acceptance_v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "config_name": {"const": "acceptance_gate"},
+    "execution_profiles": {
+      "type": "object",
+      "minProperties": 1,
+      "required": ["acceptance", "supplier_evaluation"],
+      "additionalProperties": {"$ref": "#/$defs/executionProfile"}
+    },
+    "pipeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_profile", "modules"],
+      "properties": {
+        "default_profile": {"type": "string", "minLength": 1},
+        "terminal_module": {"type": "string", "minLength": 1},
+        "modules": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "modules": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/moduleConfig"},
+      "required": [
+        "hdf5_text_info",
+        "quality_hand",
+        "keypoint_presence",
+        "keypoint_morphology",
+        "keypoint_temporal",
+        "video_quality",
+        "sam3_containment",
+        "semantic_consistency",
+        "manual_review",
+        "duplicate_check",
+        "content_validity",
+        "effective_duration"
+      ]
+    }
+  },
+  "$defs": {
+    "executionProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fail_action", "runtime_error_action"],
+      "properties": {
+        "fail_action": {
+          "enum": ["stop", "record_and_continue"]
+        },
+        "runtime_error_action": {
+          "enum": ["stop_incomplete"]
+        }
+      }
+    },
+    "moduleConfig": {
+      "type": "object",
+      "required": ["enabled", "parameters", "rules"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "implementation": {"type": "string", "minLength": 1},
+        "execution_kind": {"const": "external"},
+        "disabled_reason": {"type": "string", "minLength": 1},
+        "parameters": {"type": "object"},
+        "rules": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/ruleConfig"}
+        }
+      }
+    },
+    "ruleConfig": {
+      "type": "object",
+      "properties": {
+        "rule_id": {"type": "string"}
+      }
+    }
+  }
+}
