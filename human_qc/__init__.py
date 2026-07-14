@@ -11,6 +11,17 @@ from .timeline import (
     closed_to_half_open,
     half_open_to_closed,
 )
+from .semantic_service import (
+    BoundaryEditRequest,
+    LeaseError,
+    PendingEditError,
+    SemanticCalibrationService,
+    SemanticTaskView,
+    StaleSemanticRevisionError,
+    TaskStateError,
+    TextEdit,
+    TextEditRequest,
+)
 
 __all__ = [
     "BoundaryEdit",
@@ -20,4 +31,13 @@ __all__ = [
     "SubtaskSegment",
     "closed_to_half_open",
     "half_open_to_closed",
+    "BoundaryEditRequest",
+    "LeaseError",
+    "PendingEditError",
+    "SemanticCalibrationService",
+    "SemanticTaskView",
+    "StaleSemanticRevisionError",
+    "TaskStateError",
+    "TextEdit",
+    "TextEditRequest",
 ]

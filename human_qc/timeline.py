@@ -101,6 +101,14 @@ class SharedBoundaryTimeline:
         if segments[-1].end_frame_exclusive != self.frame_count:
             raise BoundaryError("last segment must end at frame_count")
 
+    @property
+    def boundaries(self) -> tuple[int, ...]:
+        """Return the complete boundary vector, including timeline edges."""
+
+        return (self.segments[0].start_frame,) + tuple(
+            segment.end_frame_exclusive for segment in self.segments
+        )
+
     def move_boundary(
         self,
         boundary_index: int,

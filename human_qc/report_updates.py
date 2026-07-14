@@ -24,6 +24,9 @@ from qc_common.schema import validate_asset_qc_report
 _HUMAN_MUTABLE_TOP_LEVEL = frozenset(
     {
         "semantic_calibration",
+        # The semantic workbench is the external owner of this module block;
+        # automatic modules may only write their own result blocks.
+        "semantic_consistency",
         "manual_review",
         "pipeline_state",
         "overall_decision",
