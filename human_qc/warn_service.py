@@ -93,14 +93,17 @@ def _string_ids(value: object, field_name: str) -> list[str]:
 def _machine_verdict(issue: Mapping[str, Any]) -> str | None:
     """Normalize a machine issue to pass/warn/fail without mutating it."""
 
-    raw = issue.get("verdict")
-    if raw not in {"pass", "warn", "fail"}:
-        raw = issue.get("severity")
-    if raw not in {"pass", "warn", "fail"}:
-        result_gate = issue.get("result_gate")
-        if isinstance(result_gate, Mapping):
-            raw = result_gate.get("verdict")
-    return raw if raw in {"pass", "warn", "fail"} else None
+    result_gate = issue.get("result_gate")
+    gate_verdict = result_gate.get("verdict") if isinstance(result_gate, Mapping) else None
+    values = (issue.get("severity"), issue.get("verdict"), gate_verdict)
+    # Any machine hard-fail signal wins over a conflicting/legacy warn or pass
+    # field; human review can never downgrade it.
+    if "fail" in values:
+        return "fail"
+    for value in values:
+        if value in {"pass", "warn"}:
+            return value
+    return None
 
 
 def effective_issue_verdict(
@@ -369,7 +372,7 @@ class WarnReviewService:
             and pipeline.get("next_module") is None
             and state in {"completed", "not_required"}
         ):
-            return self._view(asset_id, report)
+            raise WarnStateError("warn review is already completed")
         self._assert_manual_cursor(report)
         reviews = manual.get("issue_reviews", {})
         if not isinstance(reviews, Mapping):

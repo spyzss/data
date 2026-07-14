@@ -178,6 +178,16 @@ def test_no_selected_candidates_are_not_required(tmp_path: Path) -> None:
     assert completed.overall_decision == "pass"
 
 
+def test_terminal_warn_completion_is_rejected(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.submit_verdict(
+        ASSET_ID, "warn-1", "pass", None, expected_revision=1, lease_token=LEASE
+    )
+    service.complete(ASSET_ID, expected_revision=2, lease_token=LEASE)
+    with pytest.raises(WarnStateError, match="already completed|terminal"):
+        service.complete(ASSET_ID, expected_revision=3, lease_token=LEASE)
+
+
 def test_stale_revision_and_wrong_lease_are_rejected(tmp_path: Path) -> None:
     service = _service(tmp_path)
     with pytest.raises(WarnRevisionError):
@@ -213,6 +223,7 @@ def test_pending_semantic_edit_blocks_warn_mutation(tmp_path: Path) -> None:
         ({"severity": "warn"}, {"verdict": "pass"}, "pass"),
         ({"severity": "warn"}, {"verdict": "fail"}, "fail"),
         ({"severity": "fail"}, {"verdict": "pass"}, "fail"),
+        ({"severity": "fail", "verdict": "warn"}, {"verdict": "pass"}, "fail"),
     ],
 )
 def test_effective_verdict_preserves_machine_hard_fail(machine, review, expected) -> None:
@@ -262,3 +273,56 @@ def test_final_reducer_precedence(
         "completed_at": NOW if manual_state == "completed" else None,
     }
     assert reduce_overall_decision(report) == expected
+
+
+def test_reducer_does_not_skip_queued_candidates_without_selection() -> None:
+    report = make_v2_report(status="completed")
+    report["pipeline_state"]["status"] = "completed"
+    report["semantic_calibration"] = {
+        "state": "completed",
+        "source_dataset_path": "/label/subtask_label",
+        "base_hdf5_sha256": "sha256:" + "0" * 64,
+        "final_hdf5_sha256": "sha256:" + "1" * 64,
+        "timeline_edit_count": 0,
+        "subtask_text_edit_count": 0,
+        "pending_edit": None,
+        "audit": [],
+    }
+    report["manual_review"] = {
+        "required": True,
+        "state": "queued",
+        "candidate_issue_ids": ["warn-1"],
+        "failures_for_batch_stats_issue_ids": [],
+        "selected_issue_ids": [],
+        "selected_issue_id": None,
+        "issue_reviews": {},
+        "completed_at": None,
+    }
+    assert reduce_overall_decision(report) is None
+
+
+def test_machine_hard_fail_precedes_unfinished_semantic_stage() -> None:
+    report = make_v2_report(status="completed")
+    report["pipeline_state"]["status"] = "completed"
+    report["semantic_calibration"] = {
+        "state": "in_progress",
+        "source_dataset_path": "/label/subtask_label",
+        "base_hdf5_sha256": "sha256:" + "0" * 64,
+        "final_hdf5_sha256": None,
+        "timeline_edit_count": 0,
+        "subtask_text_edit_count": 0,
+        "pending_edit": None,
+        "audit": [],
+    }
+    report["issues"] = [_issue("hard-fail", severity="fail")]
+    report["manual_review"] = {
+        "required": False,
+        "state": "not_required",
+        "candidate_issue_ids": [],
+        "failures_for_batch_stats_issue_ids": [],
+        "selected_issue_ids": [],
+        "selected_issue_id": None,
+        "issue_reviews": {},
+        "completed_at": None,
+    }
+    assert reduce_overall_decision(report) == "fail"

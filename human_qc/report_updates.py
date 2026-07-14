@@ -246,12 +246,19 @@ def reduce_overall_decision(report: Mapping[str, Any]) -> str | None:
         runtime_errors, (str, bytes, bytearray)
     ) and runtime_errors:
         return None
-    if status in {"pending", "running", "awaiting_external", "error"}:
+    if status == "error":
         return None
 
     machine_fail = _machine_failure(report)
+    # A machine hard fail is terminal even when a later human stage has not
+    # been entered yet.  Runtime errors/status=error were handled above and
+    # intentionally remain indeterminate.
+    if machine_fail:
+        return "fail"
     if status == "stopped":
         return "fail"
+    if status in {"pending", "running", "awaiting_external"}:
+        return None
     if status != "completed":
         return None
 
@@ -265,8 +272,16 @@ def reduce_overall_decision(report: Mapping[str, Any]) -> str | None:
         candidates = manual.get("candidate_issue_ids", [])
         selected = manual.get("selected_issue_ids", [])
         state = manual.get("state")
-        if candidates and selected and manual_verdict is None:
-            return None
+        if candidates:
+            if not selected:
+                # A candidate set with no selected IDs is skippable only after
+                # the warn service explicitly records ``not_required``.  A
+                # queued/in-progress/completed block is still an incomplete
+                # required stage and must not reduce to pass.
+                if state not in {"not_required", "skipped_due_to_fail"}:
+                    return None
+            elif manual_verdict is None:
+                return None
         if not candidates and state not in {
             "not_required",
             "completed",
