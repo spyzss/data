@@ -1,0 +1,20 @@
+output_label: jdt_dr_5x100_20260712
+suppliers:
+  - supplier_id: jdt
+    root: outputs/acceptance_5x100/jdt
+    manifest: outputs/acceptance_5x100/jdt/manifest/jdt_sample_100_manifest.csv
+    manual_labels: outputs/acceptance_5x100/jdt/manual_review/manual_labels.csv
+    review_queue: outputs/acceptance_5x100/jdt/review/review_queue.csv
+    sam3_summary: outputs/acceptance_5x100/jdt/sam3_containment/window_keypoint_containment_summary.parquet
+    blocked: false
+    required_inputs:
+      - manifest
+
+  - supplier_id: deepreach
+    root: outputs/acceptance_5x100/deepreach
+    manifest: outputs/acceptance_5x100/deepreach/manifest/deepreach_sample_100_manifest.csv
+    blocker: outputs/acceptance_5x100/deepreach/blockers/sam3_containment_blocker.json
+    blocked: true
+    blocked_policy: all_frames_review
+    required_inputs:
+      - manifest

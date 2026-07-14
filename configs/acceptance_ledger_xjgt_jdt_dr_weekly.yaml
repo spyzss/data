@@ -1,0 +1,37 @@
+workbook_mode: weekly_template
+output_label: xjgt_jdt_dr_5x100_weekly
+
+suppliers:
+  - supplier_id: xjgt
+    manifest: outputs/acceptance_5x100/xjgt/ledger/xjgt_video_frame_counts.csv
+    ledger_asset_ledger: outputs/acceptance_5x100/xjgt/ledger/xjgt_100_asset_ledger.csv
+    precheck_check_results: outputs/acceptance_5x100/xjgt/precheck/check_results.parquet
+    precheck_clip_aggregates: outputs/acceptance_5x100/xjgt/precheck/clip_aggregates.parquet
+    candidate_windows: outputs/acceptance_5x100/xjgt/precheck/candidate_windows.parquet
+    video_quality: outputs/acceptance_5x100/xjgt/video_quality/video_quality_acceptance_summary.csv
+    sam3_summary: outputs/acceptance_5x100/xjgt/sam3_containment/window_keypoint_containment_summary.parquet
+    review_queue: outputs/acceptance_5x100/xjgt/review/review_queue.csv
+    manual_labels: outputs/acceptance_5x100/xjgt/manual_review/manual_labels_autosave.normalized.csv
+    text_required: true
+
+  - supplier_id: jdt
+    manifest: outputs/acceptance_5x100/jdt/manifest/jdt_sample_100_manifest.csv
+    precheck_check_results: outputs/acceptance_5x100/jdt/precheck/check_results.parquet
+    precheck_clip_aggregates: outputs/acceptance_5x100/jdt/precheck/clip_aggregates.parquet
+    candidate_windows: outputs/acceptance_5x100/jdt/precheck/candidate_windows.parquet
+    video_quality: outputs/acceptance_5x100/jdt/video_quality/video_quality_results.json
+    sam3_summary: outputs/acceptance_5x100/jdt/sam3_containment/window_keypoint_containment_summary.parquet
+    review_queue: outputs/acceptance_5x100/jdt/review/review_queue.csv
+    manual_labels: outputs/acceptance_5x100/jdt/manual_review/manual_labels.csv
+    text_required: false
+
+  - supplier_id: deepreach
+    manifest: outputs/acceptance_5x100/deepreach/manifest/deepreach_sample_100_manifest.csv
+    precheck_check_results: outputs/acceptance_5x100/deepreach/precheck/check_results.parquet
+    precheck_clip_aggregates: outputs/acceptance_5x100/deepreach/precheck/clip_aggregates.parquet
+    candidate_windows: outputs/acceptance_5x100/deepreach/precheck/candidate_windows.parquet
+    video_quality: outputs/acceptance_5x100/deepreach/video_quality/video_quality_results.json
+    blocker: outputs/acceptance_5x100/deepreach/blockers/sam3_containment_blocker.json
+    blocked: true
+    blocked_policy: candidate_windows_review
+    text_required: false
