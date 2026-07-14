@@ -1,0 +1,92 @@
+[
+  {
+    "asset_id": "pass",
+    "module": "hdf5_text_info",
+    "revision": 1,
+    "pipeline_status": "running",
+    "result_verdict": "pass",
+    "exit_state": "continue",
+    "overall_decision": null,
+    "next_module": "quality_hand"
+  },
+  {
+    "asset_id": "pass",
+    "module": "quality_hand",
+    "revision": 2,
+    "pipeline_status": "running",
+    "result_verdict": "pass",
+    "exit_state": "continue",
+    "overall_decision": null,
+    "next_module": "semantic_consistency"
+  },
+  {
+    "asset_id": "pass",
+    "module": "semantic_consistency",
+    "revision": 3,
+    "pipeline_status": "awaiting_external",
+    "result_verdict": null,
+    "exit_state": "awaiting_external",
+    "overall_decision": null,
+    "next_module": "semantic_consistency"
+  },
+  {
+    "asset_id": "warn",
+    "module": "hdf5_text_info",
+    "revision": 1,
+    "pipeline_status": "running",
+    "result_verdict": "pass",
+    "exit_state": "continue",
+    "overall_decision": null,
+    "next_module": "quality_hand"
+  },
+  {
+    "asset_id": "warn",
+    "module": "quality_hand",
+    "revision": 2,
+    "pipeline_status": "running",
+    "result_verdict": "warn",
+    "exit_state": "continue",
+    "overall_decision": null,
+    "next_module": "semantic_consistency"
+  },
+  {
+    "asset_id": "warn",
+    "module": "semantic_consistency",
+    "revision": 3,
+    "pipeline_status": "awaiting_external",
+    "result_verdict": null,
+    "exit_state": "awaiting_external",
+    "overall_decision": null,
+    "next_module": "semantic_consistency"
+  },
+  {
+    "asset_id": "hard-fail",
+    "module": "hdf5_text_info",
+    "revision": 1,
+    "pipeline_status": "stopped",
+    "result_verdict": "fail",
+    "exit_state": "stop_qc",
+    "overall_decision": "fail",
+    "next_module": null
+  },
+  {
+    "asset_id": "runtime-error",
+    "module": "hdf5_text_info",
+    "revision": 1,
+    "pipeline_status": "running",
+    "result_verdict": "pass",
+    "exit_state": "continue",
+    "overall_decision": null,
+    "next_module": "quality_hand"
+  },
+  {
+    "asset_id": "runtime-error",
+    "module": "quality_hand",
+    "revision": 2,
+    "pipeline_status": "error",
+    "result_verdict": null,
+    "exit_state": "error",
+    "overall_decision": null,
+    "next_module": "quality_hand"
+  }
+]

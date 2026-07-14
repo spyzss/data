@@ -1,0 +1,4 @@
+{"asset_id":"pass","verdicts":{"hdf5_text_info":"pass","quality_hand":"pass"}}
+{"asset_id":"warn","verdicts":{"hdf5_text_info":"pass","quality_hand":"warn"}}
+{"asset_id":"hard-fail","verdicts":{"hdf5_text_info":"fail"}}
+{"asset_id":"runtime-error","errors":{"quality_hand":"input_missing"}}
