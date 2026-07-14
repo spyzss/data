@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1011,6 +1012,37 @@ def test_formal_cli_does_not_require_legacy_config(
 def test_legacy_build_requires_config_explicitly(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="config_path is required"):
         build_acceptance_ledger(config_path=None, output_path=tmp_path / "ledger.xlsx")
+
+
+def test_formal_script_cli_runs_without_legacy_config(tmp_path: Path) -> None:
+    archive = tmp_path / "quality_archive"
+    report = make_v2_report(status="completed", overall_decision="pass")
+    report["asset_id"] = "asset-a"
+    report["execution"]["profile"] = "acceptance"
+    report["execution"]["module_states"] = {
+        "hdf5_text_info": {"state": "completed"},
+    }
+    archive.mkdir()
+    (archive / "asset-a.json").write_text(json.dumps(report), encoding="utf-8")
+    output = tmp_path / "ledger.xlsx"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "tools" / "build_acceptance_ledger.py"),
+            "--quality-archive",
+            str(archive),
+            "--output",
+            str(output),
+            "--overwrite",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output.exists()
 
 
 def test_existing_workbook_preserves_unrelated_sheets_and_replaces_generated(

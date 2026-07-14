@@ -14,6 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+# Keep ``python tools/build_acceptance_ledger.py`` equivalent to module
+# invocation so formal projection imports resolve from the repository root.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import pandas as pd
 import yaml
 from openpyxl import Workbook, load_workbook
