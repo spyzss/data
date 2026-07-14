@@ -1,5 +1,7 @@
 import csv
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -277,6 +279,30 @@ def test_formal_xjgt_cli_reconciles_all_legacy_sidecars(tmp_path: Path) -> None:
     assert main(args) == 0
     reconciliation = pd.read_csv(output_dir / "reconciliation.csv")
     assert set(reconciliation["source"]) == set(sidecars)
+    assert (output_dir / "xjgt_100_acceptance_report.xlsx").exists()
+
+
+def test_formal_xjgt_script_cli_runs_from_repository_root(tmp_path: Path) -> None:
+    archive = tmp_path / "quality_archive"
+    _write_report(archive, "asset-a", "acceptance", "pass", issues=[])
+    output_dir = tmp_path / "formal"
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "tools" / "build_xjgt_acceptance_report.py"),
+            "--quality-archive",
+            str(archive),
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
     assert (output_dir / "xjgt_100_acceptance_report.xlsx").exists()
 
 

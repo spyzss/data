@@ -8,10 +8,16 @@ import csv
 import json
 import logging
 import shutil
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+
+# Keep direct script invocation equivalent to module invocation.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import pandas as pd
 from openpyxl import Workbook
