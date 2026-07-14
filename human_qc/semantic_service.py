@@ -289,14 +289,22 @@ def _snapshot_from_dict(value: Mapping[str, Any]) -> SegmentSnapshot:
     try:
         return SegmentSnapshot(
             internal_id=str(value["internal_id"]),
-            start_frame=int(value["start_frame"]),
-            end_frame_exclusive=int(value["end_frame_exclusive"]),
+            start_frame=_strict_int(value["start_frame"], "pending snapshot start_frame"),
+            end_frame_exclusive=_strict_int(
+                value["end_frame_exclusive"], "pending snapshot end_frame_exclusive"
+            ),
             text_cn=str(value.get("text_cn", "")),
             text_en=str(value.get("text_en", "")),
             canonical_record=deepcopy(value.get("canonical_record", {})),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise TaskStateError("pending snapshot is malformed") from exc
+
+
+def _strict_int(value: object, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TaskStateError(f"{field_name} must be an integer")
+    return value
 
 
 def _pending_dict(edit: BoundaryEdit | TextEdit, *, action: str | None = None) -> dict[str, Any]:
@@ -355,7 +363,9 @@ def _pending_from_dict(value: object) -> BoundaryEdit | TextEdit | None:
     affected_ids = tuple(str(item) for item in affected)
     if kind == "boundary":
         try:
-            boundary_index = int(value["boundary_index"])
+            boundary_index = _strict_int(
+                value["boundary_index"], "pending boundary_index"
+            )
             boundary_id = str(value.get("boundary_id", f"b{boundary_index}"))
             actor = str(value["actor_segment_id"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -456,6 +466,16 @@ def _timeline_from_report(
                 raise TaskStateError(
                     "semantic working_timeline ordinal does not match source identity"
                 )
+        # An unchanged frame-derived ID is not sufficient evidence: an
+        # external writer can alter verb/object/evidence while keeping the
+        # same interval.  Validate immutable source fields on both exact-ID
+        # and ordinal-fallback paths before accepting the report timeline.
+        _validate_stable_segment_identity(
+            asset_id=loaded.asset_id,
+            ordinal=ordinal,
+            report_value=value,
+            source=source,
+        )
         seen_ordinals.add(ordinal)
         try:
             segment = replace(
@@ -463,8 +483,13 @@ def _timeline_from_report(
                 # Keep the report's stable ID even when the freshly loaded
                 # HDF5 adapter generated a new frame-derived source ID.
                 internal_id=internal_id,
-                start_frame=int(value["start_frame"]),
-                end_frame_exclusive=int(value["end_frame_exclusive"]),
+                start_frame=_strict_int(
+                    value["start_frame"], "working_timeline start_frame"
+                ),
+                end_frame_exclusive=_strict_int(
+                    value["end_frame_exclusive"],
+                    "working_timeline end_frame_exclusive",
+                ),
                 text_cn=str(value.get("text_cn", source.text_cn)),
                 text_en=str(value.get("text_en", source.text_en)),
                 canonical_record=deepcopy(
@@ -538,6 +563,68 @@ def _validate_stable_segment_identity(
             raise TaskStateError(
                 f"semantic working_timeline source identity differs at {field_name!r}"
             )
+
+
+def _advance_pipeline_after_semantic(candidate: dict[str, Any]) -> None:
+    """Advance only from the semantic external cursor.
+
+    A completed semantic stage with no warn candidates closes the pipeline;
+    candidates deliberately keep it paused at the manual-review stage.
+    """
+
+    pipeline = _require_semantic_pipeline_cursor(candidate)
+    manual = candidate.get("manual_review")
+    candidate_ids = (
+        manual.get("candidate_issue_ids", [])
+        if isinstance(manual, Mapping)
+        else []
+    )
+    if isinstance(candidate_ids, (str, bytes, bytearray)) or not isinstance(
+        candidate_ids, Sequence
+    ):
+        raise TaskStateError("manual candidate_issue_ids must be a sequence")
+    pipeline["last_completed_module"] = "semantic_consistency"
+    pipeline["stop_reason"] = None
+    if candidate_ids:
+        pipeline["status"] = "awaiting_external"
+        pipeline["next_module"] = "manual_review"
+        candidate["pipeline_state"] = pipeline
+        return
+
+    if not isinstance(manual, dict):
+        manual = {
+            "required": False,
+            "state": "not_required",
+            "candidate_issue_ids": [],
+            "failures_for_batch_stats_issue_ids": [],
+        }
+        candidate["manual_review"] = manual
+    manual.setdefault("selected_issue_ids", [])
+    manual.setdefault("selected_issue_id", None)
+    manual.setdefault("issue_reviews", {})
+    manual["state"] = "not_required"
+    manual["completed_at"] = None
+    pipeline["status"] = "completed"
+    pipeline["next_module"] = None
+    candidate["pipeline_state"] = pipeline
+    candidate["overall_decision"] = reduce_overall_decision(candidate) or "pass"
+
+
+def _require_semantic_pipeline_cursor(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Require a report paused at the semantic external module."""
+
+    pipeline = value.get("pipeline_state")
+    if not isinstance(pipeline, dict):
+        raise TaskStateError("pipeline_state must be an object")
+    if pipeline.get("status") != "awaiting_external":
+        raise TaskStateError(
+            "semantic completion requires pipeline status=awaiting_external"
+        )
+    if pipeline.get("next_module") != "semantic_consistency":
+        raise TaskStateError(
+            "semantic completion requires pipeline next_module=semantic_consistency"
+        )
+    return pipeline
 
 
 def _sha256(path: Path) -> str:
@@ -720,7 +807,10 @@ class SemanticCalibrationService:
         if self._active_pending_asset is None:
             # A new service instance must honor a pending lock already durable
             # in another process; inspect report headers without loading HDF5.
-            for other_id, report_path in self._reports.items():
+            report_candidates = dict(self._reports)
+            for other_id in self._assets:
+                report_candidates.setdefault(other_id, self.report_path(other_id))
+            for other_id, report_path in report_candidates.items():
                 if other_id == asset_id or not report_path.is_file():
                     continue
                 try:
@@ -827,6 +917,14 @@ class SemanticCalibrationService:
         actor = actor or ""
         now = _iso_now(request.now if request.now is not None else self._clock())
         try:
+            if (
+                isinstance(request.new_frame_exclusive, int)
+                and not isinstance(request.new_frame_exclusive, bool)
+                and 1 <= request.boundary_index < len(state.timeline.segments)
+                and request.new_frame_exclusive
+                == state.timeline.segments[request.boundary_index - 1].end_frame_exclusive
+            ):
+                raise BoundaryError("new boundary must change the current boundary")
             _, edit = state.timeline.move_boundary(
                 request.boundary_index,
                 request.new_frame_exclusive,
@@ -1042,10 +1140,7 @@ class SemanticCalibrationService:
             return self._view(self._load_state(asset_id, recover=False))
         if current_state in {"error", "skipped_due_to_fail"}:
             raise TaskStateError(f"semantic task cannot complete from state {current_state}")
-        pipeline = state.report.get("pipeline_state")
-        pipeline_status = pipeline.get("status") if isinstance(pipeline, Mapping) else None
-        if pipeline_status in {"stopped", "error"}:
-            raise TaskStateError(f"pipeline is not completable in state {pipeline_status}")
+        _require_semantic_pipeline_cursor(state.report)
 
         # Reconstructing SharedBoundaryTimeline above validates frame coverage,
         # positivity, and all shared-boundary invariants before any bytes stage.
@@ -1108,31 +1203,7 @@ class SemanticCalibrationService:
             module["state"] = "completed"
             module["execution_kind"] = "external"
             candidate["semantic_consistency"] = module
-            pipeline = candidate.get("pipeline_state")
-            if not isinstance(pipeline, dict):
-                pipeline = {}
-            current_next = pipeline.get("next_module")
-            manual = candidate.get("manual_review")
-            has_manual = isinstance(manual, Mapping) and bool(manual.get("candidate_issue_ids"))
-            if current_next == "semantic_consistency" or has_manual:
-                pipeline["status"] = "awaiting_external"
-                pipeline["last_completed_module"] = "semantic_consistency"
-                pipeline["next_module"] = "manual_review"
-                pipeline["stop_reason"] = None
-            else:
-                pipeline["status"] = "completed"
-                pipeline["last_completed_module"] = "semantic_consistency"
-                pipeline["next_module"] = None
-                pipeline["stop_reason"] = None
-                if isinstance(manual, dict) and not manual.get("candidate_issue_ids"):
-                    manual.setdefault("selected_issue_ids", [])
-                    manual.setdefault("selected_issue_id", None)
-                    manual.setdefault("issue_reviews", {})
-                    manual["state"] = "not_required"
-                    manual["completed_at"] = None
-                decision = reduce_overall_decision(candidate)
-                candidate["overall_decision"] = decision or "pass"
-            candidate["pipeline_state"] = pipeline
+            _advance_pipeline_after_semantic(candidate)
 
         self._mutate_report(state, state.revision, mark_completed)
         state.pending_edit = None
@@ -1207,6 +1278,12 @@ class SemanticCalibrationService:
                 "asset_id": asset_id,
             }
         record = self._record_from_dict(raw_record)
+        self._validate_finalizing_record(
+            record,
+            source_path=source_path,
+            asset_id=asset_id,
+        )
+        _require_semantic_pipeline_cursor(report)
         action = recover_hdf5_replacement(record)
         if action == RecoveryAction.MARK_REPORT_COMPLETED:
             self._mark_recovered_report(asset_id, report_path, report, record, _sha256(source_path))
@@ -1238,6 +1315,39 @@ class SemanticCalibrationService:
             return
         raise Hdf5CommitError(f"unable to recover finalizing semantic transaction for {asset_id}")
 
+    def _validate_finalizing_record(
+        self,
+        record: FinalizingRecord,
+        *,
+        source_path: Path,
+        asset_id: str,
+    ) -> None:
+        """Bind a durable recovery record to this service's task identity.
+
+        Task 3 validates staging ownership relative to the record's source;
+        this service must additionally ensure that the record itself was not
+        redirected to another asset/source/dataset by a stale or tampered
+        report before invoking that recovery API.
+        """
+
+        try:
+            current_source = Path(source_path).resolve(strict=False)
+            record_source = Path(record.source_path).resolve(strict=False)
+        except OSError as exc:
+            raise Hdf5CommitError("unable to canonicalize finalizing source_path") from exc
+        if record_source != current_source:
+            raise Hdf5CommitError(
+                "finalizing record source_path does not match the current asset source_path"
+            )
+        if record.asset_id != asset_id:
+            raise Hdf5CommitError(
+                "finalizing record asset_id does not match the requested asset"
+            )
+        if record.dataset_path != self._dataset_path:
+            raise Hdf5CommitError(
+                "finalizing record dataset_path does not match the configured dataset"
+            )
+
     def _mark_recovered_report(
         self,
         asset_id: str,
@@ -1265,14 +1375,12 @@ class SemanticCalibrationService:
                 module = {}
                 candidate["semantic_consistency"] = module
             module["state"] = "completed"
+            module["execution_kind"] = "external"
             pipeline = candidate.setdefault("pipeline_state", {})
             if not isinstance(pipeline, dict):
                 pipeline = {}
                 candidate["pipeline_state"] = pipeline
-            pipeline["last_completed_module"] = "semantic_consistency"
-            if pipeline.get("next_module") == "semantic_consistency":
-                pipeline["next_module"] = "manual_review"
-                pipeline["status"] = "awaiting_external"
+            _advance_pipeline_after_semantic(candidate)
 
         update_human_state(report_path, revision, mutate)
 

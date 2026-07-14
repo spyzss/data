@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from human_qc.semantic_service import (
     BoundaryEditRequest,
     SemanticCalibrationService,
     SemanticTaskView,
+    TaskStateError,
     TextEditRequest,
 )
 from human_qc.source_adapters import Hdf5ScalarJsonSubtaskAdapter
@@ -69,9 +71,22 @@ def _write_asset(tmp_path: Path, *, report: dict | None = None) -> tuple[Path, P
     report_path = tmp_path / "quality_archive" / f"{ASSET_ID}.json"
     value = make_v2_report(status="awaiting_external") if report is None else copy.deepcopy(report)
     value["asset_id"] = ASSET_ID
+    # A semantic workbench task is only valid when the orchestrator cursor is
+    # paused at this external module; other cursors must be rejected.
+    if report is None:
+        value["pipeline_state"]["next_module"] = "semantic_consistency"
     value["source_files"] = {"hdf5": {"path": str(hdf5_path)}}
     write_asset_qc_report(report_path, value, expected_revision=0, profile="acceptance")
     return hdf5_path, report_path
+
+
+def _mutate_external_immutable_annotation(path: Path) -> None:
+    with h5py.File(path, "r+") as handle:
+        dataset = handle[DATASET_PATH]
+        payload = json.loads(bytes(dataset[()]).decode("utf-8"))
+        payload["annotations"][0]["verb"] = "externally-changed"
+        dataset[()] = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        handle.flush()
 
 
 def _service(tmp_path: Path, *, report: dict | None = None, **kwargs) -> SemanticCalibrationService:
@@ -97,7 +112,7 @@ def boundary_request(index: int, new_frame: int, *, revision: int = 3) -> Bounda
 
 def test_confirm_boundary_edit_commits_both_segments_once(tmp_path: Path) -> None:
     service = _service(tmp_path)
-    service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
+    pending = service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
     assert len(pending.pending_edit.before) == 2
     assert len(pending.pending_edit.after) == 2
 
@@ -150,6 +165,40 @@ def test_pending_rejects_other_edits_and_completion(tmp_path: Path, method: str)
         service.complete(ASSET_ID, expected_revision=2, lease_token=LEASE)
 
 
+def test_assets_only_service_honors_pending_navigation_lock_for_second_asset(
+    tmp_path: Path,
+) -> None:
+    first_hdf5, _ = _write_asset(tmp_path)
+    other_id = "617857"
+    other_root = tmp_path / "other"
+    other_hdf5 = other_root / f"{other_id}.hdf5"
+    other_root.mkdir()
+    payload = _payload()
+    payload["id"] = other_id
+    with h5py.File(other_hdf5, "w") as handle:
+        dataset = handle.create_group("label").create_dataset(
+            "subtask_label", shape=(), dtype="S65536"
+        )
+        dataset[()] = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    other_report = other_root / "quality_archive" / f"{other_id}.json"
+    other_value = make_v2_report(status="awaiting_external")
+    other_value["asset_id"] = other_id
+    other_value["pipeline_state"]["next_module"] = "semantic_consistency"
+    write_asset_qc_report(other_report, other_value, expected_revision=0, profile="acceptance")
+
+    service = SemanticCalibrationService(
+        assets={ASSET_ID: first_hdf5, other_id: other_hdf5},
+        leases={ASSET_ID: LEASE, other_id: LEASE},
+    )
+    service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
+    restarted = SemanticCalibrationService(
+        assets={ASSET_ID: first_hdf5, other_id: other_hdf5},
+        leases={ASSET_ID: LEASE, other_id: LEASE},
+    )
+    with pytest.raises(RuntimeError, match="navigation|pending"):
+        restarted.get_task(other_id)
+
+
 def test_stale_revision_and_wrong_lease_are_rejected_without_writes(tmp_path: Path) -> None:
     service = _service(tmp_path)
     before = service.get_task(ASSET_ID)
@@ -167,6 +216,12 @@ def test_boundary_drag_rejects_outer_or_crossing_positions(tmp_path: Path) -> No
     with pytest.raises(ValueError):
         service.begin_boundary_edit(ASSET_ID, boundary_request(1, 123, revision=1))
     assert service.get_task(ASSET_ID).pending_edit is None
+
+
+def test_boundary_drag_rejects_noop_at_current_boundary(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    with pytest.raises(ValueError, match="change|boundary"):
+        service.begin_boundary_edit(ASSET_ID, boundary_request(1, 51, revision=1))
 
 
 def test_complete_prepare_failure_leaves_report_and_hdf5_unpublished(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -196,7 +251,7 @@ def test_completed_boundary_timeline_survives_service_restart_with_stable_ids(
     tmp_path: Path,
 ) -> None:
     service = _service(tmp_path)
-    pending = service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
+    service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
     confirmed = service.confirm_pending(ASSET_ID, expected_revision=2, lease_token=LEASE)
     original_ids = tuple(segment.internal_id for segment in confirmed.timeline.segments)
 
@@ -214,6 +269,83 @@ def test_completed_boundary_timeline_survives_service_restart_with_stable_ids(
         "第二步",
         "第三步",
     )
+
+
+def test_complete_rejects_pipeline_cursor_outside_semantic_stage(tmp_path: Path) -> None:
+    report = make_v2_report(status="awaiting_external")
+    report["pipeline_state"]["next_module"] = "video_quality"
+    service = _service(tmp_path, report=report)
+    before_hdf5 = service._assets[ASSET_ID].read_bytes()
+    before_report = service.report_path(ASSET_ID).read_bytes()
+
+    with pytest.raises(TaskStateError, match="pipeline|semantic|next_module"):
+        service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
+
+    assert service._assets[ASSET_ID].read_bytes() == before_hdf5
+    assert service.report_path(ASSET_ID).read_bytes() == before_report
+
+
+def test_complete_with_manual_candidates_advances_to_manual_review(tmp_path: Path) -> None:
+    report = make_v2_report(status="awaiting_external")
+    report["pipeline_state"]["next_module"] = "semantic_consistency"
+    report["manual_review"].update(
+        {
+            "state": "queued",
+            "candidate_issue_ids": ["warn-1"],
+            "required": True,
+            "selected_issue_ids": [],
+            "selected_issue_id": None,
+            "issue_reviews": {},
+            "completed_at": None,
+        }
+    )
+    service = _service(tmp_path, report=report)
+    completed = service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
+    assert completed.pipeline_state == "awaiting_external"
+    persisted = load_asset_qc_report(service.report_path(ASSET_ID))
+    assert persisted is not None
+    assert persisted["pipeline_state"]["next_module"] == "manual_review"
+
+
+@pytest.mark.parametrize("operation", ["get", "confirm", "complete"])
+def test_external_immutable_canonical_change_fails_closed(
+    tmp_path: Path, operation: str
+) -> None:
+    service = _service(tmp_path)
+    service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
+    if operation == "complete":
+        service.confirm_pending(ASSET_ID, expected_revision=2, lease_token=LEASE)
+    source_path = service._assets[ASSET_ID]
+    _mutate_external_immutable_annotation(source_path)
+    if operation == "complete":
+        report_path = service.report_path(ASSET_ID)
+        report = load_asset_qc_report(report_path)
+        assert report is not None
+        report["semantic_calibration"]["base_hdf5_sha256"] = hashlib.sha256(
+            source_path.read_bytes()
+        ).hexdigest()
+        report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(TaskStateError, match="source identity|canonical|immutable|verb"):
+        if operation == "get":
+            service.get_task(ASSET_ID)
+        elif operation == "confirm":
+            service.confirm_pending(ASSET_ID, expected_revision=2, lease_token=LEASE)
+        else:
+            service.complete(ASSET_ID, expected_revision=3, lease_token=LEASE)
+
+
+def test_corrupt_working_timeline_rejects_boolean_frame_values(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
+    report_path = service.report_path(ASSET_ID)
+    report = load_asset_qc_report(report_path)
+    assert report is not None
+    report["semantic_calibration"]["working_timeline"][0]["start_frame"] = False
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(TaskStateError, match="integer|frame|working_timeline"):
+        service.get_task(ASSET_ID)
 
 
 def test_replace_then_report_failure_recovers_finalizing_transaction(
@@ -245,6 +377,64 @@ def test_replace_then_report_failure_recovers_finalizing_transaction(
     ).get_task(ASSET_ID)
     assert recovered.report_state == "completed"
     assert recovered.semantic_consistency_state == "completed"
+
+
+def test_finalizing_record_source_path_tamper_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _service(tmp_path)
+
+    def fail_replace(prepared) -> None:
+        raise RuntimeError("replace interrupted")
+
+    monkeypatch.setattr("human_qc.semantic_service.commit_hdf5_replacement", fail_replace)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
+    monkeypatch.undo()
+
+    report_path = service.report_path(ASSET_ID)
+    report = load_asset_qc_report(report_path)
+    assert report is not None
+    foreign_path = tmp_path / "foreign" / f"{ASSET_ID}.hdf5"
+    foreign_path.parent.mkdir()
+    foreign_path.write_bytes(service._assets[ASSET_ID].read_bytes())
+    report["semantic_calibration"]["finalizing_record"]["source_path"] = str(foreign_path)
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    foreign_before = foreign_path.read_bytes()
+
+    restarted = SemanticCalibrationService(
+        assets={ASSET_ID: service._assets[ASSET_ID]},
+        reports={ASSET_ID: report_path},
+        leases={ASSET_ID: LEASE},
+    )
+    with pytest.raises(Hdf5CommitError, match="source_path"):
+        restarted.get_task(ASSET_ID)
+    assert foreign_path.read_bytes() == foreign_before
+
+
+def test_finalizing_wrong_pipeline_cursor_fails_closed_before_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path)
+
+    monkeypatch.setattr(
+        "human_qc.semantic_service.commit_hdf5_replacement",
+        lambda prepared: (_ for _ in ()).throw(RuntimeError("replace interrupted")),
+    )
+    with pytest.raises(RuntimeError, match="interrupted"):
+        service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
+
+    report_path = service.report_path(ASSET_ID)
+    report = load_asset_qc_report(report_path)
+    assert report is not None
+    report["pipeline_state"]["next_module"] = "video_quality"
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+
+    restarted = SemanticCalibrationService(
+        assets={ASSET_ID: service._assets[ASSET_ID]},
+        reports={ASSET_ID: report_path},
+        leases={ASSET_ID: LEASE},
+    )
+    with pytest.raises(TaskStateError, match="pipeline|semantic|next_module"):
+        restarted.get_task(ASSET_ID)
 
 
 def test_finalizing_task_is_recovered_before_read(tmp_path: Path) -> None:
