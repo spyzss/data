@@ -1492,7 +1492,7 @@ git commit -m "docs(qc): document unified v2 dataflow"
 - Consumes: `run_asset()`、stub registry 和真实 report mutation；不依赖模型权重。
 - Produces: 固定 trace 行：`asset_id,module,revision,pipeline_status,result_verdict,exit_state,overall_decision,next_module`。
 
-- [ ] **Step 1: 添加四类 fixture 的精确轨迹测试**
+- [x] **Step 1: 添加四类 fixture 的精确轨迹测试**
 
 ```python
 def test_four_fixture_revision_trace_matches_golden(tmp_path: Path) -> None:
@@ -1506,13 +1506,13 @@ def test_four_fixture_revision_trace_matches_golden(tmp_path: Path) -> None:
     assert by_asset["runtime-error"][-1]["overall_decision"] is None
 ```
 
-- [ ] **Step 2: 运行测试并确认 golden/trace helper 缺失**
+- [x] **Step 2: 运行测试并确认 golden/trace helper 缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_pipeline_revision_trace.py -q`
 
 Expected: FAIL，fixture 文件或 trace helper 不存在。
 
-- [ ] **Step 3: 写入四资产 fixture 和真实 revision 捕获器**
+- [x] **Step 3: 写入四资产 fixture 和真实 revision 捕获器**
 
 ```json
 {"asset_id":"pass","verdicts":{"hdf5_text_info":"pass","quality_hand":"pass"}}
@@ -1523,13 +1523,13 @@ Expected: FAIL，fixture 文件或 trace helper 不存在。
 
 每次 writer 返回后捕获实际报告，不手工推算 revision；assert revision 从 1 单调递增、warn candidate 全量重建、hard fail 不创建 external task、error 不产生 decision。
 
-- [ ] **Step 4: 运行 revision trace 与事务回归**
+- [x] **Step 4: 运行 revision trace 与事务回归**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_pipeline_revision_trace.py tests/test_report_mutation.py tests/test_qc_orchestrator.py -q`
 
 Expected: PASS，golden 与实际状态轨迹逐字段一致。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add tests/fixtures/qc_pipeline/manifest.jsonl tests/fixtures/qc_pipeline/expected_revision_trace.json tests/test_qc_pipeline_revision_trace.py
@@ -1546,7 +1546,7 @@ git commit -m "test(qc): cover complete revision trajectories"
 - Consumes: `tools.run_qc_pipeline.run_batch(...)` 与 `project_quality_archive()`。
 - 验证同一资产、同一 Config、同一 runner 输出，在两个 profile 下机器 issue 相同而模块覆盖/stop point 不同。
 
-- [ ] **Step 1: 添加双批次 E2E 测试**
+- [x] **Step 1: 添加双批次 E2E 测试**
 
 ```python
 def test_same_batch_has_profile_specific_flow_and_same_machine_findings(tmp_path: Path) -> None:
@@ -1563,13 +1563,13 @@ def test_same_batch_has_profile_specific_flow_and_same_machine_findings(tmp_path
     assert a_stats["overall"]["module_coverage"]["sam3_containment"] < s_stats["overall"]["module_coverage"]["sam3_containment"]
 ```
 
-- [ ] **Step 2: 运行 E2E 并确认 batch 入口或 coverage 不完整**
+- [x] **Step 2: 运行 E2E 并确认 batch 入口或 coverage 不完整**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_pipeline_profiles_e2e.py -q`
 
 Expected: FAIL，缺少可调用 batch helper 或 supplier fail 后未继续。
 
-- [ ] **Step 3: 补齐批次调用的可测试入口**
+- [x] **Step 3: 补齐批次调用的可测试入口**
 
 ```python
 def run_batch(contexts, *, config, profile, registry, max_workers):
@@ -1582,13 +1582,13 @@ def run_batch(contexts, *, config, profile, registry, max_workers):
 
 确保一个 asset error 不取消其他 future；每个资产 report revision 独立递增。测试 fixture 在 semantic external 暂停，因此 supplier report 尚不形成最终 pass，但已存在自动 fail 的资产在依赖人工 change 完成后 reducer 必须保持 fail。
 
-- [ ] **Step 4: 运行 E2E、并发和投影测试**
+- [x] **Step 4: 运行 E2E、并发和投影测试**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_pipeline_profiles_e2e.py tests/test_qc_orchestrator.py tests/test_qc_reporting_aggregate.py -q`
 
 Expected: PASS；同机器 findings、不同流转覆盖，分 profile 统计正确。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add tools/run_qc_pipeline.py tests/fixtures/qc_pipeline/manifest.jsonl tests/test_qc_pipeline_profiles_e2e.py

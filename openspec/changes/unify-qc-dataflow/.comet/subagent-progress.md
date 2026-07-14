@@ -58,4 +58,8 @@
 - Review: Task17 final Thorough approval Ready; no Critical/Important findings
 - Task 18: complete (`3a815f7`), docs contract `2 passed`, `openspec validate --strict` passed; PRD/Schema/reviewer/migration docs now match v2 profiles and canonical archive flow
 - OpenSpec checkoff: 3.1–3.4, 4.1–4.4, 5.1 complete
+- Task 19: complete (`7c46e4d`), focused `4 passed`, report/orchestrator regression `62 passed`, full suite `600 passed, 1 skipped`; persisted revision golden covers pass/warn/hard-fail/runtime-error
+- Task 20: complete (`a6798cb`), focused `5 passed`, E2E/orchestrator/aggregate `51 passed`, full suite `605 passed, 1 skipped`; same-batch profile flow/coverage and sibling isolation verified
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.4, 5.1–5.3 complete
+- Review: combined Task19–20 Thorough approval Ready; no Critical/Important findings
 - Current phase: build
