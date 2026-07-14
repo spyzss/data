@@ -57,15 +57,16 @@ profile 的流转差异：
    `shasum -a 256 configs/qc_acceptance/qc_acceptance_v1.1.0.yaml`），不可重新序列化
    或覆盖该快照。
 2. 用 schema reader 读取 v1；不直接修改 v1，也不把 v1 sidecar 结论拼进新 verdict。
-3. 本 change 不提供自动 v1 converter。v1 只作为只读历史输入，使用
+3. 本 change 不提供批量自动 v1 converter。v1 先作为只读历史输入，用
    `reconcile_legacy_outputs()` 或 projection CLI 生成差异证据；不得把 sidecar 结论
-   拼进新 verdict。
-4. 若需要生成 v2 master，准备符合当前 v2 Config/Schema 的 manifest 和目标
-   `batch_root`，再由仓库已有的 `tools/run_qc_pipeline.py` 作为受控 v2 writer 写入。
-   该 writer 只负责 v2 报告，不会原地转换 v1 文件。
+   拼进新 verdict。若批准将单个报告提升为 v2，必须显式调用仓库已有的迁移纯函数
+   和 CAS writer（见 8.1），并保留迁移前快照。
+4. 所有 v1 报告完成提升、且通过当前 v2 Config/Schema 校验后，才可调用仓库已有的
+   `tools/run_qc_pipeline.py` 作为受控 v2 writer 继续跑模块。该 orchestrator 假定
+   目标报告为空或已经是 v2，不是 v1 reader，也不会原地转换未提升的 v1 文件。
 5. 用当前 v2 Config 校验 profile、config version/hash、module cursor 和 v2 Schema；
-   writer 的 CAS 冲突必须拒绝写回并重新读取，不能静默覆盖。
-6. 迁移成功后，v1 原文件仍作为只读历史输入保留；后续正式模块只写 v2 master。
+   每次 writer 的 CAS 冲突必须拒绝写回并重新读取，不能静默覆盖。
+6. 迁移成功后，v1 原文件的快照仍作为只读历史输入保留；后续正式模块只写 v2 master。
 
 迁移不会自动把一个旧 sidecar 的“建议”变成 machine pass/fail。缺失证据只能形成
 结构化 runtime/evidence error 或待人工状态，不能猜测结论。
@@ -111,22 +112,22 @@ root 的 `..` 路径直接拒绝。错误分类如下：
 ```bash
 ARCHIVE=sampled/XJGT_20260616/quality_archive
 
-python tools/build_manual_review_queue.py \
+.venv/bin/python tools/build_manual_review_queue.py \
   --quality-archive "$ARCHIVE" \
   --output-dir sampled/XJGT_20260616/manual_review
 
-python tools/build_qc_json_projection.py \
+.venv/bin/python tools/build_qc_json_projection.py \
   --quality-archive "$ARCHIVE" \
   --output-dir sampled/XJGT_20260616/qc_projection \
   --cache-dir sampled/XJGT_20260616/qc_cache \
   --formats csv parquet xlsx markdown
 
-python tools/build_batch_qc_ledger.py \
+.venv/bin/python tools/build_batch_qc_ledger.py \
   --quality-archive "$ARCHIVE" \
   --output-dir sampled/XJGT_20260616/ledger \
   --formats csv parquet xlsx markdown
 
-python tools/build_xjgt_acceptance_report.py \
+.venv/bin/python tools/build_xjgt_acceptance_report.py \
   --quality-archive "$ARCHIVE" \
   --output-dir sampled/XJGT_20260616/xjgt_report
 ```
@@ -175,16 +176,62 @@ find "$ARCHIVE" -type f -name '*.json' -exec shasum -a 256 {} \; \
 tar -czf "$SNAPSHOT/quality_archive.before.tgz" -C "$BATCH_ROOT" quality_archive
 
 # 2) 本 change 不提供自动 v1 converter；保留 v1 输入只读。准备好符合 v2
-#    Config/Schema 的 manifest 和目标 batch_root 后，由现有统一 writer 生成 v2 master。
-python tools/run_qc_pipeline.py \
+#    Config/Schema 的 manifest 和目标 batch_root 后，逐个报告显式执行一次受控提升。
+ASSET_ID=408817
+REPORT_PATH="$ARCHIVE/$ASSET_ID.json" CONFIG_PATH="configs/qc_acceptance/qc_acceptance_v2.0.0.yaml" PROFILE=acceptance \
+.venv/bin/python - <<'PY'
+import os
+from pathlib import Path
+
+from qc_common.config import load_qc_acceptance_config
+from qc_common.report import load_asset_qc_report, write_asset_qc_report
+from qc_common.report_migration import migrate_v1_to_v2
+
+report_path = Path(os.environ["REPORT_PATH"])
+config = load_qc_acceptance_config(Path(os.environ["CONFIG_PATH"]))
+profile = os.environ["PROFILE"]
+v1_report = load_asset_qc_report(report_path)
+if v1_report is None or v1_report.get("schema_version") != "asset_qc_report.v1":
+    raise SystemExit(f"expected one v1 report at {report_path}")
+expected_revision = int(v1_report["report_revision"])
+# Read the same input through the repository's migration-aware loader as a
+# pre-write check; it still does not write anything.
+loaded_v2 = load_asset_qc_report(
+    report_path,
+    migrate_to_v2=True,
+    config_reference=config.json_reference(),
+    profile=profile,
+)
+promoted = migrate_v1_to_v2(
+    v1_report,
+    config_reference=config.json_reference(),
+    profile=profile,
+)
+if loaded_v2 != promoted:
+    raise SystemExit("migration-aware loader and explicit migration differ")
+promoted["report_revision"] = expected_revision + 1
+write_asset_qc_report(
+    report_path,
+    promoted,
+    expected_revision=expected_revision,
+    profile=profile,
+)
+PY
+
+# The snippet is run once per asset by the controlled migration runner.  It
+# uses the v2 config reference/profile and CAS expected revision; the v1 bytes
+# remain available in the immutable backup above.  There is no bulk converter
+# command in this change.
+# 3) 所有报告提升后，由现有统一 writer 继续运行 v2 modules。
+.venv/bin/python tools/run_qc_pipeline.py \
   --batch-root "$BATCH_ROOT" \
   --manifest "$BATCH_ROOT/manifest.csv" \
   --profile acceptance \
   --config configs/qc_acceptance/qc_acceptance_v2.0.0.yaml \
   --resume
 
-# 3) 校验 v2 schema/config 后再运行正式 projection 和统计入口。
-python tools/build_qc_json_projection.py \
+# 4) 校验 v2 schema/config 后再运行正式 projection 和统计入口。
+.venv/bin/python tools/build_qc_json_projection.py \
   --quality-archive "$ARCHIVE" \
   --output-dir "$BATCH_ROOT/qc_projection" \
   --formats csv parquet xlsx markdown
@@ -204,7 +251,7 @@ set -eu
 BATCH_ROOT=sampled/XJGT_20260616
 ARCHIVE="$BATCH_ROOT/quality_archive"
 OUT="$BATCH_ROOT/migration_readonly"
-python tools/build_qc_json_projection.py \
+.venv/bin/python tools/build_qc_json_projection.py \
   --quality-archive "$ARCHIVE" \
   --output-dir "$OUT/projection" \
   --formats csv markdown \
@@ -235,7 +282,7 @@ tar -czf "$ROLLBACK/quality_archive.v2.tgz" -C "$BATCH_ROOT" quality_archive
 
 # 2) 旧 runner 只允许生成 sidecar，禁止写入或覆盖 quality_archive/*.json
 rm -rf "$BATCH_ROOT/qc_projection" "$BATCH_ROOT/qc_cache"
-python tools/build_qc_json_projection.py \
+.venv/bin/python tools/build_qc_json_projection.py \
   --quality-archive "$ARCHIVE" \
   --output-dir "$BATCH_ROOT/qc_projection.rollback" \
   --formats csv markdown
@@ -248,6 +295,15 @@ cmp "$ROLLBACK/quality_archive.v2.sha256" "$ROLLBACK/quality_archive.after.sha25
 
 如确需从备份恢复，先将当前目录改名，再解包
 `quality_archive.v2.tgz`，最后重新执行上面的 `cmp` 和
-`python tools/build_qc_json_projection.py` 验证。旧 runner 产生的旧报表、CSV、ledger
+`.venv/bin/python tools/build_qc_json_projection.py` 验证。旧 runner 产生的旧报表、CSV、ledger
 或 sidecar 只能作为 reconciliation evidence；无论回滚还是重试，都不得覆盖已经
 存在的 v2 master JSON、降低 `report_revision` 或替换其 `overall_decision`。
+
+## 9. 兼容性验证注记
+
+batch、XJGT 和 weekly 入口仍保留带 `legacy-reconciliation` 前缀的 CLI 别名，以及
+旧 reducer 的公开 helper，供历史调用方和迁移回归测试读取 sidecar。显式调用这些
+legacy API 时可以生成旧格式的兼容输出，但它们不产生 canonical verdict，也不会写回
+`quality_archive`；正式 `main` 和 v2 writer 只走 QC JSON projection。因而 Task21 的
+`rg` 检查允许命中这些兼容参数、帮助文本和 legacy helper，但必须人工确认它们不在
+正式入口调用链中；formal `main` 中旧的 reducer 分支已经删除，不能从正式入口执行。

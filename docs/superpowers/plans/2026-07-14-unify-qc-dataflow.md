@@ -1648,10 +1648,21 @@ Run:
 .venv/bin/python -m pytest -q
 openspec validate unify-qc-dataflow --strict
 git diff --check
-rg -n "precheck_clip_aggregates|candidate_windows|sam3_window_summary|video_quality_results|manual_review_labels" tools/build_batch_qc_ledger.py tools/build_acceptance_ledger.py tools/build_weekly_supplier_acceptance_report.py tools/build_xjgt_acceptance_report.py
+rg -n "def main|quality_archive|run_projection_cli|build_acceptance_outputs" \
+  tools/build_batch_qc_ledger.py tools/build_acceptance_ledger.py \
+  tools/build_weekly_supplier_acceptance_report.py tools/build_xjgt_acceptance_report.py
+rg -n "add_candidate_windows|legacy-reconciliation|load_xjgt_source_reads" \
+  tools/build_batch_qc_ledger.py tools/build_xjgt_acceptance_report.py \
+  tools/build_weekly_supplier_acceptance_report.py
 ```
 
-Expected: pytest 全量 PASS；OpenSpec valid；`git diff --check` 无输出；最后的 `rg` 命中只允许出现在命名为 `legacy_reconciliation` 的参数、帮助文本或对账函数中。逐项将 `openspec/changes/unify-qc-dataflow/tasks.md` 的 21 个 checkbox 标为完成。
+Expected: pytest 全量 PASS；OpenSpec valid；`git diff --check` 无输出。最后的 `rg` 结果必须证明正式
+`quality_archive`/canonical entrypoint 不再读取旧 sidecar 或执行旧 reducer。仓库仍保留的公开
+legacy compatibility helper（例如 `add_candidate_windows`、`load_xjgt_source_reads`，以及
+XJGT 的旧参数）只允许位于显式 legacy/reconciliation 适配路径，且只能产出对账 evidence；
+这些 API 及其测试命中属于明确 allowlist；它们不得被正式 `main` 或 v2 writer 调用，旧
+helper 的任何结果必须在适配层被视作 sidecar evidence。逐项将
+`openspec/changes/unify-qc-dataflow/tasks.md` 的 21 个 checkbox 标为完成。
 
 - [ ] **Step 5: 提交最终验证与迁移说明**
 
