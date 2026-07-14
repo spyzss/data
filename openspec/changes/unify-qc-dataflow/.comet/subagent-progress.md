@@ -62,4 +62,7 @@
 - Task 20: complete (`a6798cb`), focused `5 passed`, E2E/orchestrator/aggregate `51 passed`, full suite `605 passed, 1 skipped`; same-batch profile flow/coverage and sibling isolation verified
 - OpenSpec checkoff: 3.1–3.4, 4.1–4.4, 5.1–5.3 complete
 - Review: combined Task19–20 Thorough approval Ready; no Critical/Important findings
-- Current phase: build
+- Task 21: complete (`74e32f1`, review fixes `fae01be`, docs/CAS follow-up `4b9d9a6`), focused migration+entrypoints `11 passed`, full suite `607 passed, 1 skipped`; migration reconciliation is read-only, legacy rows identify `asset_qc_json` as authoritative, and docs include explicit v1 CAS promotion plus formal/compatibility validation split
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.4, 5.1–5.4 complete
+- Review: final Task21 Thorough approval Ready; no Critical/Important findings; `openspec validate --strict` and `git diff --check` passed
+- Current phase: complete

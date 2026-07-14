@@ -1606,7 +1606,7 @@ git commit -m "test(qc): verify execution profile differences"
 - Consumes: v1 fixture、遗留 sidecars、v2 projection 与全部正式 CLI。
 - Produces: `reconcile_legacy_outputs(*, quality_archive, legacy_inputs) -> list[dict[str, Any]]`，只输出差异，不修改主报告。
 
-- [ ] **Step 1: 添加 v1→v2、legacy 对账和只读回滚测试**
+- [x] **Step 1: 添加 v1→v2、legacy 对账和只读回滚测试**
 
 ```python
 def test_migration_reconciliation_never_rewrites_source_or_uses_legacy_verdict(tmp_path: Path) -> None:
@@ -1620,13 +1620,13 @@ def test_migration_reconciliation_never_rewrites_source_or_uses_legacy_verdict(t
     assert differences[0]["authoritative_source"] == "asset_qc_json"
 ```
 
-- [ ] **Step 2: 运行迁移测试和全量测试，记录首轮失败**
+- [x] **Step 2: 运行迁移测试和全量测试，记录首轮失败**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_migration_reconciliation.py -q && .venv/bin/python -m pytest -q`
 
 Expected: 首条命令在 reconciliation helper 缺失处 FAIL；实现后第二条必须全量 PASS。
 
-- [ ] **Step 3: 实现只读对账并完成回滚说明**
+- [x] **Step 3: 实现只读对账并完成回滚说明**
 
 ```python
 def reconcile_legacy_outputs(*, quality_archive, legacy_inputs):
@@ -1640,7 +1640,7 @@ def reconcile_legacy_outputs(*, quality_archive, legacy_inputs):
 
 迁移文档写出三条可执行路径：正常升级（保留 sidecar、首次 module 写回迁为 v2）、只读验证（仅 projection/reconciliation）、回滚（停止 v2 writer，恢复旧 runner 只产 sidecar，但不得用旧报表覆盖已存在 v2 master JSON）。记录配置快照/hash、备份质量目录的操作和恢复验证命令。
 
-- [ ] **Step 4: 执行完整验证并勾选 21 项 OpenSpec 任务**
+- [x] **Step 4: 执行完整验证并勾选 21 项 OpenSpec 任务**
 
 Run:
 
@@ -1659,12 +1659,13 @@ rg -n "add_candidate_windows|legacy-reconciliation|load_xjgt_source_reads" \
 Expected: pytest 全量 PASS；OpenSpec valid；`git diff --check` 无输出。最后的 `rg` 结果必须证明正式
 `quality_archive`/canonical entrypoint 不再读取旧 sidecar 或执行旧 reducer。仓库仍保留的公开
 legacy compatibility helper（例如 `add_candidate_windows`、`load_xjgt_source_reads`，以及
-XJGT 的旧参数）只允许位于显式 legacy/reconciliation 适配路径，且只能产出对账 evidence；
-这些 API 及其测试命中属于明确 allowlist；它们不得被正式 `main` 或 v2 writer 调用，旧
-helper 的任何结果必须在适配层被视作 sidecar evidence。逐项将
+XJGT 的旧参数）只允许位于显式 legacy/reconciliation 适配路径。显式调用这些 helper
+可以产出旧格式兼容输出，但不能产出 canonical verdict 或写回 `quality_archive`；这些
+API 及其测试命中属于明确 allowlist；它们不得被正式 `main` 或 v2 writer 调用，旧
+helper 的结果在统一数据流中只能作为 sidecar evidence。逐项将
 `openspec/changes/unify-qc-dataflow/tasks.md` 的 21 个 checkbox 标为完成。
 
-- [ ] **Step 5: 提交最终验证与迁移说明**
+- [x] **Step 5: 提交最终验证与迁移说明**
 
 ```bash
 git add tests/test_qc_migration_reconciliation.py docs/qc-dataflow-migration.md openspec/changes/unify-qc-dataflow/tasks.md
