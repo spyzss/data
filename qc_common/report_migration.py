@@ -28,5 +28,22 @@ def migrate_v1_to_v2(
     manual.setdefault("state", "not_evaluated")
     manual.setdefault("candidate_issue_ids", [])
     manual.setdefault("failures_for_batch_stats_issue_ids", [])
+    manual.setdefault("selected_issue_ids", [])
+    manual.setdefault("selected_issue_id", None)
+    manual.setdefault("issue_reviews", {})
+    manual.setdefault("completed_at", None)
+    migrated.setdefault(
+        "semantic_calibration",
+        {
+            "state": "not_started",
+            "source_dataset_path": None,
+            "base_hdf5_sha256": None,
+            "final_hdf5_sha256": None,
+            "timeline_edit_count": 0,
+            "subtask_text_edit_count": 0,
+            "pending_edit": None,
+            "audit": [],
+        },
+    )
     migrated["pipeline_state"].setdefault("stop_reason", None)
     return migrated

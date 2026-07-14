@@ -34,6 +34,7 @@
       "items": {"type": "object", "additionalProperties": true}
     },
     "manual_review": {"$ref": "#/$defs/manualReview"},
+    "semantic_calibration": {"$ref": "#/$defs/semanticCalibration"},
     "hdf5_text_info": {"type": "object"},
     "quality_hand": {"type": "object"},
     "keypoint_presence": {"type": "object"},
@@ -226,6 +227,48 @@
           "type": "array",
           "items": {"type": "string"},
           "uniqueItems": true
+        },
+        "selected_issue_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "selected_issue_id": {"type": ["string", "null"]},
+        "issue_reviews": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "completed_at": {"type": ["string", "null"]}
+      }
+    },
+    "semanticCalibration": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "state": {
+          "enum": [
+            "not_started",
+            "in_progress",
+            "finalizing",
+            "completed",
+            "skipped_due_to_fail",
+            "error"
+          ]
+        },
+        "source_dataset_path": {"type": ["string", "null"]},
+        "base_hdf5_sha256": {"type": ["string", "null"]},
+        "final_hdf5_sha256": {"type": ["string", "null"]},
+        "timeline_edit_count": {"type": "integer", "minimum": 0},
+        "subtask_text_edit_count": {"type": "integer", "minimum": 0},
+        "pending_edit": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "object", "additionalProperties": true}
+          ]
+        },
+        "audit": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
         }
       }
     },

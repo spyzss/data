@@ -83,7 +83,10 @@ def make_v2_report(
     *,
     status: str = "running",
     overall_decision: str | None = None,
+    pipeline_status: str | None = None,
 ) -> dict[str, Any]:
+    if pipeline_status is not None:
+        status = pipeline_status
     report = make_v1_video_report()
     report.update(
         {
@@ -112,3 +115,94 @@ def make_v2_report(
         }
     )
     return copy.deepcopy(report)
+
+
+def make_boundary_edit(
+    *,
+    affected_segment_ids: list[str] | tuple[str, ...] = ("segment-0", "segment-1"),
+) -> dict[str, Any]:
+    """Return a compact boundary pending-edit fixture for human-report tests."""
+
+    ids = list(affected_segment_ids)
+    before = [
+        {
+            "internal_id": segment_id,
+            "start_frame": index * 10,
+            "end_frame_exclusive": (index + 1) * 10,
+            "text_cn": f"before-{index}",
+            "text_en": f"before-{index}",
+        }
+        for index, segment_id in enumerate(ids)
+    ]
+    after = copy.deepcopy(before)
+    return {
+        "edit_type": "boundary",
+        "boundary_id": "b1",
+        "boundary_index": 1,
+        "actor_segment_id": ids[0] if ids else "segment-0",
+        "affected_segment_ids": ids,
+        "before": before,
+        "after": after,
+        "reviewer": "alice",
+        "created_at": "2026-07-15T00:00:00Z",
+    }
+
+
+def make_text_edit(*, affected_segment_ids: list[str] | tuple[str, ...] = ("segment-0",)) -> dict[str, Any]:
+    ids = list(affected_segment_ids)
+    return {
+        "edit_type": "text",
+        "segment_id": ids[0] if ids else "segment-0",
+        "affected_segment_ids": ids,
+        "before": {"text_cn": "旧文本", "text_en": "old text"},
+        "after": {"text_cn": "新文本", "text_en": "new text"},
+        "reviewer": "alice",
+        "created_at": "2026-07-15T00:00:00Z",
+    }
+
+
+def make_semantic_block(
+    *,
+    state: str = "not_started",
+    pending_edit: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "source_dataset_path": "/label/subtask_label",
+        "base_hdf5_sha256": "sha256:" + "a" * 64,
+        "final_hdf5_sha256": None,
+        "timeline_edit_count": 0,
+        "subtask_text_edit_count": 0,
+        "pending_edit": pending_edit,
+        "audit": [],
+    }
+
+
+def make_review(verdict: str = "pass") -> dict[str, Any]:
+    return {
+        "verdict": verdict,
+        "reviewer": "alice",
+        "reviewed_at": "2026-07-15T00:00:00Z",
+    }
+
+
+def make_manual_block(
+    *,
+    state: str = "not_evaluated",
+    candidate_issue_ids: list[str] | tuple[str, ...] = (),
+    selected_issue_ids: list[str] | tuple[str, ...] = (),
+    issue_reviews: dict[str, Any] | None = None,
+    completed_at: str | None = None,
+) -> dict[str, Any]:
+    if state == "completed" and completed_at is None:
+        completed_at = "2026-07-15T00:00:00Z"
+    return {
+        "required": None,
+        "state": state,
+        "candidate_issue_ids": list(candidate_issue_ids),
+        "failures_for_batch_stats_issue_ids": [],
+        "selected_issue_ids": list(selected_issue_ids),
+        "selected_issue_id": None,
+        "issue_reviews": {} if issue_reviews is None else copy.deepcopy(issue_reviews),
+        "completed_at": completed_at,
+    }

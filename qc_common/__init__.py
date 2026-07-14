@@ -8,7 +8,7 @@ from .report import (
     load_asset_qc_report,
     write_asset_qc_report,
 )
-from .schema import validate_asset_qc_report, validate_qc_config
+from .schema import ReportValidationError, validate_asset_qc_report, validate_qc_config
 from .types import CheckResult, ClipInputs
 
 __all__ = [
@@ -20,6 +20,7 @@ __all__ = [
     "LoadedQcConfig",
     "ModuleResult",
     "StaleReportRevisionError",
+    "ReportValidationError",
     "Verdict",
     "load_asset_qc_report",
     "load_qc_acceptance_config",
