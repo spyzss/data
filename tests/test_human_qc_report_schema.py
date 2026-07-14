@@ -136,6 +136,31 @@ def test_v1_migration_adds_human_defaults_and_preserves_unknown_extensions() -> 
     validate_asset_qc_report(migrated)
 
 
+def test_v1_migration_merges_semantic_defaults_into_opaque_block() -> None:
+    from qc_common.report_migration import migrate_v1_to_v2
+
+    old = make_v1_video_report()
+    old["semantic_calibration"] = {
+        "legacy_extension": {"keep": ["before", "after"]},
+        "revision_id": "semantic-r4",
+    }
+
+    migrated = migrate_v1_to_v2(old, config_reference=old["qc_config"])
+    semantic = migrated["semantic_calibration"]
+
+    assert semantic["legacy_extension"] == {"keep": ["before", "after"]}
+    assert semantic["revision_id"] == "semantic-r4"
+    assert semantic["state"] == "not_started"
+    assert semantic["source_dataset_path"] is None
+    assert semantic["base_hdf5_sha256"] is None
+    assert semantic["final_hdf5_sha256"] is None
+    assert semantic["timeline_edit_count"] == 0
+    assert semantic["subtask_text_edit_count"] == 0
+    assert semantic["pending_edit"] is None
+    assert semantic["audit"] == []
+    validate_asset_qc_report(migrated)
+
+
 def test_v2_migration_returns_defensive_copy_with_human_blocks() -> None:
     from qc_common.report_migration import migrate_v1_to_v2
 

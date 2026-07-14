@@ -32,18 +32,20 @@ def migrate_v1_to_v2(
     manual.setdefault("selected_issue_id", None)
     manual.setdefault("issue_reviews", {})
     manual.setdefault("completed_at", None)
-    migrated.setdefault(
-        "semantic_calibration",
-        {
-            "state": "not_started",
-            "source_dataset_path": None,
-            "base_hdf5_sha256": None,
-            "final_hdf5_sha256": None,
-            "timeline_edit_count": 0,
-            "subtask_text_edit_count": 0,
-            "pending_edit": None,
-            "audit": [],
-        },
-    )
+    semantic = migrated.setdefault("semantic_calibration", {})
+    if not isinstance(semantic, dict):
+        raise ValueError("semantic_calibration must be an object")
+    semantic_defaults = {
+        "state": "not_started",
+        "source_dataset_path": None,
+        "base_hdf5_sha256": None,
+        "final_hdf5_sha256": None,
+        "timeline_edit_count": 0,
+        "subtask_text_edit_count": 0,
+        "pending_edit": None,
+        "audit": [],
+    }
+    for field, default in semantic_defaults.items():
+        semantic.setdefault(field, copy.deepcopy(default))
     migrated["pipeline_state"].setdefault("stop_reason", None)
     return migrated
