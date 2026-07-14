@@ -21,6 +21,7 @@ from human_qc.hdf5_commit import (
     prepared_replacement_from_record,
     recover_hdf5_replacement,
 )
+from human_qc.source_adapters import Hdf5ScalarJsonSubtaskAdapter, encode_canonical_payload
 
 
 DATASET_PATH = "/label/subtask_label"
@@ -146,6 +147,91 @@ def test_validation_failure_leaves_original_bytes_unchanged(tmp_path: Path) -> N
 
     assert source.read_bytes() == before
     assert not list(tmp_path.glob(".asset.hdf5.human-qc-*"))
+
+
+def test_prepare_rejects_foreign_root_identity_before_publish(tmp_path: Path) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-identity.hdf5")
+    foreign = json.loads(json.dumps(UPDATED))
+    foreign["id"] = "different-asset"
+    before = source.read_bytes()
+
+    with pytest.raises(Hdf5CommitError, match="identity|root|asset"):
+        prepare_hdf5_replacement(source, DATASET_PATH, foreign, "tx-foreign-root")
+
+    assert source.read_bytes() == before
+    assert not list(tmp_path.glob(".asset-identity.hdf5.human-qc-*"))
+
+
+def test_prepare_accepts_legacy_times_and_writes_canonical_values(tmp_path: Path) -> None:
+    source_payload = json.loads(json.dumps(UPDATED))
+    source_payload["annotations"][0]["end_time_sec"] = 0.033
+    source_payload["annotations"][1]["end_time_sec"] = 0.0995
+    source = write_complex_hdf5(tmp_path / "asset-legacy-times.hdf5", source_payload)
+
+    prepared = prepare_hdf5_replacement(
+        source, DATASET_PATH, source_payload, "tx-legacy-times"
+    )
+
+    loaded = Hdf5ScalarJsonSubtaskAdapter(DATASET_PATH).load(prepared.staged_path)
+    canonical = encode_canonical_payload(loaded, loaded.timeline)
+    assert canonical["annotations"][0]["end_time_sec"] == pytest.approx(1 / 30)
+    assert canonical["annotations"][1]["end_time_sec"] == pytest.approx(3 / 30)
+
+
+def test_prepare_rejects_helper_fields_in_payload(tmp_path: Path) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-helper-field.hdf5")
+    payload = json.loads(json.dumps(UPDATED))
+    payload["annotations"][0]["notes"] = ["review-only"]
+
+    with pytest.raises(Hdf5CommitError, match="round-trip|schema"):
+        prepare_hdf5_replacement(source, DATASET_PATH, payload, "tx-helper-field")
+
+
+def test_prepare_rejects_external_target_without_mutating_external_bytes(
+    tmp_path: Path,
+) -> None:
+    external = write_complex_hdf5(tmp_path / "external-target.hdf5")
+    before_external = external.read_bytes()
+    source = tmp_path / "asset-external-link.hdf5"
+    with h5py.File(source, "w") as handle:
+        handle.require_group("label")["subtask_label"] = h5py.ExternalLink(
+            external.name, DATASET_PATH
+        )
+
+    with pytest.raises(Hdf5CommitError, match="link|external|target"):
+        prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-external")
+
+    assert external.read_bytes() == before_external
+
+
+def test_prepared_and_durable_record_carry_dataset_and_asset_identity(
+    tmp_path: Path,
+) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-record-identity.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-record-id")
+    record = finalizing_record_from_prepared(prepared)
+
+    assert prepared.dataset_path == record.dataset_path == DATASET_PATH
+    assert prepared.asset_id == record.asset_id == UPDATED["id"]
+
+
+def test_reconstruction_rejects_foreign_asset_record(tmp_path: Path) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-record-foreign.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-record-foreign")
+    record = finalizing_record_from_prepared(prepared)
+    foreign = FinalizingRecord(
+        source_path=record.source_path,
+        staged_path=record.staged_path,
+        old_sha256=record.old_sha256,
+        new_sha256=record.new_sha256,
+        transaction_id=record.transaction_id,
+        staged_identity=record.staged_identity,
+        dataset_path=record.dataset_path,
+        asset_id="other-asset",
+    )
+
+    with pytest.raises(Hdf5CommitError, match="asset|identity"):
+        prepared_replacement_from_record(foreign)
 
 
 def test_target_dtype_and_attrs_are_preserved(tmp_path: Path) -> None:
@@ -289,6 +375,8 @@ def test_reconstruction_normalizes_json_list_stage_identity(tmp_path: Path) -> N
         new_sha256=durable.new_sha256,
         transaction_id=durable.transaction_id,
         staged_identity=list(durable.staged_identity or ()),
+        dataset_path=durable.dataset_path,
+        asset_id=durable.asset_id,
     )
 
     reconstructed = prepared_replacement_from_record(persisted)

@@ -8,6 +8,7 @@ they are small value objects shared by the timeline and later review services.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +27,11 @@ class SubtaskSegment:
     text_cn: str
     text_en: str
     canonical_record: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.canonical_record, Mapping):
+            raise BoundaryError("canonical_record must be a mapping")
+        object.__setattr__(self, "canonical_record", deepcopy(self.canonical_record))
 
 
 @dataclass(frozen=True)
@@ -53,7 +59,7 @@ class SegmentSnapshot:
             end_frame_exclusive=segment.end_frame_exclusive,
             text_cn=segment.text_cn,
             text_en=segment.text_en,
-            canonical_record=segment.canonical_record,
+            canonical_record=deepcopy(segment.canonical_record),
         )
 
 

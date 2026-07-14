@@ -78,6 +78,50 @@ __all__ = [
 ]
 
 
+def _resolve_local_hard_link_path(
+    handle: h5py.File | h5py.Group,
+    dataset_path: str,
+) -> h5py.Group | h5py.Dataset | None:
+    """Resolve an HDF5 path without following soft or external links.
+
+    A missing component is reported as ``None`` so callers can apply their
+    explicit missing-dataset policy (sidecar fallback or target creation).  A
+    link component is different from a missing path: it is rejected before any
+    object is opened, preventing a source file from redirecting reads or
+    writes outside its own HDF5 file.
+    """
+
+    if not isinstance(dataset_path, str) or not dataset_path.startswith("/"):
+        raise SubtaskSourceError("dataset path must be an absolute HDF5 path")
+    if dataset_path == "/" or dataset_path.endswith("/") or "//" in dataset_path:
+        raise SubtaskSourceError("dataset path must name a dataset")
+
+    parent: h5py.File | h5py.Group = handle
+    parts = dataset_path.strip("/").split("/")
+    for index, component in enumerate(parts):
+        link = parent.get(component, getlink=True)
+        if link is None:
+            return None
+        if not isinstance(link, h5py.HardLink):
+            raise SubtaskSourceError(
+                f"dataset path component {component!r} is not a local hard link"
+            )
+        try:
+            obj = parent[component]
+        except (KeyError, OSError) as exc:
+            raise SubtaskSourceError(
+                f"dataset path component {component!r} cannot be opened"
+            ) from exc
+        if index == len(parts) - 1:
+            return obj
+        if not isinstance(obj, h5py.Group):
+            raise SubtaskSourceError(
+                f"dataset path ancestor {component!r} is not a group"
+            )
+        parent = obj
+    return None
+
+
 class SubtaskSourceError(ValueError):
     """Raised when a subtask source cannot satisfy the canonical contract."""
 
@@ -119,8 +163,8 @@ class Hdf5ScalarJsonSubtaskAdapter:
         source_kind = "hdf5"
 
         with h5py.File(source_path, "r") as handle:
-            if self.dataset_path in handle:
-                dataset = handle[self.dataset_path]
+            dataset = _resolve_local_hard_link_path(handle, self.dataset_path)
+            if dataset is not None:
                 if not isinstance(dataset, h5py.Dataset):
                     raise SubtaskSourceError(
                         f"subtask dataset {self.dataset_path!r} is not a dataset"
@@ -179,6 +223,8 @@ def encode_canonical_payload(
         raise SubtaskSourceError(
             "timeline metadata does not match loaded root metadata"
         )
+    if loaded.asset_id and timeline.asset_id != loaded.asset_id:
+        raise SubtaskSourceError("timeline asset identity does not match loaded asset")
 
     annotations: list[dict[str, Any]] = []
     for segment in timeline.segments:
@@ -350,6 +396,7 @@ def _build_loaded_subtasks(
         frame_count=frame_count,
         fps=fps,
         segments=tuple(segments),
+        asset_id=asset_id,
     )
 
     # Keep only source root metadata.  Annotation rows are normalized into

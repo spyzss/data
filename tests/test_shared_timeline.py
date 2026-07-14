@@ -58,6 +58,35 @@ def test_dragging_internal_boundary_changes_exactly_two_segments() -> None:
     assert updated.segments[2] == make_segment("segment-2", 123, 195)
 
 
+def test_move_preserves_asset_identity_and_detaches_nested_snapshots() -> None:
+    source_record = {"details": {"status": "before"}}
+    first = SubtaskSegment(
+        internal_id="segment-0",
+        start_frame=0,
+        end_frame_exclusive=5,
+        text_cn="中文 segment-0",
+        text_en="English segment-0",
+        canonical_record=source_record,
+    )
+    second = make_segment("segment-1", 5, 10)
+    timeline = SharedBoundaryTimeline(
+        frame_count=10,
+        fps=30.0,
+        segments=(first, second),
+        asset_id="asset-1",
+    )
+
+    updated, edit = timeline.move_boundary(
+        1, 6, actor_segment_id="segment-0", reviewer="alice", now=NOW,
+    )
+    source_record["details"]["status"] = "source-mutated"
+    updated.segments[0].canonical_record["details"]["status"] = "segment-mutated"
+
+    assert timeline.asset_id == updated.asset_id == "asset-1"
+    assert edit.before[0].canonical_record["details"]["status"] == "before"
+    assert edit.after[0].canonical_record["details"]["status"] == "before"
+
+
 def test_outer_or_zero_length_boundary_is_rejected() -> None:
     timeline = make_timeline((0, 51), (51, 123))
     with pytest.raises(BoundaryError, match="internal boundary"):

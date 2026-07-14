@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -24,7 +25,12 @@ from typing import Any
 import h5py
 import numpy as np
 
-from .source_adapters import Hdf5ScalarJsonSubtaskAdapter, encode_canonical_payload
+from .source_adapters import (
+    Hdf5ScalarJsonSubtaskAdapter,
+    SubtaskSourceError,
+    _resolve_local_hard_link_path,
+    encode_canonical_payload,
+)
 
 
 class Hdf5CommitError(RuntimeError):
@@ -59,6 +65,8 @@ class PreparedReplacement:
     new_sha256: str
     transaction_id: str
     staged_identity: tuple[int, int] | None = None
+    dataset_path: str | None = None
+    asset_id: str | None = None
     _ownership: "_StagingOwnership | None" = field(
         default=None, repr=False, compare=False
     )
@@ -78,6 +86,8 @@ class FinalizingRecord:
     new_sha256: str
     transaction_id: str = ""
     staged_identity: tuple[int, int] | None = None
+    dataset_path: str = ""
+    asset_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path))
@@ -91,6 +101,8 @@ class _StagingOwnership:
     path: Path
     transaction_id: str
     staged_identity: tuple[int, int]
+    dataset_path: str
+    asset_id: str
 
 
 __all__ = [
@@ -135,6 +147,7 @@ def prepare_hdf5_replacement(
     staged: Path | None = None
     try:
         old_sha256 = _sha256_file(source)
+        source_asset_id = _prepare_source_identity(source, dataset_path, payload)
         staged = _make_staged_path(source, transaction_id)
 
         # copy2 is deliberately used instead of opening the source in write
@@ -149,7 +162,7 @@ def prepare_hdf5_replacement(
         # canonical field whitelist before any replacement is publishable.
         loaded = Hdf5ScalarJsonSubtaskAdapter(dataset_path).load(staged)
         canonical = encode_canonical_payload(loaded, loaded.timeline)
-        if canonical != dict(payload):
+        if not _canonical_payload_matches(canonical, payload):
             raise Hdf5CommitError(
                 "payload does not round-trip to the canonical subtask schema"
             )
@@ -165,7 +178,15 @@ def prepare_hdf5_replacement(
             new_sha256=new_sha256,
             transaction_id=transaction_id,
             staged_identity=staged_identity,
-            _ownership=_StagingOwnership(staged, transaction_id, staged_identity),
+            dataset_path=dataset_path,
+            asset_id=source_asset_id or loaded.asset_id,
+            _ownership=_StagingOwnership(
+                staged,
+                transaction_id,
+                staged_identity,
+                dataset_path,
+                source_asset_id or loaded.asset_id,
+            ),
         )
     except Hdf5CommitError:
         _unlink_staged(staged, source, transaction_id=transaction_id)
@@ -188,6 +209,8 @@ def finalizing_record_from_prepared(
         raise Hdf5CommitError("prepared replacement is not an owned staging artifact")
     if prepared.staged_identity is None:
         raise Hdf5CommitError("prepared replacement is missing staged identity")
+    if not _valid_prepared_metadata(prepared):
+        raise Hdf5CommitError("prepared replacement is missing dataset or asset identity")
     return FinalizingRecord(
         source_path=prepared.source_path,
         staged_path=prepared.staged_path,
@@ -195,6 +218,8 @@ def finalizing_record_from_prepared(
         new_sha256=prepared.new_sha256,
         transaction_id=prepared.transaction_id,
         staged_identity=prepared.staged_identity,
+        dataset_path=prepared.dataset_path,
+        asset_id=prepared.asset_id,
     )
 
 
@@ -256,6 +281,8 @@ def recover_hdf5_replacement(record: FinalizingRecord) -> RecoveryAction:
     if not isinstance(record, FinalizingRecord):
         raise TypeError("record must be a FinalizingRecord")
     if not isinstance(record.transaction_id, str) or not record.transaction_id:
+        return RecoveryAction.CONFLICT
+    if not _valid_record_metadata(record):
         return RecoveryAction.CONFLICT
 
     source = Path(record.source_path)
@@ -338,6 +365,8 @@ def prepared_replacement_from_record(
         raise Hdf5CommitError(
             "staged HDF5 path is not an owned prepare() namespace artifact"
         )
+    if not _valid_record_metadata(record):
+        raise Hdf5CommitError("finalizing record is missing dataset or asset identity")
     if (
         source.is_symlink()
         or staged.is_symlink()
@@ -352,6 +381,7 @@ def prepared_replacement_from_record(
             raise Hdf5CommitError("source HDF5 hash changed before reconstruction")
         if _sha256_file(staged) != record.new_sha256:
             raise Hdf5CommitError("staged HDF5 hash is invalid")
+        _validate_record_asset_identity(record)
     except Hdf5CommitError:
         raise
     except Exception as exc:
@@ -364,10 +394,14 @@ def prepared_replacement_from_record(
         new_sha256=record.new_sha256,
         transaction_id=record.transaction_id,
         staged_identity=staged_identity,
+        dataset_path=record.dataset_path,
+        asset_id=record.asset_id,
         _ownership=_StagingOwnership(
             staged,
             record.transaction_id,
             staged_identity,
+            record.dataset_path,
+            record.asset_id,
         ),
     )
 
@@ -527,10 +561,91 @@ def _serialize_payload(payload: Mapping[str, Any]) -> bytes:
         raise Hdf5CommitError(f"payload is not UTF-8 JSON serializable: {exc}") from exc
 
 
+_ROOT_IDENTITY_FIELDS = ("id", "scene", "task", "fps", "frame_count")
+_TIME_FIELDS = frozenset({"start_time_sec", "end_time_sec"})
+
+
+def _prepare_source_identity(
+    source: Path, dataset_path: str, payload: Mapping[str, Any]
+) -> str | None:
+    """Validate the source target and return its semantic asset identity."""
+
+    try:
+        with h5py.File(source, "r") as handle:
+            target = _resolve_local_hard_link_path(handle, dataset_path)
+    except (OSError, SubtaskSourceError) as exc:
+        raise Hdf5CommitError(f"source target path is unsafe: {exc}") from exc
+
+    if target is None:
+        source_id = payload.get("id")
+        if isinstance(source_id, bool) or source_id is None or str(source_id) == "":
+            return None
+        return str(source_id)
+
+    try:
+        loaded = Hdf5ScalarJsonSubtaskAdapter(dataset_path).load(source)
+    except SubtaskSourceError as exc:
+        raise Hdf5CommitError(f"source target payload is invalid: {exc}") from exc
+    for field_name in _ROOT_IDENTITY_FIELDS:
+        if field_name not in payload or payload[field_name] != loaded.root_payload[field_name]:
+            raise Hdf5CommitError(
+                f"payload root identity differs from source field {field_name!r}"
+            )
+    return loaded.asset_id
+
+
+def _canonical_payload_matches(
+    canonical: Mapping[str, Any], payload: Mapping[str, Any]
+) -> bool:
+    """Compare canonical JSON while tolerating legacy frame-time rounding."""
+
+    if set(canonical) != set(payload):
+        return False
+    for field_name, expected in canonical.items():
+        actual = payload[field_name]
+        if field_name != "annotations":
+            if not _data_equal(expected, actual):
+                return False
+            continue
+        if not isinstance(expected, (list, tuple)) or not isinstance(
+            actual, (list, tuple)
+        ) or len(expected) != len(actual):
+            return False
+        for expected_row, actual_row in zip(expected, actual):
+            if not isinstance(expected_row, Mapping) or not isinstance(actual_row, Mapping):
+                return False
+            if set(expected_row) != set(actual_row):
+                return False
+            for row_field, expected_value in expected_row.items():
+                actual_value = actual_row[row_field]
+                if row_field in _TIME_FIELDS:
+                    if not _time_values_close(expected_value, actual_value):
+                        return False
+                elif not _data_equal(expected_value, actual_value):
+                    return False
+    return True
+
+
+def _time_values_close(expected: object, actual: object) -> bool:
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return False
+    if not isinstance(expected, (int, float)) or not isinstance(actual, (int, float)):
+        return False
+    try:
+        return math.isclose(
+            float(expected), float(actual), rel_tol=1e-7, abs_tol=1e-3
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _write_scalar_dataset(path: Path, dataset_path: str, serialized: bytes) -> None:
     with h5py.File(path, "r+") as handle:
-        if dataset_path in handle:
-            dataset = handle[dataset_path]
+        try:
+            dataset = _resolve_local_hard_link_path(handle, dataset_path)
+        except SubtaskSourceError as exc:
+            raise Hdf5CommitError(str(exc)) from exc
+        if dataset is not None:
             if not isinstance(dataset, h5py.Dataset):
                 raise Hdf5CommitError(
                     f"target path {dataset_path!r} is not a dataset"
@@ -542,7 +657,10 @@ def _write_scalar_dataset(path: Path, dataset_path: str, serialized: bytes) -> N
             _assign_scalar_json(dataset, serialized, dataset_path)
         else:
             parent, _, name = dataset_path.rpartition("/")
-            group = handle.require_group(parent.strip("/")) if parent else handle
+            try:
+                group = _require_local_hard_link_group(handle, parent)
+            except SubtaskSourceError as exc:
+                raise Hdf5CommitError(str(exc)) from exc
             dataset = group.create_dataset(
                 name,
                 shape=(),
@@ -550,6 +668,33 @@ def _write_scalar_dataset(path: Path, dataset_path: str, serialized: bytes) -> N
             )
             dataset[()] = serialized
         handle.flush()
+
+
+def _require_local_hard_link_group(
+    handle: h5py.File, group_path: str
+) -> h5py.Group:
+    """Return/create a group while rejecting redirected path components."""
+
+    parent: h5py.File | h5py.Group = handle
+    parts = [part for part in group_path.strip("/").split("/") if part]
+    for component in parts:
+        link = parent.get(component, getlink=True)
+        if link is None:
+            parent = parent.create_group(component)
+            continue
+        if not isinstance(link, h5py.HardLink):
+            raise SubtaskSourceError(
+                f"dataset path component {component!r} is not a local hard link"
+            )
+        obj = parent[component]
+        if not isinstance(obj, h5py.Group):
+            raise SubtaskSourceError(
+                f"dataset path ancestor {component!r} is not a group"
+            )
+        parent = obj
+    if not isinstance(parent, h5py.Group):
+        raise SubtaskSourceError("dataset parent path is not a group")
+    return parent
 
 
 def _assign_scalar_json(dataset: h5py.Dataset, serialized: bytes, path: str) -> None:
@@ -641,6 +786,55 @@ def _valid_identity(identity: object) -> bool:
     return all(isinstance(value, int) and not isinstance(value, bool) for value in identity)
 
 
+def _valid_dataset_path_value(dataset_path: object) -> bool:
+    return (
+        isinstance(dataset_path, str)
+        and dataset_path.startswith("/")
+        and dataset_path != "/"
+        and not dataset_path.endswith("/")
+        and "//" not in dataset_path
+    )
+
+
+def _valid_asset_id(asset_id: object) -> bool:
+    return isinstance(asset_id, str) and bool(asset_id)
+
+
+def _valid_prepared_metadata(prepared: PreparedReplacement) -> bool:
+    return _valid_dataset_path_value(prepared.dataset_path) and _valid_asset_id(
+        prepared.asset_id
+    )
+
+
+def _valid_record_metadata(record: FinalizingRecord) -> bool:
+    return _valid_dataset_path_value(record.dataset_path) and _valid_asset_id(
+        record.asset_id
+    )
+
+
+def _validate_record_asset_identity(record: FinalizingRecord) -> None:
+    adapter = Hdf5ScalarJsonSubtaskAdapter(record.dataset_path)
+    try:
+        with h5py.File(record.staged_path, "r") as handle:
+            staged_target = _resolve_local_hard_link_path(handle, record.dataset_path)
+        if staged_target is None:
+            raise Hdf5CommitError("staged target dataset is missing")
+        staged_loaded = adapter.load(record.staged_path)
+        if staged_loaded.asset_id != record.asset_id:
+            raise Hdf5CommitError("staged asset identity differs from durable record")
+
+        with h5py.File(record.source_path, "r") as handle:
+            source_target = _resolve_local_hard_link_path(handle, record.dataset_path)
+        if source_target is not None:
+            source_loaded = adapter.load(record.source_path)
+            if source_loaded.asset_id != record.asset_id:
+                raise Hdf5CommitError("source asset identity differs from durable record")
+    except Hdf5CommitError:
+        raise
+    except (OSError, SubtaskSourceError) as exc:
+        raise Hdf5CommitError(f"unable to validate durable asset identity: {exc}") from exc
+
+
 def _identity_matches_record(record: FinalizingRecord) -> bool:
     if not _valid_identity(record.staged_identity):
         return False
@@ -685,6 +879,12 @@ def _is_owned_prepared(prepared: PreparedReplacement) -> bool:
     if ownership.path != Path(prepared.staged_path):
         return False
     if ownership.transaction_id != prepared.transaction_id:
+        return False
+    if not _valid_prepared_metadata(prepared):
+        return False
+    if ownership.dataset_path != prepared.dataset_path:
+        return False
+    if ownership.asset_id != prepared.asset_id:
         return False
     if not _valid_identity(prepared.staged_identity):
         return False

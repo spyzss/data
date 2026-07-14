@@ -47,6 +47,7 @@ class SharedBoundaryTimeline:
     frame_count: int
     fps: float
     segments: tuple[SubtaskSegment, ...]
+    asset_id: str | None = None
 
     def __post_init__(self) -> None:
         if not _is_int(self.frame_count) or self.frame_count <= 0:
@@ -55,6 +56,10 @@ class SharedBoundaryTimeline:
             raise BoundaryError("fps must be a positive finite number")
         if not math.isfinite(float(self.fps)) or self.fps <= 0:
             raise BoundaryError("fps must be a positive finite number")
+        if self.asset_id is not None and (
+            not isinstance(self.asset_id, str) or not self.asset_id
+        ):
+            raise BoundaryError("asset_id must be a non-empty string when supplied")
 
         # Normalize a sequence supplied by an adapter to a tuple so the frozen
         # timeline cannot be mutated through its top-level segment collection.
@@ -150,6 +155,7 @@ class SharedBoundaryTimeline:
             frame_count=self.frame_count,
             fps=self.fps,
             segments=tuple(updated_segments),
+            asset_id=self.asset_id,
         )
 
         before = (

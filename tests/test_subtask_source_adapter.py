@@ -105,6 +105,33 @@ def test_hdf5_dataset_takes_precedence_over_explicit_sidecar(tmp_path: Path) -> 
     assert loaded.root_payload["scene"] == "source"
 
 
+def test_external_link_is_rejected_before_sidecar_fallback(tmp_path: Path) -> None:
+    external = write_scalar_json_hdf5(tmp_path / "external.hdf5", read_fixture())
+    before_external = external.read_bytes()
+    source = tmp_path / "linked.hdf5"
+    with h5py.File(source, "w") as handle:
+        handle.require_group("label")["subtask_label"] = h5py.ExternalLink(
+            external.name, "/label/subtask_label"
+        )
+    sidecar = write_json_sidecar(tmp_path / "fallback.json", read_fixture())
+
+    with pytest.raises(ValueError, match="link"):
+        Hdf5ScalarJsonSubtaskAdapter().load(source, sidecar_path=sidecar)
+
+    assert external.read_bytes() == before_external
+
+
+def test_soft_link_is_rejected_before_sidecar_fallback(tmp_path: Path) -> None:
+    source = tmp_path / "soft-linked.hdf5"
+    with h5py.File(source, "w") as handle:
+        handle.create_dataset("actual", data=np.bytes_(json.dumps(read_fixture())))
+        handle.require_group("label")["subtask_label"] = h5py.SoftLink("/actual")
+    sidecar = write_json_sidecar(tmp_path / "fallback.json", read_fixture())
+
+    with pytest.raises(ValueError, match="link"):
+        Hdf5ScalarJsonSubtaskAdapter().load(source, sidecar_path=sidecar)
+
+
 def test_internal_ids_are_stable_and_not_canonical_fields(tmp_path: Path) -> None:
     source = write_scalar_json_hdf5(tmp_path / "617856.hdf5", read_fixture())
     loaded = Hdf5ScalarJsonSubtaskAdapter().load(source)
@@ -182,6 +209,20 @@ def test_encoder_rejects_timeline_with_foreign_root_metadata(tmp_path: Path) -> 
     )
 
     with pytest.raises(ValueError, match="metadata"):
+        encode_canonical_payload(loaded, foreign_timeline)
+
+
+def test_encoder_rejects_timeline_with_foreign_asset_identity(tmp_path: Path) -> None:
+    source = write_scalar_json_hdf5(tmp_path / "617856.hdf5", read_fixture())
+    loaded = Hdf5ScalarJsonSubtaskAdapter().load(source)
+    foreign_timeline = SharedBoundaryTimeline(
+        frame_count=loaded.timeline.frame_count,
+        fps=loaded.timeline.fps,
+        segments=loaded.timeline.segments,
+        asset_id="other-asset",
+    )
+
+    with pytest.raises(ValueError, match="asset"):
         encode_canonical_payload(loaded, foreign_timeline)
 
 
