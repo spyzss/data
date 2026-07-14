@@ -42,7 +42,7 @@ def test_manifest_video_quality_uses_inclusive_ranges_and_source_coordinates(
     from tools.run_manifest_video_quality import run_manifest_video_quality
 
     video = tmp_path / "source.mp4"
-    write_test_video(video, [solid_frame(90) for _ in range(12)], fps=10.0)
+    write_test_video(video, [solid_frame(90) for _ in range(16)], fps=10.0)
     manifest = _write_manifest(
         tmp_path / "manifest.csv",
         [
@@ -50,7 +50,7 @@ def test_manifest_video_quality_uses_inclusive_ranges_and_source_coordinates(
                 "asset_id": "logical-a",
                 "primary_video_path": str(video),
                 "start_frame": 2,
-                "end_frame": 8,
+                "end_frame": 13,
             }
         ],
     )
@@ -63,10 +63,10 @@ def test_manifest_video_quality_uses_inclusive_ranges_and_source_coordinates(
     assert row["asset_id"] == "logical-a"
     assert row["source_video_path"] == str(video)
     assert row["clip_start_frame"] == 2
-    assert row["clip_end_frame"] == 8
-    assert row["clip_frame_count"] == 7
-    assert row["decoded_frame_count"] == 7
-    assert row["source_video_frame_count"] == 12
+    assert row["clip_end_frame"] == 13
+    assert row["clip_frame_count"] == 12
+    assert row["decoded_frame_count"] == 12
+    assert row["source_video_frame_count"] == 16
     assert row["sampled_frame_mappings"] == [
         {
             "local_frame_idx": local_frame_idx,
@@ -78,11 +78,11 @@ def test_manifest_video_quality_uses_inclusive_ranges_and_source_coordinates(
         "frozen_intervals"
     ]
     assert intervals[0]["local_start_frame"] == 0
-    assert intervals[0]["local_end_frame"] == 6
+    assert intervals[0]["local_end_frame"] == 11
     assert intervals[0]["start_frame"] == 2
-    assert intervals[0]["end_frame"] == 8
+    assert intervals[0]["end_frame"] == 13
     assert intervals[0]["source_start_frame"] == 2
-    assert intervals[0]["source_end_frame"] == 8
+    assert intervals[0]["source_end_frame"] == 13
     assert (tmp_path / "quality" / "video_quality_results.parquet").exists()
     assert (tmp_path / "quality" / "video_quality_decision_summary.csv").exists()
     assert (tmp_path / "quality" / "video_quality_failures.json").exists()

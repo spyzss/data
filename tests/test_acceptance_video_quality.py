@@ -235,7 +235,14 @@ def test_analyze_video_records_frozen_intervals_over_five_frames(tmp_path: Path)
 
 def test_adjacent_near_duplicates_are_low_motion_not_rejection(tmp_path: Path) -> None:
     video = tmp_path / "408817_video.mp4"
-    write_test_video(video, [slow_motion_frame(index, width=256, height=128) for index in range(120)], fps=60.0)
+    write_test_video(
+        video,
+        [
+            slow_motion_frame(index // 20, width=256, height=128)
+            for index in range(120)
+        ],
+        fps=60.0,
+    )
     metrics = analyze_video(video, load_video_quality_config(None))
     metrics = replace(
         metrics,
@@ -252,7 +259,18 @@ def test_adjacent_near_duplicates_are_low_motion_not_rejection(tmp_path: Path) -
         mean_over_dark_ratio=0.0,
         mean_over_exposed_ratio=0.0,
         exposure_defect_frame_ratio=0.0,
-        defect_duration_ratio=metrics.frozen_frame_ratio + metrics.drop_frame_ratio,
+        adjacent_near_duplicate_count=114,
+        adjacent_near_duplicate_ratio=0.95,
+        freeze_candidate_frame_count=0,
+        freeze_candidate_duration_sec=0.0,
+        freeze_candidate_ratio=0.0,
+        confirmed_freeze_frame_count=0,
+        confirmed_freeze_duration_sec=0.0,
+        confirmed_freeze_ratio=0.0,
+        frozen_frame_ratio=0.0,
+        max_consecutive_frozen_sec=0.0,
+        frozen_intervals=(),
+        defect_duration_ratio=metrics.drop_frame_ratio,
     )
 
     config = load_video_quality_config(None)
