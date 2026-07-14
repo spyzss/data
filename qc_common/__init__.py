@@ -2,6 +2,7 @@
 
 from .base import BaseCheck
 from .config import LoadedQcConfig, load_qc_acceptance_config
+from .contracts import EvidenceRef, Issue, ModuleResult, Verdict
 from .report import (
     StaleReportRevisionError,
     load_asset_qc_report,
@@ -14,8 +15,12 @@ __all__ = [
     "BaseCheck",
     "CheckResult",
     "ClipInputs",
+    "EvidenceRef",
+    "Issue",
     "LoadedQcConfig",
+    "ModuleResult",
     "StaleReportRevisionError",
+    "Verdict",
     "load_asset_qc_report",
     "load_qc_acceptance_config",
     "validate_asset_qc_report",
