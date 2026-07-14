@@ -97,7 +97,7 @@ def boundary_request(index: int, new_frame: int, *, revision: int = 3) -> Bounda
 
 def test_confirm_boundary_edit_commits_both_segments_once(tmp_path: Path) -> None:
     service = _service(tmp_path)
-    pending = service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
+    service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
     assert len(pending.pending_edit.before) == 2
     assert len(pending.pending_edit.after) == 2
 
@@ -190,6 +190,30 @@ def test_complete_publishes_hdf5_then_marks_report_completed(tmp_path: Path) -> 
     assert persisted is not None
     assert persisted["semantic_calibration"]["state"] == "completed"
     assert persisted["semantic_calibration"]["final_hdf5_sha256"] == completed.hdf5_sha256
+
+
+def test_completed_boundary_timeline_survives_service_restart_with_stable_ids(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    pending = service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
+    confirmed = service.confirm_pending(ASSET_ID, expected_revision=2, lease_token=LEASE)
+    original_ids = tuple(segment.internal_id for segment in confirmed.timeline.segments)
+
+    service.complete(ASSET_ID, expected_revision=3, lease_token=LEASE)
+    restarted = SemanticCalibrationService(
+        assets={ASSET_ID: service._assets[ASSET_ID]},
+        reports={ASSET_ID: service.report_path(ASSET_ID)},
+        leases={ASSET_ID: LEASE},
+    ).get_task(ASSET_ID)
+
+    assert restarted.timeline.boundaries == (0, 60, 123, 195)
+    assert tuple(segment.internal_id for segment in restarted.timeline.segments) == original_ids
+    assert tuple(segment.text_cn for segment in restarted.timeline.segments) == (
+        "第一步",
+        "第二步",
+        "第三步",
+    )
 
 
 def test_replace_then_report_failure_recovers_finalizing_transaction(

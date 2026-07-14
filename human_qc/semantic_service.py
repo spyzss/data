@@ -388,9 +388,14 @@ def _pending_from_dict(value: object) -> BoundaryEdit | TextEdit | None:
 
 def _timeline_dict(timeline: SharedBoundaryTimeline) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    for segment in timeline.segments:
+    for ordinal, segment in enumerate(timeline.segments):
         result.append(
             {
+                # ``SubtaskSourceAdapter`` derives a source ID from the
+                # original frame interval.  A boundary edit necessarily
+                # changes that interval, so ordinal is the durable fallback
+                # identity used after an HDF5 replacement/restart.
+                "ordinal": ordinal,
                 "internal_id": segment.internal_id,
                 "start_frame": segment.start_frame,
                 "end_frame_exclusive": segment.end_frame_exclusive,
@@ -412,16 +417,52 @@ def _timeline_from_report(
         raise TaskStateError("semantic working_timeline must be a list")
     by_id = {segment.internal_id: segment for segment in loaded.timeline.segments}
     segments: list[SubtaskSegment] = []
-    for value in raw:
+    seen_ordinals: set[int] = set()
+    for position, value in enumerate(raw):
         if not isinstance(value, Mapping):
             raise TaskStateError("semantic working_timeline segment is malformed")
         internal_id = str(value.get("internal_id", ""))
         source = by_id.get(internal_id)
+        ordinal = position
         if source is None:
-            raise TaskStateError("semantic working_timeline contains unknown segment")
+            ordinal = value.get("ordinal", position)
+            if (
+                isinstance(ordinal, bool)
+                or not isinstance(ordinal, int)
+                or ordinal < 0
+                or ordinal >= len(loaded.timeline.segments)
+                or ordinal != position
+            ):
+                raise TaskStateError(
+                    "semantic working_timeline contains an invalid stable ordinal"
+                )
+            source = loaded.timeline.segments[ordinal]
+            _validate_stable_segment_identity(
+                asset_id=loaded.asset_id,
+                ordinal=ordinal,
+                report_value=value,
+                source=source,
+            )
+        elif "ordinal" in value:
+            ordinal = value["ordinal"]
+            if (
+                isinstance(ordinal, bool)
+                or not isinstance(ordinal, int)
+                or ordinal < 0
+                or ordinal >= len(loaded.timeline.segments)
+                or ordinal != position
+                or loaded.timeline.segments[ordinal].internal_id != source.internal_id
+            ):
+                raise TaskStateError(
+                    "semantic working_timeline ordinal does not match source identity"
+                )
+        seen_ordinals.add(ordinal)
         try:
             segment = replace(
                 source,
+                # Keep the report's stable ID even when the freshly loaded
+                # HDF5 adapter generated a new frame-derived source ID.
+                internal_id=internal_id,
                 start_frame=int(value["start_frame"]),
                 end_frame_exclusive=int(value["end_frame_exclusive"]),
                 text_cn=str(value.get("text_cn", source.text_cn)),
@@ -433,7 +474,9 @@ def _timeline_from_report(
         except (KeyError, TypeError, ValueError) as exc:
             raise TaskStateError("semantic working_timeline segment is malformed") from exc
         segments.append(segment)
-    if len(segments) != len(loaded.timeline.segments):
+    if len(segments) != len(loaded.timeline.segments) or seen_ordinals != set(
+        range(len(loaded.timeline.segments))
+    ):
         raise TaskStateError("semantic working_timeline must cover every source segment")
     return SharedBoundaryTimeline(
         frame_count=loaded.timeline.frame_count,
@@ -441,6 +484,60 @@ def _timeline_from_report(
         segments=tuple(segments),
         asset_id=loaded.asset_id,
     )
+
+
+def _validate_stable_segment_identity(
+    *,
+    asset_id: str,
+    ordinal: int,
+    report_value: Mapping[str, Any],
+    source: SubtaskSegment,
+) -> None:
+    """Validate ordinal fallback without weakening asset/source checks.
+
+    The source adapter's ID formula is retained as a proof that the report
+    entry belongs to this asset and original source row.  Only frame/time and
+    editable text fields are allowed to differ after a successful semantic
+    edit; immutable semantic evidence must still match the freshly loaded
+    source row.
+    """
+
+    canonical = report_value.get("canonical_record")
+    if not isinstance(canonical, Mapping):
+        raise TaskStateError(
+            "semantic working_timeline cannot recover an unknown segment without canonical identity"
+        )
+    start = canonical.get("start_frame")
+    end = canonical.get("end_frame")
+    expected_id = ""
+    if (
+        isinstance(start, int)
+        and not isinstance(start, bool)
+        and isinstance(end, int)
+        and not isinstance(end, bool)
+    ):
+        expected_id = hashlib.sha256(
+            f"{asset_id}:{ordinal}:{start}:{end}".encode("utf-8")
+        ).hexdigest()[:16]
+    if str(report_value.get("internal_id", "")) != expected_id:
+        raise TaskStateError(
+            "semantic working_timeline stable identity does not match source ordinal"
+        )
+    immutable_fields = (
+        "verb",
+        "object",
+        "target",
+        "hand",
+        "phase",
+        "evidence_frames",
+        "confidence",
+        "status",
+    )
+    for field_name in immutable_fields:
+        if field_name in canonical and canonical[field_name] != source.canonical_record.get(field_name):
+            raise TaskStateError(
+                f"semantic working_timeline source identity differs at {field_name!r}"
+            )
 
 
 def _sha256(path: Path) -> str:
