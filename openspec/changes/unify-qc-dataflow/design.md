@@ -35,6 +35,8 @@
 
 该事务层使用模块所有权映射，确保重跑只替换本模块数据并保留其他模块和未来扩展字段。
 
+人工语义工作台是后续 change 的外部写入者。这里的 v2 Schema 与事务层只提供可扩展、revision-aware 的原子写回边界，不把语义修改约束为单片段事件；因此后续工作台可以把一次共享边界拖动及其影响的相邻两段作为同一个 revision 提交。
+
 ### 3. 机器结果与实际流转分离
 
 `result_gate.verdict` 永远反映机器规则结果；`exit_gate` 由 `execution_profile` 决定。acceptance 下 fail 产生 `stop_qc`；supplier_evaluation 下同一个 fail 产生 `continue`，同时在执行轨迹记录 `continued_after_fail=true`。这样测评模式不会通过篡改 verdict 实现全流程。

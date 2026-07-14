@@ -21,6 +21,11 @@
 - **THEN** 更新后的报告保留所有既有模块字段和 issue
 - **THEN** 仅新增或替换 `sam3_containment` 拥有的字段和引用
 
+#### Scenario: 报告已包含共享边界语义修订扩展
+- **WHEN** 自动模块更新的报告包含由后续人工 change 写入的一次共享边界事务及其两个相邻片段 before/after
+- **THEN** Schema 与模块写回事务原样保留该扩展
+- **THEN** 自动模块不得拆分、覆盖或把它降格成单片段独立编辑
+
 ### Requirement: Issue 标识与字段稳定
 模块产生的每个 warn 或 fail MUST 使用单资产内稳定且唯一的 `issue_id`，并包含统一配置中登记的全局唯一 `rule_id`、机器 verdict、可序列化观测值、边界值、证据上下文和 `needs_manual_review`。同一资产同一规则同一证据区间重跑时 MUST 产生相同 `issue_id`。
 
