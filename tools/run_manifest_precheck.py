@@ -24,8 +24,10 @@ from precheck.runner import PrecheckRunner  # noqa: E402
 from precheck.adapters.supplier_hdf5 import (  # noqa: E402
     MANO_JOINT_INDEX_TO_ACCEPTANCE_BASE,
 )
+from qc_common.config import load_qc_acceptance_config  # noqa: E402
 from qc_common.io import aggregate_results  # noqa: E402
 from qc_common.types import CheckResult, ClipInputs  # noqa: E402
+from qc_pipeline.adapters.precheck import precheck_config_from_unified  # noqa: E402
 
 
 LOGGER = logging.getLogger(__name__)
@@ -301,31 +303,38 @@ def _configured_precheck(
     checks: list[str] | None,
     config_path: Path | None,
     overwrite: bool,
+    qc_config_path: Path | None = None,
 ) -> PrecheckConfig:
-    config = (
-        load_precheck_config(config_path)
-        if config_path is not None
-        else PrecheckConfig(output_dir=output_dir)
-    )
+    if config_path is not None and qc_config_path is not None:
+        raise ValueError("config_path and qc_config_path are mutually exclusive")
+    if config_path is not None:
+        config = load_precheck_config(config_path)
+        requested = list(checks or config.enabled_checks)
+        enabled_checks = requested
+        config.text_integrity.required_fields = (
+            ["task", "subtask_description"]
+            if supplier == "deepreach"
+            else ["language_instruction"]
+        )
+        config.skeleton_quality_score.reject_low_quality_hand = False
+    else:
+        requested = list(checks or DEFAULT_CHECKS)
+        config = precheck_config_from_unified(
+            load_qc_acceptance_config(qc_config_path),
+            module_names=requested,
+            output_dir=output_dir,
+        )
+        enabled_checks = config.enabled_checks
     config.output_dir = output_dir
     config.overwrite = overwrite
-    requested = list(checks or (config.enabled_checks if config_path else DEFAULT_CHECKS))
-    if "keypoint_morphology" in requested:
+    if "keypoint_morphology" in enabled_checks:
         LOGGER.warning(
             "Disabling keypoint_morphology: %s 21-joint topology is not confirmed",
             supplier,
         )
     config.enabled_checks = [
-        check for check in requested if check != "keypoint_morphology"
+        check for check in enabled_checks if check != "keypoint_morphology"
     ]
-    config.keypoint_temporal.topology_enabled = False
-    config.skeleton_quality_score.topology_enabled = False
-    config.skeleton_quality_score.reject_low_quality_hand = False
-    config.text_integrity.required_fields = (
-        ["task", "subtask_description"]
-        if supplier == "deepreach"
-        else ["language_instruction"]
-    )
     return config
 
 
@@ -560,12 +569,15 @@ def run_manifest_precheck(
     max_clips: int | None = None,
     checks: list[str] | None = None,
     config_path: Path | None = None,
+    qc_config_path: Path | None = None,
     overwrite: bool = False,
     dry_run: bool = False,
     log_level: str = "INFO",
 ) -> dict[str, Any]:
     if supplier not in {"deepreach", "jdt"}:
         raise ValueError(f"unsupported supplier: {supplier}")
+    if config_path is not None and qc_config_path is not None:
+        raise ValueError("config_path and qc_config_path are mutually exclusive")
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -586,6 +598,7 @@ def run_manifest_precheck(
             checks,
             config_path,
             overwrite,
+            qc_config_path,
         )
         producer = PrecheckRunner(config)
 
@@ -776,7 +789,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--parquet-column", default="parquet_path")
     parser.add_argument("--max-clips", type=int)
     parser.add_argument("--checks", nargs="+")
-    parser.add_argument("--config", type=Path)
+    config_group = parser.add_mutually_exclusive_group()
+    config_group.add_argument(
+        "--config-path",
+        "--config",
+        dest="config_path",
+        type=Path,
+        help="legacy precheck algorithm config (regression mode only)",
+    )
+    config_group.add_argument(
+        "--qc-config",
+        dest="qc_config_path",
+        type=Path,
+        help="unified QC v2 config",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--log-level", default="INFO")
@@ -795,7 +821,8 @@ def main(argv: list[str] | None = None) -> int:
         parquet_column=args.parquet_column,
         max_clips=args.max_clips,
         checks=args.checks,
-        config_path=args.config,
+        config_path=args.config_path,
+        qc_config_path=args.qc_config_path,
         overwrite=args.overwrite,
         dry_run=args.dry_run,
         log_level=args.log_level,
