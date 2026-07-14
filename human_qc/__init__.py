@@ -33,6 +33,8 @@ from .warn_service import (
     reduce_overall_decision,
 )
 from .evidence import EvidenceError, EvidenceService, EvidenceView
+from .lease import Lease, LeaseConflictError, LeaseError as ReviewerLeaseError, LeaseStore, LeaseTokenError
+from .workbench_service import WorkbenchService, jsonable
 
 __all__ = [
     "BoundaryEdit",
@@ -62,4 +64,11 @@ __all__ = [
     "EvidenceError",
     "EvidenceService",
     "EvidenceView",
+    "Lease",
+    "LeaseConflictError",
+    "ReviewerLeaseError",
+    "LeaseStore",
+    "LeaseTokenError",
+    "WorkbenchService",
+    "jsonable",
 ]
