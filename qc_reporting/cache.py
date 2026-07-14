@@ -33,9 +33,11 @@ _TABLE_ROWS = {
     "execution": "execution_rows",
 }
 _JSON_MARKER = "__qc_cache_json__:"
+_SCALAR_MARKER = "__qc_cache_scalar__:"
 _MANIFEST_FILE = "source_reports.json"
 _PROJECTION_MANIFEST_FILE = "projection_source_manifest.json"
 _PROJECTION_MANIFEST_HASH_FILE = "projection_source_manifest.sha256"
+_TABLE_HASHES_FILE = "projection_table_hashes.json"
 _SOURCE_MANIFEST_FIELDS = ("relative_path", "asset_id", "revision", "sha256")
 
 
@@ -95,10 +97,16 @@ def _encode_cell(value: Any) -> Any:
         return _JSON_MARKER + json.dumps(
             _json_safe(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
+    if isinstance(value, str) and (
+        value.startswith(_JSON_MARKER) or value.startswith(_SCALAR_MARKER)
+    ):
+        return _SCALAR_MARKER + value
     return _json_safe(value)
 
 
 def _decode_cell(value: Any) -> Any:
+    if isinstance(value, str) and value.startswith(_SCALAR_MARKER):
+        return value[len(_SCALAR_MARKER) :]
     if isinstance(value, str) and value.startswith(_JSON_MARKER):
         try:
             return _json_restore(json.loads(value[len(_JSON_MARKER) :]))
@@ -178,12 +186,14 @@ def _write_atomic_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-def _write_parquet_atomic(frame: pd.DataFrame, path: Path) -> None:
+def _write_parquet_atomic(frame: pd.DataFrame, path: Path) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{path.name}.", dir=path.parent) as temp_dir:
         temp_path = Path(temp_dir) / path.name
         frame.to_parquet(temp_path, index=False)
+        digest = hashlib.sha256(temp_path.read_bytes()).hexdigest()
         os.replace(temp_path, path)
+        return digest
 
 
 def _frame_from_rows(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
@@ -283,8 +293,17 @@ def write_projection_cache(projection: BatchProjection, cache_dir: Path) -> None
         cache_root / _PROJECTION_MANIFEST_HASH_FILE,
         (hashlib.sha256(projection_manifest_bytes).hexdigest() + "\n").encode("ascii"),
     )
+    table_hashes: dict[str, str] = {}
     for table, attr in _TABLE_ROWS.items():
-        _write_parquet_atomic(_frame_from_rows(getattr(projection, attr)), cache_root / CACHE_FILES[table])
+        table_hashes[table] = _write_parquet_atomic(
+            _frame_from_rows(getattr(projection, attr)), cache_root / CACHE_FILES[table]
+        )
+    _write_atomic_bytes(
+        cache_root / _TABLE_HASHES_FILE,
+        (
+            json.dumps(table_hashes, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8"),
+    )
     manifest = json.dumps(
         source_manifest,
         ensure_ascii=False,
@@ -368,6 +387,25 @@ def _read_projection_manifest_with_integrity(
     return _read_projection_manifest(manifest_path)
 
 
+def _read_table_hashes(path: Path) -> dict[str, str]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("projection table hashes must be an object")
+    expected_keys = set(CACHE_FILES)
+    if set(payload) != expected_keys:
+        raise ValueError("projection table hashes have unexpected tables")
+    hashes: dict[str, str] = {}
+    for table, digest in payload.items():
+        if (
+            not isinstance(digest, str)
+            or len(digest) != hashlib.sha256().digest_size * 2
+            or any(char not in "0123456789abcdefABCDEF" for char in digest)
+        ):
+            raise ValueError(f"invalid projection table hash for {table}")
+        hashes[str(table)] = digest
+    return hashes
+
+
 def _projection_manifest_matches_source(
     projection_manifest: Sequence[Mapping[str, Any]],
     source_manifest: Sequence[Mapping[str, Any]],
@@ -416,6 +454,16 @@ def _read_projection_table(path: Path) -> tuple[dict[str, Any], ...]:
     return tuple(rows)
 
 
+def _read_projection_table_with_integrity(
+    path: Path,
+    expected_digest: str,
+) -> tuple[dict[str, Any], ...]:
+    actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if expected_digest != actual_digest:
+        raise ValueError(f"projection table integrity check failed: {path.name}")
+    return _read_projection_table(path)
+
+
 def load_projection_cache(
     cache_dir: Path,
     expected_manifest: Iterable[Mapping[str, Any]],
@@ -439,8 +487,11 @@ def load_projection_cache(
         projection_manifest = _read_projection_manifest_with_integrity(cache_root)
         if not _projection_manifest_matches_source(projection_manifest, source_manifest):
             return None
+        table_hashes = _read_table_hashes(cache_root / _TABLE_HASHES_FILE)
         rows = {
-            table: _read_projection_table(cache_root / filename)
+            table: _read_projection_table_with_integrity(
+                cache_root / filename, table_hashes[table]
+            )
             for table, filename in CACHE_FILES.items()
         }
     except Exception:

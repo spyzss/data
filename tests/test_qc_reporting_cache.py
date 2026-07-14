@@ -72,6 +72,35 @@ def test_cache_corruption_or_missing_table_returns_none(tmp_path: Path) -> None:
     assert load_projection_cache(cache_dir, manifest) is None
 
 
+def test_valid_but_altered_table_returns_none(tmp_path: Path) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    write_projection_cache(projection, cache_dir)
+    manifest = build_source_manifest(archive)
+
+    assets_path = cache_dir / "assets.parquet"
+    assets = pd.read_parquet(assets_path)
+    assets.loc[0, "decision"] = "fail"
+    assets.to_parquet(assets_path, index=False)
+
+    assert load_projection_cache(cache_dir, manifest) is None
+
+
+def test_scalar_cache_marker_prefix_round_trips(tmp_path: Path) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    marker_value = "__qc_cache_json__:literal-string"
+    projection.asset_rows[0]["extension_marker"] = marker_value
+
+    write_projection_cache(projection, cache_dir)
+    loaded = load_projection_cache(cache_dir, build_source_manifest(archive))
+
+    assert loaded is not None
+    assert loaded.asset_rows[0]["extension_marker"] == marker_value
+
+
 def test_projection_manifest_tampering_returns_none(tmp_path: Path) -> None:
     archive = _make_archive(tmp_path)
     cache_dir = tmp_path / "cache"
