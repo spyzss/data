@@ -744,7 +744,7 @@ git commit -m "feat(qc): adapt keypoint morphology results"
 - Consumes: `keypoint_temporal`、`skeleton_quality_score` 行及 `_map_candidate_window_to_source()` 产生的 candidate rows。
 - Produces: `adapt_keypoint_temporal(*, asset_id, source_relative_path, results, candidate_windows, config) -> ModuleResult`。
 
-- [ ] **Step 1: 添加候选窗口与强时序 fail 的 golden 测试**
+- [x] **Step 1: 添加候选窗口与强时序 fail 的 golden 测试**
 
 ```python
 def test_temporal_candidate_is_one_warn_issue_with_source_range() -> None:
@@ -763,13 +763,13 @@ def test_strong_temporal_failure_remains_hard_fail() -> None:
     assert adapt_keypoint_temporal(asset_id="a", source_relative_path="hdf5/a.h5", results=rows, candidate_windows=[], config=loaded_test_config()).verdict == "fail"
 ```
 
-- [ ] **Step 2: 运行测试并确认函数缺失**
+- [x] **Step 2: 运行测试并确认函数缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_precheck_qc_adapter.py -k temporal -q`
 
 Expected: FAIL，包含 `cannot import name 'adapt_keypoint_temporal'`。
 
-- [ ] **Step 3: 实现 temporal 映射**
+- [x] **Step 3: 实现 temporal 映射**
 
 ```python
 TEMPORAL_RULES = {
@@ -782,13 +782,13 @@ TEMPORAL_RULES = {
 
 三个及以上核心 temporal metric 同帧超界映射 `strong` hard fail；projection/side-view/candidate window 映射 warn。每个 candidate window 创建一个稳定 issue，identity 使用 source path、source-inclusive start/end、hand side 与 `evidence_kind="candidate_window"`；`metrics` 保存 peak trigger metrics、候选数量和异常帧 union 数。`composite_frame_verdict` 只作为 evidence，不创建 module block。
 
-- [ ] **Step 4: 运行 temporal、坐标和候选回归**
+- [x] **Step 4: 运行 temporal、坐标和候选回归**
 
 Run: `.venv/bin/python -m pytest tests/test_precheck_qc_adapter.py -k temporal tests/test_manifest_precheck_runner.py::test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows tests/test_qc_modules_smoke.py -q`
 
 Expected: PASS；候选只生成 `keypoint_temporal` issue，source 坐标只转换一次。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_pipeline/adapters/precheck.py tests/test_precheck_qc_adapter.py tests/test_manifest_precheck_runner.py
@@ -809,8 +809,9 @@ git commit -m "feat(qc): adapt temporal candidate windows"
 - Consumes: `VideoQualityResult` 与 `asset_qc_result_to_json()` 的现有 module payload。
 - Produces: `adapt_video_quality_result(*, result: VideoQualityResult, config: LoadedQcConfig, batch_root: Path, source_range: tuple[int, int] | None = None) -> ModuleResult`。
 - Produces: `write_video_quality_result(*, context: AssetContext, result: VideoQualityResult, config: LoadedQcConfig, profile: str, expected_revision: int, next_module: str) -> dict[str, Any]`。
+- `write_video_quality_result` 只能接收已经按配置推进到 `pipeline_state.next_module == video_quality` 的报告；standalone runner 不得用 entry-module 后门绕过前置自动模块。没有前置报告时可以继续生成算法 sidecar，但必须返回结构化 prerequisite 状态且不得创建误导性的主报告。
 
-- [ ] **Step 1: 添加 batch/range 同合同与 revision 写回测试**
+- [x] **Step 1: 添加 batch/range 同合同与 revision 写回测试**
 
 ```python
 def test_batch_and_range_video_use_same_module_shape(video_result, loaded_v2_config, tmp_path) -> None:
@@ -820,21 +821,27 @@ def test_batch_and_range_video_use_same_module_shape(video_result, loaded_v2_con
     assert batch.module == ranged.module == "video_quality"
     assert ranged.issues[0].context["coordinate_system"] == "source_video_inclusive"
 
-def test_manifest_video_writes_quality_archive(tmp_path: Path) -> None:
+def test_manifest_video_writes_pre_advanced_quality_archive(tmp_path: Path) -> None:
+    advance_report_to_video_quality(tmp_path, asset_id="logical-a")
     summary = run_manifest_video_quality(manifest, tmp_path / "run", batch_root=tmp_path, profile="acceptance")
     report = json.loads((tmp_path / "quality_archive" / "logical-a.json").read_text())
     assert summary["completed_clip_count"] == 1
     assert report["schema_version"] == "asset_qc_report.v2"
     assert report["video_quality"]["flow"]["result_gate"]["verdict"] in {"pass", "warn", "fail"}
+
+def test_fresh_manifest_video_never_bypasses_predecessors(tmp_path: Path) -> None:
+    summary = run_manifest_video_quality(manifest, tmp_path / "run", batch_root=tmp_path, profile="acceptance")
+    assert summary["pipeline_prerequisite_count"] == 1
+    assert not (tmp_path / "quality_archive" / "logical-a.json").exists()
 ```
 
-- [ ] **Step 2: 运行测试并确认 manifest 未写主报告**
+- [x] **Step 2: 运行测试并确认 manifest 未写主报告**
 
 Run: `.venv/bin/python -m pytest tests/test_video_quality_qc_adapter.py tests/test_manifest_video_quality_runner.py -q`
 
-Expected: FAIL，range runner 仅生成 `video_quality_results.json`，`quality_archive/<asset>.json` 不存在。
+Expected: FAIL，统一 adapter/写回接口或 prerequisite 状态尚不存在；测试不得通过放宽 fresh-report 模块顺序来变绿。
 
-- [ ] **Step 3: 将两条路径收敛到 adapter + report mutation**
+- [x] **Step 3: 将两条路径收敛到 adapter + report mutation**
 
 ```python
 def write_video_quality_result(*, context, result, config, profile, expected_revision, next_module):
@@ -851,15 +858,15 @@ def write_video_quality_result(*, context, result, config, profile, expected_rev
     )
 ```
 
-删除 `_merge_video_quality_report()` 的正式写回职责；保留 `asset_qc_result_to_json()` 作为 v1 兼容/算法测试辅助，但新 batch writer 和 manifest writer 必须调用上述接口。Manifest CLI 新增 `--batch-root`、`--profile`、`--config`，sidecar 仍照常生成，skip 判断改为检查 QC JSON 中 video module 与 source range，而不是仅看 sidecar 是否存在。
+删除 `_merge_video_quality_report()` 的正式写回职责；保留 `asset_qc_result_to_json()` 作为 v1 兼容/算法测试辅助。新 batch writer 和 manifest writer 在报告已经合法推进到 video 模块时必须调用上述接口；fresh standalone 运行只生成 sidecar 并记录结构化 prerequisite，等待 Task 11 orchestrator 提供前置状态。Manifest CLI 新增 `--batch-root`、`--profile`、`--config`，skip 判断在存在 QC JSON 时检查其中的 video module 与 source range，而不是仅看 sidecar 是否存在。
 
-- [ ] **Step 4: 运行视频算法、两类 runner 与报告事务回归**
+- [x] **Step 4: 运行视频算法、两类 runner 与报告事务回归**
 
 Run: `.venv/bin/python -m pytest tests/test_video_quality_qc_adapter.py tests/test_acceptance_video_quality.py tests/test_manifest_video_quality_runner.py tests/test_report_mutation.py -q`
 
-Expected: PASS；算法指标不变，两类 runner 都通过 v2 mutation 写同一 module block。
+Expected: PASS；算法指标不变，合法推进的两类 runner 都通过 v2 mutation 写同一 module block；fresh standalone 不绕过模块顺序且不生成主报告。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_pipeline/adapters/video_quality.py acceptance_pull/video_quality.py tools/run_manifest_video_quality.py tests/test_video_quality_qc_adapter.py tests/test_acceptance_video_quality.py tests/test_manifest_video_quality_runner.py
@@ -871,14 +878,17 @@ git commit -m "feat(qc): unify video quality report writes"
 **Files:**
 - Create: `qc_pipeline/adapters/sam3_containment.py`
 - Modify: `tools/run_manifest_sam3_containment.py:475-906`
+- Modify: `configs/qc_acceptance/qc_acceptance_v2.0.0.yaml`
+- Modify: `configs/qc_acceptance.yaml`
 - Create: `tests/test_sam3_qc_adapter.py`
 - Modify: `tests/test_manifest_sam3_containment_runner.py:184-345`
+- Modify: `tests/test_qc_config_v2.py`
 
 **Interfaces:**
 - Produces: `adapt_sam3_containment(*, asset_id, batch_root, window_summaries, evidence_rows, config) -> ModuleResult`。
 - Produces: `write_sam3_asset_result(*, context, window_summaries, evidence_rows, config, profile, expected_revision, next_module) -> dict[str, Any]`。
 
-- [ ] **Step 1: 添加 window verdict、相对 evidence 与缺失 sidecar 测试**
+- [x] **Step 1: 添加 window verdict、相对 evidence 与缺失 sidecar 测试**
 
 ```python
 def test_sam3_adapter_maps_fail_and_overlay_reference(tmp_path: Path) -> None:
@@ -899,13 +909,13 @@ def test_missing_overlay_is_integrity_error(tmp_path: Path) -> None:
         adapt_sam3_containment(asset_id="a", batch_root=tmp_path, window_summaries=[], evidence_rows=[{"asset_id": "a", "evidence_type": "combined_overlay", "source_path": str(tmp_path / "missing.png")}], config=loaded_test_config())
 ```
 
-- [ ] **Step 2: 运行测试并确认 adapter 缺失**
+- [x] **Step 2: 运行测试并确认 adapter 缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_sam3_qc_adapter.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_pipeline.adapters.sam3_containment'`。
 
-- [ ] **Step 3: 实现 SAM3 映射并按资产写回**
+- [x] **Step 3: 实现 SAM3 映射并按资产写回**
 
 ```python
 SAM3_VERDICT = {
@@ -919,13 +929,15 @@ SAM3_VERDICT = {
 
 每个 window/hand 生成最多一个 issue，context 保存 source-inclusive window；evidence ID 由 asset/window/hand/kind/path 的稳定 JSON 哈希得到。Runner 完成 sidecar 后按 asset 分组调用 writer；任一窗口异常导致该资产运行错误，不提交伪造 module success。阈值由统一 Config 注入 `FRAME_THRESHOLDS`/`WINDOW_THRESHOLDS`，测试固定现有有效数值。
 
-- [ ] **Step 4: 运行 SAM3 adapter、overlay 与原算法回归**
+实际 producer 的结构化字段是 `window_containment_verdict`，adapter 必须对 `containment_fail`、`acceptable_flagged`、`projection_review`、`side_view_manual_review`、`rotation_manual_review`、`mixed_review` 和 `review` 做显式 canonical 映射，禁止从文件名或 reason 推断。若 v2.0.0 快照遗漏 legacy frame/window 参数或数值与当前算法常量不一致，必须在合并发布前校正 v2 快照和字节一致的 active config，并用回归逐字段证明注入值等于现有有效算法值；不得用 hardcoded fallback 掩盖 Config 漂移，历史 v1 快照仍不可改。
+
+- [x] **Step 4: 运行 SAM3 adapter、overlay 与原算法回归**
 
 Run: `.venv/bin/python -m pytest tests/test_sam3_qc_adapter.py tests/test_manifest_sam3_containment_runner.py tests/test_sam3_keypoint_containment.py -q`
 
 Expected: PASS；overlay 仍生成，主报告只保存相对引用和汇总结论。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_pipeline/adapters/sam3_containment.py tools/run_manifest_sam3_containment.py tests/test_sam3_qc_adapter.py tests/test_manifest_sam3_containment_runner.py

@@ -21,3 +21,16 @@
 - OpenSpec checkoff: 1.1–1.3 and 2.1–2.3 complete
 - Current phase: checkoff
 - Review: Thorough combined Task 5–7 approved after fix round 1; no open findings
+- Task 8: implemented with concern (`8972b79`), focused `9 passed`, relevant `78 passed`, full suite `441 passed, 1 skipped`; production net +299 lines, maintainability review required
+- Task 9: implemented with concern (`53b22be`), focused `71 passed`, full suite `448 passed, 1 skipped`; production +539/-91, single write path, maintainability review required
+- Task 10: implemented with concern (`901fd1f`), focused `62 passed`, full suite `468 passed, 1 skipped`; combined review requires fixes
+- Review round 1 fixes: temporal `f3b9808`, SAM3 `18dfe77`, video readiness `60e5079`
+- Task 8 fix round 1 committed (`f3b9808`), focused `10 passed`, relevant `79 passed`, full suite `469 passed, 1 skipped`
+- Task 10 fix round 1 committed (`18dfe77`), focused `83 passed`, full suite `479 passed, 1 skipped`; adapter now 388 lines, maintainability re-review required
+- Task 9 fix round 2 committed (`6f3d25c`), focused `90 passed`, full suite `498 passed, 1 skipped`
+- Task 8: complete (`8972b79`, fix `f3b9808`)
+- Task 9: complete (`53b22be`, fixes `60e5079`, `6f3d25c`)
+- Task 10: complete (`901fd1f`, fix `18dfe77`)
+- OpenSpec checkoff: 1.1–1.3 and 2.1–2.6 complete
+- Current phase: checkoff
+- Review: Thorough combined Task 8–10 approved after final round 2; no open findings
