@@ -50,4 +50,7 @@
 - Task 15: implemented (`4256d38`, compatibility aliases `6c459b7`), focused `7 passed`, Task14/Schema `54 passed`, full suite `568 passed, 1 skipped`; awaiting Thorough review
 - Task 15: complete; final Thorough review Ready in `.superpowers/sdd/review-task15-final-v2.md`, focused `54 passed`, full suite `568 passed, 1 skipped`, no findings
 - OpenSpec checkoff: 3.1–3.4, 4.1–4.2 complete; plan Task 11–15 checked
+- Task 16: complete (`3ec76de`, `64a19bd`, `453de8a`, `e36f4ff`, `1309646`, `a2fac14`, `de0fbe7`, `facb92b`, `7365e8d`), focused `87 passed`, full suite `585 passed, 1 skipped`; formal weekly/XJGT aliases and direct CLI entrypoints verified
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.3 complete
+- Review: final Task16 Thorough verification complete; no Critical/Important findings after direct projection CLI fix
 - Current phase: build

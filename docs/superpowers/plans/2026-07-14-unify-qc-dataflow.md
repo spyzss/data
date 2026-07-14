@@ -1304,7 +1304,7 @@ git commit -m "feat(qc): aggregate asset report projections"
 - Existing formal tools 新增并默认要求 `--quality-archive`；sidecar 参数移动到 `--legacy-reconciliation-*`，只能输出差异，不能改正式 verdict。
 - Produces: `write_projection_outputs(projection, statistics, output_dir, formats) -> dict[str, Path]`。
 
-- [ ] **Step 1: 添加 sidecar 冲突时 QC JSON 胜出的入口测试**
+- [x] **Step 1: 添加 sidecar 冲突时 QC JSON 胜出的入口测试**
 
 ```python
 def test_formal_ledger_ignores_conflicting_legacy_sidecar(tmp_path: Path) -> None:
@@ -1318,13 +1318,13 @@ def test_formal_ledger_ignores_conflicting_legacy_sidecar(tmp_path: Path) -> Non
     assert reconciliation.loc[0, "difference_type"] == "legacy_conflicts_with_qc_json"
 ```
 
-- [ ] **Step 2: 运行入口测试并确认现有工具仍解释 sidecar**
+- [x] **Step 2: 运行入口测试并确认现有工具仍解释 sidecar**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_entrypoints.py -q`
 
 Expected: FAIL，现有 `build_batch_qc_ledger` 将 sidecar fail 当作正式结论。
 
-- [ ] **Step 3: 让所有正式输出消费同一 projection**
+- [x] **Step 3: 让所有正式输出消费同一 projection**
 
 ```python
 projection = project_quality_archive(args.quality_archive)
@@ -1339,13 +1339,13 @@ if args.legacy_reconciliation_candidate_windows:
 
 CSV/Parquet 写 asset/issue/execution 三表；XLSX 固定 sheet 为 `Summary`、`Assets`、`Issues`、`Execution`、`Data_Dictionary`；Markdown 从同一 statistics 渲染。`build_acceptance_ledger` 与 weekly/XJGT 的正式结论列改为 projection 字段；遗留供应商特有 evidence 页可保留，但必须标注 `derived_evidence_only` 且不得回算 acceptance status。
 
-- [ ] **Step 4: 运行四类报表和遗留对账回归**
+- [x] **Step 4: 运行四类报表和遗留对账回归**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_entrypoints.py tests/test_batch_qc_ledger.py tests/test_acceptance_ledger.py tests/test_xjgt_acceptance_report.py tests/test_weekly_supplier_acceptance_report.py -q`
 
 Expected: PASS；正式 verdict 都来自 QC JSON，旧输入只影响 reconciliation/evidence 页。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add tools/build_qc_json_projection.py tools/build_batch_qc_ledger.py tools/build_acceptance_ledger.py tools/build_weekly_supplier_acceptance_report.py tools/build_xjgt_acceptance_report.py tests/test_qc_reporting_entrypoints.py tests/test_batch_qc_ledger.py tests/test_acceptance_ledger.py tests/test_weekly_supplier_acceptance_report.py tests/test_xjgt_acceptance_report.py
