@@ -53,4 +53,7 @@
 - Task 16: complete (`3ec76de`, `64a19bd`, `453de8a`, `e36f4ff`, `1309646`, `a2fac14`, `de0fbe7`, `facb92b`, `7365e8d`), focused `87 passed`, full suite `585 passed, 1 skipped`; formal weekly/XJGT aliases and direct CLI entrypoints verified
 - OpenSpec checkoff: 3.1–3.4, 4.1–4.3 complete
 - Review: final Task16 Thorough verification complete; no Critical/Important findings after direct projection CLI fix
+- Task 17: complete (`8f2211f`, fixes `141b60c`, `7651e7d`), focused `21 passed`, full suite `594 passed, 1 skipped`; cache generation barriers, table hashes, manifest validation, corruption/stale rebuild and direct CLI verified
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.4 complete
+- Review: Task17 final Thorough approval Ready; no Critical/Important findings
 - Current phase: build

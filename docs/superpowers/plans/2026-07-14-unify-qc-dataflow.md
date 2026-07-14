@@ -1364,7 +1364,7 @@ git commit -m "feat(qc): migrate reports to asset json projection"
 - Produces: `write_projection_cache(projection, cache_dir: Path) -> None`。
 - Produces: `load_projection_cache(cache_dir, expected_manifest) -> BatchProjection | None`；任何不一致返回 None。
 
-- [ ] **Step 1: 添加删除重建和 stale cache 无效测试**
+- [x] **Step 1: 添加删除重建和 stale cache 无效测试**
 
 ```python
 def test_cache_can_be_deleted_and_rebuilt_identically(tmp_path: Path) -> None:
@@ -1381,13 +1381,13 @@ def test_revision_change_invalidates_cache(tmp_path: Path) -> None:
     assert load_projection_cache(tmp_path / "cache", build_source_manifest(archive)) is None
 ```
 
-- [ ] **Step 2: 运行测试并确认缓存模块不存在**
+- [x] **Step 2: 运行测试并确认缓存模块不存在**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_cache.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_reporting.cache'`。
 
-- [ ] **Step 3: 实现 manifest 驱动缓存**
+- [x] **Step 3: 实现 manifest 驱动缓存**
 
 ```python
 CACHE_FILES = {"assets": "assets.parquet", "issues": "issues.parquet", "execution": "execution.parquet"}
@@ -1403,13 +1403,13 @@ def load_projection_cache(cache_dir, expected_manifest):
 
 写缓存先写 `.tmp` 后逐文件 replace，最后写 manifest；CLI `--cache-dir` 只用于加速，cache missing/corrupt/stale 时自动从 QC JSON 重建。统计函数不得接受 cache 文件路径，只接受 `BatchProjection`。
 
-- [ ] **Step 4: 验证缓存、投影和 CLI**
+- [x] **Step 4: 验证缓存、投影和 CLI**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_cache.py tests/test_qc_reporting_projection.py tests/test_qc_reporting_entrypoints.py -q`
 
 Expected: PASS；删除、损坏或 revision 变化都能回源重建且统计一致。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_reporting/cache.py tools/build_qc_json_projection.py tests/test_qc_reporting_cache.py

@@ -25,7 +25,7 @@
 - [x] 4.1 从 QC JSON issues/evidence 生成 warn 人工队列输入，停止直接拼接多套 sidecar 结论
 - [x] 4.2 实现仅遍历 `quality_archive/*.json` 的批次投影和按 profile 分组统计
 - [x] 4.3 将现有 batch ledger/weekly report 正式入口迁移到统一投影，并保留遗留结果对账测试
-- [ ] 4.4 增加可删除重建的 Parquet/CSV 缓存并验证缓存不参与事实判定
+- [x] 4.4 增加可删除重建的 Parquet/CSV 缓存并验证缓存不参与事实判定
 
 ## 5. 文档与端到端验证
 
