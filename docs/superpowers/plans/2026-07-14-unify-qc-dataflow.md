@@ -85,7 +85,7 @@ base-ref: 44ee01f5221a00343e48046bfb477889a82a68cc
 - Produces: `LoadedQcConfig.pipeline_modules: tuple[str, ...]`、`LoadedQcConfig.default_profile: str`、`LoadedQcConfig.execution_profile(name: str) -> dict[str, str]`、`LoadedQcConfig.module_config(name: str) -> dict[str, Any]`、`LoadedQcConfig.assert_same_reference(reference: Mapping[str, str]) -> None`。
 - Produces: `validate_qc_config(data: dict[str, Any])` 按 `schema_version` 选择 v1/v2 Schema，未知版本抛 `ValueError`。
 
-- [ ] **Step 1: 添加会失败的 v2 Config 合同测试**
+- [x] **Step 1: 添加会失败的 v2 Config 合同测试**
 
 ```python
 # tests/test_qc_config_v2.py
@@ -129,13 +129,13 @@ def test_v2_rejects_enabled_module_without_implementation(tmp_path: Path) -> Non
         load_qc_acceptance_config(path)
 ```
 
-- [ ] **Step 2: 运行测试并确认因 v2 文件/属性缺失而失败**
+- [x] **Step 2: 运行测试并确认因 v2 文件/属性缺失而失败**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_config_v2.py tests/test_qc_config.py -q`
 
 Expected: FAIL，首个失败包含 `qc_acceptance_config_schema.v1 != qc_acceptance_config_schema.v2` 或缺少 `default_profile`。
 
-- [ ] **Step 3: 发布 Config v2 并扩展 loader**
+- [x] **Step 3: 发布 Config v2 并扩展 loader**
 
 Config v2 顶层必须包含以下精确结构；现有各模块阈值和 rule 映射原值迁入相应 `parameters`/`rules`，不得改变数值：
 
@@ -196,13 +196,13 @@ def assert_same_reference(self, reference: Mapping[str, str]) -> None:
 
 Loader 的语义校验必须逐项执行：pipeline 模块存在、rule ID 非空且全局唯一、profile 动作属于 Schema 枚举、enabled 模块必须二选一拥有 `implementation` 或 `execution_kind: external`、disabled 模块必须有 `disabled_reason`。默认入口加载时还要比较活跃文件与 `configs/qc_acceptance/<config_version>.yaml` 的字节。
 
-- [ ] **Step 4: 验证 Config 与现有视频阈值回归**
+- [x] **Step 4: 验证 Config 与现有视频阈值回归**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_config.py tests/test_qc_config_v2.py tests/test_acceptance_video_quality.py::test_default_video_quality_config_comes_from_unified_config tests/test_acceptance_video_quality.py::test_unified_video_threshold_override_changes_runtime_config -q`
 
 Expected: PASS；v1 快照 hash 不变、活跃入口等于 v2 快照、视频阈值回归通过。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add schemas/qc_acceptance_config.v2.schema.json configs/qc_acceptance.yaml configs/qc_acceptance/qc_acceptance_v2.0.0.yaml qc_common/schema.py qc_common/config.py tests/test_qc_config.py tests/test_qc_config_v2.py
@@ -226,7 +226,7 @@ git commit -m "feat(qc): publish unified config v2"
 - Produces: `migrate_v1_to_v2(report: Mapping[str, Any], *, config_reference: Mapping[str, str], profile: str = "acceptance") -> dict[str, Any]`，纯函数、不写盘、不修改输入。
 - Produces: `load_asset_qc_report(path, *, migrate_to_v2=False, config_reference=None, profile="acceptance")`；仅显式请求时投影 v1。
 
-- [ ] **Step 1: 添加 v2 状态约束和 v1 迁移失败测试**
+- [x] **Step 1: 添加 v2 状态约束和 v1 迁移失败测试**
 
 ```python
 # tests/test_asset_qc_schema_v2.py
@@ -261,13 +261,13 @@ def test_migrate_v1_preserves_video_unknown_fields_and_revision() -> None:
     assert migrated["extension_from_colleague"] == {"keep": True}
 ```
 
-- [ ] **Step 2: 运行测试并确认 v2 Schema/迁移模块不存在**
+- [x] **Step 2: 运行测试并确认 v2 Schema/迁移模块不存在**
 
 Run: `.venv/bin/python -m pytest tests/test_asset_qc_schema_v2.py tests/test_asset_qc_schema.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_common.report_migration'`。
 
-- [ ] **Step 3: 实现通用 Schema 和纯函数迁移**
+- [x] **Step 3: 实现通用 Schema 和纯函数迁移**
 
 v2 Schema 必须要求：`schema_version`、`asset_id`、`report_revision`、`qc_config`、`execution`、`pipeline_state`、`overall_decision`、`source_files`、`issues`、`runtime_errors`、`manual_review`；允许已登记 module block 与未知扩展字段共存。`manual_review` 及未来人工语义扩展不得用 Schema 固化为“一次只修改一个片段”，并必须允许后续 change 在一次 revision 中原子保存受共享边界影响的相邻两段 before/after。关键条件使用 `allOf/if/then`：
 
@@ -312,13 +312,13 @@ def migrate_v1_to_v2(report, *, config_reference, profile="acceptance"):
     return migrated
 ```
 
-- [ ] **Step 4: 验证 v1/v2 双读和原 v1 回归**
+- [x] **Step 4: 验证 v1/v2 双读和原 v1 回归**
 
 Run: `.venv/bin/python -m pytest tests/test_asset_qc_schema.py tests/test_asset_qc_schema_v2.py tests/test_acceptance_video_quality.py::test_video_qc_preserves_existing_module_blocks_and_increments_revision -q`
 
 Expected: PASS；读取 v1 不改盘，迁移结果通过 v2 Schema，原视频测试仍可读 v1 fixture。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add schemas/asset_qc_report.v2.schema.json qc_common/schema.py qc_common/report.py qc_common/report_migration.py tests/qc_report_fixtures.py tests/test_asset_qc_schema.py tests/test_asset_qc_schema_v2.py
