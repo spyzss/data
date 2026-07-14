@@ -13,8 +13,20 @@ from typing import Any, Literal
 
 
 Verdict = Literal["pass", "warn", "fail", "skipped"]
+ModuleExecutionState = Literal[
+    "completed",
+    "disabled",
+    "skipped",
+    "not_implemented",
+    "runtime_error",
+    "awaiting_external",
+    "skipped_due_to_fail",
+]
 _VERDICTS = ("pass", "warn", "fail", "skipped")
 _ISSUE_SEVERITIES = ("warn", "fail")
+RETRYABLE_RUNTIME_ERROR_TYPES = frozenset(
+    {"stale_revision", "process_error", "evidence_integrity_error"}
+)
 
 
 def _to_json_safe(value: Any) -> Any:
@@ -108,6 +120,29 @@ class ModuleResult:
 
     def to_dict(self) -> dict[str, Any]:
         return _to_json_safe(self)
+
+
+@dataclass(frozen=True)
+class RuntimeErrorRecord:
+    module: str
+    error_type: str
+    message: str
+    occurred_at: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("module", "error_type", "message", "occurred_at"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"runtime error {field_name} must not be empty")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "module": self.module,
+            "error_type": self.error_type,
+            "message": self.message,
+            "occurred_at": self.occurred_at,
+            "retryable": self.error_type in RETRYABLE_RUNTIME_ERROR_TYPES,
+        }
 
 
 def build_issue_id(

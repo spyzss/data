@@ -18,6 +18,14 @@ ModuleRunner = Callable[["AssetContext", LoadedQcConfig], ModuleResult]
 class ModuleUnavailableError(KeyError):
     """Raised when Config names an automatic implementation with no runner."""
 
+    def __init__(self, module: str) -> None:
+        self.module = module
+        self.message = f"automatic module implementation is unavailable: {module}"
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        return self.message
+
 
 class ModulePrerequisiteError(RuntimeError):
     """A declared automatic runner lacks a source it needs to execute."""
@@ -47,9 +55,7 @@ class ModuleRegistry:
         try:
             return self._runners[name]
         except KeyError:
-            raise ModuleUnavailableError(
-                f"automatic module implementation is unavailable: {name}"
-            ) from None
+            raise ModuleUnavailableError(name) from None
 
     def has(self, name: str) -> bool:
         return name in self._runners

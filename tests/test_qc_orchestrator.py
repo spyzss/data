@@ -10,13 +10,16 @@ from typing import Any
 import pytest
 
 from qc_common.config import LoadedQcConfig
-from qc_common.contracts import Issue, ModuleResult
+from qc_common.contracts import EvidenceRef, Issue, ModuleResult
 from qc_common.module_registry import ModuleRegistry, ModuleUnavailableError
+from qc_common.report import StaleReportRevisionError, write_asset_qc_report
 from qc_common.report_mutation import (
     ConfigDriftError,
     apply_module_result,
+    initialize_v2_report,
     mark_remaining_skipped_due_to_fail,
     record_awaiting_external,
+    record_runtime_error,
 )
 from qc_pipeline.context import AssetContext
 from qc_pipeline.orchestrator import (
@@ -192,8 +195,9 @@ def test_registry_resolves_config_implementation_names() -> None:
     assert registry.has("precheck.quality_hand")
     assert registry.resolve("precheck.quality_hand") is runner
     assert not registry.has("quality_hand")
-    with pytest.raises(ModuleUnavailableError, match="unavailable"):
+    with pytest.raises(ModuleUnavailableError, match="unavailable") as caught:
         registry.resolve("quality_hand")
+    assert caught.value.module == "quality_hand"
 
 
 def test_generic_registry_import_does_not_load_qc_pipeline() -> None:
@@ -263,6 +267,36 @@ def test_orchestrator_runs_in_config_order_and_retains_external_pause(
     assert second.report["execution"]["updated_at"] == "2026-07-14T00:00:00Z"
 
 
+def test_module_states_distinguish_completed_skipped_and_awaiting_external(
+    tmp_path: Path,
+) -> None:
+    modules = ["hdf5_text_info", "quality_hand", "semantic_consistency"]
+    config = _config(tmp_path, modules)
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="acceptance",
+        registry=_registry(
+            [],
+            config,
+            {"hdf5_text_info": "pass", "quality_hand": "skipped"},
+        ),
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
+
+    assert outcome.status == "awaiting_external"
+    assert outcome.report["execution"]["module_states"] == {
+        "hdf5_text_info": {"state": "completed"},
+        "quality_hand": {"state": "skipped"},
+        "semantic_consistency": {"state": "awaiting_external"},
+    }
+    assert outcome.report["quality_hand"]["flow"]["result_gate"]["verdict"] == (
+        "skipped"
+    )
+    assert "semantic_consistency" not in outcome.report
+
+
 def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
     modules = [
         "hdf5_text_info",
@@ -314,6 +348,8 @@ def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
     assert "sam3_containment" not in acceptance
     assert "semantic_consistency" not in acceptance
     assert acceptance["execution"]["module_states"] == {
+        "hdf5_text_info": {"state": "completed"},
+        "video_quality": {"state": "completed"},
         "sam3_containment": {"state": "skipped_due_to_fail"},
         "semantic_consistency": {"state": "skipped_due_to_fail"},
         "manual_review": {"state": "skipped_due_to_fail"},
@@ -410,33 +446,52 @@ def test_fresh_asset_starts_at_first_configured_module(tmp_path: Path) -> None:
     assert outcome.report["report_revision"] == 2
 
 
-def test_orchestrator_resumes_exactly_from_persisted_next_module(
+@pytest.mark.parametrize("profile", ["acceptance", "supplier_evaluation"])
+def test_runner_error_stops_incomplete_and_terminal_rerun_is_idempotent(
     tmp_path: Path,
+    profile: str,
 ) -> None:
     modules = ["hdf5_text_info", "quality_hand", "keypoint_presence"]
     config = _config(tmp_path, modules)
     first_calls: list[str] = []
 
-    with pytest.raises(RuntimeError, match="failed:quality_hand"):
-        run_asset(
-            _context(tmp_path),
-            config=config,
-            profile="acceptance",
-            registry=_registry(
-                first_calls,
-                config,
-                {name: "pass" for name in modules},
-                errors={"quality_hand"},
-            ),
-            now=lambda: "2026-07-14T00:00:00Z",
-        )
-
-    assert first_calls == ["hdf5_text_info", "quality_hand"]
-    second_calls: list[str] = []
-    outcome = run_asset(
+    first = run_asset(
         _context(tmp_path),
         config=config,
-        profile="acceptance",
+        profile=profile,
+        registry=_registry(
+            first_calls,
+            config,
+            {name: "pass" for name in modules},
+            errors={"quality_hand"},
+        ),
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
+
+    assert first_calls == ["hdf5_text_info", "quality_hand"]
+    assert first.executed_modules == ("hdf5_text_info",)
+    assert first.status == "error"
+    assert first.report["overall_decision"] is None
+    assert first.report["pipeline_state"]["next_module"] == "quality_hand"
+    assert first.report["runtime_errors"] == [
+        {
+            "module": "quality_hand",
+            "error_type": "process_error",
+            "message": "failed:quality_hand",
+            "occurred_at": "2026-07-14T00:00:00Z",
+            "retryable": True,
+        }
+    ]
+    assert first.report["execution"]["module_states"]["quality_hand"] == {
+        "state": "runtime_error",
+        "reason": "process_error",
+    }
+    assert "quality_hand" not in first.report
+    second_calls: list[str] = []
+    second = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile=profile,
         registry=_registry(
             second_calls,
             config,
@@ -445,9 +500,111 @@ def test_orchestrator_resumes_exactly_from_persisted_next_module(
         now=lambda: "2026-07-14T00:01:00Z",
     )
 
-    assert second_calls == ["quality_hand", "keypoint_presence"]
-    assert outcome.report["report_revision"] == 3
-    assert outcome.status == "completed"
+    assert second_calls == []
+    assert second.report == first.report
+    assert second.status == "error"
+
+
+def test_missing_runner_input_is_structured_without_quality_verdict(
+    tmp_path: Path,
+) -> None:
+    module = "hdf5_text_info"
+    config = _config(tmp_path, [module])
+    registry = ModuleRegistry()
+
+    def run(context: AssetContext, loaded: LoadedQcConfig) -> ModuleResult:
+        raise ModulePrerequisiteError(module, "source_files.hdf5.path")
+
+    registry.register("test.hdf5_text_info", run)
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="acceptance",
+        registry=registry,
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
+
+    assert outcome.status == "error"
+    assert outcome.report["overall_decision"] is None
+    assert outcome.report["runtime_errors"][0]["error_type"] == "input_missing"
+    assert outcome.report["runtime_errors"][0]["retryable"] is False
+    assert outcome.report["pipeline_state"]["stop_reason"] == "input_missing"
+    assert "hdf5_text_info" not in outcome.report
+
+
+def test_evidence_integrity_error_is_structured_without_partial_result(
+    tmp_path: Path,
+) -> None:
+    module = "hdf5_text_info"
+    config = _config(tmp_path, [module])
+    registry = ModuleRegistry()
+
+    def run(context: AssetContext, loaded: LoadedQcConfig) -> ModuleResult:
+        return ModuleResult(
+            module,
+            "pass",
+            {},
+            {},
+            evidence=(
+                EvidenceRef(
+                    "bad-evidence",
+                    "test",
+                    "/outside-batch.json",
+                    "frame_index",
+                ),
+            ),
+        )
+
+    registry.register("test.hdf5_text_info", run)
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="acceptance",
+        registry=registry,
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
+
+    assert outcome.status == "error"
+    assert outcome.report["runtime_errors"][0]["error_type"] == (
+        "evidence_integrity_error"
+    )
+    assert outcome.report["runtime_errors"][0]["retryable"] is True
+    assert outcome.report["overall_decision"] is None
+    assert outcome.report["issues"] == []
+    assert module not in outcome.report
+
+
+def test_detector_value_error_is_structured_as_nonretryable_runtime_error(
+    tmp_path: Path,
+) -> None:
+    module = "hdf5_text_info"
+    config = _config(tmp_path, [module])
+    registry = ModuleRegistry()
+
+    def run(context: AssetContext, loaded: LoadedQcConfig) -> ModuleResult:
+        raise ValueError("detector payload is malformed")
+
+    registry.register("test.hdf5_text_info", run)
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="acceptance",
+        registry=registry,
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
+
+    assert outcome.status == "error"
+    assert outcome.report["runtime_errors"][0] == {
+        "module": module,
+        "error_type": "detector_error",
+        "message": "detector payload is malformed",
+        "occurred_at": "2026-07-14T00:00:00Z",
+        "retryable": False,
+    }
+    assert outcome.report["overall_decision"] is None
 
 
 def test_disabled_module_advances_without_a_fake_result(tmp_path: Path) -> None:
@@ -465,23 +622,78 @@ def test_disabled_module_advances_without_a_fake_result(tmp_path: Path) -> None:
 
     assert calls == ["hdf5_text_info"]
     assert "quality_hand" not in outcome.report
+    assert outcome.report["execution"]["module_states"]["quality_hand"] == {
+        "state": "disabled",
+        "reason": "not_available",
+    }
     assert outcome.report["pipeline_state"]["next_module"] == "semantic_consistency"
 
 
-def test_unavailable_automatic_runner_never_becomes_a_pass(tmp_path: Path) -> None:
+def test_leading_disabled_module_persists_before_first_enabled_module(
+    tmp_path: Path,
+) -> None:
+    modules = ["effective_duration", "hdf5_text_info"]
+    config = _config(tmp_path, modules, disabled={"effective_duration"})
+    calls: list[str] = []
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="acceptance",
+        registry=_registry(calls, config, {"hdf5_text_info": "pass"}),
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
+
+    assert calls == ["hdf5_text_info"]
+    assert outcome.status == "completed"
+    assert outcome.report["report_revision"] == 2
+    assert outcome.report["execution"]["module_states"]["effective_duration"] == {
+        "state": "disabled",
+        "reason": "not_available",
+    }
+    assert "effective_duration" not in outcome.report
+
+
+def test_unavailable_automatic_runner_is_persisted_as_incomplete_error(
+    tmp_path: Path,
+) -> None:
     config = _config(tmp_path, ["hdf5_text_info"])
     context = _context(tmp_path)
 
-    with pytest.raises(ModuleUnavailableError, match="test.hdf5_text_info"):
-        run_asset(
-            context,
-            config=config,
-            profile="acceptance",
-            registry=ModuleRegistry(),
-            now=lambda: "2026-07-14T00:00:00Z",
-        )
+    outcome = run_asset(
+        context,
+        config=config,
+        profile="acceptance",
+        registry=ModuleRegistry(),
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
 
-    assert not context.report_path.exists()
+    assert outcome.status == "error"
+    assert outcome.report["pipeline_state"] == {
+        "status": "error",
+        "last_completed_module": None,
+        "next_module": "hdf5_text_info",
+        "stop_reason": "module_unavailable",
+    }
+    assert outcome.report["overall_decision"] is None
+    assert outcome.report["runtime_errors"] == [
+        {
+            "module": "hdf5_text_info",
+            "error_type": "module_unavailable",
+            "message": (
+                "automatic module implementation is unavailable: "
+                "test.hdf5_text_info"
+            ),
+            "occurred_at": "2026-07-14T00:00:00Z",
+            "retryable": False,
+        }
+    ]
+    assert outcome.report["execution"]["module_states"]["hdf5_text_info"] == {
+        "state": "not_implemented",
+        "reason": "module_unavailable",
+    }
+    assert "hdf5_text_info" not in outcome.report
+    assert outcome.report["issues"] == []
 
 
 def test_config_drift_is_rejected_before_resuming(tmp_path: Path) -> None:
@@ -553,6 +765,195 @@ def test_external_pause_transaction_preserves_extensions_and_is_idempotent(
     assert paused["pipeline_state"]["next_module"] == "semantic_consistency"
     assert paused["report_revision"] == 2
     assert same == paused
+
+
+def test_runtime_error_transaction_preserves_report_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    modules = ["hdf5_text_info", "quality_hand"]
+    config = _config(tmp_path, modules)
+    context = _context(tmp_path)
+    prior_issue = Issue(
+        "hdf5_text_info:warning:11111111111111111111",
+        "warning",
+        "warn",
+        "hdf5_text_info",
+        "test_warning",
+        "test_metric",
+        1,
+        ">",
+        0,
+        "hdf5_text_info.warning",
+        True,
+    )
+    report = apply_module_result(
+        context.report_path,
+        context=context,
+        config=config,
+        profile="acceptance",
+        result=ModuleResult(
+            "hdf5_text_info",
+            "warn",
+            {},
+            {},
+            issues=(prior_issue,),
+        ),
+        expected_revision=0,
+        next_module="quality_hand",
+        now="2026-07-14T00:00:00Z",
+    )
+    report["future_extension"] = {"keep": True}
+    report["manual_review"]["semantic_revision"] = {"revision_id": "semantic-r4"}
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    errored = record_runtime_error(
+        context.report_path,
+        module="quality_hand",
+        error_type="process_error",
+        message="worker exited 9",
+        expected_revision=1,
+        context=context,
+        config=config,
+        profile="acceptance",
+        now="2026-07-14T00:02:00Z",
+    )
+    same = record_runtime_error(
+        context.report_path,
+        module="quality_hand",
+        error_type="process_error",
+        message="worker exited 9",
+        expected_revision=2,
+        context=context,
+        config=config,
+        profile="acceptance",
+        now="2026-07-14T00:01:00Z",
+    )
+
+    assert errored["hdf5_text_info"] == report["hdf5_text_info"]
+    assert errored["issues"] == report["issues"]
+    assert errored["manual_review"] == report["manual_review"]
+    assert errored["future_extension"] == {"keep": True}
+    assert errored["report_revision"] == 2
+    assert same == errored
+    assert json.loads(context.report_path.read_text(encoding="utf-8")) == errored
+
+
+def test_runtime_error_transaction_rejects_stale_revision_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    modules = ["hdf5_text_info", "semantic_consistency"]
+    config = _config(tmp_path, modules)
+    context = _context(tmp_path)
+    apply_module_result(
+        context.report_path,
+        context=context,
+        config=config,
+        profile="acceptance",
+        result=ModuleResult("hdf5_text_info", "pass", {}, {}),
+        expected_revision=0,
+        next_module="semantic_consistency",
+        now="2026-07-14T00:00:00Z",
+    )
+    record_awaiting_external(
+        context.report_path,
+        context=context,
+        config=config,
+        profile="acceptance",
+        expected_revision=1,
+        module="semantic_consistency",
+        now="2026-07-14T00:01:00Z",
+    )
+    before = context.report_path.read_bytes()
+
+    with pytest.raises(StaleReportRevisionError, match="expected revision 1, found 2"):
+        record_runtime_error(
+            context.report_path,
+            module="semantic_consistency",
+            error_type="stale_revision",
+            message="concurrent update",
+            expected_revision=1,
+            context=context,
+            config=config,
+            profile="acceptance",
+            now="2026-07-14T00:02:00Z",
+        )
+
+    assert context.report_path.read_bytes() == before
+
+
+def test_orchestrator_records_stale_revision_when_latest_cursor_is_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = "hdf5_text_info"
+    config = _config(tmp_path, [module])
+    context = _context(tmp_path)
+
+    def stale_apply(*args: object, **kwargs: object) -> dict[str, Any]:
+        concurrent = initialize_v2_report(
+            context,
+            config,
+            "acceptance",
+            "2026-07-14T00:00:00Z",
+        )
+        concurrent["future_extension"] = {"keep": True}
+        concurrent["report_revision"] = 1
+        write_asset_qc_report(
+            context.report_path,
+            concurrent,
+            expected_revision=0,
+            profile="acceptance",
+        )
+        raise StaleReportRevisionError("expected revision 0, found 1")
+
+    monkeypatch.setattr("qc_pipeline.orchestrator.apply_module_result", stale_apply)
+
+    outcome = run_asset(
+        context,
+        config=config,
+        profile="acceptance",
+        registry=_registry([], config, {module: "pass"}),
+        now=lambda: "2026-07-14T00:01:00Z",
+    )
+
+    assert outcome.status == "error"
+    assert outcome.report["report_revision"] == 2
+    assert outcome.report["future_extension"] == {"keep": True}
+    assert outcome.report["runtime_errors"][0]["error_type"] == "stale_revision"
+    assert outcome.report["runtime_errors"][0]["retryable"] is True
+
+
+def test_orchestrator_does_not_mark_stale_when_latest_cursor_advanced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modules = ["hdf5_text_info", "quality_hand"]
+    config = _config(tmp_path, modules)
+    context = _context(tmp_path)
+    real_apply = apply_module_result
+    latest_bytes: list[bytes] = []
+
+    def concurrent_apply(*args: object, **kwargs: object) -> dict[str, Any]:
+        real_apply(*args, **kwargs)
+        latest_bytes.append(context.report_path.read_bytes())
+        raise StaleReportRevisionError("expected revision 0, found 1")
+
+    monkeypatch.setattr("qc_pipeline.orchestrator.apply_module_result", concurrent_apply)
+
+    calls: list[str] = []
+    outcome = run_asset(
+        context,
+        config=config,
+        profile="acceptance",
+        registry=_registry(calls, config, {name: "pass" for name in modules}),
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
+
+    assert calls == ["hdf5_text_info"]
+    assert outcome.status == "running"
+    assert outcome.report["pipeline_state"]["next_module"] == "quality_hand"
+    assert outcome.report["runtime_errors"] == []
+    assert context.report_path.read_bytes() == latest_bytes[0]
 
 
 def test_asset_context_rejects_report_and_sources_outside_batch(
@@ -759,6 +1160,41 @@ def test_batch_builds_an_independent_registry_per_asset(tmp_path: Path) -> None:
     assert set(outcomes) == {"a", "b"}
     assert outcomes["a"].report is not outcomes["b"].report
     assert outcomes["a"].status == outcomes["b"].status == "completed"
+
+
+def test_batch_keeps_other_assets_running_when_one_runner_errors(
+    tmp_path: Path,
+) -> None:
+    from tools.run_qc_pipeline import run_batch
+
+    module = "hdf5_text_info"
+    config = _config(tmp_path, [module])
+    contexts = [_context(tmp_path, "good"), _context(tmp_path, "bad")]
+
+    def registry_factory(context: AssetContext) -> ModuleRegistry:
+        return _registry(
+            [],
+            config,
+            {module: "pass"},
+            errors={module} if context.asset_id == "bad" else set(),
+        )
+
+    outcomes = run_batch(
+        contexts,
+        config=config,
+        profile="supplier_evaluation",
+        registry_factory=registry_factory,
+        max_workers=2,
+    )
+
+    assert outcomes["good"].status == "completed"
+    assert outcomes["good"].report["overall_decision"] == "pass"
+    assert outcomes["bad"].status == "error"
+    assert outcomes["bad"].report["overall_decision"] is None
+    assert outcomes["bad"].report["runtime_errors"][0]["error_type"] == (
+        "process_error"
+    )
+    assert outcomes["good"].report is not outcomes["bad"].report
 
 
 def test_cli_accepts_required_batch_and_resume_options(tmp_path: Path) -> None:

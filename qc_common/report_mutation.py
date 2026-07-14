@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from qc_common.config import LoadedQcConfig
-from qc_common.contracts import EvidenceRef, ModuleResult
+from qc_common.contracts import EvidenceRef, ModuleResult, RuntimeErrorRecord
 from qc_common.report import (
     StaleReportRevisionError,
     load_asset_qc_report,
@@ -121,6 +121,44 @@ def validate_report_identity(
         config=config,
         profile=profile,
     )
+
+
+def _load_or_initialize_report(
+    path: Path,
+    *,
+    context: AssetContext,
+    config: LoadedQcConfig,
+    profile: str,
+    expected_revision: int,
+    now: str,
+) -> dict[str, Any]:
+    """Load one validated revision or create the uncommitted first revision."""
+    _assert_same_report_path(path, context)
+    loaded = load_asset_qc_report(path)
+    if loaded is not None:
+        validate_report_identity(
+            loaded,
+            context=context,
+            config=config,
+            profile=profile,
+        )
+    report = (
+        initialize_v2_report(context, config, profile, now)
+        if loaded is None
+        else copy.deepcopy(loaded)
+    )
+    current_revision = int(report.get("report_revision", 0))
+    if current_revision != expected_revision:
+        raise StaleReportRevisionError(
+            f"expected revision {expected_revision}, found {current_revision}: {path}"
+        )
+    _assert_report_identity(
+        report,
+        context=context,
+        config=config,
+        profile=profile,
+    )
+    return report
 
 
 def _expected_next_module(
@@ -477,6 +515,12 @@ def apply_module_result(
     execution = report.get("execution")
     if not isinstance(execution, dict):
         raise ValueError("execution must be an object")
+    module_states = execution.setdefault("module_states", {})
+    if not isinstance(module_states, dict):
+        raise ValueError("execution.module_states must be an object")
+    module_states[result.module] = {
+        "state": "skipped" if result.verdict == "skipped" else "completed"
+    }
     execution["updated_at"] = now
 
     if pipeline_status == "stopped":
@@ -516,36 +560,19 @@ def record_awaiting_external(
     now: str,
 ) -> dict[str, Any]:
     """Persist an external boundary without fabricating a module result."""
-    _assert_same_report_path(path, context)
     module_config = config.module_config(module)
     if not module_config.get("enabled"):
         raise ValueError(f"external module is disabled: {module}")
     if module_config.get("execution_kind") != "external":
         raise ValueError(f"module is not external: {module}")
 
-    loaded = load_asset_qc_report(path)
-    if loaded is not None:
-        validate_report_identity(
-            loaded,
-            context=context,
-            config=config,
-            profile=profile,
-        )
-    report = (
-        initialize_v2_report(context, config, profile, now)
-        if loaded is None
-        else copy.deepcopy(loaded)
-    )
-    current_revision = int(report.get("report_revision", 0))
-    if current_revision != expected_revision:
-        raise StaleReportRevisionError(
-            f"expected revision {expected_revision}, found {current_revision}: {path}"
-        )
-    _assert_report_identity(
-        report,
+    report = _load_or_initialize_report(
+        path,
         context=context,
         config=config,
         profile=profile,
+        expected_revision=expected_revision,
+        now=now,
     )
 
     pipeline_state = report.get("pipeline_state")
@@ -573,7 +600,159 @@ def record_awaiting_external(
     execution = report.get("execution")
     if not isinstance(execution, dict):
         raise ValueError("execution must be an object")
+    module_states = execution.setdefault("module_states", {})
+    if not isinstance(module_states, dict):
+        raise ValueError("execution.module_states must be an object")
+    module_states[module] = {"state": "awaiting_external"}
     execution["updated_at"] = now
+    report["report_revision"] = expected_revision + 1
+    write_asset_qc_report(
+        path,
+        report,
+        expected_revision=expected_revision,
+        profile=profile,
+    )
+    return report
+
+
+def record_disabled_transition(
+    path: Path,
+    *,
+    context: AssetContext,
+    config: LoadedQcConfig,
+    profile: str,
+    expected_revision: int,
+    module: str,
+    next_module: str | None,
+    overall_decision: str | None,
+    now: str,
+) -> dict[str, Any]:
+    """Persist one configured-disabled module without a result block."""
+    module_config = config.module_config(module)
+    if module_config.get("enabled"):
+        raise ValueError(f"module is enabled: {module}")
+    reason = str(module_config.get("disabled_reason", "")).strip()
+    if not reason:
+        raise ValueError(f"disabled module has no reason: {module}")
+    if next_module != _expected_next_module(config.pipeline_modules, module):
+        raise ModuleOrderError(f"invalid successor for disabled module: {module}")
+
+    report = _load_or_initialize_report(
+        path,
+        context=context,
+        config=config,
+        profile=profile,
+        expected_revision=expected_revision,
+        now=now,
+    )
+    pipeline_state = report.get("pipeline_state")
+    if not isinstance(pipeline_state, dict):
+        raise ValueError("pipeline_state must be an object")
+    if pipeline_state.get("next_module") != module:
+        raise ModuleOrderError(
+            f"expected current module {pipeline_state.get('next_module')}, got {module}"
+        )
+
+    execution = report.get("execution")
+    if not isinstance(execution, dict):
+        raise ValueError("execution must be an object")
+    module_states = execution.setdefault("module_states", {})
+    if not isinstance(module_states, dict):
+        raise ValueError("execution.module_states must be an object")
+    module_states[module] = {"state": "disabled", "reason": reason}
+    execution["updated_at"] = now
+
+    completed = next_module is None
+    pipeline_state.update(
+        {
+            "status": "completed" if completed else "running",
+            "last_completed_module": module,
+            "next_module": next_module,
+            "stop_reason": None,
+        }
+    )
+    report["overall_decision"] = overall_decision
+    report["report_revision"] = expected_revision + 1
+    write_asset_qc_report(
+        path,
+        report,
+        expected_revision=expected_revision,
+        profile=profile,
+    )
+    return report
+
+
+def record_runtime_error(
+    path: Path,
+    *,
+    module: str,
+    error_type: str,
+    message: str,
+    expected_revision: int,
+    context: AssetContext,
+    config: LoadedQcConfig,
+    profile: str,
+    now: str,
+) -> dict[str, Any]:
+    """Persist an incomplete runtime outcome without fabricating quality data."""
+    if module not in config.pipeline_modules:
+        raise ModuleOrderError(f"module is not in configured pipeline: {module}")
+    runtime_error = RuntimeErrorRecord(module, error_type, message, now).to_dict()
+
+    report = _load_or_initialize_report(
+        path,
+        context=context,
+        config=config,
+        profile=profile,
+        expected_revision=expected_revision,
+        now=now,
+    )
+
+    pipeline_state = report.get("pipeline_state")
+    if not isinstance(pipeline_state, dict):
+        raise ValueError("pipeline_state must be an object")
+    if pipeline_state.get("status") == "error":
+        runtime_errors = report.get("runtime_errors")
+        same_error = isinstance(runtime_errors, list) and any(
+            isinstance(item, Mapping)
+            and item.get("module") == module
+            and item.get("error_type") == error_type
+            and item.get("message") == message
+            for item in runtime_errors
+        )
+        if same_error:
+            return report
+        raise ModuleOrderError("cannot replace a different persisted runtime error")
+    if pipeline_state.get("next_module") != module:
+        raise ModuleOrderError(
+            f"expected current module {pipeline_state.get('next_module')}, got {module}"
+        )
+
+    runtime_errors = report.get("runtime_errors")
+    if not isinstance(runtime_errors, list):
+        raise ValueError("runtime_errors must be an array")
+    runtime_errors.append(runtime_error)
+    execution = report.get("execution")
+    if not isinstance(execution, dict):
+        raise ValueError("execution must be an object")
+    module_states = execution.setdefault("module_states", {})
+    if not isinstance(module_states, dict):
+        raise ValueError("execution.module_states must be an object")
+    module_states[module] = {
+        "state": (
+            "not_implemented" if error_type == "module_unavailable" else "runtime_error"
+        ),
+        "reason": error_type,
+    }
+    execution["updated_at"] = now
+    pipeline_state.update(
+        {
+            "status": "error",
+            "next_module": module,
+            "stop_reason": error_type,
+        }
+    )
+    report["overall_decision"] = None
     report["report_revision"] = expected_revision + 1
     write_asset_qc_report(
         path,
