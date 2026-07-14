@@ -58,10 +58,57 @@ def test_missing_overlay_is_integrity_error(tmp_path: Path) -> None:
             evidence_rows=[
                 {
                     "asset_id": "a",
+                    "window_start_frame": 10,
+                    "window_end_frame": 20,
                     "evidence_type": "combined_overlay",
                     "source_path": str(tmp_path / "missing.png"),
                 }
             ],
+            config=loaded_test_config(),
+        )
+
+
+@pytest.mark.parametrize("row_kind", ["summary", "evidence"])
+@pytest.mark.parametrize(
+    ("window_fields", "message"),
+    [
+        ({"window_end_frame": 20}, "missing window_start_frame"),
+        ({"window_start_frame": 10}, "missing window_end_frame"),
+        (
+            {"window_start_frame": 20, "window_end_frame": 10},
+            "window_end_frame must be >= window_start_frame",
+        ),
+    ],
+)
+def test_sam3_adapter_requires_complete_inclusive_windows(
+    row_kind: str,
+    window_fields: dict[str, int],
+    message: str,
+    tmp_path: Path,
+) -> None:
+    overlay = tmp_path / "sam3" / "overlay.png"
+    overlay.parent.mkdir(parents=True)
+    overlay.write_bytes(b"png")
+    summary = {
+        "asset_id": "a",
+        "hand_side": "left",
+        "window_containment_verdict": "acceptable_flagged",
+        **window_fields,
+    }
+    evidence = {
+        "asset_id": "a",
+        "hand_side": "both",
+        "evidence_type": "combined_overlay",
+        "source_path": str(overlay),
+        **window_fields,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        adapt_sam3_containment(
+            asset_id="a",
+            batch_root=tmp_path,
+            window_summaries=[summary] if row_kind == "summary" else [],
+            evidence_rows=[evidence] if row_kind == "evidence" else [],
             config=loaded_test_config(),
         )
 
@@ -130,6 +177,8 @@ def test_sam3_adapter_rejects_absolute_evidence_outside_batch(
             evidence_rows=[
                 {
                     "asset_id": "a",
+                    "window_start_frame": 10,
+                    "window_end_frame": 20,
                     "evidence_type": "combined_overlay",
                     "source_path": str(outside),
                 }
@@ -158,6 +207,121 @@ def test_sam3_adapter_emits_at_most_one_issue_per_window_hand(
         config=loaded_test_config(),
     )
 
+    assert len(result.issues) == 1
+
+
+def test_identical_window_verdict_rows_dedupe_before_aggregation(
+    tmp_path: Path,
+) -> None:
+    overlay = tmp_path / "sam3" / "combined_overlays" / "a_10.png"
+    overlay.parent.mkdir(parents=True)
+    overlay.write_bytes(b"png")
+    summary = {
+        "asset_id": "a",
+        "window_start_frame": 10,
+        "window_end_frame": 20,
+        "hand_side": "left",
+        "window_containment_verdict": "containment_fail",
+        "inside_ratio_mean": 0.1,
+    }
+
+    result = adapt_sam3_containment(
+        asset_id="a",
+        batch_root=tmp_path,
+        window_summaries=[summary, dict(summary)],
+        evidence_rows=[
+            {
+                "asset_id": "a",
+                "window_start_frame": 10,
+                "window_end_frame": 20,
+                "hand_side": "both",
+                "evidence_type": "combined_overlay",
+                "source_path": str(overlay),
+            }
+        ],
+        config=loaded_test_config(),
+    )
+
+    assert result.evaluation["window_count"] == 1
+    assert result.metrics["window_verdict_counts"] == {
+        "strong_containment_mismatch": 1
+    }
+    assert len(result.issues) == 1
+    assert result.evidence[0].path == "sam3/combined_overlays/a_10.png"
+    assert result.evidence[0].checksum is not None
+    assert result.evidence[0].start_frame == 10
+    assert result.evidence[0].end_frame == 20
+    assert result.evidence[0].hand_side == "both"
+    assert result.issues[0].evidence_ids == (result.evidence[0].evidence_id,)
+
+
+def test_conflicting_window_verdict_rows_are_rejected(tmp_path: Path) -> None:
+    common = {
+        "asset_id": "a",
+        "window_start_frame": 10,
+        "window_end_frame": 20,
+        "hand_side": "left",
+    }
+
+    with pytest.raises(ValueError, match="conflicting SAM3 containment verdicts"):
+        adapt_sam3_containment(
+            asset_id="a",
+            batch_root=tmp_path,
+            window_summaries=[
+                {**common, "window_containment_verdict": "acceptable_flagged"},
+                {**common, "window_containment_verdict": "containment_fail"},
+            ],
+            evidence_rows=[],
+            config=loaded_test_config(),
+        )
+
+
+def test_authoritative_window_verdict_cannot_be_downgraded_by_legacy_field(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="contradictory SAM3 containment verdict fields",
+    ):
+        adapt_sam3_containment(
+            asset_id="a",
+            batch_root=tmp_path,
+            window_summaries=[
+                {
+                    "asset_id": "a",
+                    "window_start_frame": 10,
+                    "window_end_frame": 20,
+                    "hand_side": "left",
+                    "window_containment_verdict": "containment_fail",
+                    "containment_verdict": "acceptable",
+                }
+            ],
+            evidence_rows=[],
+            config=loaded_test_config(),
+        )
+
+
+def test_equivalent_authoritative_and_legacy_verdict_fields_are_accepted(
+    tmp_path: Path,
+) -> None:
+    result = adapt_sam3_containment(
+        asset_id="a",
+        batch_root=tmp_path,
+        window_summaries=[
+            {
+                "asset_id": "a",
+                "window_start_frame": 10,
+                "window_end_frame": 20,
+                "hand_side": "left",
+                "window_containment_verdict": "containment_fail",
+                "containment_verdict": "strong_containment_mismatch",
+            }
+        ],
+        evidence_rows=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "fail"
     assert len(result.issues) == 1
 
 

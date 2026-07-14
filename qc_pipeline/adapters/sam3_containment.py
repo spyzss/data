@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
 import mimetypes
+from numbers import Integral
 from pathlib import Path
 from typing import Any, cast
 
@@ -65,24 +66,21 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _integer(value: Any, name: str) -> int | None:
+def _integer(value: Any, name: str) -> int:
     if value is None:
-        return None
-    if isinstance(value, bool):
+        raise ValueError(f"missing {name}")
+    if isinstance(value, bool) or not isinstance(value, Integral):
         raise ValueError(f"{name} must be an integer")
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be an integer") from None
-    if parsed != value or parsed < 0:
+    parsed = int(value)
+    if parsed < 0:
         raise ValueError(f"{name} must be a non-negative integer")
     return parsed
 
 
-def _window(row: Mapping[str, Any]) -> tuple[int | None, int | None]:
+def _window(row: Mapping[str, Any]) -> tuple[int, int]:
     start = _integer(row.get("window_start_frame"), "window_start_frame")
     end = _integer(row.get("window_end_frame"), "window_end_frame")
-    if start is not None and end is not None and end < start:
+    if end < start:
         raise ValueError("window_end_frame must be >= window_start_frame")
     return start, end
 
@@ -110,6 +108,8 @@ def _evidence_ref(
     batch_root: Path,
     row: Mapping[str, Any],
 ) -> EvidenceRef:
+    start_frame, end_frame = _window(row)
+    hand_side = _hand_side(row.get("hand_side"))
     source_path = row.get("source_path")
     if not isinstance(source_path, str) or not source_path.strip():
         raise ValueError("evidence source_path must be a non-empty string")
@@ -121,8 +121,6 @@ def _evidence_ref(
     kind = row.get("evidence_type")
     if not isinstance(kind, str) or not kind.strip():
         raise ValueError("evidence_type must be a non-empty string")
-    start_frame, end_frame = _window(row)
-    hand_side = _hand_side(row.get("hand_side"))
     mime_type, _encoding = mimetypes.guess_type(absolute_path.name)
     return EvidenceRef(
         evidence_id=build_issue_id(
@@ -147,11 +145,58 @@ def _evidence_ref(
     )
 
 
-def _normalized_verdict(row: Mapping[str, Any]) -> str:
-    value = row.get("containment_verdict", row.get("window_containment_verdict"))
+def _canonical_verdict(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value:
-        raise ValueError("window summary has no containment verdict")
-    return _LEGACY_VERDICT.get(value, value)
+        raise ValueError(f"window summary has no valid {field}")
+    canonical = _LEGACY_VERDICT.get(value, value)
+    if canonical not in SAM3_VERDICT:
+        raise ValueError(f"unsupported SAM3 containment verdict: {value!r}")
+    return canonical
+
+
+def _normalized_verdict(row: Mapping[str, Any]) -> str:
+    authoritative = "window_containment_verdict"
+    legacy = "containment_verdict"
+    if authoritative in row:
+        canonical = _canonical_verdict(row[authoritative], authoritative)
+        if legacy in row:
+            legacy_canonical = _canonical_verdict(row[legacy], legacy)
+            if legacy_canonical != canonical:
+                raise ValueError(
+                    "contradictory SAM3 containment verdict fields: "
+                    f"{canonical!r} != {legacy_canonical!r}"
+                )
+        return canonical
+    if legacy in row:
+        return _canonical_verdict(row[legacy], legacy)
+    raise ValueError("window summary has no containment verdict")
+
+
+def _normalized_summaries(
+    asset_id: str,
+    rows: Sequence[Mapping[str, Any]],
+) -> list[tuple[Mapping[str, Any], str]]:
+    normalized: dict[
+        tuple[str, int, int, str | None],
+        tuple[Mapping[str, Any], str],
+    ] = {}
+    for row in rows:
+        if row.get("asset_id") != asset_id:
+            continue
+        start_frame, end_frame = _window(row)
+        hand_side = _hand_side(row.get("hand_side"))
+        verdict = _normalized_verdict(row)
+        key = (asset_id, start_frame, end_frame, hand_side)
+        previous = normalized.get(key)
+        if previous is not None:
+            if previous[1] != verdict:
+                raise ValueError(
+                    "conflicting SAM3 containment verdicts for "
+                    f"{key}: {previous[1]!r} != {verdict!r}"
+                )
+            continue
+        normalized[key] = (row, verdict)
+    return [normalized[key] for key in sorted(normalized, key=repr)]
 
 
 def _matching_evidence_ids(
@@ -255,7 +300,7 @@ def adapt_sam3_containment(
 ) -> ModuleResult:
     """Translate one asset's structured SAM3 sidecars without rerunning QC."""
     batch_root = Path(batch_root)
-    summaries = [row for row in window_summaries if row.get("asset_id") == asset_id]
+    summaries = _normalized_summaries(asset_id, window_summaries)
     evidence = tuple(
         _evidence_ref(asset_id=asset_id, batch_root=batch_root, row=row)
         for row in evidence_rows
@@ -266,14 +311,8 @@ def adapt_sam3_containment(
     issue_ids: set[str] = set()
     verdicts: list[Verdict] = []
     verdict_counts: Counter[str] = Counter()
-    for row in summaries:
-        normalized = _normalized_verdict(row)
-        try:
-            verdict, rule_id = SAM3_VERDICT[normalized]
-        except KeyError:
-            raise ValueError(
-                f"unsupported SAM3 containment verdict: {normalized!r}"
-            ) from None
+    for row, normalized in summaries:
+        verdict, rule_id = SAM3_VERDICT[normalized]
         verdicts.append(verdict)
         verdict_counts[normalized] += 1
         if rule_id is None:
