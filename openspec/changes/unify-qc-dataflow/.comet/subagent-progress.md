@@ -47,4 +47,7 @@
 - OpenSpec checkoff: 3.1–3.4 complete; plan Task 11–13 implementation steps checked
 - Task 14: complete (`ad2b500`, path hardening `164c0d9`, fix `e775638`), final Thorough review Ready in `.superpowers/sdd/review-task14-after-fix.md`; focused `20 passed`, full suite `561 passed, 1 skipped`, no findings
 - OpenSpec checkoff: 3.1–3.4 and 4.1 complete; plan Task 11–14 checked
+- Task 15: implemented (`4256d38`, compatibility aliases `6c459b7`), focused `7 passed`, Task14/Schema `54 passed`, full suite `568 passed, 1 skipped`; awaiting Thorough review
+- Task 15: complete; final Thorough review Ready in `.superpowers/sdd/review-task15-final-v2.md`, focused `54 passed`, full suite `568 passed, 1 skipped`, no findings
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.2 complete; plan Task 11–15 checked
 - Current phase: build

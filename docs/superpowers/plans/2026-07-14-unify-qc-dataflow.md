@@ -1231,7 +1231,7 @@ git commit -m "feat(qc): project warn queue from asset reports"
 - Produces: `project_quality_archive(path: Path) -> BatchProjection`。
 - Produces: `aggregate_projection(projection: BatchProjection) -> dict[str, Any]`，顶层含 `overall` 与 `by_profile`。
 
-- [ ] **Step 1: 添加资产/issue 去重和 profile 隔离统计测试**
+- [x] **Step 1: 添加资产/issue 去重和 profile 隔离统计测试**
 
 ```python
 def test_aggregation_counts_assets_and_issues_separately(tmp_path: Path) -> None:
@@ -1247,13 +1247,13 @@ def test_aggregation_counts_assets_and_issues_separately(tmp_path: Path) -> None
     assert stats["by_profile"]["supplier_evaluation"]["module_coverage"]["sam3_containment"] == 1.0
 ```
 
-- [ ] **Step 2: 运行测试并确认聚合接口缺失**
+- [x] **Step 2: 运行测试并确认聚合接口缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_projection.py tests/test_qc_reporting_aggregate.py -q`
 
 Expected: FAIL，缺少 `BatchProjection` 或 `aggregate_projection`。
 
-- [ ] **Step 3: 实现规范化投影和精确指标**
+- [x] **Step 3: 实现规范化投影和精确指标**
 
 ```python
 def aggregate_projection(projection):
@@ -1272,13 +1272,13 @@ def aggregate_projection(projection):
 
 `asset_rows` 一资产一行，含 profile/status/decision/report_revision/config hash/模块覆盖率；`issue_rows` 一 issue 一行，含 machine severity、human/effective verdict（字段不存在时 null）、rule/module/window；`execution_rows` 一 module state 一行，含 duration、continued_after_fail、runtime error。统计必须输出 total/completed/incomplete、自动 fail 资产与 issue、machine warn 资产与 issue、人工消解/确认（当前可为 0）、最终 pass/fail、pass rate、每模块 coverage 与 stop position。
 
-- [ ] **Step 4: 运行投影、Schema 和双 profile 测试**
+- [x] **Step 4: 运行投影、Schema 和双 profile 测试**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_projection.py tests/test_qc_reporting_aggregate.py tests/test_asset_qc_schema_v2.py -q`
 
 Expected: PASS；同资产多个 issue 不重复资产计数，两种 profile 不混合 coverage。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_reporting/projection.py qc_reporting/aggregate.py tests/test_qc_reporting_projection.py tests/test_qc_reporting_aggregate.py
