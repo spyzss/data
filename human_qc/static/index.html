@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>人工复核工作台 · 语义校准</title>
+    <link rel="stylesheet" href="./workbench.css">
+    <link rel="modulepreload" href="./semantic_adapter.js">
+  </head>
+  <body>
+    <main id="app" data-reviewer="">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <div><span class="eyebrow">人工复核工作台</span><h1>语义校准</h1></div>
+        </div>
+        <div class="topbar-actions">
+          <span class="status-dot" aria-hidden="true"></span><span data-reviewer>reviewer —</span>
+          <button class="ghost-button" type="button" data-action="refresh" data-mutation-control>刷新任务</button>
+        </div>
+      </header>
+
+      <section class="context-bar" aria-label="任务上下文">
+        <div><span class="context-label">当前资产</span><strong data-asset-id>未加载资产</strong></div>
+        <div class="context-divider" aria-hidden="true"></div>
+        <div><span class="context-label">工作进度</span><strong data-progress>—</strong></div>
+        <div class="context-divider" aria-hidden="true"></div>
+        <div><span class="context-label">服务端版本</span><strong data-revision>revision —</strong></div>
+        <div class="context-spacer"></div>
+        <button class="ghost-button" type="button" data-action="previous-asset" data-navigation-control aria-label="上一个资产">上一条</button>
+        <button class="ghost-button" type="button" data-action="next-asset" data-navigation-control aria-label="下一个资产">下一条</button>
+        <button class="lease-button" type="button" data-action="acquire-lease">获取编辑锁</button>
+      </section>
+
+      <section class="workspace-grid">
+        <section class="media-panel" aria-label="视频预览">
+          <div class="panel-heading"><span>视频预览</span><span class="frame-readout">当前帧 <strong data-current-frame>—</strong></span></div>
+          <div class="video-stage">
+            <video data-video controls preload="metadata"></video>
+            <div class="video-placeholder"><span class="play-glyph" aria-hidden="true">▶</span><span>选择任务后加载视频</span></div>
+          </div>
+          <div class="transport-row">
+            <button class="icon-button" type="button" data-action="step-back" aria-label="上一帧">−1</button>
+            <button class="play-button" type="button" data-action="play" aria-label="播放">▶</button>
+            <button class="icon-button" type="button" data-action="step-forward" aria-label="下一帧">+1</button>
+            <div class="frame-scrubber"><span class="scrubber-progress"></span></div>
+            <span class="time-readout" data-time-readout>00:00 / 00:00</span>
+          </div>
+        </section>
+
+        <aside class="inspector-panel" aria-label="复核信息">
+          <div class="panel-heading"><span>任务信息</span><span class="task-kind" data-task-kind>Semantic</span></div>
+          <dl class="inspector-list">
+            <div><dt>编辑锁</dt><dd data-lease-status>未获取</dd></div>
+            <div><dt>时间轴修改</dt><dd data-timeline-count>0 次</dd></div>
+            <div><dt>文字修改</dt><dd data-text-count>0 次</dd></div>
+          </dl>
+          <div class="inspector-note">只允许拖动相邻任务之间的共享边界。每次修改先进入待确认状态。</div>
+        </aside>
+      </section>
+
+      <section class="task-panel" aria-label="任务区域">
+        <div class="task-panel-heading"><div><span class="eyebrow">当前步骤</span><h2>语义时间轴校准</h2></div><span class="task-progress" data-progress>—</span></div>
+        <div data-workbench-stage class="workbench-stage">
+          <div class="empty-stage">输入资产编号后开始复核。</div>
+        </div>
+        <div class="save-error" data-save-error hidden role="alert"></div>
+      </section>
+
+      <footer class="footer-note"><span class="footer-lock" aria-hidden="true">⌑</span>所有变更以服务端 revision 为准。发生冲突或锁失效时，请刷新任务后继续。</footer>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
