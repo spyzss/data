@@ -362,7 +362,7 @@ def _rebuild_issue_collections(report: dict[str, Any]) -> None:
     )
 
 
-def _has_machine_fail(
+def has_machine_fail(
     report: Mapping[str, Any],
     modules: tuple[str, ...],
 ) -> bool:
@@ -527,7 +527,7 @@ def apply_module_result(
         report["overall_decision"] = "fail"
     elif pipeline_status == "completed":
         report["overall_decision"] = (
-            "fail" if _has_machine_fail(report, config.pipeline_modules) else "pass"
+            "fail" if has_machine_fail(report, config.pipeline_modules) else "pass"
         )
     else:
         report["overall_decision"] = None

@@ -16,6 +16,7 @@ from qc_common.module_registry import (
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report
 from qc_common.report_mutation import (
     apply_module_result,
+    has_machine_fail,
     initialize_v2_report,
     record_awaiting_external,
     record_disabled_transition,
@@ -46,15 +47,14 @@ def _successor(modules: tuple[str, ...], module: str) -> str | None:
     return modules[index + 1] if index + 1 < len(modules) else None
 
 
-def _disabled_overall_decision(report: Mapping[str, Any], completed: bool) -> str | None:
+def _disabled_overall_decision(
+    report: Mapping[str, Any],
+    completed: bool,
+    modules: tuple[str, ...],
+) -> str | None:
     if not completed:
         return None
-    issues = report.get("issues")
-    has_fail = isinstance(issues, list) and any(
-        isinstance(issue, Mapping) and issue.get("severity") == "fail"
-        for issue in issues
-    )
-    return "fail" if has_fail else "pass"
+    return "fail" if has_machine_fail(report, modules) else "pass"
 
 
 def _record_stale_revision_if_current(
@@ -167,7 +167,11 @@ def run_asset(
                 expected_revision=expected_revision,
                 module=module_name,
                 next_module=next_module,
-                overall_decision=_disabled_overall_decision(report, completed),
+                overall_decision=_disabled_overall_decision(
+                    report,
+                    completed,
+                    config.pipeline_modules,
+                ),
                 now=timestamp,
             )
             continue

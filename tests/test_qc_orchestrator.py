@@ -407,6 +407,40 @@ def test_supplier_profile_preserves_prior_fail_at_automatic_completion(
     assert report["overall_decision"] == "fail"
 
 
+def test_supplier_failure_without_issue_survives_trailing_disabled_modules(
+    tmp_path: Path,
+) -> None:
+    modules = ["hdf5_text_info", "quality_hand", "effective_duration"]
+    config = _config(tmp_path, modules, disabled={"effective_duration"})
+    calls: list[str] = []
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="supplier_evaluation",
+        registry=_registry(
+            calls,
+            config,
+            {"hdf5_text_info": "pass", "quality_hand": "fail"},
+        ),
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
+
+    assert calls == ["hdf5_text_info", "quality_hand"]
+    assert outcome.status == "completed"
+    assert outcome.report["issues"] == []
+    assert outcome.report["quality_hand"]["flow"]["result_gate"] == {
+        "verdict": "fail",
+        "has_fail": True,
+        "has_warn": False,
+    }
+    assert outcome.report["execution"]["module_states"]["effective_duration"] == {
+        "state": "disabled",
+        "reason": "not_available",
+    }
+    assert outcome.report["overall_decision"] == "fail"
+
+
 def test_unknown_profile_is_rejected_before_runner_work(tmp_path: Path) -> None:
     config = _config(tmp_path, ["hdf5_text_info"])
     context = _context(tmp_path)
