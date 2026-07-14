@@ -25,6 +25,7 @@ base-ref: 44ee01f5221a00343e48046bfb477889a82a68cc
 - `duplicate_check`、`content_validity`、`effective_duration` 在 v2.0.0 中必须 `enabled: false` 且 `disabled_reason: no_registered_implementation`，不能写成 Pass。
 - `semantic_consistency`、`manual_review` 必须声明为 `execution_kind: external`；自动 orchestrator 到达外部阶段时写 `awaiting_external` 并暂停。
 - v2 报告对人工语义扩展必须保持结构开放且原样保留，不得把一次语义修订限制为“单片段独立编辑”；后续工作台可用一个 revision 原子记录共享边界调整所影响的相邻两段。
+- external-stage 语义 payload 的帧边界必须可原样承载严格递增半开区间 `[b_i, b_{i+1})`；统一数据流不得把内部边界误写成闭区间 end，也不得在投影时丢失 `UI end = b_{i+1} - 1` 的 off-by-one 合同。
 - 同一资产模块串行写回且每次校验 expected revision；不同资产可由批次调度并行，不能共享可变报告对象。
 - evidence 路径必须相对批次根目录，禁止 `..` 逃逸；大体量逐帧、mask、视频和 overlay 只保留 sidecar 引用。
 - 正式批次决策与统计只遍历 `quality_archive/*.json`；sidecar 仅用于算法回归、证据展示和迁移对账。
