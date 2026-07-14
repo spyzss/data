@@ -58,6 +58,7 @@ class PreparedReplacement:
     old_sha256: str
     new_sha256: str
     transaction_id: str
+    staged_identity: tuple[int, int] | None = None
     _ownership: "_StagingOwnership | None" = field(
         default=None, repr=False, compare=False
     )
@@ -76,6 +77,7 @@ class FinalizingRecord:
     old_sha256: str
     new_sha256: str
     transaction_id: str = ""
+    staged_identity: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path))
@@ -88,6 +90,7 @@ class _StagingOwnership:
 
     path: Path
     transaction_id: str
+    staged_identity: tuple[int, int]
 
 
 __all__ = [
@@ -97,6 +100,7 @@ __all__ = [
     "RecoveryAction",
     "assert_only_dataset_changed",
     "commit_hdf5_replacement",
+    "finalizing_record_from_prepared",
     "prepare_hdf5_replacement",
     "prepared_replacement_from_record",
     "recover_hdf5_replacement",
@@ -153,13 +157,15 @@ def prepare_hdf5_replacement(
         assert_only_dataset_changed(source, staged, dataset_path)
         _fsync_file(staged)
         new_sha256 = _sha256_file(staged)
+        staged_identity = _lstat_identity(staged)
         return PreparedReplacement(
             source_path=source,
             staged_path=staged,
             old_sha256=old_sha256,
             new_sha256=new_sha256,
             transaction_id=transaction_id,
-            _ownership=_StagingOwnership(staged, transaction_id),
+            staged_identity=staged_identity,
+            _ownership=_StagingOwnership(staged, transaction_id, staged_identity),
         )
     except Hdf5CommitError:
         _unlink_staged(staged, source, transaction_id=transaction_id)
@@ -169,6 +175,27 @@ def prepare_hdf5_replacement(
         raise Hdf5CommitError(
             f"failed to prepare HDF5 replacement for {source}: {exc}"
         ) from exc
+
+
+def finalizing_record_from_prepared(
+    prepared: PreparedReplacement,
+) -> FinalizingRecord:
+    """Persist the identity-bearing fields needed for restart recovery."""
+
+    if not isinstance(prepared, PreparedReplacement):
+        raise TypeError("prepared must be a PreparedReplacement")
+    if not _is_owned_prepared(prepared):
+        raise Hdf5CommitError("prepared replacement is not an owned staging artifact")
+    if prepared.staged_identity is None:
+        raise Hdf5CommitError("prepared replacement is missing staged identity")
+    return FinalizingRecord(
+        source_path=prepared.source_path,
+        staged_path=prepared.staged_path,
+        old_sha256=prepared.old_sha256,
+        new_sha256=prepared.new_sha256,
+        transaction_id=prepared.transaction_id,
+        staged_identity=prepared.staged_identity,
+    )
 
 
 def commit_hdf5_replacement(prepared: PreparedReplacement) -> None:
@@ -228,6 +255,8 @@ def recover_hdf5_replacement(record: FinalizingRecord) -> RecoveryAction:
 
     if not isinstance(record, FinalizingRecord):
         raise TypeError("record must be a FinalizingRecord")
+    if not isinstance(record.transaction_id, str):
+        return RecoveryAction.CONFLICT
 
     source = Path(record.source_path)
     staged = Path(record.staged_path)
@@ -240,7 +269,15 @@ def recover_hdf5_replacement(record: FinalizingRecord) -> RecoveryAction:
         return RecoveryAction.CONFLICT
 
     if current_sha256 == record.new_sha256:
-        if _is_managed_staged_path(source, staged, record.transaction_id) and staged.is_file():
+        if not staged.exists():
+            if not _valid_identity(record.staged_identity):
+                return RecoveryAction.CONFLICT
+            return RecoveryAction.MARK_REPORT_COMPLETED
+        if (
+            _is_managed_staged_path(source, staged, record.transaction_id)
+            and _identity_matches_record(record)
+            and staged.is_file()
+        ):
             try:
                 if _sha256_file(staged) == record.new_sha256:
                     _unlink_staged(
@@ -252,7 +289,8 @@ def recover_hdf5_replacement(record: FinalizingRecord) -> RecoveryAction:
                 # The source is already the committed new bytes; failure to
                 # clean an ancillary staging file must not downgrade recovery.
                 pass
-        return RecoveryAction.MARK_REPORT_COMPLETED
+            return RecoveryAction.MARK_REPORT_COMPLETED
+        return RecoveryAction.CONFLICT
 
     if current_sha256 == record.old_sha256:
         if staged.is_symlink():
@@ -260,6 +298,8 @@ def recover_hdf5_replacement(record: FinalizingRecord) -> RecoveryAction:
         if not staged.exists():
             return RecoveryAction.REBUILD_STAGING
         if not _is_managed_staged_path(source, staged, record.transaction_id):
+            return RecoveryAction.CONFLICT
+        if not _identity_matches_record(record):
             return RecoveryAction.CONFLICT
         if not staged.is_file() or source.is_symlink():
             return RecoveryAction.REBUILD_STAGING
@@ -289,6 +329,9 @@ def prepared_replacement_from_record(
         raise TypeError("record must be a FinalizingRecord")
     if not isinstance(record.transaction_id, str) or not record.transaction_id:
         raise Hdf5CommitError("finalizing record transaction_id must be non-empty")
+    if not _valid_identity(record.staged_identity):
+        raise Hdf5CommitError("finalizing record is missing staged identity")
+    staged_identity = tuple(record.staged_identity)
     source = Path(record.source_path)
     staged = Path(record.staged_path)
     if not _is_managed_staged_path(source, staged, record.transaction_id):
@@ -302,6 +345,8 @@ def prepared_replacement_from_record(
         or not staged.is_file()
     ):
         raise Hdf5CommitError("source or staged HDF5 file is missing or symlinked")
+    if not _identity_matches_record(record):
+        raise Hdf5CommitError("staged HDF5 file identity changed before reconstruction")
     try:
         if _sha256_file(source) != record.old_sha256:
             raise Hdf5CommitError("source HDF5 hash changed before reconstruction")
@@ -318,7 +363,12 @@ def prepared_replacement_from_record(
         old_sha256=record.old_sha256,
         new_sha256=record.new_sha256,
         transaction_id=record.transaction_id,
-        _ownership=_StagingOwnership(staged, record.transaction_id),
+        staged_identity=staged_identity,
+        _ownership=_StagingOwnership(
+            staged,
+            record.transaction_id,
+            staged_identity,
+        ),
     )
 
 
@@ -376,6 +426,21 @@ def assert_only_dataset_changed(
                         f"allowed target dataset {allowed_dataset_path!r} is not UTF-8 JSON"
                     )
 
+            # A target dataset can have additional hard-link aliases.  Updating
+            # the target object changes the bytes visible through every alias,
+            # so those paths are part of the sanctioned data change too.  Keep
+            # this allowance identity-based rather than path-based; a hard-link
+            # retarget to another object with identical bytes must still be
+            # rejected by the link descriptor comparison below.
+            left_target_identity = (
+                _hdf5_object_identity(left_objects[allowed_dataset_path])
+                if allowed_dataset_path in left_objects
+                else None
+            )
+            right_target_identity = _hdf5_object_identity(
+                right_objects[allowed_dataset_path]
+            )
+
             all_paths = set(left_objects) | set(right_objects)
             for path in sorted(all_paths):
                 left_obj = left_objects.get(path)
@@ -392,6 +457,10 @@ def assert_only_dataset_changed(
                         ):
                             raise Hdf5CommitError(
                                 f"new target ancestor {path!r} is not a group"
+                            )
+                        if right_obj is not None and len(right_obj.attrs):
+                            raise Hdf5CommitError(
+                                f"unexpected attributes on new target path {path!r}"
                             )
                         continue
                     raise Hdf5CommitError(f"unexpected HDF5 path added: {path}")
@@ -411,7 +480,17 @@ def assert_only_dataset_changed(
                         raise Hdf5CommitError(f"HDF5 dtype changed at {path}")
                     if left_obj.shape != right_obj.shape:
                         raise Hdf5CommitError(f"HDF5 shape changed at {path}")
-                    if path != allowed_dataset_path and not _data_equal(
+                    target_alias = path == allowed_dataset_path
+                    if (
+                        not target_alias
+                        and left_target_identity is not None
+                        and right_target_identity is not None
+                    ):
+                        target_alias = (
+                            _hdf5_object_identity(left_obj) == left_target_identity
+                            and _hdf5_object_identity(right_obj) == right_target_identity
+                        )
+                    if not target_alias and not _data_equal(
                         left_obj[()], right_obj[()]
                     ):
                         raise Hdf5CommitError(
@@ -549,6 +628,29 @@ def _safe_transaction_id(transaction_id: str) -> str:
     return _SAFE_TRANSACTION_ID.sub("_", transaction_id).strip(".") or "tx"
 
 
+def _lstat_identity(path: Path) -> tuple[int, int]:
+    stat = os.lstat(path)
+    if not stat:
+        raise Hdf5CommitError(f"unable to stat staged HDF5 path: {path}")
+    return int(stat.st_dev), int(stat.st_ino)
+
+
+def _valid_identity(identity: object) -> bool:
+    if not isinstance(identity, (tuple, list)) or len(identity) != 2:
+        return False
+    return all(isinstance(value, int) and not isinstance(value, bool) for value in identity)
+
+
+def _identity_matches_record(record: FinalizingRecord) -> bool:
+    if not _valid_identity(record.staged_identity):
+        return False
+    staged = Path(record.staged_path)
+    try:
+        return _lstat_identity(staged) == tuple(record.staged_identity)
+    except OSError:
+        return False
+
+
 def _is_managed_staged_path(
     source: Path, staged: Path, transaction_id: str
 ) -> bool:
@@ -556,6 +658,8 @@ def _is_managed_staged_path(
 
     source = Path(source)
     staged = Path(staged)
+    if not isinstance(transaction_id, str):
+        return False
     try:
         if source.parent.resolve() != staged.parent.resolve():
             return False
@@ -581,6 +685,15 @@ def _is_owned_prepared(prepared: PreparedReplacement) -> bool:
     if ownership.path != Path(prepared.staged_path):
         return False
     if ownership.transaction_id != prepared.transaction_id:
+        return False
+    if not _valid_identity(prepared.staged_identity):
+        return False
+    if ownership.staged_identity != tuple(prepared.staged_identity):
+        return False
+    try:
+        if _lstat_identity(Path(prepared.staged_path)) != tuple(prepared.staged_identity):
+            return False
+    except OSError:
         return False
     return _is_managed_staged_path(
         Path(prepared.source_path),
@@ -622,14 +735,39 @@ def _collect_objects(handle: h5py.File) -> dict[str, h5py.Group | h5py.Dataset]:
         objects["/" + name] = obj
 
     handle.visititems(visit)
+
+    # ``visititems`` intentionally visits each HDF5 object once and therefore
+    # omits additional hard-link aliases.  Include every hard-link path so
+    # path additions/removals cannot hide behind aliasing.
+    def visit_link(name: str, link: object) -> None:
+        if not isinstance(link, h5py.HardLink):
+            return
+        try:
+            obj = handle[name]
+        except (KeyError, OSError):
+            return
+        objects["/" + name] = obj
+
+    handle.visititems_links(visit_link)
     return objects
 
 
 def _collect_links(handle: h5py.File) -> dict[str, tuple[object, ...]]:
     links: dict[str, tuple[object, ...]] = {}
+    first_alias: dict[tuple[object, ...], str] = {}
 
     def visit(name: str, link: object) -> None:
-        links["/" + name] = _link_descriptor(link)
+        path = "/" + name
+        if isinstance(link, h5py.HardLink):
+            try:
+                identity = _hdf5_object_identity(handle[name])
+            except (KeyError, OSError):
+                links[path] = ("hard", path)
+                return
+            canonical = first_alias.setdefault(identity, path)
+            links[path] = ("hard", canonical)
+            return
+        links[path] = _link_descriptor(link)
 
     # ``visititems_links`` includes dangling soft/external links and hard
     # links separately from their targets, which is required for a strict
@@ -639,13 +777,15 @@ def _collect_links(handle: h5py.File) -> dict[str, tuple[object, ...]]:
 
 
 def _link_descriptor(link: object) -> tuple[object, ...]:
-    if isinstance(link, h5py.HardLink):
-        return ("hard",)
     if isinstance(link, h5py.SoftLink):
         return ("soft", link.path)
     if isinstance(link, h5py.ExternalLink):
         return ("external", link.filename, link.path)
     return (type(link).__name__, repr(link))
+
+
+def _hdf5_object_identity(obj: h5py.Group | h5py.Dataset) -> tuple[object, ...]:
+    return (type(obj).__name__, int(h5py.h5o.get_info(obj.id).addr))
 
 
 def _assert_links_unchanged(

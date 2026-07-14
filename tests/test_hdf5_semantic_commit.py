@@ -17,6 +17,7 @@ from human_qc.hdf5_commit import (
     assert_only_dataset_changed,
     commit_hdf5_replacement,
     prepare_hdf5_replacement,
+    finalizing_record_from_prepared,
     prepared_replacement_from_record,
     recover_hdf5_replacement,
 )
@@ -112,20 +113,15 @@ def _sha256(path: Path) -> str:
 
 
 def _prepared_record(prepared: PreparedReplacement) -> FinalizingRecord:
-    return FinalizingRecord(
-        source_path=prepared.source_path,
-        staged_path=prepared.staged_path,
-        old_sha256=prepared.old_sha256,
-        new_sha256=prepared.new_sha256,
-        transaction_id=prepared.transaction_id,
-    )
+    return finalizing_record_from_prepared(prepared)
 
 
 def make_record_after_replace_before_report_commit(tmp_path: Path) -> FinalizingRecord:
     source = write_complex_hdf5(tmp_path / "asset.hdf5")
     prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-recovery")
+    record = _prepared_record(prepared)
     os.replace(prepared.staged_path, source)
-    return _prepared_record(prepared)
+    return record
 
 
 def test_prepare_changes_only_subtask_scalar_dataset(tmp_path: Path) -> None:
@@ -282,6 +278,25 @@ def test_recovery_retry_can_reconstruct_prepared_and_commit_after_restart(
     assert not record.staged_path.exists()
 
 
+def test_reconstruction_normalizes_json_list_stage_identity(tmp_path: Path) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-list-identity.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-list-id")
+    durable = _prepared_record(prepared)
+    persisted = FinalizingRecord(
+        source_path=durable.source_path,
+        staged_path=durable.staged_path,
+        old_sha256=durable.old_sha256,
+        new_sha256=durable.new_sha256,
+        transaction_id=durable.transaction_id,
+        staged_identity=list(durable.staged_identity or ()),
+    )
+
+    reconstructed = prepared_replacement_from_record(persisted)
+    commit_hdf5_replacement(reconstructed)
+
+    assert _sha256(source) == durable.new_sha256
+
+
 def test_reconstruction_rejects_foreign_stage_without_touching_it(
     tmp_path: Path,
 ) -> None:
@@ -297,6 +312,7 @@ def test_reconstruction_rejects_foreign_stage_without_touching_it(
         old_sha256=prepared.old_sha256,
         new_sha256=prepared.new_sha256,
         transaction_id=prepared.transaction_id,
+        staged_identity=prepared.staged_identity,
     )
 
     with pytest.raises(Hdf5CommitError, match="owned|staging|namespace"):
@@ -339,12 +355,139 @@ def test_reconstruction_requires_transaction_id(tmp_path: Path) -> None:
     prepared.staged_path.unlink()
 
 
+def test_spoofed_same_prefix_stage_survives_current_new_recovery(
+    tmp_path: Path,
+) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-spoof-new.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-spoof")
+    record = finalizing_record_from_prepared(prepared)
+    os.replace(prepared.staged_path, source)
+    spoof = Path(record.staged_path)
+    spoof.write_bytes(source.read_bytes())
+    before = spoof.read_bytes()
+
+    assert recover_hdf5_replacement(record) == RecoveryAction.CONFLICT
+    assert spoof.read_bytes() == before
+
+
+def test_spoofed_same_prefix_stage_cannot_be_retried_or_committed(
+    tmp_path: Path,
+) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-spoof-old.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-spoof-old")
+    record = finalizing_record_from_prepared(prepared)
+    spoof = Path(record.staged_path)
+    original = spoof.read_bytes()
+    spoof.unlink()
+    spoof.write_bytes(original)
+
+    assert recover_hdf5_replacement(record) == RecoveryAction.CONFLICT
+    with pytest.raises(Hdf5CommitError):
+        commit_hdf5_replacement(prepared)
+    assert spoof.read_bytes() == original
+
+
+def test_recovery_requires_persisted_stage_identity(tmp_path: Path) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-identity.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-identity")
+    record = finalizing_record_from_prepared(prepared)
+    missing_identity = FinalizingRecord(
+        source_path=record.source_path,
+        staged_path=record.staged_path,
+        old_sha256=record.old_sha256,
+        new_sha256=record.new_sha256,
+        transaction_id=record.transaction_id,
+    )
+    assert recover_hdf5_replacement(missing_identity) == RecoveryAction.CONFLICT
+    prepared.staged_path.unlink()
+
+
+def test_prepare_rejects_non_string_transaction_id_with_controlled_error(
+    tmp_path: Path,
+) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-bad-tx.hdf5")
+
+    with pytest.raises(Hdf5CommitError, match="transaction_id"):
+        prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, 123)  # type: ignore[arg-type]
+
+
+def test_recovery_classifies_non_string_transaction_id_without_raw_type_error(
+    tmp_path: Path,
+) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-bad-record-tx.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-record")
+    record = FinalizingRecord(
+        source_path=prepared.source_path,
+        staged_path=prepared.staged_path,
+        old_sha256=prepared.old_sha256,
+        new_sha256=prepared.new_sha256,
+        transaction_id=123,  # type: ignore[arg-type]
+        staged_identity=prepared.staged_identity,
+    )
+
+    assert recover_hdf5_replacement(record) == RecoveryAction.CONFLICT
+    prepared.staged_path.unlink()
+
+
+def test_prepare_preserves_target_hidden_behind_hard_link_alias(tmp_path: Path) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-hard-alias.hdf5")
+    with h5py.File(source, "r+") as handle:
+        original = handle[DATASET_PATH]
+        handle.require_group("metadata")["canonical_subtask"] = original
+        del handle[DATASET_PATH]
+        handle[DATASET_PATH] = handle["metadata/canonical_subtask"]
+
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-alias")
+
+    assert_only_dataset_changed(source, prepared.staged_path, DATASET_PATH)
+    with h5py.File(prepared.staged_path, "r") as handle:
+        np.testing.assert_array_equal(
+            handle[DATASET_PATH][()], handle["metadata/canonical_subtask"][()]
+        )
+
+
+def test_assert_only_dataset_changed_rejects_hard_link_retarget(tmp_path: Path) -> None:
+    before = write_complex_hdf5(tmp_path / "before-hard-link.hdf5")
+    with h5py.File(before, "r+") as handle:
+        group = handle.require_group("data")
+        group.create_dataset("first", data=np.asarray([7], dtype=np.int64))
+        group.create_dataset("second", data=np.asarray([7], dtype=np.int64))
+        group["alias"] = group["first"]
+    after = tmp_path / "after-hard-link.hdf5"
+    after.write_bytes(before.read_bytes())
+    with h5py.File(after, "r+") as handle:
+        del handle["data/alias"]
+        handle["data/alias"] = handle["data/second"]
+
+    with pytest.raises(Hdf5CommitError, match="link|path|content"):
+        assert_only_dataset_changed(before, after, DATASET_PATH)
+
+
+def test_assert_only_dataset_changed_rejects_attrs_on_new_target_ancestors(
+    tmp_path: Path,
+) -> None:
+    before = tmp_path / "before-new-target.hdf5"
+    with h5py.File(before, "w") as handle:
+        handle.create_group("other").create_dataset("values", data=[1, 2, 3])
+    after = tmp_path / "after-new-target.hdf5"
+    after.write_bytes(before.read_bytes())
+    with h5py.File(after, "r+") as handle:
+        label = handle.create_group("label")
+        label.attrs["unexpected"] = "must-reject"
+        target = label.create_dataset("subtask_label", shape=(), dtype="S16384")
+        target[()] = json.dumps(UPDATED, ensure_ascii=False).encode("utf-8")
+
+    with pytest.raises(Hdf5CommitError, match="attribute"):
+        assert_only_dataset_changed(before, after, DATASET_PATH)
+
+
 def test_recovery_requests_rebuild_when_old_hash_has_no_staged_file(tmp_path: Path) -> None:
     source = write_complex_hdf5(tmp_path / "asset.hdf5")
     prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-rebuild")
+    record = _prepared_record(prepared)
     prepared.staged_path.unlink()
 
-    assert recover_hdf5_replacement(_prepared_record(prepared)) == RecoveryAction.REBUILD_STAGING
+    assert recover_hdf5_replacement(record) == RecoveryAction.REBUILD_STAGING
 
 
 def test_recovery_requests_rebuild_when_managed_staged_hash_is_corrupt(
@@ -352,9 +495,10 @@ def test_recovery_requests_rebuild_when_managed_staged_hash_is_corrupt(
 ) -> None:
     source = write_complex_hdf5(tmp_path / "asset.hdf5")
     prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-corrupt")
+    record = _prepared_record(prepared)
     prepared.staged_path.write_bytes(prepared.staged_path.read_bytes() + b"corrupt")
 
-    assert recover_hdf5_replacement(_prepared_record(prepared)) == RecoveryAction.REBUILD_STAGING
+    assert recover_hdf5_replacement(record) == RecoveryAction.REBUILD_STAGING
 
 
 def test_recovery_does_not_touch_foreign_stage_on_old_hash_conflict(tmp_path: Path) -> None:
@@ -381,20 +525,21 @@ def test_recovery_does_not_remove_unmanaged_file_when_current_is_new(
 ) -> None:
     source = write_complex_hdf5(tmp_path / "asset.hdf5")
     prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-unmanaged")
+    record = _prepared_record(prepared)
     os.replace(prepared.staged_path, source)
     foreign = tmp_path / "foreign-stage.bin"
     foreign.write_bytes(source.read_bytes())
     before = foreign.read_bytes()
-    record = _prepared_record(prepared)
     record = FinalizingRecord(
         source_path=record.source_path,
         staged_path=foreign,
         old_sha256=record.old_sha256,
         new_sha256=record.new_sha256,
         transaction_id=record.transaction_id,
+        staged_identity=record.staged_identity,
     )
 
-    assert recover_hdf5_replacement(record) == RecoveryAction.MARK_REPORT_COMPLETED
+    assert recover_hdf5_replacement(record) == RecoveryAction.CONFLICT
     assert foreign.read_bytes() == before
 
 
