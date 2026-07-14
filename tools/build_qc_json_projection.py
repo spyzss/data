@@ -27,6 +27,11 @@ import pandas as pd
 from openpyxl import Workbook
 
 from qc_reporting.aggregate import aggregate_projection
+from qc_reporting.cache import (
+    build_source_manifest,
+    load_projection_cache,
+    write_projection_cache,
+)
 from qc_reporting.projection import BatchProjection, project_quality_archive
 
 
@@ -173,7 +178,10 @@ def _write_parquet(df: pd.DataFrame, path: Path) -> Path:
 
 def _write_csv(df: pd.DataFrame, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
+    # Use a stable textual null marker so repeated projections compare
+    # byte-for-byte after a CSV round-trip (pandas otherwise materializes an
+    # empty field as a fresh NaN on every read, making record equality false).
+    df.to_csv(path, index=False, na_rep="<NULL>")
     return path
 
 
@@ -464,13 +472,23 @@ def run_projection_cli(
     output_dir: Path,
     *,
     formats: Iterable[str] = SUPPORTED_FORMATS,
+    cache_dir: Path | None = None,
     legacy_sidecars: Mapping[str, Path | None] | None = None,
     legacy_candidate_windows: Path | None = None,
     legacy_sam3_window_summary: Path | None = None,
     legacy_video_quality: Path | None = None,
     legacy_issue_events: Path | None = None,
 ) -> dict[str, Path]:
-    projection = project_quality_archive(Path(quality_archive))
+    archive_path = Path(quality_archive)
+    if cache_dir is None:
+        projection = project_quality_archive(archive_path)
+    else:
+        cache_path = Path(cache_dir)
+        expected_manifest = build_source_manifest(archive_path)
+        projection = load_projection_cache(cache_path, expected_manifest)
+        if projection is None:
+            projection = project_quality_archive(archive_path)
+            write_projection_cache(projection, cache_path)
     statistics = aggregate_projection(projection)
     paths = write_projection_outputs(projection, statistics, Path(output_dir), formats)
     sidecars = _normalize_legacy_sidecars(legacy_sidecars or {})
@@ -510,6 +528,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=SUPPORTED_FORMATS,
         default=list(SUPPORTED_FORMATS),
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="Optional rebuildable parquet cache directory for the projection.",
+    )
     parser.add_argument("--legacy-reconciliation-candidate-windows", type=Path)
     parser.add_argument("--legacy-reconciliation-sam3-window-summary", type=Path)
     parser.add_argument("--legacy-reconciliation-video-quality", type=Path)
@@ -528,6 +551,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.quality_archive,
         args.output_dir,
         formats=args.formats,
+        cache_dir=args.cache_dir,
         legacy_candidate_windows=args.legacy_reconciliation_candidate_windows,
         legacy_sam3_window_summary=args.legacy_reconciliation_sam3_window_summary,
         legacy_video_quality=args.legacy_reconciliation_video_quality,

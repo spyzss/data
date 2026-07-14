@@ -1,0 +1,328 @@
+"""Rebuildable parquet cache for canonical QC projections.
+
+The cache is an acceleration layer only.  The JSON reports under a quality
+archive remain the source of truth; a cache is accepted only when its source
+manifest exactly matches the current archive and all three projection tables
+can be read successfully.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from qc_reporting.projection import BatchProjection
+
+
+CACHE_FILES = {
+    "assets": "assets.parquet",
+    "issues": "issues.parquet",
+    "execution": "execution.parquet",
+}
+
+_TABLE_ROWS = {
+    "assets": "asset_rows",
+    "issues": "issue_rows",
+    "execution": "execution_rows",
+}
+_JSON_MARKER = "__qc_cache_json__:"
+_MANIFEST_FILE = "source_reports.json"
+_PROJECTION_MANIFEST_FILE = "projection_source_manifest.json"
+
+
+def _json_safe(value: Any) -> Any:
+    """Return a JSON-compatible representation of *value*.
+
+    Projection rows contain tuples (for example ``runtime_errors``), so the
+    cache encoder carries a small type tag rather than relying on pandas' type
+    inference.  This keeps a cache round-trip equal to the original
+    :class:`BatchProjection` instead of changing tuples into lists.
+    """
+
+    if isinstance(value, Mapping):
+        return {
+            "__qc_cache_type__": "mapping",
+            "value": [[str(key), _json_safe(item)] for key, item in value.items()],
+        }
+    if isinstance(value, tuple):
+        return {"__qc_cache_type__": "tuple", "value": [_json_safe(item) for item in value]}
+    if isinstance(value, list):
+        return {"__qc_cache_type__": "list", "value": [_json_safe(item) for item in value]}
+    if isinstance(value, set):
+        return {
+            "__qc_cache_type__": "set",
+            "value": [_json_safe(item) for item in sorted(value, key=repr)],
+        }
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        if value != value or value in {float("inf"), float("-inf")}:
+            return None
+        return value
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
+def _json_restore(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return value
+    if value.get("__qc_cache_type__") == "mapping":
+        return {str(key): _json_restore(item) for key, item in value.get("value", ())}
+    if value.get("__qc_cache_type__") == "tuple":
+        return tuple(_json_restore(item) for item in value.get("value", ()))
+    if value.get("__qc_cache_type__") == "list":
+        return [_json_restore(item) for item in value.get("value", ())]
+    if value.get("__qc_cache_type__") == "set":
+        return {_json_restore(item) for item in value.get("value", ())}
+    return {str(key): _json_restore(item) for key, item in value.items()}
+
+
+def _encode_cell(value: Any) -> Any:
+    if isinstance(value, (Mapping, tuple, list, set)):
+        return _JSON_MARKER + json.dumps(
+            _json_safe(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    return _json_safe(value)
+
+
+def _decode_cell(value: Any) -> Any:
+    if isinstance(value, str) and value.startswith(_JSON_MARKER):
+        try:
+            return _json_restore(json.loads(value[len(_JSON_MARKER) :]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("invalid encoded projection value")
+    # pandas represents nulls as NaN in object columns after a parquet read.
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _manifest_path(path: Path, quality_archive: Path) -> str:
+    try:
+        return path.relative_to(quality_archive).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"source report is outside quality archive: {path}") from exc
+
+
+def build_source_manifest(quality_archive: Path) -> tuple[dict[str, Any], ...]:
+    """Build a deterministic manifest for every canonical report JSON.
+
+    ``relative_path`` is relative to ``quality_archive`` and uses POSIX
+    separators so the manifest compares identically across operating systems.
+    The file digest catches edits that do not bump ``report_revision``.
+    """
+
+    root = Path(quality_archive)
+    if not root.is_dir():
+        raise ValueError(f"quality archive directory does not exist: {root}")
+    rows: list[dict[str, Any]] = []
+    for path in sorted(root.glob("*.json"), key=lambda item: item.name):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid QC report {path}: {exc}") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"invalid QC report {path}: root must be an object")
+        asset_id = payload.get("asset_id")
+        if asset_id is None or str(asset_id) == "":
+            raise ValueError(f"invalid QC report {path}: asset_id must be non-empty")
+        revision = payload.get("report_revision", 0)
+        try:
+            revision = int(revision)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid QC report {path}: report_revision must be an integer") from exc
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        rows.append(
+            {
+                "relative_path": _manifest_path(path, root),
+                "asset_id": str(asset_id),
+                "revision": revision,
+                "sha256": digest,
+            }
+        )
+    return tuple(rows)
+
+
+def _write_atomic_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _write_parquet_atomic(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{path.name}.", dir=path.parent) as temp_dir:
+        temp_path = Path(temp_dir) / path.name
+        frame.to_parquet(temp_path, index=False)
+        os.replace(temp_path, path)
+
+
+def _frame_from_rows(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
+    materialized = [dict(row) for row in rows]
+    columns = tuple(dict.fromkeys(key for row in materialized for key in row))
+    if not columns:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        [{str(key): _encode_cell(value) for key, value in row.items()} for row in materialized],
+        columns=columns,
+    )
+
+
+def write_projection_cache(projection: BatchProjection, cache_dir: Path) -> None:
+    """Atomically write all projection tables and their source manifest."""
+
+    if not isinstance(projection, BatchProjection):
+        raise TypeError("projection must be a BatchProjection")
+    cache_root = Path(cache_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    # The cache manifest is derived from the projection's source paths when
+    # available.  CLI callers pass a projection built from the archive, so
+    # those paths are sufficient to calculate the same source identity.
+    source_manifest: list[dict[str, Any]] = []
+    for source in projection.source_manifest:
+        if not isinstance(source, Mapping):
+            continue
+        path_value = source.get("path") or source.get("report_path") or source.get("json_path")
+        if not path_value:
+            continue
+        path = Path(str(path_value))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            asset_id = str(payload.get("asset_id") or source.get("asset_id") or "")
+            revision = int(payload.get("report_revision", source.get("report_revision", 0)))
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            # If a caller provides a projection with a non-file source
+            # manifest, retain its identity fields where possible.  The CLI
+            # path always has canonical files and therefore takes the branch
+            # above.
+            asset_id = str(source.get("asset_id") or "")
+            revision = int(source.get("report_revision", source.get("revision", 0)) or 0)
+            digest = str(source.get("sha256") or "")
+        source_manifest.append(
+            {
+                "relative_path": str(source.get("relative_path") or path.name),
+                "asset_id": asset_id,
+                "revision": revision,
+                "sha256": digest,
+            }
+        )
+    source_manifest.sort(key=lambda row: str(row["relative_path"]))
+
+    for table, attr in _TABLE_ROWS.items():
+        _write_parquet_atomic(_frame_from_rows(getattr(projection, attr)), cache_root / CACHE_FILES[table])
+    manifest = json.dumps(
+        source_manifest,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+    _write_atomic_bytes(
+        cache_root / _MANIFEST_FILE,
+        manifest.encode("utf-8"),
+    )
+    _write_atomic_bytes(
+        cache_root / _PROJECTION_MANIFEST_FILE,
+        (
+            json.dumps(
+                [dict(row) for row in projection.source_manifest],
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+
+
+def _read_manifest(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes)):
+        raise ValueError("cache manifest must be an array")
+    return [dict(row) for row in payload if isinstance(row, Mapping)]
+
+
+def _read_projection_manifest(path: Path) -> tuple[dict[str, Any], ...]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes)):
+        raise ValueError("projection source manifest must be an array")
+    return tuple(dict(row) for row in payload if isinstance(row, Mapping))
+
+
+def _read_projection_table(path: Path) -> tuple[dict[str, Any], ...]:
+    frame = pd.read_parquet(path)
+    rows: list[dict[str, Any]] = []
+    for raw in frame.to_dict(orient="records"):
+        rows.append({str(key): _decode_cell(value) for key, value in raw.items()})
+    return tuple(rows)
+
+
+def load_projection_cache(
+    cache_dir: Path,
+    expected_manifest: Iterable[Mapping[str, Any]],
+) -> BatchProjection | None:
+    """Load a cache only when its manifest and all tables are valid.
+
+    Any missing, malformed, unreadable, or stale cache artifact is treated as
+    a cache miss.  Callers can then rebuild from canonical JSON without
+    needing to distinguish the failure mode.
+    """
+
+    cache_root = Path(cache_dir)
+    try:
+        source_manifest = _read_manifest(cache_root / _MANIFEST_FILE)
+        expected = [dict(row) for row in expected_manifest]
+        if source_manifest != expected:
+            return None
+        if not all((cache_root / filename).is_file() for filename in CACHE_FILES.values()):
+            return None
+        projection_manifest = _read_projection_manifest(
+            cache_root / _PROJECTION_MANIFEST_FILE
+        )
+        rows = {
+            table: _read_projection_table(cache_root / filename)
+            for table, filename in CACHE_FILES.items()
+        }
+    except Exception:
+        return None
+    return BatchProjection(
+        asset_rows=rows["assets"],
+        issue_rows=rows["issues"],
+        execution_rows=rows["execution"],
+        source_manifest=tuple(projection_manifest),
+    )
+
+
+__all__ = [
+    "CACHE_FILES",
+    "build_source_manifest",
+    "load_projection_cache",
+    "write_projection_cache",
+]
