@@ -13,6 +13,7 @@ from qc_common.report import (
     write_asset_qc_report,
 )
 from qc_common.report_migration import migrate_v1_to_v2
+from qc_common.schema import validate_asset_qc_report
 from qc_pipeline.context import AssetContext
 
 
@@ -84,6 +85,41 @@ def _assert_config_reference(
         raise ConfigDriftError(
             f"QC profile drift: {execution.get('profile')} != {profile}"
         )
+
+
+def _assert_report_identity(
+    report: Mapping[str, Any],
+    *,
+    context: AssetContext,
+    config: LoadedQcConfig,
+    profile: str,
+) -> None:
+    if report.get("schema_version") != "asset_qc_report.v2":
+        raise ValueError("asset orchestrator requires an asset_qc_report.v2 report")
+    if report.get("asset_id") != context.asset_id:
+        raise ValueError(
+            f"asset_id mismatch: {report.get('asset_id')} != {context.asset_id}"
+        )
+    if report.get("source_files") != dict(context.source_files):
+        raise ValueError("source_files mismatch between report and AssetContext")
+    _assert_config_reference(report, config, profile)
+
+
+def validate_report_identity(
+    report: Mapping[str, Any],
+    *,
+    context: AssetContext,
+    config: LoadedQcConfig,
+    profile: str,
+) -> None:
+    """Validate a persisted report before any detector work is resumed."""
+    validate_asset_qc_report(dict(report))
+    _assert_report_identity(
+        report,
+        context=context,
+        config=config,
+        profile=profile,
+    )
 
 
 def _expected_next_module(
@@ -338,11 +374,12 @@ def apply_module_result(
         raise StaleReportRevisionError(
             f"expected revision {expected_revision}, found {current_revision}: {path}"
         )
-    if report.get("asset_id") != context.asset_id:
-        raise ValueError(
-            f"asset_id mismatch: {report.get('asset_id')} != {context.asset_id}"
-        )
-    _assert_config_reference(report, config, profile)
+    _assert_report_identity(
+        report,
+        context=context,
+        config=config,
+        profile=profile,
+    )
     _assert_module_order(
         report,
         result_module=result.module,
@@ -411,6 +448,85 @@ def apply_module_result(
     else:
         report["overall_decision"] = None
 
+    report["report_revision"] = expected_revision + 1
+    write_asset_qc_report(
+        path,
+        report,
+        expected_revision=expected_revision,
+        profile=profile,
+    )
+    return report
+
+
+def record_awaiting_external(
+    path: Path,
+    *,
+    context: AssetContext,
+    config: LoadedQcConfig,
+    profile: str,
+    expected_revision: int,
+    module: str,
+    now: str,
+) -> dict[str, Any]:
+    """Persist an external boundary without fabricating a module result."""
+    _assert_same_report_path(path, context)
+    module_config = config.module_config(module)
+    if not module_config.get("enabled"):
+        raise ValueError(f"external module is disabled: {module}")
+    if module_config.get("execution_kind") != "external":
+        raise ValueError(f"module is not external: {module}")
+
+    loaded = load_asset_qc_report(path)
+    if loaded is not None:
+        validate_report_identity(
+            loaded,
+            context=context,
+            config=config,
+            profile=profile,
+        )
+    report = (
+        initialize_v2_report(context, config, profile, now)
+        if loaded is None
+        else copy.deepcopy(loaded)
+    )
+    current_revision = int(report.get("report_revision", 0))
+    if current_revision != expected_revision:
+        raise StaleReportRevisionError(
+            f"expected revision {expected_revision}, found {current_revision}: {path}"
+        )
+    _assert_report_identity(
+        report,
+        context=context,
+        config=config,
+        profile=profile,
+    )
+
+    pipeline_state = report.get("pipeline_state")
+    if not isinstance(pipeline_state, dict):
+        raise ValueError("pipeline_state must be an object")
+    if pipeline_state.get("next_module") != module:
+        raise ModuleOrderError(
+            f"expected current module {pipeline_state.get('next_module')}, got {module}"
+        )
+    if pipeline_state.get("status") == "awaiting_external":
+        return report
+    if pipeline_state.get("status") not in {"pending", "running"}:
+        raise ModuleOrderError(
+            f"cannot await external module from status {pipeline_state.get('status')}"
+        )
+
+    pipeline_state.update(
+        {
+            "status": "awaiting_external",
+            "next_module": module,
+            "stop_reason": None,
+        }
+    )
+    report["overall_decision"] = None
+    execution = report.get("execution")
+    if not isinstance(execution, dict):
+        raise ValueError("execution must be an object")
+    execution["updated_at"] = now
     report["report_revision"] = expected_revision + 1
     write_asset_qc_report(
         path,
