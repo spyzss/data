@@ -255,7 +255,7 @@ def recover_hdf5_replacement(record: FinalizingRecord) -> RecoveryAction:
 
     if not isinstance(record, FinalizingRecord):
         raise TypeError("record must be a FinalizingRecord")
-    if not isinstance(record.transaction_id, str):
+    if not isinstance(record.transaction_id, str) or not record.transaction_id:
         return RecoveryAction.CONFLICT
 
     source = Path(record.source_path)

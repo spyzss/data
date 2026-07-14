@@ -429,6 +429,22 @@ def test_recovery_classifies_non_string_transaction_id_without_raw_type_error(
     prepared.staged_path.unlink()
 
 
+def test_recovery_rejects_empty_transaction_id_as_conflict(tmp_path: Path) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-empty-record-tx.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-record")
+    record = FinalizingRecord(
+        source_path=prepared.source_path,
+        staged_path=prepared.staged_path,
+        old_sha256=prepared.old_sha256,
+        new_sha256=prepared.new_sha256,
+        transaction_id="",
+        staged_identity=prepared.staged_identity,
+    )
+
+    assert recover_hdf5_replacement(record) == RecoveryAction.CONFLICT
+    prepared.staged_path.unlink()
+
+
 def test_prepare_preserves_target_hidden_behind_hard_link_alias(tmp_path: Path) -> None:
     source = write_complex_hdf5(tmp_path / "asset-hard-alias.hdf5")
     with h5py.File(source, "r+") as handle:
