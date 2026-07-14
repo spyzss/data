@@ -57,11 +57,14 @@ profile 的流转差异：
    `shasum -a 256 configs/qc_acceptance/qc_acceptance_v1.1.0.yaml`），不可重新序列化
    或覆盖该快照。
 2. 用 schema reader 读取 v1；不直接修改 v1，也不把 v1 sidecar 结论拼进新 verdict。
-3. 调用纯函数 `migrate_v1_to_v2()`，保留 video block、unknown fields、原
-   `report_revision`、source files 和可解释的历史 `qc_config` 引用。
-4. 用当前 v2 Config 校验 profile、config version/hash、module cursor 和 v2 Schema。
-5. 将迁移结果作为一次 v2 CAS 写回；若预期 revision 不匹配，拒绝写回并重新读取，
-   不能静默覆盖。
+3. 本 change 不提供自动 v1 converter。v1 只作为只读历史输入，使用
+   `reconcile_legacy_outputs()` 或 projection CLI 生成差异证据；不得把 sidecar 结论
+   拼进新 verdict。
+4. 若需要生成 v2 master，准备符合当前 v2 Config/Schema 的 manifest 和目标
+   `batch_root`，再由仓库已有的 `tools/run_qc_pipeline.py` 作为受控 v2 writer 写入。
+   该 writer 只负责 v2 报告，不会原地转换 v1 文件。
+5. 用当前 v2 Config 校验 profile、config version/hash、module cursor 和 v2 Schema；
+   writer 的 CAS 冲突必须拒绝写回并重新读取，不能静默覆盖。
 6. 迁移成功后，v1 原文件仍作为只读历史输入保留；后续正式模块只写 v2 master。
 
 迁移不会自动把一个旧 sidecar 的“建议”变成 machine pass/fail。缺失证据只能形成
@@ -171,8 +174,15 @@ find "$ARCHIVE" -type f -name '*.json' -exec shasum -a 256 {} \; \
   | sort > "$SNAPSHOT/quality_archive.before.sha256"
 tar -czf "$SNAPSHOT/quality_archive.before.tgz" -C "$BATCH_ROOT" quality_archive
 
-# 2) 由受控 runner 对每个 v1 report 调用 migrate_v1_to_v2()，再用预期
-#    report_revision 做 CAS 写回；不得原地重序列化 v1 文件或拼接 sidecar verdict。
+# 2) 本 change 不提供自动 v1 converter；保留 v1 输入只读。准备好符合 v2
+#    Config/Schema 的 manifest 和目标 batch_root 后，由现有统一 writer 生成 v2 master。
+python tools/run_qc_pipeline.py \
+  --batch-root "$BATCH_ROOT" \
+  --manifest "$BATCH_ROOT/manifest.csv" \
+  --profile acceptance \
+  --config configs/qc_acceptance/qc_acceptance_v2.0.0.yaml \
+  --resume
+
 # 3) 校验 v2 schema/config 后再运行正式 projection 和统计入口。
 python tools/build_qc_json_projection.py \
   --quality-archive "$ARCHIVE" \

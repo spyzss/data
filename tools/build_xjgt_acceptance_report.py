@@ -242,42 +242,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             LOGGER.info("Wrote %s", path)
         return 0
-    required_legacy = {
-        "--manifest": args.legacy_manifest,
-        "--precheck-clip-aggregates": args.legacy_precheck_clip_aggregates,
-        "--precheck-candidate-windows": args.legacy_precheck_candidate_windows,
-        "--video-quality-results": args.legacy_video_quality_results,
-        "--sam3-window-summary": args.sam3_window_summary,
-        "--manual-review-labels": args.manual_review_labels,
-    }
-    missing = [name for name, value in required_legacy.items() if value is None]
-    if missing:
-        raise SystemExit(
-            "--quality-archive is required for formal output; missing legacy arguments: "
-            + ", ".join(missing)
-        )
-    outputs = build_acceptance_outputs(
-        manifest=args.legacy_manifest,
-        precheck_clip_aggregates=args.legacy_precheck_clip_aggregates,
-        precheck_candidate_windows=args.legacy_precheck_candidate_windows,
-        video_quality_results=args.legacy_video_quality_results,
-        sam3_window_summary=args.sam3_window_summary,
-        manual_review_labels=args.manual_review_labels,
-        output_dir=args.output_dir,
-        precheck_check_results=args.legacy_precheck_check_results,
-        video_quality_summary=args.video_quality_summary,
-        sam3_clip_summary=args.sam3_clip_summary,
-        sam3_frame_results=args.sam3_frame_results,
-        manual_review_csv=args.manual_review_csv,
-    )
-    for path in (
-        outputs.asset_ledger_csv,
-        outputs.issue_events_csv,
-        outputs.workbook_xlsx,
-        outputs.summary_json,
-    ):
-        LOGGER.info("Wrote %s", path)
-    return 0
 
 
 def build_acceptance_outputs(

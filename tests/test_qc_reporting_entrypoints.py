@@ -192,6 +192,7 @@ def test_generic_legacy_sidecars_are_all_reconciled_as_evidence(tmp_path: Path) 
     reconciliation = pd.read_csv(paths["reconciliation_csv"])
     assert set(reconciliation["source"]) == set(sidecars)
     assert set(reconciliation["difference_type"]) == {"match"}
+    assert set(reconciliation["authoritative_source"]) == {"asset_qc_json"}
 
 
 def test_reconciliation_csv_has_fixed_headers_for_empty_rows(tmp_path: Path) -> None:
@@ -210,6 +211,7 @@ def test_reconciliation_csv_has_fixed_headers_for_empty_rows(tmp_path: Path) -> 
         "legacy_verdict",
         "qc_json_verdict",
         "difference_type",
+        "authoritative_source",
     )
 
 

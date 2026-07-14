@@ -45,6 +45,7 @@ RECONCILIATION_COLUMNS = (
     "legacy_verdict",
     "qc_json_verdict",
     "difference_type",
+    "authoritative_source",
 )
 _TABLE_ROWS = {
     "asset": "asset_rows",
@@ -417,6 +418,9 @@ def build_reconciliation_rows(
                     "legacy_verdict": legacy_verdict,
                     "qc_json_verdict": qc_verdict,
                     "difference_type": difference_type,
+                    # Legacy rows are evidence only, including matching rows;
+                    # canonical QC JSON remains the source of truth.
+                    "authoritative_source": "asset_qc_json",
                 }
             )
     return rows

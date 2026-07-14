@@ -341,19 +341,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     LOGGER.info("Wrote %s", outputs.workbook_xlsx)
     LOGGER.info("Wrote %s", outputs.summary_csv)
     return 0
-    outputs = build_weekly_report(
-        args.run_root,
-        require_xjgt_text=(
-            args.require_xjgt_text or not args.skip_xjgt_text
-        ),
-        xjgt_precheck_config=args.xjgt_precheck_config,
-        xjgt_video_quality_config=args.xjgt_video_quality_config,
-        xjgt_sam3_config=args.xjgt_sam3_config,
-        xjgt_weekly_policy_config=args.xjgt_weekly_policy_config,
-    )
-    LOGGER.info("Wrote %s", outputs.workbook_xlsx)
-    LOGGER.info("Wrote %s", outputs.summary_csv)
-    return 0
 
 
 def build_weekly_report(
