@@ -30,6 +30,64 @@ _TABLE_ROWS = {
     "issue": "issue_rows",
     "execution": "execution_rows",
 }
+# Projection tables are a public interchange format.  Keep their columns
+# stable even when a valid batch has no rows for a table (for example, an
+# all-pass batch has no issue rows).
+_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "asset": (
+        "asset_id",
+        "supplier_id",
+        "profile",
+        "schema_version",
+        "status",
+        "pipeline_status",
+        "decision",
+        "overall_decision",
+        "report_revision",
+        "config_hash",
+        "config_version",
+        "config_path",
+        "module_coverage",
+        "stop_position",
+        "stop_reason",
+        "finalizable",
+    ),
+    "issue": (
+        "asset_id",
+        "supplier_id",
+        "profile",
+        "report_revision",
+        "issue_id",
+        "module",
+        "rule_id",
+        "code",
+        "issue_type",
+        "machine_severity",
+        "machine_verdict",
+        "severity",
+        "human_verdict",
+        "effective_verdict",
+        "needs_manual_review",
+        "window_start_frame",
+        "window_end_frame",
+        "source_level",
+        "review",
+    ),
+    "execution": (
+        "asset_id",
+        "supplier_id",
+        "profile",
+        "report_revision",
+        "module",
+        "state",
+        "duration_sec",
+        "duration_ms",
+        "duration",
+        "continued_after_fail",
+        "runtime_error",
+        "runtime_errors",
+    ),
+}
 
 
 def _json_safe(value: Any) -> Any:
@@ -58,7 +116,11 @@ def _rows_for_table(projection: BatchProjection, table: str) -> tuple[Mapping[st
     return tuple(row for row in rows if isinstance(row, Mapping))
 
 
-def _dataframe(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
+def _dataframe(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    columns: Iterable[str] | None = None,
+) -> pd.DataFrame:
     normalized: list[dict[str, Any]] = []
     for row in rows:
         normalized.append(
@@ -71,7 +133,18 @@ def _dataframe(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
                 for key, value in row.items()
             }
         )
-    return pd.DataFrame(normalized)
+    if columns is None:
+        return pd.DataFrame(normalized)
+    return pd.DataFrame(normalized, columns=tuple(str(column) for column in columns))
+
+
+def _table_dataframe(projection: BatchProjection, table: str) -> pd.DataFrame:
+    if table not in _TABLE_COLUMNS:
+        raise ValueError(f"unsupported projection table: {table}")
+    return _dataframe(
+        _rows_for_table(projection, table),
+        columns=_TABLE_COLUMNS[table],
+    )
 
 
 def _write_parquet(df: pd.DataFrame, path: Path) -> Path:
@@ -146,16 +219,13 @@ def _write_xlsx(
     workbook.remove(workbook.active)
     tables: list[tuple[str, pd.DataFrame]] = [
         ("Summary", _dataframe(_summary_rows(statistics))),
-        ("Assets", _dataframe(_rows_for_table(projection, "asset"))),
-        ("Issues", _dataframe(_rows_for_table(projection, "issue"))),
-        ("Execution", _dataframe(_rows_for_table(projection, "execution"))),
+        ("Assets", _table_dataframe(projection, "asset")),
+        ("Issues", _table_dataframe(projection, "issue")),
+        ("Execution", _table_dataframe(projection, "execution")),
         ("Data_Dictionary", _dataframe(_data_dictionary_rows())),
     ]
     for sheet_name, frame in tables:
         sheet = workbook.create_sheet(sheet_name)
-        if frame.empty:
-            sheet.append([])
-            continue
         sheet.append([str(column) for column in frame.columns])
         for row in frame.itertuples(index=False, name=None):
             sheet.append([None if pd.isna(value) else value for value in row])
@@ -211,9 +281,9 @@ def write_projection_outputs(
         raise ValueError(f"unsupported projection formats: {', '.join(unsupported)}")
     paths: dict[str, Path] = {}
     frames = {
-        "asset": _dataframe(_rows_for_table(projection, "asset")),
-        "issue": _dataframe(_rows_for_table(projection, "issue")),
-        "execution": _dataframe(_rows_for_table(projection, "execution")),
+        "asset": _table_dataframe(projection, "asset"),
+        "issue": _table_dataframe(projection, "issue"),
+        "execution": _table_dataframe(projection, "execution"),
     }
     if "csv" in requested:
         for table, frame in frames.items():
