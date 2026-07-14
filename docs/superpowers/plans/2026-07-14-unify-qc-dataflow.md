@@ -338,7 +338,7 @@ git commit -m "feat(qc): add asset report v2 contract"
 - Produces: `build_issue_id(*, asset_id, module, rule_id, source_relative_path, coordinate_system, start_frame, end_frame, hand_side, evidence_kind) -> str`。
 - Produces: `relative_evidence_path(path: Path, batch_root: Path) -> str`，路径逃逸抛 `ValueError`。
 
-- [ ] **Step 1: 添加稳定性、敏感性和路径边界测试**
+- [x] **Step 1: 添加稳定性、敏感性和路径边界测试**
 
 ```python
 # tests/test_qc_contracts.py
@@ -367,13 +367,13 @@ def test_evidence_path_cannot_escape_batch(tmp_path: Path) -> None:
         relative_evidence_path(tmp_path.parent / "secret.png", tmp_path)
 ```
 
-- [ ] **Step 2: 运行测试并确认合同模块缺失**
+- [x] **Step 2: 运行测试并确认合同模块缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_contracts.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_common.contracts'`。
 
-- [ ] **Step 3: 实现 frozen 合同与规范化哈希**
+- [x] **Step 3: 实现 frozen 合同与规范化哈希**
 
 ```python
 Verdict = Literal["pass", "warn", "fail", "skipped"]
@@ -420,13 +420,13 @@ class ModuleResult:
 
 `build_issue_id` 使用 `json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)` 后 SHA-256，rule name 取 `rule_id.rsplit(".", 1)[-1]`，仅截取 20 个 hex。`to_dict()` 必须深度转为 JSON-safe 原生类型并保持 tuple 顺序；不得将 reason、时间戳或格式化浮点字符串加入 identity。
 
-- [ ] **Step 4: 验证合同序列化和路径规则**
+- [x] **Step 4: 验证合同序列化和路径规则**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_contracts.py -q`
 
 Expected: PASS，稳定 ID 重跑一致且坐标/手侧变化会改变 ID。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_common/contracts.py qc_common/__init__.py tests/test_qc_contracts.py
@@ -449,7 +449,7 @@ git commit -m "feat(qc): define module result contracts"
 - Produces: `write_pipeline_transition(path, *, expected_revision, module, state, next_module, stop_reason, overall_decision, now) -> dict[str, Any]`。
 - Produces exceptions: `ModuleOrderError`、`ConfigDriftError`，并复用 `StaleReportRevisionError`。
 
-- [ ] **Step 1: 添加所有权、重跑去重、revision 和原子失败测试**
+- [x] **Step 1: 添加所有权、重跑去重、revision 和原子失败测试**
 
 ```python
 # tests/test_report_mutation.py
@@ -484,13 +484,13 @@ def test_stale_revision_never_changes_file(tmp_path: Path) -> None:
     assert context.report_path.read_bytes() == before
 ```
 
-- [ ] **Step 2: 运行测试并确认事务模块不存在**
+- [x] **Step 2: 运行测试并确认事务模块不存在**
 
 Run: `.venv/bin/python -m pytest tests/test_report_mutation.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_common.report_mutation'`。
 
-- [ ] **Step 3: 实现固定九步事务算法**
+- [x] **Step 3: 实现固定九步事务算法**
 
 实现顺序必须与设计一致：load/init → v1 纯迁移 → revision/asset/config/next_module 校验 → 删除本模块旧 block/issues/evidence → 写新 block → 全量重建 candidate/fail IDs → 计算 profile 对应 exit gate → 仅终态计算 decision → revision+1/schema validate/atomic replace。
 
@@ -519,13 +519,13 @@ report["manual_review"]["failures_for_batch_stats_issue_ids"] = sorted({i["issue
 
 `qc_common/report.py` 在 `os.replace` 后打开父目录并 `os.fsync`；Schema 失败、Config drift、模块顺序错误、stale revision 均发生在替换之前。
 
-- [ ] **Step 4: 运行事务、Schema 与现有原子写回回归**
+- [x] **Step 4: 运行事务、Schema 与现有原子写回回归**
 
 Run: `.venv/bin/python -m pytest tests/test_report_mutation.py tests/test_asset_qc_schema_v2.py tests/test_acceptance_video_quality.py::test_video_qc_preserves_existing_module_blocks_and_increments_revision -q`
 
 Expected: PASS；重跑不累积 issue，未知字段保留，失败写入不改变原文件。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_pipeline/context.py qc_common/report.py qc_common/report_mutation.py tests/test_report_mutation.py

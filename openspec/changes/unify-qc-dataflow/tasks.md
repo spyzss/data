@@ -1,8 +1,8 @@
 ## 1. 统一合同与 Schema
 
 - [x] 1.1 为 execution profile、通用 module flow、runtime error、evidence 和二元 final decision 增加配置及 JSON Schema 测试
-- [ ] 1.2 在 `qc_common` 定义统一 `ModuleResult`、`Issue`、`EvidenceRef` 和稳定 issue ID 接口
-- [ ] 1.3 实现模块所有权感知的 revision-aware 报告 mutation，并验证重跑去重与未知字段保留
+- [x] 1.2 在 `qc_common` 定义统一 `ModuleResult`、`Issue`、`EvidenceRef` 和稳定 issue ID 接口
+- [x] 1.3 实现模块所有权感知的 revision-aware 报告 mutation，并验证重跑去重与未知字段保留
 
 ## 2. 已合入自动模块适配
 
