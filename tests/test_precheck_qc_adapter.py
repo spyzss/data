@@ -21,6 +21,7 @@ from qc_pipeline.adapters.precheck import (
     adapt_hdf5_text_info,
     adapt_keypoint_morphology,
     adapt_keypoint_presence,
+    adapt_keypoint_temporal,
     adapt_quality_hand,
     precheck_config_from_unified,
 )
@@ -587,6 +588,316 @@ def test_presence_does_not_infer_missing_keypoints_from_absent_quality_hand() ->
     assert result.verdict == "skipped"
     assert result.evaluation["reason"] == "source_signal_not_provided"
     assert result.issues == ()
+
+
+def test_temporal_candidate_is_one_warn_issue_with_source_range() -> None:
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[],
+        candidate_windows=[
+            {
+                "asset_id": "a",
+                "start_frame": 30,
+                "end_frame": 42,
+                "coordinate_space": "source",
+                "hand_side": "both",
+                "trigger_metrics": {"joint_displacement_m_max": 0.08},
+            }
+        ],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "warn"
+    assert len(result.issues) == 1
+    issue = result.issues[0]
+    assert issue.module == "keypoint_temporal"
+    assert issue.rule_id == "keypoint_temporal.composite_frame_verdict"
+    assert issue.context == {
+        "coordinate_system": "source_inclusive",
+        "start_frame": 30,
+        "end_frame": 42,
+        "hand_side": "both",
+    }
+    assert issue.needs_manual_review is True
+    assert issue.evidence_ids == (f"{issue.issue_id}:candidate_window",)
+    assert result.evidence[0].kind == "candidate_window"
+    assert result.evidence[0].path == "candidate_windows.json"
+    assert result.evidence[0].start_frame == 30
+    assert result.evidence[0].end_frame == 42
+    assert result.metrics == {
+        "peak_trigger_metrics": {"joint_displacement_m_max": 0.08},
+        "candidate_window_count": 1,
+        "candidate_frame_union_count": 13,
+    }
+
+
+def test_strong_temporal_failure_remains_hard_fail() -> None:
+    rows = [
+        CheckResult(
+            "skeleton_quality_score",
+            0,
+            9,
+            {
+                "skeleton_verdict": "suspect",
+                "which_thresholds_exceeded": [
+                    "joint_acceleration_m_s2_max",
+                    "joint_displacement_m_max",
+                    "rotation_delta_max",
+                ],
+            },
+            True,
+            "threshold exceeded",
+        )
+    ]
+
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        candidate_windows=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "fail"
+    assert len(result.issues) == 1
+    issue = result.issues[0]
+    assert issue.rule_id == "keypoint_temporal.strong_temporal_failure"
+    assert issue.context["start_frame"] == 9
+    assert issue.context["end_frame"] == 9
+    assert issue.context["hand_side"] == "both"
+    assert issue.metric == "exceeded_temporal_metric_count"
+    assert issue.observed_value == 3
+    assert issue.operator == ">="
+    assert issue.boundary_value == 3
+    assert issue.needs_manual_review is False
+    assert result.evidence[0].path == "check_results.json"
+
+
+def test_temporal_projection_review_is_warn_without_candidate_window() -> None:
+    row = CheckResult(
+        "skeleton_quality_score",
+        0,
+        20,
+        {
+            "skeleton_verdict": "review",
+            "which_thresholds_exceeded": ["rotation_delta_max"],
+            "needs_projection_review": 1.0,
+            "left_needs_projection_review": 1.0,
+            "right_needs_projection_review": 0.0,
+            "left_num_points_near_border": 21.0,
+        },
+        None,
+        "projection review",
+    )
+
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[row],
+        candidate_windows=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "warn"
+    assert len(result.issues) == 1
+    issue = result.issues[0]
+    assert issue.rule_id == "keypoint_temporal.projection_review"
+    assert issue.context["hand_side"] == "left"
+    assert issue.needs_manual_review is True
+
+
+def test_temporal_non_strong_skeleton_review_remains_manual_warn() -> None:
+    row = CheckResult(
+        "skeleton_quality_score",
+        0,
+        6,
+        {
+            "skeleton_verdict": "suspect",
+            "which_thresholds_exceeded": ["joint_acceleration_m_s2_max"],
+            "joint_acceleration_m_s2_max": 16.0,
+        },
+        True,
+        "single structured signal",
+    )
+
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[row],
+        candidate_windows=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "warn"
+    assert result.issues[0].rule_id == "keypoint_temporal.skeleton_quality_score"
+    assert result.issues[0].needs_manual_review is True
+
+
+def test_temporal_reason_text_does_not_create_a_failure() -> None:
+    row = CheckResult(
+        "skeleton_quality_score",
+        0,
+        7,
+        {
+            "skeleton_verdict": "good",
+            "which_thresholds_exceeded": [],
+        },
+        None,
+        (
+            "joint_acceleration_m_s2_max, joint_displacement_m_max, and "
+            "rotation_delta_max exceeded"
+        ),
+    )
+
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[row],
+        candidate_windows=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "pass"
+    assert result.issues == ()
+
+
+def test_temporal_empty_rows_and_windows_are_skipped_not_inferred_pass() -> None:
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[],
+        candidate_windows=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "skipped"
+    assert result.evaluation["reason"] == "source_signal_not_provided"
+    assert result.issues == ()
+
+
+def test_temporal_candidate_metrics_use_inclusive_window_union_and_peaks() -> None:
+    candidates = [
+        {
+            "asset_id": "a",
+            "start_frame": 10,
+            "end_frame": 12,
+            "coordinate_space": "source",
+            "hand_side": "left",
+            "trigger_metrics": {
+                "joint_displacement_m_max": 0.08,
+                "rotation_delta_max": 0.4,
+            },
+        },
+        {
+            "asset_id": "a",
+            "start_frame": 12,
+            "end_frame": 14,
+            "coordinate_space": "source",
+            "hand_side": "right",
+            "trigger_metrics": {
+                "joint_displacement_m_max": 0.09,
+                "joint_acceleration_m_s2_max": 20.0,
+            },
+        },
+    ]
+
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[],
+        candidate_windows=candidates,
+        config=loaded_test_config(),
+    )
+
+    assert result.metrics == {
+        "peak_trigger_metrics": {
+            "joint_acceleration_m_s2_max": 20.0,
+            "joint_displacement_m_max": 0.09,
+            "rotation_delta_max": 0.4,
+        },
+        "candidate_window_count": 2,
+        "candidate_frame_union_count": 5,
+    }
+
+
+def test_temporal_issue_ids_are_stable_and_distinguish_rule_side_window() -> None:
+    def candidate_issue(*, side: str, start: int, end: int):
+        result = adapt_keypoint_temporal(
+            asset_id="a",
+            source_relative_path="hdf5/a.h5",
+            results=[],
+            candidate_windows=[
+                {
+                    "asset_id": "a",
+                    "start_frame": start,
+                    "end_frame": end,
+                    "coordinate_space": "source",
+                    "hand_side": side,
+                    "trigger_metrics": {"joint_displacement_m_max": 0.08},
+                }
+            ],
+            config=loaded_test_config(),
+        )
+        return result.issues[0]
+
+    left = candidate_issue(side="left", start=10, end=10)
+    repeated = candidate_issue(side="left", start=10, end=10)
+    right = candidate_issue(side="right", start=10, end=10)
+    shifted = candidate_issue(side="left", start=11, end=11)
+    projection = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[
+            CheckResult(
+                "skeleton_quality_score",
+                0,
+                10,
+                {
+                    "skeleton_verdict": "review",
+                    "which_thresholds_exceeded": [],
+                    "left_needs_projection_review": 1.0,
+                    "right_needs_projection_review": 0.0,
+                },
+                None,
+                "structured projection",
+            )
+        ],
+        candidate_windows=[],
+        config=loaded_test_config(),
+    ).issues[0]
+
+    assert left.issue_id == repeated.issue_id
+    assert len(
+        {left.issue_id, right.issue_id, shifted.issue_id, projection.issue_id}
+    ) == 4
+
+
+def test_temporal_candidate_identity_ignores_local_peak_and_seed_coordinates() -> None:
+    base = {
+        "asset_id": "a",
+        "start_frame": 30,
+        "end_frame": 42,
+        "coordinate_space": "source",
+        "hand_side": "both",
+        "trigger_metrics": {"joint_displacement_m_max": 0.08},
+    }
+
+    def adapt(extra: dict[str, int]):
+        return adapt_keypoint_temporal(
+            asset_id="a",
+            source_relative_path="hdf5/a.h5",
+            results=[],
+            candidate_windows=[{**base, **extra}],
+            config=loaded_test_config(),
+        )
+
+    first = adapt({"peak_frame": 4, "seed_run_start": 2, "seed_run_end": 6})
+    second = adapt({"peak_frame": 5, "seed_run_start": 3, "seed_run_end": 7})
+
+    assert first.issues[0].issue_id == second.issues[0].issue_id
+    assert first.evidence[0].start_frame == 30
+    assert first.evidence[0].end_frame == 42
 
 
 def test_morphology_review_maps_to_warn_with_frame_evidence() -> None:

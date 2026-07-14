@@ -57,6 +57,20 @@ MORPHOLOGY_REASON_TO_RULE = {
     ),
 }
 
+TEMPORAL_RULES = {
+    "candidate": "keypoint_temporal.composite_frame_verdict",
+    "skeleton_review": "keypoint_temporal.skeleton_quality_score",
+    "projection": "keypoint_temporal.projection_review",
+    "strong": "keypoint_temporal.strong_temporal_failure",
+}
+
+_CORE_TEMPORAL_METRICS = (
+    "joint_angle_change_deg_max",
+    "rotation_delta_max",
+    "joint_acceleration_m_s2_max",
+    "joint_displacement_m_max",
+)
+
 _MORPHOLOGY_OBSERVED_METRIC = {
     "palm_scale_too_small": "palm_scale_m",
     "bone_length_ratio_spread": "bone_length_ratio_spread",
@@ -161,6 +175,11 @@ def _json_safe_observed(value: Any) -> Any:
         if math.isfinite(numeric):
             return int(value) if isinstance(value, int) else numeric
         return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_observed(item)
+            for key, item in value.items()
+        }
     if isinstance(value, tuple):
         return [_json_safe_observed(item) for item in value]
     if isinstance(value, list):
@@ -787,6 +806,289 @@ def adapt_keypoint_presence(
     )
 
 
+class _TemporalCandidate(NamedTuple):
+    start_frame: int
+    end_frame: int
+    hand_side: str | None
+    trigger_metrics: Mapping[str, Any]
+
+
+def _temporal_rule(config: LoadedQcConfig, alias: str) -> Mapping[str, Any]:
+    return _rule(
+        config, "keypoint_temporal", TEMPORAL_RULES[alias].rsplit(".", 1)[-1]
+    )
+
+
+def _temporal_row_failures(
+    row: CheckResult,
+    *,
+    config: LoadedQcConfig,
+    parameters: Mapping[str, Any],
+) -> tuple[_NormalizedFailure, ...]:
+    if row.check != "skeleton_quality_score" or row.frame_idx < 0:
+        return ()
+
+    skeleton_verdict = row.metrics.get("skeleton_verdict")
+    raw_tokens = row.metrics.get("which_thresholds_exceeded")
+    tokens = (
+        {
+            token
+            for token in raw_tokens
+            if isinstance(token, str) and token in _CORE_TEMPORAL_METRICS
+        }
+        if isinstance(raw_tokens, (list, tuple))
+        else set()
+    )
+
+    def failure(
+        alias: str,
+        side: str,
+        metric: str,
+        observed: Any,
+        operator: str,
+        boundary: Any,
+    ) -> _NormalizedFailure:
+        rule = _temporal_rule(config, alias)
+        return _NormalizedFailure(
+            side, row.frame_idx, _rule_verdict(rule), str(rule["rule_id"]),
+            metric, observed, operator, boundary,
+        )
+
+    hard_count = int(parameters["hard_exceeded_metric_count"])
+    if skeleton_verdict == "suspect" and len(tokens) >= hard_count:
+        return (
+            failure(
+                "strong", "both", "exceeded_temporal_metric_count",
+                len(tokens), ">=", hard_count,
+            ),
+        )
+
+    projection_sides = [
+        side
+        for side in parameters["sides"]
+        if bool(row.metrics.get(f"{side}_needs_projection_review", 0.0))
+    ]
+    if projection_sides:
+        return tuple(
+            failure(
+                "projection", str(side), f"{side}_needs_projection_review",
+                row.metrics[f"{side}_needs_projection_review"], "==", 1.0,
+            )
+            for side in projection_sides
+        )
+    if bool(row.metrics.get("needs_projection_review", 0.0)):
+        return (
+            failure(
+                "projection", "both", "needs_projection_review",
+                row.metrics["needs_projection_review"], "==", 1.0,
+            ),
+        )
+
+    if skeleton_verdict not in {"review", "suspect"}:
+        return ()
+    return (
+        failure(
+            "skeleton_review", "both", "skeleton_verdict",
+            skeleton_verdict, "in", ["review", "suspect"],
+        ),
+    )
+
+
+def _source_temporal_candidates(
+    asset_id: str,
+    candidate_windows: Sequence[Mapping[str, Any]],
+) -> tuple[_TemporalCandidate, ...]:
+    def normalize(candidate: Mapping[str, Any]) -> _TemporalCandidate:
+        side = candidate.get("hand_side")
+        trigger_metrics = candidate.get("trigger_metrics")
+        return _TemporalCandidate(
+            start_frame=int(candidate["start_frame"]),
+            end_frame=int(candidate["end_frame"]),
+            hand_side=side if isinstance(side, str) and side else None,
+            trigger_metrics=(
+                trigger_metrics if isinstance(trigger_metrics, Mapping) else {}
+            ),
+        )
+
+    return tuple(
+        normalize(candidate)
+        for candidate in candidate_windows
+        if candidate.get("asset_id") == asset_id
+        and candidate.get("coordinate_space") == "source"
+        and candidate.get("frame_coordinate_system") in {None, "source_inclusive"}
+    )
+
+
+def _peak_trigger_metrics(
+    candidates: Sequence[_TemporalCandidate],
+) -> dict[str, float | int]:
+    peaks: dict[str, float | int] = {}
+
+    def update(name: str, value: Any) -> None:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            return
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return
+        previous = peaks.get(name)
+        if previous is None or numeric > float(previous):
+            peaks[name] = int(value) if isinstance(value, int) else numeric
+
+    for candidate in candidates:
+        for name, value in candidate.trigger_metrics.items():
+            if isinstance(name, str):
+                update(name, value)
+    return {name: peaks[name] for name in sorted(peaks)}
+
+
+def _link_issue_evidence(
+    issue: Issue,
+    *,
+    kind: str,
+    path: str,
+    frame_range: tuple[int, int],
+    hand_side: str | None,
+) -> tuple[Issue, EvidenceRef]:
+    evidence_id = f"{issue.issue_id}:{kind}"
+    evidence = EvidenceRef(
+        evidence_id=evidence_id,
+        kind=kind,
+        path=path,
+        coordinate_system="source_inclusive",
+        start_frame=frame_range[0],
+        end_frame=frame_range[1],
+        hand_side=hand_side,
+    )
+    return replace(issue, evidence_ids=(evidence_id,)), evidence
+
+
+def adapt_keypoint_temporal(
+    *,
+    asset_id: str,
+    source_relative_path: str,
+    results: Sequence[CheckResult],
+    candidate_windows: Sequence[Mapping[str, Any]],
+    config: LoadedQcConfig,
+) -> ModuleResult:
+    """Adapt structured temporal rows and mapped source candidate windows."""
+    rows = [
+        row
+        for row in results
+        if row.check in {"keypoint_temporal", "skeleton_quality_score"}
+    ]
+    candidates = _source_temporal_candidates(asset_id, candidate_windows)
+    if not rows and not candidates:
+        return ModuleResult(
+            module="keypoint_temporal",
+            verdict="skipped",
+            evaluation={
+                "decision": "skipped",
+                "reason": "source_signal_not_provided",
+            },
+            metrics={},
+        )
+
+    parameters = config.module_parameters("keypoint_temporal")
+    failures = tuple(
+        failure
+        for row in rows
+        for failure in _temporal_row_failures(
+            row,
+            config=config,
+            parameters=parameters,
+        )
+    )
+    issue_evidence: list[tuple[Issue, EvidenceRef]] = []
+    row_for_issue = rows[0] if rows else None
+    if row_for_issue is not None:
+        for failure, frame_range in _compact_failures(failures):
+            issue = _issue_from_row(
+                asset_id=asset_id,
+                module="keypoint_temporal",
+                rule_id=failure.rule_id,
+                row=row_for_issue,
+                source_relative_path=source_relative_path,
+                severity=failure.severity,
+                needs_manual_review=failure.severity == "warn",
+                metric=failure.metric,
+                observed_value=failure.observed,
+                operator=failure.operator,
+                boundary_value=failure.boundary,
+                hand_side=failure.side,
+                frame_range=frame_range,
+                evidence_kind="frame_metrics",
+            )
+            issue_evidence.append(
+                _link_issue_evidence(
+                    issue,
+                    kind="frame_metrics",
+                    path="check_results.json",
+                    frame_range=frame_range,
+                    hand_side=failure.side,
+                )
+            )
+
+    candidate_rule = (
+        _temporal_rule(config, "candidate") if candidates else None
+    )
+    if candidate_rule is not None:
+        candidate_row = CheckResult(
+            "composite_frame_verdict", 0, -1, {}, None, "candidate window"
+        )
+        for candidate in candidates:
+            issue = _issue_from_row(
+                asset_id=asset_id,
+                module="keypoint_temporal",
+                rule_id=str(candidate_rule["rule_id"]),
+                row=candidate_row,
+                source_relative_path=source_relative_path,
+                severity=_rule_verdict(candidate_rule),
+                needs_manual_review=True,
+                metric="trigger_metrics",
+                observed_value=candidate.trigger_metrics,
+                operator="exists",
+                boundary_value=True,
+                hand_side=candidate.hand_side,
+                frame_range=(candidate.start_frame, candidate.end_frame),
+                evidence_kind="candidate_window",
+            )
+            issue_evidence.append(
+                _link_issue_evidence(
+                    issue,
+                    kind="candidate_window",
+                    path="candidate_windows.json",
+                    frame_range=(candidate.start_frame, candidate.end_frame),
+                    hand_side=candidate.hand_side,
+                )
+            )
+
+    issues = tuple(issue for issue, _evidence in issue_evidence)
+    verdict = _worst("pass", *(issue.severity for issue in issues))
+    checked_frames = {row.frame_idx for row in rows if row.frame_idx >= 0}
+    return ModuleResult(
+        module="keypoint_temporal",
+        verdict=verdict,
+        evaluation={
+            "decision": verdict,
+            "checked_frame_count": len(checked_frames),
+            "candidate_window_count": len(candidates),
+        },
+        metrics={
+            "peak_trigger_metrics": _peak_trigger_metrics(candidates),
+            "candidate_window_count": len(candidates),
+            "candidate_frame_union_count": len(
+                {
+                    frame
+                    for candidate in candidates
+                    for frame in range(candidate.start_frame, candidate.end_frame + 1)
+                }
+            ),
+        },
+        issues=issues,
+        evidence=tuple(evidence for _issue, evidence in issue_evidence),
+    )
+
+
 def _morphology_failure(
     row: CheckResult,
     token: Any,
@@ -900,18 +1202,14 @@ def adapt_keypoint_morphology(
             frame_range=frame_range,
             evidence_kind="frame_metrics",
         )
-        evidence_id = f"{issue.issue_id}:frame_metrics"
-        evidence = EvidenceRef(
-            evidence_id=evidence_id,
-            kind="frame_metrics",
-            path="check_results.json",
-            coordinate_system="source_inclusive",
-            start_frame=frame_range[0],
-            end_frame=frame_range[1],
-            hand_side=failure.side,
-        )
         issue_evidence.append(
-            (replace(issue, evidence_ids=(evidence_id,)), evidence)
+            _link_issue_evidence(
+                issue,
+                kind="frame_metrics",
+                path="check_results.json",
+                frame_range=frame_range,
+                hand_side=failure.side,
+            )
         )
     return ModuleResult(
         module="keypoint_morphology",
@@ -982,6 +1280,7 @@ __all__ = [
     "adapt_hdf5_text_info",
     "adapt_keypoint_morphology",
     "adapt_keypoint_presence",
+    "adapt_keypoint_temporal",
     "adapt_quality_hand",
     "precheck_config_from_unified",
 ]

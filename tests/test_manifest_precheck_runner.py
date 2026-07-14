@@ -205,6 +205,28 @@ def test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows(
     assert all(window["source_end_frame"] == window["end_frame"] for window in windows)
     assert all(window["local_start_frame"] == window["start_frame"] - 3 for window in windows)
     assert all(window["local_end_frame"] == window["end_frame"] - 3 for window in windows)
+    from qc_pipeline.adapters.precheck import adapt_keypoint_temporal
+    from tests.qc_report_fixtures import loaded_test_config
+
+    adapted = adapt_keypoint_temporal(
+        asset_id="dr-range",
+        source_relative_path="deepreach.h5",
+        results=[],
+        candidate_windows=windows,
+        config=loaded_test_config(),
+    )
+    assert adapted.verdict == "warn"
+    assert len(adapted.issues) == len(windows)
+    assert all(issue.module == "keypoint_temporal" for issue in adapted.issues)
+    assert [
+        (issue.context["start_frame"], issue.context["end_frame"])
+        for issue in adapted.issues
+    ] == [(window["start_frame"], window["end_frame"]) for window in windows]
+    assert all(
+        evidence.path == "candidate_windows.json"
+        and evidence.coordinate_system == "source_inclusive"
+        for evidence in adapted.evidence
+    )
     aggregates = json.loads((output_dir / "clip_aggregates.json").read_text())
     assert all(row["morphology_status"] == "not_ready_topology" for row in aggregates)
     assert all(row["supplier_quality_signal"] == "not_provided" for row in aggregates)
