@@ -180,6 +180,27 @@ def test_nonzero_window_sampling_matches_existing_boundary_behavior() -> None:
     ) == [3, 4, 6, 9, 10]
 
 
+def test_sam3_thresholds_are_injected_from_unified_config() -> None:
+    from qc_common.config import load_qc_acceptance_config
+    from tools.run_manifest_sam3_containment import configured_sam3_thresholds
+
+    frame_thresholds, window_thresholds = configured_sam3_thresholds(
+        load_qc_acceptance_config()
+    )
+
+    assert frame_thresholds == {
+        "abnormal_inside_ratio_threshold": 1.0,
+        "projected_in_image_ratio_threshold": 0.8,
+        "strong_inside_ratio_threshold": 0.2,
+        "acceptable_inside_ratio_threshold": 0.6,
+        "mask_tiny_area_ratio_threshold": 0.0,
+    }
+    assert window_thresholds == {
+        "fail_min_strong_frames": 3,
+        "fail_strong_frame_ratio": 0.6,
+    }
+
+
 def test_runner_evaluates_both_hands_with_source_coordinates(tmp_path: Path) -> None:
     from tools.run_manifest_sam3_containment import run_manifest_sam3_containment
 
@@ -234,6 +255,167 @@ def test_runner_evaluates_both_hands_with_source_coordinates(tmp_path: Path) -> 
     ):
         assert (output_dir / filename).exists()
     assert not list(output_dir.rglob("*.mp4"))
+
+
+def _advance_report_to_sam3(tmp_path: Path, asset_id: str) -> int:
+    from qc_common.contracts import ModuleResult
+    from qc_common.report_mutation import apply_module_result
+    from qc_pipeline.context import AssetContext
+    from tests.qc_report_fixtures import loaded_test_config
+
+    config = loaded_test_config()
+    modules = config.pipeline_modules
+    target_index = modules.index("sam3_containment")
+    context = AssetContext(
+        asset_id=asset_id,
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / f"{asset_id}.json",
+        source_files={},
+    )
+    revision = 0
+    for index, module in enumerate(modules[:target_index]):
+        report = apply_module_result(
+            context.report_path,
+            context=context,
+            config=config,
+            profile="acceptance",
+            result=ModuleResult(module, "pass", {}, {}),
+            expected_revision=revision,
+            next_module=modules[index + 1],
+            now=f"2026-07-14T00:00:{index:02d}Z",
+        )
+        revision = int(report["report_revision"])
+    return revision
+
+
+def test_runner_groups_asset_windows_into_one_shared_report_write(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_sam3_containment import run_manifest_sam3_containment
+
+    manifest, windows, _, _ = _write_inputs(tmp_path)
+    pd.DataFrame(
+        [
+            {
+                "asset_id": "jd-range",
+                "start_frame": 3,
+                "end_frame": 4,
+                "hand_side": "left",
+            },
+            {
+                "asset_id": "jd-range",
+                "start_frame": 9,
+                "end_frame": 10,
+                "hand_side": "right",
+            },
+        ]
+    ).to_parquet(windows, index=False)
+    revision = _advance_report_to_sam3(tmp_path, "jd-range")
+    output_dir = tmp_path / "sam3"
+
+    summary = run_manifest_sam3_containment(
+        manifest=manifest,
+        candidate_windows=windows,
+        supplier="jdt",
+        output_dir=output_dir,
+        batch_root=tmp_path,
+        profile="acceptance",
+        sam3_model=None,
+        source_cache=FakeSourceCache(),
+        segmenter=FakeSegmenter(),
+    )
+
+    report = json.loads(
+        (tmp_path / "quality_archive" / "jd-range.json").read_text()
+    )
+    assert summary["qc_report_write_count"] == 1
+    assert report["report_revision"] == revision + 1
+    assert report["sam3_containment"]["metrics"]["window_count"] == 2
+    assert report["sam3_containment"]["flow"]["result_gate"]["verdict"] == "pass"
+    assert all(
+        not Path(item["path"]).is_absolute()
+        for item in report["sam3_containment"]["evidence"]
+    )
+    assert json.loads((output_dir / "run_config.json").read_text())[
+        "frame_thresholds"
+    ]["strong_inside_ratio_threshold"] == 0.2
+
+
+def test_runner_does_not_commit_asset_when_any_window_fails(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_sam3_containment import run_manifest_sam3_containment
+
+    manifest, windows, _, _ = _write_inputs(tmp_path)
+    pd.DataFrame(
+        [
+            {
+                "asset_id": "jd-range",
+                "start_frame": 3,
+                "end_frame": 4,
+                "hand_side": "left",
+            },
+            {
+                "asset_id": "jd-range",
+                "start_frame": 10,
+                "end_frame": 20,
+                "hand_side": "right",
+            },
+        ]
+    ).to_parquet(windows, index=False)
+    revision = _advance_report_to_sam3(tmp_path, "jd-range")
+    report_path = tmp_path / "quality_archive" / "jd-range.json"
+    before = report_path.read_bytes()
+
+    summary = run_manifest_sam3_containment(
+        manifest=manifest,
+        candidate_windows=windows,
+        supplier="jdt",
+        output_dir=tmp_path / "sam3",
+        batch_root=tmp_path,
+        profile="acceptance",
+        sam3_model=None,
+        source_cache=FakeSourceCache(),
+        segmenter=FakeSegmenter(),
+    )
+
+    assert summary["failed_asset_count"] == 1
+    assert summary["qc_report_write_count"] == 0
+    assert report_path.read_bytes() == before
+    assert json.loads(before)["report_revision"] == revision
+
+
+def test_runner_does_not_commit_when_combined_overlay_sidecar_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.run_manifest_sam3_containment as runner
+
+    manifest, windows, _, _ = _write_inputs(tmp_path)
+    _advance_report_to_sam3(tmp_path, "jd-range")
+    report_path = tmp_path / "quality_archive" / "jd-range.json"
+    before = report_path.read_bytes()
+
+    def fail_overlay(**_kwargs):
+        raise OSError("overlay encoder failed")
+
+    monkeypatch.setattr(runner, "write_combined_overlay_image", fail_overlay)
+    summary = runner.run_manifest_sam3_containment(
+        manifest=manifest,
+        candidate_windows=windows,
+        supplier="jdt",
+        output_dir=tmp_path / "sam3",
+        batch_root=tmp_path,
+        profile="acceptance",
+        sam3_model=None,
+        source_cache=FakeSourceCache(),
+        segmenter=FakeSegmenter(),
+    )
+
+    assert summary["failed_window_count"] == 1
+    assert summary["failed_asset_count"] == 1
+    assert summary["qc_report_write_count"] == 0
+    assert report_path.read_bytes() == before
 
 
 def test_write_overlays_keeps_per_hand_and_adds_combined_review_images(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import math
@@ -17,7 +18,13 @@ import pandas as pd
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from qc_common.config import LoadedQcConfig, load_qc_acceptance_config  # noqa: E402
 from qc_common.keypoints import acceptance_joint_names  # noqa: E402
+from qc_common.report import load_asset_qc_report  # noqa: E402
+from qc_pipeline.adapters.sam3_containment import (  # noqa: E402
+    write_sam3_asset_result,
+)
+from qc_pipeline.context import AssetContext  # noqa: E402
 from tools.sam3_keypoint_containment import (  # noqa: E402
     aggregate_window_containment_summaries,
     candidate_window_metadata,
@@ -39,15 +46,15 @@ SAM3_CONFIG = {
     "max_instances_per_query": 10,
 }
 FRAME_THRESHOLDS = {
-    "abnormal_inside_ratio_threshold": 1.0,
-    "projected_in_image_ratio_threshold": 0.8,
-    "strong_inside_ratio_threshold": 0.2,
-    "acceptable_inside_ratio_threshold": 0.6,
-    "mask_tiny_area_ratio_threshold": 0.0,
+    "abnormal_inside_ratio_threshold": "abnormal_inside_ratio_threshold",
+    "projected_in_image_ratio_threshold": "projected_in_image_ratio_threshold",
+    "strong_inside_ratio_threshold": "strong_inside_ratio_threshold",
+    "acceptable_inside_ratio_threshold": "acceptable_inside_ratio_threshold",
+    "mask_tiny_area_ratio_threshold": "mask_tiny_area_ratio_threshold",
 }
 WINDOW_THRESHOLDS = {
-    "fail_min_strong_frames": 3,
-    "fail_strong_frame_ratio": 0.6,
+    "fail_min_strong_frames": "fail_min_strong_frames",
+    "fail_strong_frame_ratio": "fail_strong_frame_ratio",
 }
 OUTPUT_FILENAMES = (
     "frame_keypoint_containment.json",
@@ -58,6 +65,7 @@ OUTPUT_FILENAMES = (
     "run_config.json",
     "review_evidence_manifest.csv",
     "review_evidence_manifest.parquet",
+    "qc_report_prerequisites.json",
 )
 EVIDENCE_MANIFEST_COLUMNS = (
     "review_id",
@@ -75,6 +83,40 @@ EVIDENCE_MANIFEST_COLUMNS = (
 OVERLAY_MODES = ("combined", "per-hand", "both", "none")
 
 
+def configured_sam3_thresholds(
+    config: LoadedQcConfig,
+) -> tuple[dict[str, float], dict[str, float | int]]:
+    """Resolve every legacy algorithm threshold from the unified Config."""
+    parameters = config.module_parameters("sam3_containment")
+
+    def numeric(name: str, *, integer: bool = False) -> float | int:
+        value = parameters.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"sam3_containment parameter {name} must be numeric")
+        if not math.isfinite(float(value)):
+            raise ValueError(f"sam3_containment parameter {name} must be finite")
+        if integer:
+            if int(value) != value:
+                raise ValueError(
+                    f"sam3_containment parameter {name} must be an integer"
+                )
+            return int(value)
+        return float(value)
+
+    frame = {
+        argument: float(numeric(parameter))
+        for argument, parameter in FRAME_THRESHOLDS.items()
+    }
+    window: dict[str, float | int] = {
+        argument: numeric(
+            parameter,
+            integer=argument == "fail_min_strong_frames",
+        )
+        for argument, parameter in WINDOW_THRESHOLDS.items()
+    }
+    return frame, window
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -86,10 +128,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-windows", type=Path, required=True)
     parser.add_argument("--supplier", choices=("jdt",), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--batch-root", type=Path, required=True)
+    parser.add_argument("--profile", default="acceptance")
     parser.add_argument("--frames-per-window", type=int, default=3)
     parser.add_argument("--max-windows", type=int, default=None)
     parser.add_argument("--max-clips", type=int, default=None)
     parser.add_argument("--sam3-model", type=Path, default=None)
+    parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--queries", default=DEFAULT_QUERIES)
     parser.add_argument(
         "--overlay-mode",
@@ -494,6 +539,44 @@ def _write_evidence_outputs(rows: list[dict[str, Any]], output_dir: Path) -> Non
     frame.to_parquet(output_dir / "review_evidence_manifest.parquet", index=False)
 
 
+def _sam3_write_is_ready(report: dict[str, Any] | None) -> bool:
+    if report is None:
+        return False
+    pipeline_state = report.get("pipeline_state")
+    if not isinstance(pipeline_state, dict):
+        return False
+    if pipeline_state.get("next_module") == "sam3_containment":
+        return True
+    if pipeline_state.get("last_completed_module") != "sam3_containment":
+        return False
+    module = report.get("sam3_containment")
+    flow = module.get("flow") if isinstance(module, dict) else None
+    exit_gate = flow.get("exit_gate") if isinstance(flow, dict) else None
+    return isinstance(exit_gate, dict)
+
+
+def _sam3_prerequisite(
+    *,
+    asset_id: str,
+    report: dict[str, Any] | None,
+    report_path: Path,
+    batch_root: Path,
+) -> dict[str, Any]:
+    pipeline_state = report.get("pipeline_state") if report is not None else None
+    current_next = (
+        pipeline_state.get("next_module")
+        if isinstance(pipeline_state, dict)
+        else None
+    )
+    return {
+        "asset_id": asset_id,
+        "condition": "awaiting_pipeline",
+        "current_next_module": current_next,
+        "required_module": "sam3_containment",
+        "report_path": report_path.relative_to(batch_root).as_posix(),
+    }
+
+
 def resolve_overlay_mode(
     overlay_mode: str | None,
     write_overlays: bool | None,
@@ -564,6 +647,9 @@ def run_manifest_sam3_containment(
     dry_run: bool = False,
     source_cache: Any | None = None,
     segmenter: Any | None = None,
+    config_path: Path | None = None,
+    batch_root: Path | None = None,
+    profile: str = "acceptance",
 ) -> dict[str, Any]:
     if supplier != "jdt":
         raise ValueError(f"unsupported supplier: {supplier}")
@@ -579,6 +665,13 @@ def run_manifest_sam3_containment(
     manifest = Path(manifest)
     candidate_windows = Path(candidate_windows)
     output_dir = Path(output_dir)
+    batch_root = Path(batch_root) if batch_root is not None else output_dir.parent
+    loaded_config = load_qc_acceptance_config(config_path)
+    loaded_config.execution_profile(profile)
+    frame_thresholds, window_thresholds = configured_sam3_thresholds(loaded_config)
+    modules = loaded_config.pipeline_modules
+    sam3_index = modules.index("sam3_containment")
+    next_module = modules[sam3_index + 1] if sam3_index + 1 < len(modules) else None
     manifest_rows = read_records(manifest)
     windows = read_records(candidate_windows)
     manifest_by_asset, manifest_order, manifest_failures = _manifest_index(
@@ -612,6 +705,9 @@ def run_manifest_sam3_containment(
         "completed_window_count": 0,
         "failed_window_count": len(window_failures),
         "failed_manifest_row_count": len(manifest_failures),
+        "failed_asset_count": 0,
+        "qc_report_write_count": 0,
+        "awaiting_pipeline_asset_count": 0,
         "dry_run": dry_run,
     }
     if dry_run:
@@ -642,6 +738,7 @@ def run_manifest_sam3_containment(
             manifest_row = item["manifest"]
             window = item["window"]
             window_rows: list[dict[str, Any]] = []
+            window_evidence_rows: list[dict[str, Any]] = []
             try:
                 video_path = manifest_row["primary_video_path"]
                 parquet_path = manifest_row["parquet_path"]
@@ -688,7 +785,7 @@ def run_manifest_sam3_containment(
                                 pixels=pixels,
                                 joint_names=joint_names,
                                 masks=masks,
-                                **FRAME_THRESHOLDS,
+                                **frame_thresholds,
                             )
                         )
                         combined_hands[hand_side] = {
@@ -761,7 +858,7 @@ def run_manifest_sam3_containment(
                                     pixels=pixels,
                                     joint_names=joint_names,
                                     masks=masks,
-                                    **FRAME_THRESHOLDS,
+                                    **frame_thresholds,
                                 )
                                 combined_hands[hand_side] = {
                                     "pixels": pixels,
@@ -780,7 +877,7 @@ def run_manifest_sam3_containment(
                                 frame_idx=source_frame_idx,
                                 output_dir=output_dir / "combined_overlays",
                             )
-                            evidence_rows.append(
+                            window_evidence_rows.append(
                                 {
                                     "review_id": "",
                                     "supplier_id": str(
@@ -817,13 +914,12 @@ def run_manifest_sam3_containment(
                                 }
                             )
                         except Exception as exc:
-                            LOGGER.warning(
-                                "Combined overlay failed for %s frame %d: %s",
-                                item["asset_id"],
-                                source_frame_idx,
-                                exc,
-                            )
+                            raise RuntimeError(
+                                "combined overlay failed for "
+                                f"{item['asset_id']} frame {source_frame_idx}: {exc}"
+                            ) from exc
                 frame_rows.extend(window_rows)
+                evidence_rows.extend(window_evidence_rows)
                 summary["completed_window_count"] += 1
             except Exception as exc:
                 LOGGER.exception(
@@ -845,7 +941,7 @@ def run_manifest_sam3_containment(
 
     window_summaries = aggregate_window_containment_summaries(
         frame_rows,
-        **WINDOW_THRESHOLDS,
+        **window_thresholds,
     )
     _augment_window_summaries(window_summaries, frame_rows)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -860,12 +956,85 @@ def run_manifest_sam3_containment(
         parquet_path=output_dir / "window_keypoint_containment_summary.parquet",
     )
     _write_evidence_outputs(evidence_rows, output_dir)
+    failed_assets = {
+        str(row["asset_id"])
+        for row in failures
+        if row.get("asset_id") is not None
+    }
+    selected_assets = list(
+        dict.fromkeys(str(item["asset_id"]) for item in prepared)
+    )
+    prerequisites: list[dict[str, Any]] = []
+    for asset_id in selected_assets:
+        if asset_id in failed_assets:
+            continue
+        report_path = batch_root / "quality_archive" / f"{asset_id}.json"
+        report = load_asset_qc_report(report_path)
+        if not _sam3_write_is_ready(report):
+            prerequisites.append(
+                _sam3_prerequisite(
+                    asset_id=asset_id,
+                    report=report,
+                    report_path=report_path,
+                    batch_root=batch_root,
+                )
+            )
+            continue
+        assert report is not None
+        source_files = report.get("source_files")
+        if not isinstance(source_files, dict):
+            failures.append(
+                {
+                    "failure_stage": "qc_report_write",
+                    "asset_id": asset_id,
+                    "error": "asset QC report source_files must be an object",
+                }
+            )
+            failed_assets.add(asset_id)
+            continue
+        try:
+            context = AssetContext(
+                asset_id=asset_id,
+                batch_root=batch_root,
+                report_path=report_path,
+                source_files=copy.deepcopy(source_files),
+            )
+            write_sam3_asset_result(
+                context=context,
+                window_summaries=[
+                    row for row in window_summaries if row.get("asset_id") == asset_id
+                ],
+                evidence_rows=[
+                    row for row in evidence_rows if row.get("asset_id") == asset_id
+                ],
+                config=loaded_config,
+                profile=profile,
+                expected_revision=int(report.get("report_revision", 0)),
+                next_module=next_module,
+            )
+            summary["qc_report_write_count"] += 1
+        except Exception as exc:
+            LOGGER.exception("SAM3 QC report write failed for %s", asset_id)
+            failures.append(
+                {
+                    "failure_stage": "qc_report_write",
+                    "asset_id": asset_id,
+                    "error": str(exc),
+                }
+            )
+            failed_assets.add(asset_id)
+    summary["failed_asset_count"] = len(failed_assets)
+    summary["awaiting_pipeline_asset_count"] = len(prerequisites)
+    write_json(prerequisites, output_dir / "qc_report_prerequisites.json")
     write_json(failures, output_dir / "failures.json")
     run_config = {
         "manifest": str(manifest),
         "candidate_windows": str(candidate_windows),
         "supplier": supplier,
         "output_dir": str(output_dir),
+        "batch_root": str(batch_root),
+        "profile": profile,
+        "qc_config": loaded_config.json_reference(),
         "frames_per_window": frames_per_window,
         "include_window_boundaries": True,
         "max_windows": max_windows,
@@ -876,27 +1045,27 @@ def run_manifest_sam3_containment(
         "write_overlays": effective_overlay_mode != "none",
         "write_per_hand_overlays": write_per_hand_overlays,
         "write_combined_overlays": write_combined_overlays,
-        "frame_thresholds": FRAME_THRESHOLDS,
-        "window_thresholds": WINDOW_THRESHOLDS,
-        "abnormal_inside_ratio_threshold": FRAME_THRESHOLDS[
+        "frame_thresholds": frame_thresholds,
+        "window_thresholds": window_thresholds,
+        "abnormal_inside_ratio_threshold": frame_thresholds[
             "abnormal_inside_ratio_threshold"
         ],
-        "projected_in_image_ratio_threshold": FRAME_THRESHOLDS[
+        "projected_in_image_ratio_threshold": frame_thresholds[
             "projected_in_image_ratio_threshold"
         ],
-        "strong_containment_inside_ratio_threshold": FRAME_THRESHOLDS[
+        "strong_containment_inside_ratio_threshold": frame_thresholds[
             "strong_inside_ratio_threshold"
         ],
-        "acceptable_inside_ratio_threshold": FRAME_THRESHOLDS[
+        "acceptable_inside_ratio_threshold": frame_thresholds[
             "acceptable_inside_ratio_threshold"
         ],
-        "mask_tiny_area_ratio_threshold": FRAME_THRESHOLDS[
+        "mask_tiny_area_ratio_threshold": frame_thresholds[
             "mask_tiny_area_ratio_threshold"
         ],
-        "containment_fail_min_strong_frames": WINDOW_THRESHOLDS[
+        "containment_fail_min_strong_frames": window_thresholds[
             "fail_min_strong_frames"
         ],
-        "containment_fail_strong_frame_ratio": WINDOW_THRESHOLDS[
+        "containment_fail_strong_frame_ratio": window_thresholds[
             "fail_strong_frame_ratio"
         ],
         "primary_camera": "observation.images.cam_left",
@@ -918,6 +1087,8 @@ def main() -> None:
         candidate_windows=args.candidate_windows,
         supplier=args.supplier,
         output_dir=args.output_dir,
+        batch_root=args.batch_root,
+        profile=args.profile,
         frames_per_window=args.frames_per_window,
         max_windows=args.max_windows,
         max_clips=args.max_clips,
@@ -927,6 +1098,7 @@ def main() -> None:
         write_overlays=args.write_overlays,
         overwrite=args.overwrite,
         dry_run=args.dry_run,
+        config_path=args.config,
     )
     print(json.dumps(json_safe(summary), indent=2, sort_keys=True))
 

@@ -513,7 +513,14 @@ modules:
       - right
       joint_names: null
       inside_ratio_warn: 0.6
-      inside_ratio_fail: 0.3
+      inside_ratio_fail: 0.2
+      abnormal_inside_ratio_threshold: 1.0
+      projected_in_image_ratio_threshold: 0.8
+      strong_inside_ratio_threshold: 0.2
+      acceptable_inside_ratio_threshold: 0.6
+      mask_tiny_area_ratio_threshold: 0.0
+      fail_min_strong_frames: 3
+      fail_strong_frame_ratio: 0.6
       max_projection_error_px_warn: 5
       max_projection_error_px_fail: 20
       side_view_warn_only: true
