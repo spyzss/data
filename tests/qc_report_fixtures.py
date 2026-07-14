@@ -1,7 +1,24 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 from typing import Any
+
+from qc_common.config import LoadedQcConfig, load_qc_acceptance_config
+from qc_pipeline.context import AssetContext
+
+
+def make_asset_context(tmp_path: Path, asset_id: str) -> AssetContext:
+    return AssetContext(
+        asset_id=asset_id,
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / f"{asset_id}.json",
+        source_files={},
+    )
+
+
+def loaded_test_config() -> LoadedQcConfig:
+    return load_qc_acceptance_config()
 
 
 def make_v1_video_report() -> dict[str, Any]:
