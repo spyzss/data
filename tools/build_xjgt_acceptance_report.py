@@ -159,7 +159,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build the final XJGT asset ledger, issue events, summary, and Excel report."
     )
-    parser.add_argument("--quality-archive", type=Path)
+    parser.add_argument("--quality-archive", required=True, type=Path)
     parser.add_argument("--legacy-reconciliation-manifest", "--manifest", dest="legacy_manifest", type=Path)
     parser.add_argument("--legacy-reconciliation-precheck-check-results", "--precheck-check-results", dest="legacy_precheck_check_results", type=Path)
     parser.add_argument("--legacy-reconciliation-precheck-clip-aggregates", "--precheck-clip-aggregates", dest="legacy_precheck_clip_aggregates", type=Path)

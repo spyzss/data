@@ -80,7 +80,9 @@ def parse_args() -> argparse.Namespace:
         description="Build an XLSX acceptance ledger from supplier module outputs."
     )
     parser.add_argument("--quality-archive", required=True, type=Path)
-    parser.add_argument("--config", required=True, type=Path)
+    # Config remains part of the legacy helper API, but is not needed when
+    # formal output is sourced from a canonical quality archive.
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--existing-workbook", type=Path)
     parser.add_argument("--overwrite", action="store_true")
