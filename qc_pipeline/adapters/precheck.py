@@ -59,7 +59,6 @@ MORPHOLOGY_REASON_TO_RULE = {
 
 TEMPORAL_RULES = {
     "candidate": "keypoint_temporal.composite_frame_verdict",
-    "skeleton_review": "keypoint_temporal.skeleton_quality_score",
     "projection": "keypoint_temporal.projection_review",
     "strong": "keypoint_temporal.strong_temporal_failure",
 }
@@ -884,14 +883,7 @@ def _temporal_row_failures(
             ),
         )
 
-    if skeleton_verdict not in {"review", "suspect"}:
-        return ()
-    return (
-        failure(
-            "skeleton_review", "both", "skeleton_verdict",
-            skeleton_verdict, "in", ["review", "suspect"],
-        ),
-    )
+    return ()
 
 
 def _source_temporal_candidates(

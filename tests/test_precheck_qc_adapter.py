@@ -707,7 +707,7 @@ def test_temporal_projection_review_is_warn_without_candidate_window() -> None:
     assert issue.needs_manual_review is True
 
 
-def test_temporal_non_strong_skeleton_review_remains_manual_warn() -> None:
+def test_temporal_non_strong_row_without_candidate_does_not_create_issue() -> None:
     row = CheckResult(
         "skeleton_quality_score",
         0,
@@ -729,9 +729,58 @@ def test_temporal_non_strong_skeleton_review_remains_manual_warn() -> None:
         config=loaded_test_config(),
     )
 
+    assert result.verdict == "pass"
+    assert result.issues == ()
+
+
+def test_temporal_matching_row_and_candidate_emit_only_candidate_window() -> None:
+    row = CheckResult(
+        "skeleton_quality_score",
+        0,
+        36,
+        {
+            "skeleton_verdict": "review",
+            "which_thresholds_exceeded": ["rotation_delta_max"],
+            "rotation_delta_max": 0.5,
+        },
+        None,
+        "moderate temporal review",
+    )
+    candidate = {
+        "asset_id": "a",
+        "start_frame": 30,
+        "end_frame": 42,
+        "coordinate_space": "source",
+        "hand_side": "both",
+        "trigger_metrics": {"rotation_delta_max": 0.5},
+    }
+    kwargs = {
+        "asset_id": "a",
+        "source_relative_path": "hdf5/a.h5",
+        "results": [row],
+        "candidate_windows": [candidate],
+        "config": loaded_test_config(),
+    }
+
+    result = adapt_keypoint_temporal(**kwargs)
+    repeated = adapt_keypoint_temporal(**kwargs)
+
     assert result.verdict == "warn"
-    assert result.issues[0].rule_id == "keypoint_temporal.skeleton_quality_score"
-    assert result.issues[0].needs_manual_review is True
+    assert len(result.issues) == 1
+    issue = result.issues[0]
+    assert issue.rule_id == "keypoint_temporal.composite_frame_verdict"
+    assert issue.context == {
+        "coordinate_system": "source_inclusive",
+        "start_frame": 30,
+        "end_frame": 42,
+        "hand_side": "both",
+    }
+    assert issue.issue_id == repeated.issues[0].issue_id
+    assert issue.evidence_ids == (f"{issue.issue_id}:candidate_window",)
+    assert len(result.evidence) == 1
+    assert result.evidence[0].kind == "candidate_window"
+    assert result.evidence[0].start_frame == 30
+    assert result.evidence[0].end_frame == 42
 
 
 def test_temporal_reason_text_does_not_create_a_failure() -> None:
