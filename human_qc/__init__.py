@@ -32,6 +32,7 @@ from .warn_service import (
     effective_issue_verdict,
     reduce_overall_decision,
 )
+from .evidence import EvidenceError, EvidenceService, EvidenceView
 
 __all__ = [
     "BoundaryEdit",
@@ -58,4 +59,7 @@ __all__ = [
     "WarnTaskView",
     "effective_issue_verdict",
     "reduce_overall_decision",
+    "EvidenceError",
+    "EvidenceService",
+    "EvidenceView",
 ]
