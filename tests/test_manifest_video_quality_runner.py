@@ -24,6 +24,14 @@ def _result_rows(output_dir: Path) -> list[dict[str, object]]:
     )
 
 
+def _prerequisite_rows(output_dir: Path) -> list[dict[str, object]]:
+    return json.loads(
+        (output_dir / "video_quality_prerequisites.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
 def _advance_report_to_video(
     batch_root: Path,
     *,
@@ -209,6 +217,7 @@ def test_manifest_video_quality_fresh_run_records_pipeline_prerequisite(
             "asset_id": "logical-a",
             "condition": "awaiting_pipeline",
             "current_next_module": None,
+            "reason": "report_missing",
             "required_module": "video_quality",
             "report_path": "quality_archive/logical-a.json",
             "source_range": {
@@ -314,6 +323,107 @@ def test_manifest_video_quality_handles_repeated_source_ranges_independently(
     assert rows["left-range"]["clip_frame_count"] == 3
     assert rows["right-range"]["decoded_frame_count"] == 4
     assert rows["right-range"]["clip_frame_count"] == 4
+
+
+def test_manifest_video_rejects_completed_block_without_valid_exit_gate(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_video_quality import run_manifest_video_quality
+
+    video = tmp_path / "source.mp4"
+    write_test_video(video, [solid_frame(90) for _ in range(5)], fps=10.0)
+    manifest = _write_manifest(
+        tmp_path / "manifest.csv",
+        [
+            {
+                "asset_id": "logical-a",
+                "primary_video_path": str(video),
+                "start_frame": 0,
+                "end_frame": 4,
+            }
+        ],
+    )
+    _advance_report_to_video(
+        tmp_path,
+        asset_id="logical-a",
+        video_path=video,
+        source_range=(0, 5),
+    )
+    output_dir = tmp_path / "quality"
+    run_manifest_video_quality(manifest, output_dir, batch_root=tmp_path)
+    report_path = tmp_path / "quality_archive" / "logical-a.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    del report["video_quality"]["flow"]["exit_gate"]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    before = report_path.read_bytes()
+
+    summary = run_manifest_video_quality(
+        manifest,
+        output_dir,
+        batch_root=tmp_path,
+    )
+
+    assert summary["skipped_clip_count"] == 0
+    assert summary["qc_report_write_count"] == 0
+    assert summary["awaiting_pipeline_clip_count"] == 1
+    assert report_path.read_bytes() == before
+    prerequisite = _prerequisite_rows(output_dir)[0]
+    assert prerequisite["condition"] == "invalid_report"
+    assert prerequisite["reason"] == "video_quality_exit_gate_invalid"
+
+
+def test_manifest_video_rejects_completed_source_range_mismatch(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_video_quality import run_manifest_video_quality
+
+    video = tmp_path / "source.mp4"
+    write_test_video(video, [solid_frame(90) for _ in range(5)], fps=10.0)
+    first_manifest = _write_manifest(
+        tmp_path / "first.csv",
+        [
+            {
+                "asset_id": "logical-a",
+                "primary_video_path": str(video),
+                "start_frame": 0,
+                "end_frame": 2,
+            }
+        ],
+    )
+    _advance_report_to_video(
+        tmp_path,
+        asset_id="logical-a",
+        video_path=video,
+        source_range=(0, 3),
+    )
+    output_dir = tmp_path / "quality"
+    run_manifest_video_quality(first_manifest, output_dir, batch_root=tmp_path)
+    report_path = tmp_path / "quality_archive" / "logical-a.json"
+    before = report_path.read_bytes()
+    second_manifest = _write_manifest(
+        tmp_path / "second.csv",
+        [
+            {
+                "asset_id": "logical-a",
+                "primary_video_path": str(video),
+                "start_frame": 1,
+                "end_frame": 3,
+            }
+        ],
+    )
+
+    summary = run_manifest_video_quality(
+        second_manifest,
+        output_dir,
+        batch_root=tmp_path,
+    )
+
+    assert summary["qc_report_write_count"] == 0
+    assert summary["awaiting_pipeline_clip_count"] == 1
+    assert report_path.read_bytes() == before
+    prerequisite = _prerequisite_rows(output_dir)[0]
+    assert prerequisite["condition"] == "invalid_report"
+    assert prerequisite["reason"] == "video_quality_source_range_mismatch"
 
 
 def test_manifest_video_quality_rejects_source_drift_before_report_write(
@@ -434,7 +544,7 @@ def test_manifest_video_quality_dry_run_writes_no_producer_outputs(
     assert not (output_dir / "run_config.json").exists()
 
 
-def test_manifest_video_quality_skips_completed_assets_unless_overwrite(
+def test_manifest_video_quality_skips_valid_completed_asset_even_with_overwrite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import tools.run_manifest_video_quality as runner
@@ -474,5 +584,10 @@ def test_manifest_video_quality_skips_completed_assets_unless_overwrite(
     assert calls == 0
     assert skipped["skipped_clip_count"] == 1
 
-    runner.run_manifest_video_quality(manifest, output_dir, overwrite=True)
-    assert calls == 1
+    overwritten = runner.run_manifest_video_quality(
+        manifest,
+        output_dir,
+        overwrite=True,
+    )
+    assert calls == 0
+    assert overwritten["skipped_clip_count"] == 1

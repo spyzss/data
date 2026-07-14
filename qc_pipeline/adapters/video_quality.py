@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import mimetypes
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from acceptance_pull.video_quality import (
     VideoQualityResult,
@@ -26,6 +28,182 @@ from qc_pipeline.context import AssetContext
 
 
 _COORDINATE_SYSTEM = "source_video_inclusive"
+_READINESS_CONDITIONS = frozenset(
+    {
+        "ready_to_write",
+        "already_completed",
+        "awaiting_pipeline",
+        "invalid_report",
+    }
+)
+
+
+@dataclass(frozen=True)
+class VideoQualityReportReadiness:
+    """Canonical readiness result shared by both video-quality runners."""
+
+    condition: Literal[
+        "ready_to_write",
+        "already_completed",
+        "awaiting_pipeline",
+        "invalid_report",
+    ]
+    reason: str
+    current_next_module: str | None
+
+    def __post_init__(self) -> None:
+        if self.condition not in _READINESS_CONDITIONS:
+            raise ValueError(f"unsupported readiness condition: {self.condition}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "condition": self.condition,
+            "reason": self.reason,
+            "current_next_module": self.current_next_module,
+            "required_module": "video_quality",
+        }
+
+
+def _readiness(
+    condition: Literal[
+        "ready_to_write",
+        "already_completed",
+        "awaiting_pipeline",
+        "invalid_report",
+    ],
+    reason: str,
+    current_next_module: str | None,
+) -> VideoQualityReportReadiness:
+    return VideoQualityReportReadiness(
+        condition=condition,
+        reason=reason,
+        current_next_module=current_next_module,
+    )
+
+
+def _valid_exit_gate(module: Mapping[str, Any]) -> bool:
+    flow = module.get("flow")
+    exit_gate = flow.get("exit_gate") if isinstance(flow, Mapping) else None
+    if not isinstance(exit_gate, Mapping):
+        return False
+    state = exit_gate.get("state")
+    continue_to_next = exit_gate.get("continue_to_next_module")
+    next_module = exit_gate.get("next_module")
+    if state not in {"continue", "stop_qc"}:
+        return False
+    if not isinstance(continue_to_next, bool):
+        return False
+    if next_module is not None and not isinstance(next_module, str):
+        return False
+    return (state == "continue") == continue_to_next
+
+
+def _matching_source_evidence(
+    module: Mapping[str, Any],
+    *,
+    source_video_path: str,
+    start_frame: int | None,
+    end_frame: int | None,
+) -> bool:
+    evidence = module.get("evidence")
+    return isinstance(evidence, list) and any(
+        isinstance(item, Mapping)
+        and item.get("kind") == "source_video"
+        and item.get("path") == source_video_path
+        and item.get("coordinate_system") == _COORDINATE_SYSTEM
+        and item.get("start_frame") == start_frame
+        and item.get("end_frame") == end_frame
+        for item in evidence
+    )
+
+
+def inspect_video_quality_report(
+    *,
+    report: Mapping[str, Any] | None,
+    asset_id: str,
+    source_video_path: str,
+    source_range: tuple[int, int] | None,
+) -> VideoQualityReportReadiness:
+    """Classify whether a report can accept or already contains this result."""
+    if source_range is None:
+        start_frame = end_frame = None
+    else:
+        start_frame, exclusive_end = source_range
+        if start_frame < 0 or exclusive_end <= start_frame:
+            raise ValueError("source_range must be a non-empty half-open frame range")
+        end_frame = exclusive_end - 1
+
+    if report is None:
+        return _readiness("awaiting_pipeline", "report_missing", None)
+
+    if report.get("asset_id") != asset_id:
+        return _readiness("invalid_report", "asset_id_mismatch", None)
+
+    source_files = report.get("source_files")
+    recorded_video = (
+        source_files.get("video") if isinstance(source_files, Mapping) else None
+    )
+    recorded_path = (
+        recorded_video.get("path")
+        if isinstance(recorded_video, Mapping)
+        else None
+    )
+    if recorded_path != source_video_path:
+        return _readiness("invalid_report", "source_video_path_mismatch", None)
+
+    pipeline_state = report.get("pipeline_state")
+    if not isinstance(pipeline_state, Mapping):
+        return _readiness("invalid_report", "pipeline_state_invalid", None)
+    current_next = pipeline_state.get("next_module")
+    last_completed = pipeline_state.get("last_completed_module")
+    if current_next is not None and not isinstance(current_next, str):
+        return _readiness("invalid_report", "pipeline_state_invalid", None)
+    if last_completed is not None and not isinstance(last_completed, str):
+        return _readiness("invalid_report", "pipeline_state_invalid", current_next)
+
+    module = report.get("video_quality")
+    if module is not None:
+        if not isinstance(module, Mapping):
+            return _readiness(
+                "invalid_report",
+                "video_quality_block_invalid",
+                current_next,
+            )
+        if not _valid_exit_gate(module):
+            return _readiness(
+                "invalid_report",
+                "video_quality_exit_gate_invalid",
+                current_next,
+            )
+        if not _matching_source_evidence(
+            module,
+            source_video_path=source_video_path,
+            start_frame=start_frame,
+            end_frame=end_frame,
+        ):
+            return _readiness(
+                "invalid_report",
+                "video_quality_source_range_mismatch",
+                current_next,
+            )
+        if last_completed == "video_quality":
+            return _readiness(
+                "already_completed",
+                "video_quality_already_completed",
+                current_next,
+            )
+
+    if current_next == "video_quality":
+        return _readiness(
+            "ready_to_write",
+            "pipeline_ready_for_video_quality",
+            current_next,
+        )
+    return _readiness(
+        "awaiting_pipeline",
+        "pipeline_not_ready_for_video_quality",
+        current_next,
+    )
 
 
 def _utc_now() -> str:

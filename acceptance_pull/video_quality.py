@@ -2332,20 +2332,6 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
     }
 
 
-def _video_report_ready(report: dict[str, Any] | None) -> bool:
-    if report is None:
-        return False
-    pipeline_state = report.get("pipeline_state")
-    if not isinstance(pipeline_state, dict):
-        return False
-    if pipeline_state.get("next_module") == "video_quality":
-        return True
-    return (
-        pipeline_state.get("last_completed_module") == "video_quality"
-        and isinstance(report.get("video_quality"), dict)
-    )
-
-
 def _relative_batch_path(path: Path, batch_dir: Path) -> str:
     try:
         return path.resolve().relative_to(batch_dir.resolve()).as_posix()
@@ -2353,18 +2339,17 @@ def _relative_batch_path(path: Path, batch_dir: Path) -> str:
         raise ValueError(f"source path is outside batch root: {path}") from None
 
 
-def _assert_report_source_path(
+def _assert_report_hdf5_path(
     report: dict[str, Any],
     *,
-    source_name: str,
     expected_path: str,
 ) -> None:
     source_files = report.get("source_files")
-    recorded = source_files.get(source_name) if isinstance(source_files, dict) else None
+    recorded = source_files.get("hdf5") if isinstance(source_files, dict) else None
     recorded_path = recorded.get("path") if isinstance(recorded, dict) else None
     if recorded_path != expected_path:
         raise ValueError(
-            f"source_files.{source_name}.path mismatch: "
+            "source_files.hdf5.path mismatch: "
             f"{recorded_path!r} != {expected_path!r}"
         )
 
@@ -2376,7 +2361,10 @@ def write_per_asset_qc_json_reports(
     *,
     profile: str = "acceptance",
 ) -> int:
-    from qc_pipeline.adapters.video_quality import write_video_quality_result
+    from qc_pipeline.adapters.video_quality import (
+        inspect_video_quality_report,
+        write_video_quality_result,
+    )
 
     modules = config.pipeline_modules
     video_index = modules.index("video_quality")
@@ -2385,25 +2373,29 @@ def write_per_asset_qc_json_reports(
     for result in results:
         path = batch_dir / "quality_archive" / f"{result.metrics.asset_id}.json"
         existing = load_asset_qc_report(path)
-        if not _video_report_ready(existing):
+        relative_video_path = _relative_batch_path(result.metrics.path, batch_dir)
+        source_range = (
+            (0, result.metrics.frame_count)
+            if result.metrics.frame_count > 0
+            else None
+        )
+        readiness = inspect_video_quality_report(
+            report=existing,
+            asset_id=result.metrics.asset_id,
+            source_video_path=relative_video_path,
+            source_range=source_range,
+        )
+        if readiness.condition == "already_completed":
+            continue
+        if readiness.condition != "ready_to_write":
             awaiting_pipeline += 1
-            current_next = None
-            if existing is not None and isinstance(existing.get("pipeline_state"), dict):
-                current_next = existing["pipeline_state"].get("next_module")
             LOGGER.warning(
-                "Skipping QC report write for %s: video_quality awaits pipeline "
-                "state (current next_module=%r)",
+                "Skipping QC report write for %s: video_quality_prerequisite=%s",
                 result.metrics.asset_id,
-                current_next,
+                json.dumps(readiness.to_dict(), sort_keys=True),
             )
             continue
         assert existing is not None
-        relative_video_path = _relative_batch_path(result.metrics.path, batch_dir)
-        _assert_report_source_path(
-            existing,
-            source_name="video",
-            expected_path=relative_video_path,
-        )
         source_files: dict[str, Any] = {
             "video": {"path": relative_video_path}
         }
@@ -2415,9 +2407,8 @@ def write_per_asset_qc_json_reports(
                 result.alignment.hdf5_path,
                 batch_dir,
             )
-            _assert_report_source_path(
+            _assert_report_hdf5_path(
                 existing,
-                source_name="hdf5",
                 expected_path=relative_hdf5_path,
             )
             source_files["hdf5"] = {

@@ -30,6 +30,8 @@ from acceptance_pull.video_quality import (  # noqa: E402
 from qc_common.config import load_qc_acceptance_config  # noqa: E402
 from qc_common.report import load_asset_qc_report  # noqa: E402
 from qc_pipeline.adapters.video_quality import (  # noqa: E402
+    VideoQualityReportReadiness,
+    inspect_video_quality_report,
     write_video_quality_result,
 )
 from qc_pipeline.context import AssetContext  # noqa: E402
@@ -240,69 +242,17 @@ def _relative_path(path: Path, batch_root: Path) -> str | None:
         return None
 
 
-def _video_evidence_matches(
-    report: dict[str, Any] | None,
-    *,
-    source_path: str | None,
-    start_frame: int,
-    end_frame: int,
-) -> bool:
-    if report is None or source_path is None:
-        return False
-    module = report.get("video_quality")
-    if not isinstance(module, dict):
-        return False
-    flow = module.get("flow")
-    result_gate = flow.get("result_gate") if isinstance(flow, dict) else None
-    if not isinstance(result_gate, dict) or result_gate.get("verdict") not in {
-        "pass",
-        "warn",
-        "fail",
-        "skipped",
-    }:
-        return False
-    evidence = module.get("evidence")
-    return isinstance(evidence, list) and any(
-        isinstance(item, dict)
-        and item.get("kind") == "source_video"
-        and item.get("path") == source_path
-        and item.get("coordinate_system") == "source_video_inclusive"
-        and item.get("start_frame") == start_frame
-        and item.get("end_frame") == end_frame
-        for item in evidence
-    )
-
-
-def _video_write_is_ready(report: dict[str, Any] | None) -> bool:
-    if report is None:
-        return False
-    pipeline_state = report.get("pipeline_state")
-    if not isinstance(pipeline_state, dict):
-        return False
-    if pipeline_state.get("next_module") == "video_quality":
-        return True
-    if pipeline_state.get("last_completed_module") != "video_quality":
-        return False
-    module = report.get("video_quality")
-    if not isinstance(module, dict):
-        return False
-    flow = module.get("flow")
-    exit_gate = flow.get("exit_gate") if isinstance(flow, dict) else None
-    return isinstance(exit_gate, dict)
-
-
-def _assert_report_source_path(
+def _assert_report_hdf5_path(
     report: dict[str, Any],
     *,
-    source_name: str,
     expected_path: str,
 ) -> None:
     source_files = report.get("source_files")
-    recorded = source_files.get(source_name) if isinstance(source_files, dict) else None
+    recorded = source_files.get("hdf5") if isinstance(source_files, dict) else None
     recorded_path = recorded.get("path") if isinstance(recorded, dict) else None
     if recorded_path != expected_path:
         raise ValueError(
-            f"source_files.{source_name}.path mismatch: "
+            "source_files.hdf5.path mismatch: "
             f"{recorded_path!r} != {expected_path!r}"
         )
 
@@ -310,23 +260,15 @@ def _assert_report_source_path(
 def _prerequisite_record(
     *,
     asset_id: str,
-    report: dict[str, Any] | None,
     report_path: Path,
     batch_root: Path,
     start_frame: int,
     end_frame: int,
+    readiness: VideoQualityReportReadiness,
 ) -> dict[str, Any]:
-    pipeline_state = report.get("pipeline_state") if report is not None else None
-    current_next = (
-        pipeline_state.get("next_module")
-        if isinstance(pipeline_state, dict)
-        else None
-    )
     return {
         "asset_id": asset_id,
-        "condition": "awaiting_pipeline",
-        "current_next_module": current_next,
-        "required_module": "video_quality",
+        **readiness.to_dict(),
         "report_path": report_path.relative_to(batch_root).as_posix(),
         "source_range": {
             "coordinate_system": "source_video_inclusive",
@@ -421,30 +363,37 @@ def run_manifest_video_quality(
             report_path = batch_root / "quality_archive" / f"{asset_id}.json"
             report = load_asset_qc_report(report_path)
             relative_video_path = _relative_path(validated["video_path"], batch_root)
-            if (
-                not overwrite
-                and _video_evidence_matches(
-                    report,
-                    source_path=relative_video_path,
-                    start_frame=start_frame,
-                    end_frame=end_frame,
+            readiness = inspect_video_quality_report(
+                report=report,
+                asset_id=asset_id,
+                source_video_path=relative_video_path or "",
+                source_range=(start_frame, end_frame + 1),
+            )
+            if readiness.reason == "source_video_path_mismatch":
+                raise ValueError(
+                    "source_video_path_mismatch: source_files.video.path mismatch: "
+                    f"report does not match {relative_video_path!r}"
                 )
-            ):
+            if readiness.reason == "asset_id_mismatch":
+                raise ValueError(
+                    f"asset_id mismatch: report does not match {asset_id!r}"
+                )
+            if readiness.condition == "already_completed":
                 skipped += 1
                 continue
             if dry_run:
                 continue
             record, result = _result_record(validated, config)
             new_records.append(record)
-            if not _video_write_is_ready(report):
+            if readiness.condition != "ready_to_write":
                 prerequisites.append(
                     _prerequisite_record(
                         asset_id=asset_id,
-                        report=report,
                         report_path=report_path,
                         batch_root=batch_root,
                         start_frame=start_frame,
                         end_frame=end_frame,
+                        readiness=readiness,
                     )
                 )
                 continue
@@ -453,11 +402,6 @@ def run_manifest_video_quality(
                 raise ValueError(
                     f"source video is outside batch root: {validated['video_path']}"
                 )
-            _assert_report_source_path(
-                report,
-                source_name="video",
-                expected_path=relative_video_path,
-            )
             source_files: dict[str, Any] = {
                 "video": {"path": relative_video_path}
             }
@@ -468,9 +412,8 @@ def run_manifest_video_quality(
                     raise ValueError(
                         f"HDF5 is outside batch root: {hdf5_path}"
                     )
-                _assert_report_source_path(
+                _assert_report_hdf5_path(
                     report,
-                    source_name="hdf5",
                     expected_path=relative_hdf5_path,
                 )
                 source_files["hdf5"] = {"path": relative_hdf5_path}

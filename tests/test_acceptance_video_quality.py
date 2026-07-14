@@ -942,6 +942,65 @@ def test_run_video_quality_check_does_not_bypass_pipeline_on_fresh_report(
     assert not (batch / "quality_archive" / "408817.json").exists()
 
 
+def _completed_batch_video_report(tmp_path: Path) -> Path:
+    video = tmp_path / "video" / "408817_video.mp4"
+    write_test_video(
+        video,
+        [textured_frame(0), textured_frame(10), textured_frame(20)],
+        fps=30.0,
+    )
+    write_quality_hdf5(tmp_path / "hdf5" / "408817_hdf5.hdf5", 3)
+    advance_batch_report_to_video(tmp_path, "408817")
+    assert run_video_quality_check(tmp_path) == 0
+    return tmp_path / "quality_archive" / "408817.json"
+
+
+def test_batch_video_rejects_completed_block_without_valid_exit_gate(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    report_path = _completed_batch_video_report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    del report["video_quality"]["flow"]["exit_gate"]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    before = report_path.read_bytes()
+
+    with caplog.at_level("WARNING"):
+        exit_code = run_video_quality_check(tmp_path)
+
+    assert exit_code == 3
+    assert report_path.read_bytes() == before
+    assert '"condition": "invalid_report"' in caplog.text
+    assert '"reason": "video_quality_exit_gate_invalid"' in caplog.text
+
+
+def test_batch_video_rejects_completed_source_range_mismatch(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    report_path = _completed_batch_video_report(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["video_quality"]["evidence"][0]["end_frame"] = 99
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    before = report_path.read_bytes()
+
+    with caplog.at_level("WARNING"):
+        exit_code = run_video_quality_check(tmp_path)
+
+    assert exit_code == 3
+    assert report_path.read_bytes() == before
+    assert '"condition": "invalid_report"' in caplog.text
+    assert '"reason": "video_quality_source_range_mismatch"' in caplog.text
+
+
+def test_batch_video_skips_valid_completed_block(tmp_path: Path) -> None:
+    report_path = _completed_batch_video_report(tmp_path)
+    before = report_path.read_bytes()
+
+    assert run_video_quality_check(tmp_path) == 0
+    assert report_path.read_bytes() == before
+
+
 def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tmp_path: Path) -> None:
     batch = tmp_path
     video_dir = batch / "video"
