@@ -52,7 +52,7 @@ def test_default_video_quality_config_comes_from_unified_config() -> None:
     config = load_video_quality_config(None)
 
     assert config.module_version == "video_prefilter_v0.3.2"
-    assert config.qc_config_reference["config_version"] == "qc_acceptance_v1.1.0"
+    assert config.qc_config_reference["config_version"] == "qc_acceptance_v2.0.0"
     assert not hasattr(config, "threshold_version")
     assert config.pipeline.stop_before_mask_if_fail is True
     assert config.pipeline.do_keypoint_quality_check is False
@@ -896,8 +896,9 @@ def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tm
     assert not (batch / "reports").exists()
     report = json.loads((batch / "quality_archive" / "408817.json").read_text(encoding="utf-8"))
     assert report["asset_id"] == "408817"
-    assert report["qc_config"]["schema_version"] == "qc_acceptance_config_schema.v1"
-    assert report["qc_config"]["config_version"] == "qc_acceptance_v1.1.0"
+    assert report["schema_version"] == "asset_qc_report.v2"
+    assert report["qc_config"]["schema_version"] == "qc_acceptance_config_schema.v2"
+    assert report["qc_config"]["config_version"] == "qc_acceptance_v2.0.0"
     assert report["qc_config"]["config_name"] == "acceptance_gate"
     assert report["qc_config"]["config_path"] == "configs/qc_acceptance.yaml"
     assert report["qc_config"]["config_hash"].startswith("sha256:")
@@ -905,6 +906,7 @@ def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tm
         "status": "running",
         "last_completed_module": "video_quality",
         "next_module": "sam3_containment",
+        "stop_reason": None,
     }
     assert report["overall_decision"] is None
     assert report["manual_review"]["required"] is None
@@ -927,8 +929,8 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     assert report_path.is_file()
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["schema_version"] == "asset_qc_report.v1"
-    assert report["qc_config"]["config_version"] == "qc_acceptance_v1.1.0"
+    assert report["schema_version"] == "asset_qc_report.v2"
+    assert report["qc_config"]["config_version"] == "qc_acceptance_v2.0.0"
     assert report["asset_id"] == "408817"
     assert report["report_revision"] == 1
     assert report["issues"] == []
@@ -1050,6 +1052,7 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
         "status": "stopped",
         "last_completed_module": "video_quality",
         "next_module": "batch_statistics",
+        "stop_reason": None,
     }
     assert report["overall_decision"] == "fail"
     assert report["manual_review"]["state"] == "skipped_due_to_fail"

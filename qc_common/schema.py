@@ -68,8 +68,22 @@ def validate_qc_config(data: dict[str, Any]) -> None:
 
 
 def validate_asset_qc_report(report: dict[str, Any]) -> None:
+    schema_version = report.get("schema_version")
+    schema_paths = {
+        "asset_qc_report.v1": _repo_root()
+        / "schemas"
+        / "asset_qc_report.v1.schema.json",
+        "asset_qc_report.v2": _repo_root()
+        / "schemas"
+        / "asset_qc_report.v2.schema.json",
+    }
+    try:
+        schema_path = schema_paths[schema_version]
+    except KeyError as exc:
+        raise ValueError(f"unknown asset QC report schema_version: {schema_version}") from exc
+
     _validate_with_schema(
         report,
-        _repo_root() / "schemas" / "asset_qc_report.v1.schema.json",
+        schema_path,
         "asset QC report",
     )
