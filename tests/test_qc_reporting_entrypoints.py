@@ -225,6 +225,8 @@ def test_batch_and_xjgt_accept_legacy_reconciliation_aliases(
             "manifest.json",
             "--legacy-reconciliation-precheck-clip-aggregates",
             "clip.json",
+            "--legacy-reconciliation-precheck-check-results",
+            "check.json",
             "--legacy-reconciliation-candidate-windows",
             "candidate.json",
             "--legacy-reconciliation-sam3-window-summary",
@@ -237,6 +239,7 @@ def test_batch_and_xjgt_accept_legacy_reconciliation_aliases(
     )
     batch = parse_batch_args()
     assert batch.supplier_sample_manifest == Path("manifest.json")
+    assert batch.legacy_reconciliation_precheck_check_results == Path("check.json")
 
     xjgt = parse_xjgt_args(
         [
@@ -265,6 +268,7 @@ def test_batch_cli_reconciles_every_legacy_input_without_changing_verdict(
     _write_report(archive, "a", "acceptance", "pass", issues=[])
     sidecar_names = {
         "manifest": "manifest.json",
+        "precheck_check_results": "check.json",
         "precheck_clip_aggregates": "clip.json",
         "precheck_candidate_windows": "candidate.json",
         "sam3_window_summary": "sam3.json",
@@ -285,6 +289,7 @@ def test_batch_cli_reconciles_every_legacy_input_without_changing_verdict(
         path.write_text(json.dumps([{"asset_id": "a", "verdict": "pass"}]), encoding="utf-8")
         option = {
             "manifest": "--legacy-reconciliation-manifest",
+            "precheck_check_results": "--legacy-reconciliation-precheck-check-results",
             "precheck_clip_aggregates": "--legacy-reconciliation-precheck-clip-aggregates",
             "precheck_candidate_windows": "--legacy-reconciliation-candidate-windows",
             "sam3_window_summary": "--legacy-reconciliation-sam3-window-summary",

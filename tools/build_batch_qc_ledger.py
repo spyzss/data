@@ -77,6 +77,12 @@ def parse_args() -> argparse.Namespace:
         dest="supplier_sample_manifest",
         type=Path,
     )
+    parser.add_argument(
+        "--legacy-reconciliation-precheck-check-results",
+        "--precheck-check-results",
+        dest="legacy_reconciliation_precheck_check_results",
+        type=Path,
+    )
     parser.add_argument("--legacy-reconciliation-precheck-clip-aggregates", "--precheck-clip-aggregates", dest="legacy_reconciliation_precheck_clip_aggregates", type=Path)
     parser.add_argument("--legacy-reconciliation-candidate-windows", "--precheck-candidate-windows", dest="legacy_reconciliation_candidate_windows", type=Path)
     parser.add_argument("--legacy-reconciliation-sam3-window-summary", "--sam3-window-summary", dest="legacy_reconciliation_sam3_window_summary", type=Path)
@@ -112,6 +118,7 @@ def main() -> int:
         formats=args.formats,
         legacy_sidecars={
             "manifest": args.supplier_sample_manifest,
+            "precheck_check_results": args.legacy_reconciliation_precheck_check_results,
             "precheck_clip_aggregates": args.legacy_reconciliation_precheck_clip_aggregates,
             "precheck_candidate_windows": args.legacy_reconciliation_candidate_windows,
             "sam3_window_summary": args.legacy_reconciliation_sam3_window_summary,
