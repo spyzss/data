@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -63,6 +64,24 @@ def test_projection_cli_prefers_qc_json_over_conflicting_legacy_sidecar(
         "Execution",
         "Data_Dictionary",
     ]
+
+
+def test_projection_script_cli_help_runs_from_repository_root() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "tools" / "build_qc_json_projection.py"),
+            "--help",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Project canonical QC JSON reports" in result.stdout
 
 
 def test_projection_cli_writes_parquet_tables_from_same_projection(
