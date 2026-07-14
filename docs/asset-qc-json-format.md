@@ -1,0 +1,344 @@
+# 单资产 QC JSON 格式
+
+## 1. 定位
+
+每条数据从拉取完成开始，只维护一份主质检档案：
+
+```text
+<batch>/quality_archive/<asset_id>.json
+```
+
+这份 JSON 随数据走完整个 QC 流程。模块只更新自己拥有的 block 和 issue，
+不得创建另一份模块专属主报告。CSV、HTML、sidecar、overlay 和 ledger 都只是
+证据或批次派生产物。
+
+当前 schema：
+
+```text
+schemas/asset_qc_report.v1.schema.json
+```
+
+当前代码已实现 `video_quality` 的写入合同；其余模块按
+`docs/PRD-qc-gated-json.md` 接入。
+
+## 2. 顶层结构
+
+视频质检完成后的典型结构如下。示例省略了部分 metrics：
+
+```json
+{
+  "schema_version": "asset_qc_report.v1",
+  "qc_config": {
+    "schema_version": "qc_acceptance_config_schema.v1",
+    "config_version": "qc_acceptance_v1.1.0",
+    "config_name": "acceptance_gate",
+    "config_path": "configs/qc_acceptance.yaml",
+    "config_hash": "sha256:<64 lowercase hex characters>"
+  },
+  "asset_id": "file-008",
+  "report_revision": 3,
+  "pipeline_state": {
+    "status": "running",
+    "last_completed_module": "video_quality",
+    "next_module": "sam3_containment"
+  },
+  "overall_decision": null,
+  "issues": [
+    {
+      "issue_id": "video_quality:fps_below_pass:001",
+      "code": "fps_below_pass",
+      "severity": "warn",
+      "module": "video_quality",
+      "issue_type": "low_fps",
+      "metric": "video_basic.fps",
+      "observed_value": 22.5,
+      "operator": "<",
+      "boundary_value": 24.0,
+      "rule_id": "video_quality.fps_below_pass",
+      "needs_manual_review": true,
+      "context": {}
+    }
+  ],
+  "manual_review": {
+    "required": null,
+    "state": "not_evaluated",
+    "candidate_issue_ids": [
+      "video_quality:fps_below_pass:001"
+    ],
+    "failures_for_batch_stats_issue_ids": []
+  },
+  "source_files": {
+    "video": {
+      "path": "video/file-008.mp4",
+      "filename": "file-008.mp4",
+      "extension": ".mp4"
+    },
+    "hdf5": {
+      "path": "hdf5/file-008.hdf5",
+      "exists": true
+    }
+  },
+  "video_quality": {
+    "stage": "video_prefilter",
+    "module_version": "video_prefilter_v0.3.2",
+    "flow": {
+      "entry_gate": {
+        "state": "ready",
+        "eligible": true,
+        "blocked_by_module": null,
+        "required_inputs": ["source_files.video.path"],
+        "missing_inputs": [],
+        "upstream_continue": true
+      },
+      "result_gate": {
+        "verdict": "warn",
+        "has_fail": false,
+        "has_warn": true
+      },
+      "exit_gate": {
+        "state": "continue",
+        "continue_to_next_module": true,
+        "next_module": "sam3_containment"
+      }
+    },
+    "evaluation": {
+      "decision": "warn",
+      "reasons": [],
+      "warn_reasons": ["fps_below_pass"],
+      "issue_ids": ["video_quality:fps_below_pass:001"],
+      "should_run_mask_qc": true
+    },
+    "metadata": {},
+    "sampling": {},
+    "metrics": {},
+    "errors": []
+  },
+  "reference_quality": {
+    "mode": "none",
+    "reference_video_path": null,
+    "vmaf": null,
+    "note": "当前无标准对照视频，未计算 VMAF。"
+  }
+}
+```
+
+## 3. 顶层字段
+
+| 字段 | 规则 |
+|---|---|
+| `schema_version` | 固定为 `asset_qc_report.v1`。 |
+| `qc_config` | 本次 pipeline 初始化时锁定的统一配置引用。 |
+| `asset_id` | 资产唯一 ID，也是 JSON 文件名。 |
+| `report_revision` | 每次成功写回加 1，用于防止旧结果覆盖新结果。 |
+| `pipeline_state` | 当前流程位置，不代表单个模块质量。 |
+| `overall_decision` | 只有流程停止或全部完成时才形成最终结论。 |
+| `issues` | 所有模块共享的 warn/fail 事实表。 |
+| `manual_review` | 人工路由输入、状态和结果。 |
+| `<module_name>` | 模块自己的 gate、指标和证据。 |
+
+### 3.1 `qc_config`
+
+`qc_config` 在该资产建档时写入一次，并在整条 pipeline 中保持不变：
+
+```json
+{
+  "schema_version": "qc_acceptance_config_schema.v1",
+  "config_version": "qc_acceptance_v1.1.0",
+  "config_name": "acceptance_gate",
+  "config_path": "configs/qc_acceptance.yaml",
+  "config_hash": "sha256:..."
+}
+```
+
+规则：
+
+- `config_hash` 必须根据实际读取的 YAML 字节计算。
+- 模块不得在自己的 block 复制 thresholds 或 `config_ref`。
+- issue 不重复写 `config_version`；顶层版本是唯一权威来源。
+- 同一次 asset pipeline 不能中途更换 config。发现 hash/version 不一致必须拒绝写入。
+
+### 3.2 `pipeline_state` 与 `overall_decision`
+
+| `pipeline_state.status` | 含义 | `overall_decision` |
+|---|---|---|
+| `pending` | 已建档，尚未开始或等待当前 gate。 | 必须为 `null` |
+| `running` | 自动 QC 仍在继续。 | 必须为 `null` |
+| `stopped` | 某个模块 hard fail，后续 QC 已停止。 | 必须为 `fail` |
+| `completed` | 所有应运行模块完成。 | `pass` 或 `warn` |
+
+`pending` 不是质量等级，也不等于 warn。`warn` 是模块对具体问题的判定；
+流程未结束时只保存在 module verdict 和 `issues`，不提前写进
+`overall_decision`。
+
+## 4. Issue 结构
+
+每个触发的指标单独生成一个 issue 对象。一个视频有多个 warn 时，`issues`
+中就有多个对象；不是把多个 metric/value 塞进同一个字段。
+
+```json
+{
+  "issue_id": "video_quality:fps_below_pass:001",
+  "code": "fps_below_pass",
+  "severity": "warn",
+  "module": "video_quality",
+  "issue_type": "low_fps",
+  "metric": "video_basic.fps",
+  "observed_value": 22.5,
+  "operator": "<",
+  "boundary_value": 24.0,
+  "rule_id": "video_quality.fps_below_pass",
+  "needs_manual_review": true,
+  "context": {}
+}
+```
+
+| 字段 | 规则 |
+|---|---|
+| `issue_id` | 在该 asset 内稳定且唯一，供模块、人工和批次统计引用。 |
+| `code` | 稳定原因码，不写自然语言句子。 |
+| `severity` | 只能是 `warn` 或 `fail`。pass 不生成 issue。 |
+| `module` | 产生问题的模块名。 |
+| `issue_type` | 跨指标归类，如 `freeze`、`low_fps`、`exposure`。 |
+| `metric` | 指标路径；无单一指标时可为 `null`。 |
+| `observed_value` | 实际观测值，可为数值、布尔、字符串或结构。 |
+| `operator` | 触发比较符，如 `<`、`>`、`==`；不适用时为 `null`。 |
+| `boundary_value` | 触发边界；不适用时可为 `null`。 |
+| `rule_id` | 回查统一 config 的稳定规则 ID。 |
+| `needs_manual_review` | 该问题是否应成为人工候选。 |
+| `context` | 区间、检测可靠性、文件位置等附加证据。 |
+
+不再使用：
+
+```text
+reason_details
+warn_reason_details
+value
+comparison
+issue.config_version
+module.thresholds
+```
+
+模块内 `reasons` / `warn_reasons` 可以保留简短 code 数组以兼容和快速展示，
+但完整事实只在顶层 `issues` 保存一次。模块用 `issue_ids` 引用它们。
+
+## 5. Gate 结构
+
+每个自动 QC 模块都应写：
+
+```json
+{
+  "flow": {
+    "entry_gate": {},
+    "result_gate": {},
+    "exit_gate": {}
+  }
+}
+```
+
+通用规则：
+
+- `pass`：`continue_to_next_module=true`。
+- `warn`：生成 issue，追加到人工候选，继续下一模块。
+- `fail`：`state=stop_qc`、`continue_to_next_module=false`、
+  `next_module=batch_statistics`。
+- 下游只读取上游 `exit_gate` 或顶层 `pipeline_state`，不解析自然语言原因。
+- 上游已 fail 时，后续高成本模块不得运行。
+
+## 6. `manual_review`
+
+自动模块只负责累计候选：
+
+```json
+{
+  "required": null,
+  "state": "not_evaluated",
+  "candidate_issue_ids": ["video_quality:fps_below_pass:001"],
+  "failures_for_batch_stats_issue_ids": []
+}
+```
+
+到达人工路由模块后，由人工策略统一决定：
+
+- `required=false`：无候选或按抽样策略无需人工。
+- `required=true`：进入 `queued` / `in_progress` / `completed`。
+- 自动 QC 已 hard fail：`required=false`、`state=skipped_due_to_fail`，问题直接供
+  批次统计和返工使用。
+
+人工结果必须引用 `issue_id`，并写结构化结论、reviewer、时间和备注；不得覆盖
+机器观测值。完整字段由 `docs/PRD-qc-gated-json.md` 约束。
+
+## 7. Video QC Block
+
+当前视频模块写入：
+
+- `flow`：入口、结果、出口 gate。
+- `evaluation`：模块 decision、原因码和 issue 引用。
+- `metadata`：帧数、FPS、时长、尺寸。
+- `sampling`：配置抽样上限、实际抽样和解码数量。
+- `metrics.video_basic`：基础可用性和尺寸。
+- `metrics.timeline_metrics`：PTS、丢帧估算和时间间隔。
+- `metrics.decode_metrics`：抽样解码完整性。
+- `metrics.exposure_metrics`：黑帧、过暗、过曝。
+- `metrics.sharpness_global`：全帧清晰度代理。
+- `metrics.freeze_metrics`：低运动、候选/确认冻结和区间。
+- `metrics.defect_metrics`：瑕疵总时长比例。
+- `metrics.hdf5_alignment`：视频/HDF5 帧数对齐。
+- `errors`：运行错误。
+
+不包含手部 ROI 清晰度。HDF5 文本、关键点质量、mask 和语义结果属于各自模块，
+视频 writer 不拥有也不重写这些 block。
+
+### 7.1 Freeze 与掉帧证据
+
+冻结区间至少记录：
+
+```json
+{
+  "start_frame": 120,
+  "end_frame": 158,
+  "frame_count": 39,
+  "start_time_sec": 4.0,
+  "end_time_sec": 5.267,
+  "duration_sec": 1.267,
+  "duration_ms": 1267.0,
+  "mean_frame_diff": 0.3,
+  "mean_hist_diff": 0.002,
+  "mean_ssim": 0.998,
+  "mean_phash_hamming": 1.0,
+  "motion_conflict": false,
+  "motion_conflict_signals": [],
+  "critical_window": false,
+  "critical_keywords": []
+}
+```
+
+时间轴至少记录 `drop_detection_source`、`drop_detection_reliable`、
+`estimated_missing_frames` 和 `drop_frame_ratio`。这样后续裁切或人工复核能区分
+可靠 PTS 证据与 OpenCV fallback。
+
+## 8. 更新与并发规则
+
+模块写回必须：
+
+1. 读取当前 JSON 和 `report_revision`。
+2. 校验 `asset_id` 与顶层 `qc_config` 未变化。
+3. 只替换本模块拥有的 block 和本模块 issue。
+4. 保留未知字段和其他模块 block。
+5. 将 revision 加 1。
+6. 通过 JSON Schema 校验。
+7. 先写临时文件并 `fsync`，再原子替换目标文件。
+
+revision 与预期不一致时必须报 stale-write 错误，不能静默覆盖。
+
+## 9. 批次派生输出
+
+以下内容可以从 `quality_archive/*.json` 生成，但都不是单资产主档案：
+
+- 批次 CSV / XLSX；
+- review queue 和 review index；
+- issue 频率、供应商对比和有效时长汇总；
+- sidecar、overlay、mask 证据；
+- ledger events。
+
+`sidecar` 是大体积模块明细的旁路文件；`ledger events` 是流程事件日志；CSV 是
+表格视图。它们可被 JSON 用相对路径引用，但不能代替 `<asset_id>.json`。

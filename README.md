@@ -83,6 +83,23 @@ python run_annotate.py configs/anygrasp_full.yaml --use-mock
 
 `--stage segmentation|depth|both` 覆盖 config 里的 `stage`（不传则用 config，默认 `both`）。
 
+### Supplier acceptance tools
+
+供应商交付验收工具独立于 SAM3/DA3 标注链路：
+
+```bash
+# 抽样拉取 HDF5 + video，并写 reports/
+python run_acceptance_pull.py --config pull.yaml
+
+# 对抽样批次做无参考视频质检
+python run_acceptance_video_quality.py --batch sampled/XJGT_20260616
+```
+
+详细配置见 `ACCEPTANCE.md`。
+单条数据 QC 档案 JSON 格式见 `docs/asset-qc-json-format.md`。
+非视频 QC 模块按流程图 gate 思路改造的 PRD 见 `docs/PRD-qc-gated-json.md`。
+统一版本化 QC 配置规范见 `docs/PRD-qc-unified-config.md`。
+
 ### Subtask-aware 采样
 
 长视频逐帧标注浪费（相邻帧 mask/depth 近乎不变）。`sampling.mode: subtask_aware` 会读取每帧的

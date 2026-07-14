@@ -1,0 +1,710 @@
+schema_version: qc_acceptance_config_schema.v1
+config_version: qc_acceptance_v1.1.0
+config_name: acceptance_gate
+config_date: "2026-07-09"
+description: Versioned QC gate config for one-asset-one-json acceptance reports.
+
+source:
+  base_branch: feat/qc-modules
+  aligned_branch: tmp/integrate-colleague-acceptance-20260707
+  aligned_branch_additions:
+    - keypoint_morphology
+    - KeypointMorphologyConfig
+    - configs/precheck_example.yaml keypoint_morphology section
+    - tests/test_keypoint_morphology.py
+
+version_policy:
+  schema_version:
+    bump_when:
+      - config file structure changes
+      - required JSON config reference fields change
+  config_version:
+    bump_when:
+      - any threshold changes
+      - pass/warn/fail semantics change
+      - module order changes
+      - manual review routing policy changes
+  json_reproducibility_rule: >
+    Asset JSON stores only the top-level qc_config version/hash. Thresholds are
+    resolved from the versioned config, not copied into every module block.
+
+pipeline:
+  stop_on_fail: true
+  default_start_module: hdf5_text_info
+  terminal_module: batch_statistics
+  modules:
+    - hdf5_text_info
+    - quality_hand
+    - keypoint_presence
+    - keypoint_morphology
+    - keypoint_temporal
+    - video_quality
+    - sam3_containment
+    - semantic_consistency
+    - manual_review
+    - duplicate_check
+    - content_validity
+    - effective_duration
+
+json_report:
+  root_dir_name: quality_archive
+  config_field_name: qc_config
+  write_config_reference_at_top_level: true
+  write_config_hash: true
+  write_module_threshold_snapshot: false
+  preserve_unknown_fields: true
+  required_top_level_config_reference:
+    schema_version: qc_acceptance_config_schema.v1
+    config_version: qc_acceptance_v1.1.0
+    config_name: acceptance_gate
+    config_path: configs/qc_acceptance.yaml
+    config_hash: sha256:<computed_at_runtime>
+  module_block_rules:
+    write_thresholds: false
+    write_config_ref: false
+    write_rule_ids: true
+  issue_fields_required:
+    - issue_id
+    - code
+    - severity
+    - module
+    - issue_type
+    - metric
+    - observed_value
+    - operator
+    - boundary_value
+    - rule_id
+    - needs_manual_review
+    - context
+
+module_flow_contract:
+  entry_gate_states:
+    - ready
+    - blocked
+    - skipped
+  result_gate_verdicts:
+    - pass
+    - warn
+    - fail
+    - skipped
+  exit_gate_states:
+    - continue
+    - stop_qc
+    - complete_qc
+  on_pass: continue
+  on_warn: record_warning_and_continue
+  on_fail: stop_qc_and_record_batch_statistics
+
+rule_id_prefix:
+  hdf5_text_info: hdf5_text
+  quality_hand: quality_hand
+  keypoint_presence: keypoint_presence
+  keypoint_morphology: keypoint_morphology
+  keypoint_temporal: keypoint_temporal
+  video_quality: video_quality
+  sam3_containment: sam3_containment
+  semantic_consistency: semantic_consistency
+  manual_review: manual_review
+  duplicate_check: duplicate_check
+  content_validity: content_validity
+  effective_duration: effective_duration
+
+modules:
+  hdf5_text_info:
+    enabled: true
+    source_check_alias: text_integrity
+    required_fields:
+      - scene
+      - task
+    required_any_text_field:
+      - text_label
+      - text_en
+    optional_fields:
+      - action
+      - subtask
+    fail_on_missing_required_field: true
+    rules:
+      missing_required_field:
+        rule_id: hdf5_text.missing_required_field
+        verdict: fail
+      missing_text_field:
+        rule_id: hdf5_text.missing_text_field
+        verdict: fail
+
+  quality_hand:
+    enabled: true
+    source_check_alias:
+      - quality_score
+      - label.quality_hand
+    expected_shape: [2]
+    valid_values: [0, 1]
+    low_quality_hand_value: 0
+    pass_threshold: 0.90
+    mode: warn_unless_both_hands_low_quality
+    rules:
+      invalid_quality_hand_shape:
+        rule_id: quality_hand.invalid_shape
+        verdict: fail
+      invalid_quality_hand_value:
+        rule_id: quality_hand.invalid_value
+        verdict: fail
+      low_quality_single_hand:
+        rule_id: quality_hand.single_hand_low_quality
+        verdict: warn
+      low_quality_both_hands:
+        rule_id: quality_hand.both_hands_low_quality
+        verdict: fail
+
+  keypoint_presence:
+    enabled: true
+    source_check_alias: keypoint_missing
+    sides:
+      - left
+      - right
+    joint_names: null
+    fps: null
+    expected_keypoints_per_hand: 21
+    min_valid_points_per_hand_warn: 18
+    min_valid_points_per_hand_fail: 8
+    missing_frame_ratio_warn: 0.05
+    missing_frame_ratio_fail: 0.20
+    window_seconds: 10.0
+    allowed_missing_seconds: 1.0
+    nan_or_inf_fail: true
+    rules:
+      missing_keypoint_field:
+        rule_id: keypoint_presence.missing_keypoint_field
+        verdict: fail
+      too_few_valid_points:
+        rule_id: keypoint_presence.too_few_valid_points
+        warn_metric: min_valid_points_per_hand_warn
+        fail_metric: min_valid_points_per_hand_fail
+      high_missing_frame_ratio:
+        rule_id: keypoint_presence.high_missing_frame_ratio
+        warn_metric: missing_frame_ratio_warn
+        fail_metric: missing_frame_ratio_fail
+      nan_or_inf:
+        rule_id: keypoint_presence.nan_or_inf
+        verdict: fail
+
+  keypoint_morphology:
+    enabled: true
+    source_check_alias: keypoint_morphology
+    method: static_per_frame_21_point_hand_geometry
+    sides:
+      - left
+      - right
+    duplicate_joint_distance_m: 0.00001
+    min_palm_scale_m: 0.0001
+    max_bone_length_ratio_spread_review: 3.0
+    max_bone_length_ratio_spread_fail: 8.0
+    max_normalized_bone_length_review: 3.0
+    max_normalized_bone_length_fail: 6.0
+    max_zero_length_bone_count_review: 1
+    max_zero_length_bone_count_fail: 2
+    max_duplicate_joint_pair_count_review: 1
+    max_duplicate_joint_pair_count_fail: 3
+    min_joint_angle_deg_review: 5.0
+    min_joint_angle_deg_fail: 1.0
+    max_joint_angle_violation_fraction_review: 0.15
+    max_joint_angle_violation_fraction_fail: 0.40
+    not_applicable_when_keypoints_incomplete: true
+    review_maps_to_json_warn: true
+    rules:
+      palm_scale_too_small:
+        rule_id: keypoint_morphology.palm_scale_too_small
+        verdict: fail
+      bone_length_ratio_spread:
+        rule_id: keypoint_morphology.bone_length_ratio_spread
+        review_metric: max_bone_length_ratio_spread_review
+        fail_metric: max_bone_length_ratio_spread_fail
+      max_normalized_bone_length:
+        rule_id: keypoint_morphology.max_normalized_bone_length
+        review_metric: max_normalized_bone_length_review
+        fail_metric: max_normalized_bone_length_fail
+      zero_length_bone_count:
+        rule_id: keypoint_morphology.zero_length_bone_count
+        review_metric: max_zero_length_bone_count_review
+        fail_metric: max_zero_length_bone_count_fail
+      duplicate_joint_pair_count:
+        rule_id: keypoint_morphology.duplicate_joint_pair_count
+        review_metric: max_duplicate_joint_pair_count_review
+        fail_metric: max_duplicate_joint_pair_count_fail
+      collapsed_finger_count:
+        rule_id: keypoint_morphology.collapsed_finger_count
+        review_verdict: warn
+        severe_verdict: fail
+      joint_angle_min_deg:
+        rule_id: keypoint_morphology.joint_angle_min_deg
+        review_metric: min_joint_angle_deg_review
+        fail_metric: min_joint_angle_deg_fail
+      joint_angle_violation_fraction:
+        rule_id: keypoint_morphology.joint_angle_violation_fraction
+        review_metric: max_joint_angle_violation_fraction_review
+        fail_metric: max_joint_angle_violation_fraction_fail
+
+  keypoint_temporal:
+    enabled: true
+    source_check_alias:
+      - keypoint_temporal
+      - skeleton_quality_score
+      - composite_frame_verdict
+    sides:
+      - left
+      - right
+    joint_names: null
+    fps: null
+    project_2d: true
+    min_angle_degrees: 5.0
+    max_angle_degrees: 175.0
+    decision_mode: any_threshold
+    joint_angle_change_deg_max_threshold: 10.0
+    rotation_delta_max_threshold: 0.45
+    joint_acceleration_m_s2_max_threshold: 15.0
+    joint_displacement_m_max_threshold: 0.05
+    hard_exceeded_metric_count: 3
+    strong_acceleration_ratio: 2.5
+    strong_displacement_ratio: 1.8
+    rotation_mask_review_ratio: 1.0
+    rotation_delta_extreme_review_threshold: null
+    palm_camera_angle_review_threshold_deg: null
+    palm_camera_axis: [0.0, 0.0, 1.0]
+    palm_camera_angle_min_valid_hands: 1
+    promote_sustained_review: false
+    sustained_review_min_frames: 6
+    reject_missing_keypoints: true
+    reject_low_quality_hand: false
+    allowed_missing_keypoints_per_hand: 0
+    projection_enabled: true
+    projection_image_width: null
+    projection_image_height: null
+    projection_fx: null
+    projection_fy: null
+    projection_cx: null
+    projection_cy: null
+    projection_border_margin_px: 20.0
+    projection_near_border_count_threshold: 6
+    projection_outside_count_threshold: 1
+    projection_center_jump_px_threshold: 120.0
+    projection_bbox_area_change_ratio_threshold: 3.0
+    candidate_gap_close_frames: 2
+    candidate_min_seed_run_frames: 3
+    candidate_pre_context_frames: 10
+    candidate_post_context_frames: 10
+    candidate_merge_overlapping_only: true
+    pass_threshold: 0.90
+    rules:
+      composite_frame_verdict:
+        rule_id: keypoint_temporal.composite_frame_verdict
+        verdict: warn
+      skeleton_quality_score:
+        rule_id: keypoint_temporal.skeleton_quality_score
+        verdict: warn
+      projection_review:
+        rule_id: keypoint_temporal.projection_review
+        verdict: warn
+      strong_temporal_failure:
+        rule_id: keypoint_temporal.strong_temporal_failure
+        verdict: fail
+
+  video_quality:
+    enabled: true
+    source_check_alias: video_prefilter
+    module_version: video_prefilter_v0.3.2
+    decision_passthrough: true
+    hard_fail_blocks_next_qc: true
+    note: >
+      Video QC should stop writing per-module thresholds into asset JSON. It
+      should write only metric values, rule_id, and top-level qc_config version.
+    parameters:
+      pipeline:
+        stop_before_mask_if_fail: true
+        do_keypoint_quality_check: false
+        do_keypoint_mask_matching: false
+        do_keypoint_temporal_check: false
+      fps:
+        expected_fps: null
+        min_fps_pass: 24.0
+        min_fps_warn: 20.0
+        min_fps_fail: 20.0
+      resolution:
+        exact_resolution_required: false
+        use_display_size_after_rotation: true
+        min_short_side_fail: 720
+        min_long_side_fail: 1280
+        min_short_side_warn: 720
+        min_long_side_warn: 1280
+      timeline:
+        use_actual_fps: true
+        drop_interval_factor: 1.35
+        drop_interval_extra_ms: 10.0
+        drop_frame_ratio_pass: 0.05
+        drop_frame_ratio_warn: 0.10
+        max_gap_factor: 3.0
+        max_gap_floor_ms: 100.0
+        pts_monotonic_required: true
+      decode:
+        sample_decode_ratio_pass: 0.995
+        sample_decode_ratio_warn: 0.98
+        max_sample_frames: 300
+        sample_interval_sec: 0.5
+        include_head_tail_frames: 10
+      exposure:
+        black:
+          mean_y_max: 10.0
+          dark_pixel_ratio_min: 0.98
+          ratio_pass: 0.01
+          ratio_warn: 0.90
+          max_frame_count_fail: 10
+        over_dark:
+          mean_y_max: 35.0
+          dark_pixel_ratio_min: 0.75
+          ratio_pass: 0.05
+          ratio_warn: 0.90
+        over_exposed:
+          mean_y_min: 235.0
+          over_exposed_pixel_ratio_min: 0.35
+          ratio_pass: 0.05
+          ratio_warn: 0.90
+      sharpness_global:
+        normalize_before_compute: true
+        target_short_side: 720
+        no_upscale: true
+        laplacian_p10_pass: 15.0
+        laplacian_p10_warn: 0.0
+        laplacian_median_pass: 20.0
+        laplacian_median_warn: 0.0
+        laplacian_under_100_ratio_pass: 1.0
+        laplacian_under_100_ratio_warn: 1.0
+        tenengrad_p10_pass: 6.0
+        tenengrad_p10_warn: 4.0
+        tenengrad_median_pass: 7.0
+        tenengrad_median_warn: 4.0
+      freeze:
+        enabled: true
+        downscale_short_side: 360
+        frame_diff_mean_abs_max: 1.0
+        hist_diff_max: 0.01
+        ssim_min: 0.995
+        phash_hamming_max: 4
+        freeze_candidate_window_sec: 0.5
+        confirmed_freeze_window_sec: 1.0
+        adjacent_near_duplicate_ratio_warn: 0.90
+        frozen_frame_ratio_pass: 0.05
+        frozen_frame_ratio_warn: 0.10
+        min_interval_frames: 6
+        min_interval_duration_ms: 100.0
+        max_consecutive_frozen_sec_pass: 0.5
+        max_consecutive_frozen_sec_fail: 1.0
+        motion_conflict_enabled: true
+        motion_keypoint_delta_normalized_min: 0.02
+        motion_keypoint_delta_px_min: 12.0
+        motion_numeric_delta_min: 0.01
+        critical_window_enabled: true
+        critical_window_keywords:
+          - grasp
+          - place
+          - contact
+          - hand-object
+          - hand object
+          - interaction
+          - 抓取
+          - 放置
+          - 接触
+          - 交互
+        critical_window_interval_duration_ms_fail: 100.0
+        video_state_conflict_noncritical_duration_ms_fail: 1000.0
+        video_state_conflict_critical_duration_ms_fail: 500.0
+      defects:
+        max_duration_ratio_fail: 0.10
+        duration_ratio_warn: 0.05
+      hdf5_alignment:
+        enabled: true
+        mode: fail
+        max_delta_frames_pass: 2
+        max_delta_frames_warn: 5
+        max_delta_ratio_pass: 0.001
+        max_delta_ratio_warn: 0.005
+    rules:
+      video_not_opened:
+        rule_id: video_quality.video_not_opened
+        verdict: fail
+      cannot_open_video:
+        rule_id: video_quality.cannot_open_video
+        verdict: fail
+      video_stream_missing:
+        rule_id: video_quality.video_stream_missing
+        verdict: fail
+      codec_unreadable:
+        rule_id: video_quality.codec_unreadable
+        verdict: fail
+      metadata_unreadable:
+        rule_id: video_quality.metadata_unreadable
+        verdict: fail
+      fps_below_min:
+        rule_id: video_quality.fps_below_min
+        verdict: fail
+      fps_below_pass:
+        rule_id: video_quality.fps_below_pass
+        verdict: warn
+      fps_below_expected:
+        rule_id: video_quality.fps_below_expected
+        verdict: warn
+      short_side_below_min:
+        rule_id: video_quality.short_side_below_min
+        verdict: fail
+      long_side_below_min:
+        rule_id: video_quality.long_side_below_min
+        verdict: fail
+      pts_monotonic_invalid:
+        rule_id: video_quality.pts_monotonic_invalid
+        verdict: fail
+      drop_frame_ratio_above_max:
+        rule_id: video_quality.drop_frame_ratio_above_max
+        verdict: fail
+      drop_frame_ratio_warn:
+        rule_id: video_quality.drop_frame_ratio_warn
+        verdict: warn
+      frame_interval_p99_ms_above_max:
+        rule_id: video_quality.frame_interval_p99_ms_above_max
+        verdict: fail
+      frame_interval_p99_ms_warn:
+        rule_id: video_quality.frame_interval_p99_ms_warn
+        verdict: warn
+      max_frame_gap_ms_above_max:
+        rule_id: video_quality.max_frame_gap_ms_above_max
+        verdict: fail
+      sample_decode_ratio_below_min:
+        rule_id: video_quality.sample_decode_ratio_below_min
+        verdict: fail
+      sample_decode_ratio_warn:
+        rule_id: video_quality.sample_decode_ratio_warn
+        verdict: warn
+      black_frame_ratio_above_max:
+        rule_id: video_quality.black_frame_ratio_above_max
+        verdict: fail
+      black_frame_ratio_warn:
+        rule_id: video_quality.black_frame_ratio_warn
+        verdict: warn
+      black_frame_count_above_max:
+        rule_id: video_quality.black_frame_count_above_max
+        verdict: fail
+      defect_duration_ratio_above_max:
+        rule_id: video_quality.defect_duration_ratio_above_max
+        verdict: fail
+      defect_duration_ratio_warn:
+        rule_id: video_quality.defect_duration_ratio_warn
+        verdict: warn
+      mean_over_dark_ratio_above_max:
+        rule_id: video_quality.mean_over_dark_ratio_above_max
+        verdict: fail
+      mean_over_dark_ratio_warn:
+        rule_id: video_quality.mean_over_dark_ratio_warn
+        verdict: warn
+      mean_over_exposed_ratio_above_max:
+        rule_id: video_quality.mean_over_exposed_ratio_above_max
+        verdict: fail
+      mean_over_exposed_ratio_warn:
+        rule_id: video_quality.mean_over_exposed_ratio_warn
+        verdict: warn
+      laplacian_p10_below_min:
+        rule_id: video_quality.laplacian_p10_below_min
+        verdict: fail
+      laplacian_p10_warn:
+        rule_id: video_quality.laplacian_p10_warn
+        verdict: warn
+      laplacian_median_below_min:
+        rule_id: video_quality.laplacian_median_below_min
+        verdict: fail
+      laplacian_median_warn:
+        rule_id: video_quality.laplacian_median_warn
+        verdict: warn
+      laplacian_under_100_ratio_above_max:
+        rule_id: video_quality.laplacian_under_100_ratio_above_max
+        verdict: fail
+      laplacian_under_100_ratio_warn:
+        rule_id: video_quality.laplacian_under_100_ratio_warn
+        verdict: warn
+      tenengrad_p10_below_min:
+        rule_id: video_quality.tenengrad_p10_below_min
+        verdict: fail
+      tenengrad_p10_warn:
+        rule_id: video_quality.tenengrad_p10_warn
+        verdict: warn
+      tenengrad_median_below_min:
+        rule_id: video_quality.tenengrad_median_below_min
+        verdict: fail
+      tenengrad_median_warn:
+        rule_id: video_quality.tenengrad_median_warn
+        verdict: warn
+      adjacent_near_duplicate_ratio_warn:
+        rule_id: video_quality.adjacent_near_duplicate_ratio_warn
+        verdict: warn
+      frozen_frame_ratio_above_max:
+        rule_id: video_quality.frozen_frame_ratio_above_max
+        verdict: fail
+      frozen_frame_ratio_warn:
+        rule_id: video_quality.frozen_frame_ratio_warn
+        verdict: warn
+      max_consecutive_frozen_sec_above_max:
+        rule_id: video_quality.max_consecutive_frozen_sec_above_max
+        verdict: fail
+      max_consecutive_frozen_sec_warn:
+        rule_id: video_quality.max_consecutive_frozen_sec_warn
+        verdict: warn
+      video_state_conflict:
+        rule_id: video_quality.video_state_conflict
+        verdict: fail
+      video_state_conflict_warn:
+        rule_id: video_quality.video_state_conflict_warn
+        verdict: warn
+      hdf5_missing:
+        rule_id: video_quality.hdf5_missing
+        verdict: configured_by_hdf5_alignment_mode
+      hdf5_unreadable:
+        rule_id: video_quality.hdf5_unreadable
+        verdict: configured_by_hdf5_alignment_mode
+      hdf5_frame_count_mismatch:
+        rule_id: video_quality.hdf5_frame_count_mismatch
+        verdict: fail
+      hdf5_frame_count_mismatch_warn:
+        rule_id: video_quality.hdf5_frame_count_mismatch_warn
+        verdict: warn
+      no_sample_frames_decoded:
+        rule_id: video_quality.no_sample_frames_decoded
+        verdict: fail
+
+  sam3_containment:
+    enabled: true
+    source_check_alias:
+      - mask_containment
+      - sam3_containment
+    sides:
+      - left
+      - right
+    joint_names: null
+    inside_ratio_warn: 0.60
+    inside_ratio_fail: 0.30
+    max_projection_error_px_warn: 5
+    max_projection_error_px_fail: 20
+    side_view_warn_only: true
+    rules:
+      strong_containment_mismatch:
+        rule_id: sam3_containment.strong_containment_mismatch
+        verdict: fail
+      side_view_manual_review:
+        rule_id: sam3_containment.side_view_manual_review
+        verdict: warn
+      projection_review:
+        rule_id: sam3_containment.projection_review
+        verdict: warn
+
+  semantic_consistency:
+    enabled: true
+    object_match_score_warn: 0.60
+    object_match_score_fail: 0.30
+    action_match_score_warn: 0.60
+    action_match_score_fail: 0.30
+    model_name: configured_by_runtime
+    prompt_version: semantic_consistency_v1
+    rules:
+      object_mismatch:
+        rule_id: semantic_consistency.object_mismatch
+        warn_metric: object_match_score_warn
+        fail_metric: object_match_score_fail
+      action_mismatch:
+        rule_id: semantic_consistency.action_mismatch
+        warn_metric: action_match_score_warn
+        fail_metric: action_match_score_fail
+
+  manual_review:
+    enabled: true
+    selection_policy: config_driven_from_warn_candidates
+    required_for_warn_issue_types:
+      - keypoint_static_morphology_abnormal
+      - keypoint_duplicate_or_collapsed
+      - keypoint_joint_angle_abnormal
+      - temporal_jump
+      - mask_projection_mismatch
+      - semantic_mismatch
+    pass_sample_enabled: true
+    max_pass_samples_per_supplier: 10
+    confirm_fail_labels:
+      - true_positive
+      - partial
+      - false_negative
+    acceptable_labels:
+      - false_positive
+      - acceptable_flagged
+
+  duplicate_check:
+    enabled: true
+    video_similarity_warn: 0.92
+    video_similarity_fail: 0.98
+    time_overlap_ratio_fail: 0.90
+    exact_hash_duplicate_fail: true
+    rules:
+      exact_hash_duplicate:
+        rule_id: duplicate_check.exact_hash_duplicate
+        verdict: fail
+      high_similarity_duplicate:
+        rule_id: duplicate_check.high_similarity_duplicate
+        warn_metric: video_similarity_warn
+        fail_metric: video_similarity_fail
+
+  content_validity:
+    enabled: true
+    invalid_content_duration_sec_warn: 1.0
+    invalid_content_ratio_fail: 0.90
+    no_action_duration_sec_warn: 1.0
+    no_hand_visible_duration_sec_warn: 1.0
+    rules:
+      invalid_content_segment:
+        rule_id: content_validity.invalid_content_segment
+        verdict: warn
+      mostly_invalid_content:
+        rule_id: content_validity.mostly_invalid_content
+        verdict: fail
+
+  effective_duration:
+    enabled: true
+    effective_duration_sec_fail: 0.0
+    effective_ratio_warn: 0.80
+    rules:
+      no_effective_duration:
+        rule_id: effective_duration.no_effective_duration
+        verdict: fail
+      low_effective_ratio:
+        rule_id: effective_duration.low_effective_ratio
+        verdict: warn
+
+precheck_compatibility:
+  output_dir: outputs/precheck_example
+  overwrite: false
+  fps: 29.97
+  input_paths: []
+  enabled_checks:
+    - text_integrity
+    - quality_score
+    - keypoint_missing
+    - keypoint_morphology
+    - keypoint_temporal
+    - skeleton_quality_score
+    - composite_frame_verdict
+
+legacy_checks:
+  overexposure:
+    enabled: false
+    near_saturation: 250
+    fraction_threshold: null
+    mapped_to: video_quality
+  mask_containment:
+    enabled: true
+    mapped_to: sam3_containment
+
+batch_statistics:
+  aggregate_from_quality_archive_only: true
+  output_formats:
+    - csv
+    - xlsx
+    - markdown
