@@ -34,8 +34,8 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 {
   "schema_version": "asset_qc_report.v2",
   "qc_config": {
-    "schema_version": "qc_acceptance_config_schema.v1",
-    "config_version": "qc_acceptance_v1.1.0",
+    "schema_version": "qc_acceptance_config_schema.v2",
+    "config_version": "qc_acceptance_v2.0.0",
     "config_name": "acceptance_gate",
     "config_path": "configs/qc_acceptance.yaml",
     "config_hash": "sha256:<64 lowercase hex characters>"
@@ -156,8 +156,8 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 
 ```json
 {
-  "schema_version": "qc_acceptance_config_schema.v1",
-  "config_version": "qc_acceptance_v1.1.0",
+  "schema_version": "qc_acceptance_config_schema.v2",
+  "config_version": "qc_acceptance_v2.0.0",
   "config_name": "acceptance_gate",
   "config_path": "configs/qc_acceptance.yaml",
   "config_hash": "sha256:..."
@@ -177,10 +177,12 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 |---|---|---|
 | `pending` | 已建档，尚未开始或等待当前 gate。 | 必须为 `null` |
 | `running` | 自动 QC 仍在继续。 | 必须为 `null` |
-| `stopped` | 某个模块 hard fail，后续 QC 已停止。 | 必须为 `fail` |
-| `completed` | 所有应运行模块完成。 | `pass` 或 `warn` |
+| `awaiting_external` | 等待 `semantic_consistency` 或 `manual_review` 外部阶段。 | 必须为 `null` |
+| `stopped` | `acceptance` profile 的 hard fail，后续 QC 已停止。 | 必须为 `fail` |
+| `completed` | 所有应运行模块和外部阶段完成。 | `pass` 或 `fail` |
+| `error` | runtime/evidence/config/CAS 错误，未形成质量结论。 | 必须为 `null` |
 
-`pending` 不是质量等级，也不等于 warn。`warn` 是模块对具体问题的判定；
+`pending`、`running`、`awaiting_external` 不是质量等级，也不等于 warn。`warn` 是模块对具体问题的判定；
 流程未结束时只保存在 module verdict 和 `issues`，不提前写进
 `overall_decision`。
 
@@ -253,9 +255,13 @@ module.thresholds
 
 - `pass`：`continue_to_next_module=true`。
 - `warn`：生成 issue，追加到人工候选，继续下一模块。
-- `fail` 且当前 profile 要求停止：`state=stop_qc`、
+- `acceptance` + `fail`：`state=stop_qc`、
   `continue_to_next_module=false`、`next_module=null`；顶层
   `pipeline_state.status=stopped` 且 `pipeline_state.next_module=null`。
+- `supplier_evaluation` + `fail`：机器 verdict 仍为 `fail`，出口继续，并在 module
+  runtime 写 `continued_after_fail=true`；完成时 `overall_decision=fail`。
+- runtime/evidence/config/CAS 错误：写 `runtime_errors[]`，module state 为
+  `runtime_error`、顶层 `status=error`，不当成质量 fail。
 - 下游只读取上游 `exit_gate` 或顶层 `pipeline_state`，不解析自然语言原因。
 - 上游已 fail 时，后续高成本模块不得运行。
 
@@ -275,7 +281,9 @@ module.thresholds
 到达人工路由模块后，由人工策略统一决定：
 
 - `required=false`：无候选或按抽样策略无需人工。
-- `required=true`：进入 `queued` / `in_progress` / `completed`。
+- `required=true`：进入 `queued` / `in_progress` / `completed`；候选为空时必须是
+  `state=not_required`，不做正常 Pass 样本抽检。
+- 语义 `semantic_consistency` 是 `execution_kind=external`，完成后才进入上述路由。
 - 自动 QC 已 hard fail：`required=false`、`state=skipped_due_to_fail`，问题直接供
   批次统计和返工使用。
 
@@ -347,7 +355,8 @@ revision 与预期不一致时必须报 stale-write 错误，不能静默覆盖�
 
 ## 9. 批次派生输出
 
-以下内容可以从 `quality_archive/*.json` 生成，但都不是单资产主档案：
+以下内容可以从 `quality_archive/*.json` 生成，但都不是单资产主档案；
+`quality_archive/*.json` 是唯一事实源：
 
 - 批次 CSV / XLSX；
 - review queue 和 review index；
@@ -355,5 +364,33 @@ revision 与预期不一致时必须报 stale-write 错误，不能静默覆盖�
 - sidecar、overlay、mask 证据；
 - ledger events。
 
-`sidecar` 是大体积模块明细的旁路文件；`ledger events` 是流程事件日志；CSV 是
-表格视图。它们可被 JSON 用相对路径引用，但不能代替 `<asset_id>.json`。
+`sidecar` 是大体积模块明细的旁路文件，sidecar 只作证据和 reconciliation；
+`ledger events` 是流程事件日志；CSV 是表格视图。它们可被 JSON 用相对路径引用，
+但不能代替、覆盖或回退 `<asset_id>.json` 的 master verdict。
+
+## 10. v2 CLI、cache 与迁移边界
+
+```bash
+python tools/build_manual_review_queue.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/manual_review
+
+python tools/build_qc_json_projection.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/qc_projection \
+  --cache-dir sampled/XJGT_20260616/qc_cache \
+  --formats csv parquet xlsx markdown
+
+python tools/build_batch_qc_ledger.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/ledger \
+  --formats csv parquet xlsx markdown
+```
+
+projection/cache 读取每份 JSON 并校验 schema；cache manifest 保存相对路径、revision 和
+SHA-256，任一不一致都必须重建。旧 sidecar 参数只产生 reconciliation 行，不进入正式
+asset/issue/execution/aggregate 结论。
+
+v1 报告仅只读；首次 v2 写回必须先做纯函数 `migrate_v1_to_v2()`，保留 video block、
+unknown fields 和 revision，再通过 v2 schema/CAS 原子写盘。迁移失败或回滚只能保留
+v1 master、另写旁路/迁移产物，禁止覆盖 master verdict 或把 v1 内容写回 v2 主档案。

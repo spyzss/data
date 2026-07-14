@@ -4,17 +4,18 @@
 
 | 项目 | 当前值 |
 |---|---|
-| 配置 schema | `qc_acceptance_config_schema.v1` |
-| 当前配置版本 | `qc_acceptance_v1.1.0` |
+| 配置 schema | `qc_acceptance_config_schema.v2` |
+| 当前配置版本 | `qc_acceptance_v2.0.0` |
 | 当前模块版本 | `video_prefilter_v0.3.2` |
 | 活动配置 | `configs/qc_acceptance.yaml` |
-| 不可变归档 | `configs/qc_acceptance/qc_acceptance_v1.1.0.yaml` |
-| 配置 schema 文件 | `schemas/qc_acceptance_config.v1.schema.json` |
-| 已接入代码 | `video_quality` |
-| 待同事接入 | 其他 QC 模块与 pipeline orchestrator |
+| 不可变归档 | `configs/qc_acceptance/qc_acceptance_v2.0.0.yaml` |
+| 配置 schema 文件 | `schemas/qc_acceptance_config.v2.schema.json` |
+| 已接入代码 | 自动 adapters、双 profile orchestrator、projection |
+| 外部阶段 | `semantic_consistency`、`manual_review` |
 
-本 PRD 定义全流程模块共用一份版本化配置的规范。当前提交只实现统一 loader、
-schema、视频质检接入和文档；其他模块开发者按本 PRD 读取自己的 section。
+本 PRD 定义全流程模块共用一份版本化配置的规范。v2 Config 是模块顺序、阈值、
+rule、profile 和外部阶段边界的唯一来源；每条数据的报告只保存 config 引用和
+实际读取字节的 hash。
 
 ## 2. 目标
 
@@ -49,29 +50,25 @@ python run_acceptance_video_quality.py \
   --config configs/qc_acceptance.yaml
 ```
 
-`--config` 可以指向另一份完整统一配置，但不接受旧的 video-only YAML。统一配置
-必须包含 `schema_version`、`config_version`、`pipeline`、`json_report` 和
-`modules`。
+`--config` 可以指向另一份完整统一配置，但不接受旧的 video-only YAML。v2 统一
+配置必须包含 `schema_version`、`config_version`、`execution_profiles`、`pipeline`
+和 `modules`。
 
 ## 5. 顶层结构
 
 ```yaml
-schema_version: qc_acceptance_config_schema.v1
-config_version: qc_acceptance_v1.1.0
+schema_version: qc_acceptance_config_schema.v2
+config_version: qc_acceptance_v2.0.0
 config_name: acceptance_gate
-config_date: "2026-07-09"
-description: Versioned QC gate config for one-asset-one-json acceptance reports.
-
-source: {}
-version_policy: {}
+execution_profiles:
+  acceptance:
+    fail_action: stop
+    runtime_error_action: stop_incomplete
+  supplier_evaluation:
+    fail_action: record_and_continue
+    runtime_error_action: stop_incomplete
 pipeline: {}
-json_report: {}
-module_flow_contract: {}
-rule_id_prefix: {}
 modules: {}
-precheck_compatibility: {}
-legacy_checks: {}
-batch_statistics: {}
 ```
 
 | 字段 | 用途 |
@@ -79,12 +76,9 @@ batch_statistics: {}
 | `schema_version` | YAML 结构版本；结构变化时升级。 |
 | `config_version` | 阈值与流程策略版本。 |
 | `config_name` | 当前固定为 `acceptance_gate`。 |
-| `pipeline` | 模块顺序、起点和 fail 终点。 |
-| `json_report` | 单资产 JSON 写入合同。 |
-| `module_flow_contract` | gate 状态枚举和 pass/warn/fail 行为。 |
-| `rule_id_prefix` | 各模块 rule ID 命名空间。 |
+| `execution_profiles` | acceptance 截断或 supplier_evaluation 记录后继续；runtime error 都停止未完成。 |
+| `pipeline` | 模块顺序、默认 profile 和 terminal module。 |
 | `modules` | 各模块参数和规则表。 |
-| `batch_statistics` | 批次聚合策略。 |
 
 ## 6. 版本策略
 
@@ -122,8 +116,7 @@ configs/qc_acceptance/<config_version>.yaml
 
 ```yaml
 pipeline:
-  stop_on_fail: true
-  default_start_module: hdf5_text_info
+  default_profile: acceptance
   terminal_module: batch_statistics
   modules:
     - hdf5_text_info
@@ -144,7 +137,8 @@ pipeline:
 
 - `pipeline.modules` 是默认 gate 顺序。
 - 模块必须存在于 `modules.<module_name>`。
-- `pass` 和 `warn` 继续；`fail` 直接转 `batch_statistics`。
+- `pass` 和 `warn` 继续；`acceptance` 的 `fail` 直接转 `batch_statistics`。
+- `supplier_evaluation` 的 `fail` 记录后继续，最终 `overall_decision` 仍为 `fail`。
 - warn 只累计人工候选，是否人工由 `manual_review` 模块决定。
 - `overall_decision` 不是每个模块都重算的 summary；流程未结束时保持 `null`。
 
@@ -210,8 +204,10 @@ hand_roi
 ### 8.2 其他模块
 
 统一配置已经给出 HDF5 文本、`quality_hand`、关键点、SAM3、语义、人工和批次
-统计的配置合同。对应实现由模块负责人完成，验收条件见
-`docs/PRD-qc-gated-json.md`。本次视频模块提交不修改这些模块源码。
+统计的配置合同。`semantic_consistency` 与 `manual_review` 使用
+`execution_kind: external`，到达时由外部人工工作台/未来模型 adapter 接续，
+不在 Config 中伪造本地 implementation。`duplicate_check`、`content_validity`、
+`effective_duration` 未注册时必须显式 disabled/not_implemented，不得写成 pass。
 
 ## 9. JSON 配置引用
 
@@ -220,8 +216,8 @@ hand_roi
 ```json
 {
   "qc_config": {
-    "schema_version": "qc_acceptance_config_schema.v1",
-    "config_version": "qc_acceptance_v1.1.0",
+    "schema_version": "qc_acceptance_config_schema.v2",
+    "config_version": "qc_acceptance_v2.0.0",
     "config_name": "acceptance_gate",
     "config_path": "configs/qc_acceptance.yaml",
     "config_hash": "sha256:<actual loaded file bytes>"
@@ -280,7 +276,7 @@ issue.config_version
 
 1. 读取调用方指定路径或默认活动配置。
 2. 保存实际读取字节并计算 SHA-256。
-3. YAML 解析后通过 `schemas/qc_acceptance_config.v1.schema.json`。
+3. YAML 解析后通过 `schemas/qc_acceptance_config.v2.schema.json`。
 4. 校验 pipeline 中每个模块均有配置。
 5. 校验所有 rule ID 唯一。
 6. 暴露 `module_parameters(module_name)`。
@@ -293,7 +289,7 @@ issue.config_version
 
 配置 schema 至少校验：
 
-- 顶层必填字段和版本格式；
+- 顶层必填字段、双 profile 和版本格式；
 - `pipeline.modules` 非空且元素唯一；
 - `json_report.issue_fields_required` 使用统一 issue 字段；
 - 视频参数结构和必要字段；
@@ -325,3 +321,77 @@ issue.config_version
 - 视频 JSON 不包含 threshold snapshot、per-issue config version 或手部 ROI。
 - 同一 asset 若已有另一 config 版本/hash，视频 writer 拒绝覆盖。
 - 完整测试通过后才允许发布新 config 版本。
+
+## 15. v2 发布、流转与回滚合同
+
+当前生产值必须保持一致：
+
+```text
+config schema: qc_acceptance_config_schema.v2
+config version: qc_acceptance_v2.0.0
+active: configs/qc_acceptance.yaml
+immutable: configs/qc_acceptance/qc_acceptance_v2.0.0.yaml
+report: asset_qc_report.v2
+report root: <batch>/quality_archive/*.json
+```
+
+发布新配置时以活动 YAML 为输入，升级 `config_version`，运行 v2 schema、rule 唯一性
+和全量测试，再将同一字节复制到 `configs/qc_acceptance/<version>.yaml`。快照发布后
+不可原地修改；同一 asset 的 report 只能使用一个 config hash，发现漂移时拒绝写回。
+历史 v1 快照和 hash 保持不变，供只读迁移/对账使用。
+
+### 15.1 双 profile 与 external 模块
+
+```yaml
+execution_profiles:
+  acceptance:
+    fail_action: stop
+    runtime_error_action: stop_incomplete
+  supplier_evaluation:
+    fail_action: record_and_continue
+    runtime_error_action: stop_incomplete
+```
+
+`acceptance` hard fail 立即 `stopped`/`fail`，不进入
+`semantic_consistency` 或 `manual_review`；`supplier_evaluation` 保留机器 fail、
+记录 `continued_after_fail` 并继续。两种 profile 的 runtime error 均为
+`error`/`overall_decision=null`。`semantic_consistency` 和 `manual_review` 是
+`execution_kind: external`，前者完成后才根据 `candidate_issue_ids` 决定后者
+`not_required` 或 `queued`。
+
+### 15.2 唯一事实源、证据路径和 CAS
+
+- `quality_archive/*.json` 是唯一 master verdict；sidecar 只作证据和 reconciliation，
+  不参加正式 aggregate，也不覆盖 JSON 的 machine/human verdict。
+- `EvidenceRef.path` 必须是相对 batch root 的 POSIX 路径；绝对路径和 `..` 越界路径
+  直接拒绝。
+- 写回流程是读取当前 revision → 校验 asset/config/profile/next_module → 只替换模块
+  所有权 → 重建 candidates/failures → revision + 1 → v2 schema → `fsync` + `os.replace`。
+  expected revision 不一致是显式 CAS/stale-write 错误，不能静默覆盖。
+
+### 15.3 CLI 与 cache
+
+```bash
+python tools/build_qc_json_projection.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/qc_projection \
+  --cache-dir sampled/XJGT_20260616/qc_cache \
+  --formats csv parquet xlsx markdown
+
+python tools/build_manual_review_queue.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/manual_review
+
+python tools/build_batch_qc_ledger.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/ledger \
+  --formats csv parquet xlsx markdown
+
+python tools/build_xjgt_acceptance_report.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/xjgt_report
+```
+
+cache 的 source manifest 记录 report relative path、revision、SHA-256；任何不一致都
+必须删除/重建 cache。旧 sidecar CLI 参数仅生成对账表，不得改变 `quality_archive/*.json`
+投影或批次统计。

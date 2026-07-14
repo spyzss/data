@@ -4,15 +4,16 @@
 
 | 项目 | 状态 |
 |---|---|
-| 单资产 JSON 与 gate 合同 | 本 PRD 定稿 |
-| 统一配置 loader/schema | 已实现 |
-| `video_quality` | 已实现 |
-| 其他自动 QC 模块 | 由对应同事按本 PRD改造 |
-| 人工质检模块 | 由对应同事按本 PRD 实现 |
-| 全流程 orchestrator | 待对应负责人接入 |
+| 单资产 JSON 与 gate 合同 | `asset_qc_report.v2` 已实现 |
+| 统一配置 loader/schema | `qc_acceptance_config_schema.v2` 已实现 |
+| 配置版本 | `qc_acceptance_v2.0.0` |
+| 自动模块适配与双 profile orchestrator | 已实现 |
+| 人工/语义阶段接口 | `execution_kind: external`，由外部工作台接续 |
+| 批次投影、缓存与 ledger 入口 | 已切换为 `quality_archive/*.json` |
 
-本次代码同步只修改视频质检及其必需的公共 config/schema/report 支撑，不修改其他
-同事负责的模块源码。本 PRD 是其他模块的实现合同。
+本页原有 v1 章节保留作为历史迁移参考；当前生产合同以本文末尾“v2 canonical
+contract”为准。模块源码仍由各模块负责人维护，但所有正式写回和统计都必须遵守
+v2 报告事务、profile 和唯一事实源规则。
 
 ## 2. 核心结论
 
@@ -28,11 +29,20 @@
 创建档案 -> 自动 QC gate 串行执行 -> warn 累积 -> 人工路由 -> 后续批次检查 -> 批次统计
 ```
 
-三个不可变规则：
+当前不可变规则：
 
-1. 每个自动模块 `fail` 后立即停止后续 QC，并转到 `batch_statistics`。
-2. `warn` 不阻断流程，只写顶层 issue，并成为人工质检候选。
-3. 下游判断是否运行只读结构化 gate，不解析原因文本。
+1. `asset_qc_report.v2` 是每条数据唯一主报告；正式批次输出只投影
+   `quality_archive/*.json`。
+2. `acceptance` profile 的自动 hard fail 写入 `stopped`/`overall_decision=fail`，
+   跳过后续模块、语义阶段和人工候选；`supplier_evaluation` profile 的同一 fail
+   写入机器 fail 并 `record_and_continue`，直到全流程结束仍保留最终 fail。
+3. 自动 warn 只累计到 `manual_review.candidate_issue_ids`。语义阶段
+   `semantic_consistency` 是外部阶段；语义完成且候选为空时人工状态为
+   `not_required`，有候选时为 `queued`。
+4. runtime error、revision/CAS 冲突、配置漂移和 evidence 完整性错误不是质量
+   fail；它们写入 `runtime_errors`，状态为 `error`，`overall_decision=null`。
+5. 下游只读结构化 gate/status，不解析自然语言 reason；sidecar 只作证据和对账，
+   不得覆盖主报告 verdict。
 
 ## 3. 目标与非目标
 
@@ -49,9 +59,9 @@
 
 - 不把所有 QC 模块合并进一个 Python 文件。
 - 不把视频帧、mask、overlay 等大对象直接嵌入 JSON。
-- 不要求 hard fail 再走人工确认；hard fail 直接记录并停止。
-- 不使用 CSV、sidecar 或 ledger 代替单资产主档案。
-- 本次不实现除视频质检以外的模块源码。
+- 不要求 acceptance hard fail 再走语义或人工确认；hard fail 直接记录并停止。
+- 不使用 CSV、cache、sidecar 或 ledger 代替单资产主档案；sidecar 只作证据。
+- 不把 `supplier_evaluation` 的 fail 改写为 warn/pass，也不删除其批次统计事实。
 
 ## 4. 流程图
 
@@ -59,8 +69,10 @@
 flowchart TD
   A["拉取完成并创建 asset JSON"] --> B["hdf5_text_info"]
   B --> BG{"result gate"}
-  BG -->|fail| Z["停止 QC并转 batch_statistics"]
+  BG -->|acceptance fail| Z["stopped / overall fail"]
+  BG -->|supplier_evaluation fail| S["记录 fail 后继续"]
   BG -->|pass or warn| C["quality_hand"]
+  S --> C
   C --> CG{"result gate"}
   CG -->|fail| Z
   CG -->|pass or warn| D["keypoint_presence"]
@@ -78,16 +90,13 @@ flowchart TD
   GG -->|pass or warn| H["sam3_containment"]
   H --> HG{"result gate"}
   HG -->|fail| Z
-  HG -->|pass or warn| I["semantic_consistency"]
-  I --> IG{"result gate"}
-  IG -->|fail| Z
-  IG -->|pass or warn| J["manual_review routing"]
-  J --> JG{"manual required"}
-  JG -->|yes| K["人工复核并写回 JSON"]
-  JG -->|no| L["继续后续批次检查"]
-  K --> KR{"human verdict"}
-  KR -->|reject| Z
-  KR -->|accept or accept_with_risk| L
+  HG -->|pass or warn| SC["semantic_consistency (external)"]
+  SC --> SR{"candidate_issue_ids"}
+  SR -->|empty| NR["manual_review=not_required"]
+  SR -->|non-empty| J["manual_review=queued"]
+  J --> K["人工复核并写回 JSON"]
+  K --> L["manual_review=completed"]
+  NR --> L
   L --> M["duplicate_check"]
   M --> N["content_validity"]
   N --> O["effective_duration"]
@@ -96,29 +105,39 @@ flowchart TD
   Z --> Q
 ```
 
-模块顺序以该资产顶层 `qc_config` 指向的版本化配置为准。流程图中的名称对应
-`configs/qc_acceptance.yaml` 当前顺序。
+模块顺序、profile 行为和 external 边界以该资产顶层 `qc_config` 指向的
+`qc_acceptance_v2.0.0` 版本化配置为准。`supplier_evaluation` 的 fail 分支会
+汇入同一条“记录 fail 后继续”路径；图中的 acceptance hard fail 才会进入停止节点。
 
 ## 5. 单资产 JSON 顶层合同
 
 ```json
 {
-  "schema_version": "asset_qc_report.v1",
+  "schema_version": "asset_qc_report.v2",
   "qc_config": {
-    "schema_version": "qc_acceptance_config_schema.v1",
-    "config_version": "qc_acceptance_v1.1.0",
+    "schema_version": "qc_acceptance_config_schema.v2",
+    "config_version": "qc_acceptance_v2.0.0",
     "config_name": "acceptance_gate",
     "config_path": "configs/qc_acceptance.yaml",
     "config_hash": "sha256:..."
   },
   "asset_id": "episode_000123",
+  "supplier_id": "supplier-a",
   "report_revision": 7,
+  "execution": {
+    "profile": "acceptance",
+    "started_at": "2026-07-14T10:00:00Z",
+    "updated_at": "2026-07-14T10:05:00Z",
+    "module_states": {}
+  },
   "pipeline_state": {
     "status": "running",
     "last_completed_module": "video_quality",
-    "next_module": "sam3_containment"
+    "next_module": "sam3_containment",
+    "stop_reason": null
   },
   "overall_decision": null,
+  "runtime_errors": [],
   "issues": [],
   "manual_review": {
     "required": null,
@@ -151,10 +170,14 @@ flowchart TD
 |---|---|---|
 | `pending` | 已建档，等待第一个或下一个模块。 | `null` |
 | `running` | 自动/人工 QC 仍在执行。 | `null` |
-| `stopped` | 某个 gate fail，流程提前终止。 | `fail` |
-| `completed` | 所有应运行模块完成。 | `pass` 或 `warn` |
+| `awaiting_external` | 到达 `semantic_consistency` 或 `manual_review` 外部工作台，等待写回。 | `null` |
+| `stopped` | `acceptance` profile 的自动 hard fail，流程提前终止。 | `fail` |
+| `completed` | 所有应运行模块和外部阶段完成。 | `pass` 或 `fail` |
+| `error` | runtime/evidence/config/CAS 错误，未形成质量结论。 | `null` |
 
-`pending` 只表示流程状态，不表示质量。`warn` 是模块或最终质量结论，两者不能混用。
+`pending`、`running`、`awaiting_external` 和 `error` 只表示流程状态，不表示质量。
+`warn` 是 issue 的机器严重级别，不是 `overall_decision`；最终结论只允许 `pass`、
+`fail` 或未完成时的 `null`。
 
 ### 6.2 模块 gate
 
@@ -196,12 +219,13 @@ flowchart TD
 
 ### 6.3 Gate 转换表
 
-| 模块 verdict | issue | 出口 | 顶层状态 | 下一步 |
+| profile/模块 verdict | issue | 出口 | 顶层状态 | 下一步 |
 |---|---|---|---|---|
-| `pass` | 无 | `continue` | `running` | 配置中的下一模块 |
-| `warn` | 生成 warn issue | `continue` | `running` | 配置中的下一模块 |
-| `fail` | 生成 fail issue | `stop_qc` | `stopped` | `batch_statistics` |
-| `skipped` | 视原因决定 | `continue` 或 `stop_qc` | 按策略 | 显式写出 |
+| 任一 profile + `pass` | 无 | `continue` | `running` | 配置中的下一模块 |
+| 任一 profile + `warn` | 生成 warn issue | `continue` | `running` | 配置中的下一模块 |
+| `acceptance` + `fail` | 生成 fail issue | `stop_qc` | `stopped` | `batch_statistics` |
+| `supplier_evaluation` + `fail` | 生成 fail issue，`continued_after_fail=true` | `continue` | `running` | 配置中的下一模块 |
+| `skipped`/disabled/external | 必须记录结构化 state | `continue`、`awaiting_external` 或 `stop_qc` | 按策略 | 显式写出 |
 
 输入缺失若使模块无法完成必要检查，通常应生成 fail issue，而不是把 `skipped`
 当成无问题。可选模块被配置关闭时才使用普通 skipped。
@@ -249,16 +273,40 @@ flowchart TD
 3. 将 `issue_id` 追加到 `manual_review.candidate_issue_ids`。
 4. 继续后续自动模块。
 
-自动模块 fail 时：
+`acceptance` 自动模块 fail 时：
 
 1. 写顶层 fail issue。
 2. 将 `issue_id` 追加到
    `manual_review.failures_for_batch_stats_issue_ids`。
 3. 设置 `manual_review.required=false`、
    `manual_review.state=skipped_due_to_fail`。
-4. 停止后续 QC，直接进入批次统计。
+4. 停止后续 QC、语义阶段和人工质检，直接进入批次统计；后续模块标记
+   `skipped_due_to_fail`。
 
-### 8.2 人工路由模块
+`supplier_evaluation` 自动模块 fail 时仍写 fail issue 和
+`failures_for_batch_stats_issue_ids`，但不停止流程；模块 block 的 runtime 写入
+`continued_after_fail=true`，最终全流程完成后 `overall_decision=fail`。
+
+### 8.2 语义与人工外部阶段
+
+`semantic_consistency` 和 `manual_review` 在统一 Config 中是
+`execution_kind: external`。orchestrator 到达任一阶段时只写
+`pipeline_state.status=awaiting_external`、`next_module` 和对应
+`execution.module_states.<module>.state=awaiting_external`，不会伪造模型结论。
+语义校准先由人工工作台完成；后续可替换为模型 adapter，报告接口不变。
+
+语义阶段完成后按累计 warn 候选路由：
+
+- `manual_review.candidate_issue_ids=[]`：写 `required=false`、`state=not_required`，
+  不做正常 Pass 样本抽检；
+- 非空：写 `required=true`、`state=queued`，逐条复核候选 issue；
+- 复核过程中使用 `in_progress`，全部写回后使用 `completed`；
+- acceptance hard fail 已停止时使用 `skipped_due_to_fail`，不创建人工任务。
+
+人工 verdict 只能补充 issue review 和统计，不得删除/改写机器 issue；人工确认 fail
+会进入 `human_confirmed_fail_issue_count` 和最终 fail 统计。
+
+### 8.3 人工路由模块
 
 到达 `manual_review` 时，路由器只需要读取：
 
@@ -268,7 +316,7 @@ manual_review.candidate_issue_ids
 issues
 source_files
 各 issue 的 context/evidence path
-统一 config 的 manual_review 策略
+统一 config 的 manual_review 策略和 semantic_consistency 写回状态
 ```
 
 路由结果建议写：
@@ -478,7 +526,8 @@ schema 校验 -> 临时文件 `fsync` -> 原子替换。
 
 ### 11.1 Sidecar
 
-sidecar 是模块的大体积明细文件，例如逐帧 SAM 指标或完整候选窗口。主 JSON 只写：
+sidecar 是模块的大体积明细文件，例如逐帧 SAM 指标或完整候选窗口。sidecar 只作证据
+和旧系统对账，不能作为正式 verdict、人工队列或批次统计的事实源。主 JSON 只写：
 
 ```json
 {
@@ -488,7 +537,8 @@ sidecar 是模块的大体积明细文件，例如逐帧 SAM 指标或完整候�
 }
 ```
 
-它不是第二份主质检报告。
+它不是第二份主质检报告；sidecar 缺失只能记录 evidence integrity/runtime error，
+不能由聚合器猜测 pass/fail。
 
 ### 11.2 CSV
 
@@ -502,10 +552,11 @@ ledger event 是“模块开始、结束、重试、写回”等事件日志，�
 
 ## 12. 批次统计
 
-`batch_statistics` 不再运行高成本 QC，只聚合：
+`batch_statistics` 不再运行高成本 QC，只遍历并校验 `quality_archive/*.json` 聚合：
 
 - `overall_decision` 和停止模块；
-- pass/warn/fail 数量；
+- 自动 hard fail 资产/issue 数量（含 supplier_evaluation 的记录后继续 fail）；
+- 机器 warn、人工已检查、人工确认 fail 和最终 pass/fail 数量；
 - issue code/type/rule ID 频率；
 - 人工结论、返工项和风险项；
 - 重复率、无效时长、有效时长；
@@ -514,6 +565,10 @@ ledger event 是“模块开始、结束、重试、写回”等事件日志，�
 
 批次统计必须保留 asset ID 和 issue ID 追溯链。
 
+正式 projection 允许写 CSV/XLSX/Markdown/Parquet 和可重建 cache；这些派生文件都
+必须带 source report `relative_path`、revision、SHA-256 清单。清单不一致时先重建，
+不能继续使用旧 cache 作结论。
+
 ## 13. 开发验收清单
 
 每个同事提交模块时必须证明：
@@ -521,7 +576,8 @@ ledger event 是“模块开始、结束、重试、写回”等事件日志，�
 - [ ] 从统一 config 读取自己的阈值和 rule ID。
 - [ ] entry/result/exit gate 完整。
 - [ ] pass/warn/fail 与本 PRD 一致。
-- [ ] warn 继续，fail 停止并转 batch statistics。
+- [ ] warn 继续；acceptance fail 停止并转 batch statistics，supplier_evaluation fail
+      记录后继续且最终仍为 fail。
 - [ ] 每个异常生成独立 issue，包含实际值和边界。
 - [ ] 模块只引用 issue ID，不复制 issue detail。
 - [ ] 保留未知字段和其他模块 block。
@@ -536,8 +592,8 @@ ledger event 是“模块开始、结束、重试、写回”等事件日志，�
 本次可合并内容：
 
 - 统一 config loader 和 schema；
-- `qc_acceptance_v1.1.0` 活动/归档配置；
-- `asset_qc_report.v1` schema 和安全 writer；
+- `qc_acceptance_v2.0.0` 活动/归档配置；
+- `asset_qc_report.v2` schema、迁移器和 CAS writer；
 - 新 `video_quality` gate、issue、config 和 JSON 输出；
 - 本 PRD、统一 config PRD 和视频使用文档。
 
@@ -549,3 +605,94 @@ ledger event 是“模块开始、结束、重试、写回”等事件日志，�
 - 人工 review UI。
 
 这些由对应同事按本 PRD 后续提交。
+
+## 15. v2 canonical contract（当前生产接口）
+
+以下规则覆盖本文早期 v1 示例：
+
+```text
+schema_version: asset_qc_report.v2
+config schema: qc_acceptance_config_schema.v2
+config version: qc_acceptance_v2.0.0
+active config: configs/qc_acceptance.yaml
+immutable snapshot: configs/qc_acceptance/qc_acceptance_v2.0.0.yaml
+archive: <batch>/quality_archive/<asset_id>.json
+```
+
+Config 必须声明两个 profile：
+
+```yaml
+execution_profiles:
+  acceptance:
+    fail_action: stop
+    runtime_error_action: stop_incomplete
+  supplier_evaluation:
+    fail_action: record_and_continue
+    runtime_error_action: stop_incomplete
+```
+
+两种 profile 共享机器 `result_gate.verdict`。只有流转动作不同：acceptance 的
+hard fail 为 `pipeline_state.status=stopped`、`overall_decision=fail`；
+supplier_evaluation 的 hard fail 记录 `continued_after_fail=true` 并继续，完成所有
+应运行/外部阶段后才以 `overall_decision=fail` 收口。runtime error 不属于质量 fail，
+写 `runtime_errors[]`、模块状态 `runtime_error`、顶层 `status=error` 和
+`overall_decision=null`。
+
+### 15.1 统一数据流
+
+```text
+自动 QC Gate
+  acceptance: hard fail -> stopped/fail；不进入语义和人工质检
+  supplier_evaluation: hard fail -> 记录并继续
+-> semantic_consistency external
+-> candidate_issue_ids 为空：manual_review=not_required
+-> candidate_issue_ids 非空：manual_review=queued
+-> 最终 overall_decision=pass|fail
+-> 批次输出只投影 quality_archive/*.json
+```
+
+`semantic_consistency` 是自动链上的外部阶段，不与人工 warn review 并列；人工
+校准先写回语义 block，未来模型接入保持同一 external 边界。人工候选状态只能是
+`not_evaluated`、`not_required`、`required`、`queued`、`in_progress`、`completed`
+或 `skipped_due_to_fail`。
+
+### 15.2 写回、证据与并发
+
+- `evidence.path` 必须是相对于 batch root 的路径，禁止绝对路径、`..` 越界路径。
+- writer 读取当前 `report_revision`，校验 asset/config/profile/next_module，按模块
+  所有权替换内容，revision 加 1，通过 v2 Schema 后临时文件 `fsync` + `os.replace`。
+- expected revision 不匹配必须失败（CAS/stale revision），不能静默覆盖其他 writer。
+- master verdict 仅来自 QC JSON；sidecar 只作证据和 reconciliation，不能覆盖
+  `overall_decision`、机器 severity 或人工 effective verdict。
+- v1 报告只读；首次 v2 写回必须先 `migrate_v1_to_v2()` 并通过 v2 schema。失败或
+  回滚时只能读取 v1/写旁路迁移报告，禁止把旧内容覆盖回 master QC verdict。
+
+### 15.3 正式 CLI 与可重建 cache
+
+```bash
+# 人工候选队列：正式模式只读 quality_archive/*.json
+python tools/build_manual_review_queue.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/manual_review
+
+# 三张规范化投影 + 汇总；cache 可删除、可重建，不是事实源
+python tools/build_qc_json_projection.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/qc_projection \
+  --cache-dir sampled/XJGT_20260616/qc_cache \
+  --formats csv parquet xlsx markdown
+
+# 兼容入口仍从同一 QC JSON 投影；legacy 参数只生成 reconciliation 表
+python tools/build_batch_qc_ledger.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/ledger \
+  --formats csv parquet xlsx markdown
+
+python tools/build_xjgt_acceptance_report.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/xjgt_report
+```
+
+正式输出只能解释 `quality_archive/*.json`；传入旧 candidate/SAM3/video/manual
+sidecar 时，它们只进入 reconciliation/evidence，不得改变 canonical asset、issue、
+execution 行或 aggregate verdict。

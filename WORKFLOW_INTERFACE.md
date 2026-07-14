@@ -17,6 +17,37 @@ supplier data / raw video
 
 注意：这个顺序是外部 workflow，不得硬编码进任何 root module。每个 root module 都必须能独立运行或被独立测试。
 
+### 1.1 Canonical QC dataflow (v2)
+
+The acceptance workflow that produces formal quality decisions is separate from
+the legacy annotation outputs above. It is driven by
+`configs/qc_acceptance.yaml` (`qc_acceptance_config_schema.v2`,
+`qc_acceptance_v2.0.0`) and writes one
+`<batch>/quality_archive/<asset_id>.json` per asset with
+`schema_version=asset_qc_report.v2`.
+
+```text
+automatic QC Gate
+  acceptance: hard fail -> stopped/fail; skip semantic/manual
+  supplier_evaluation: hard fail -> record and continue
+-> semantic_consistency (external)
+-> no candidate_issue_ids -> manual_review=not_required
+-> candidate_issue_ids -> manual_review=queued/in_progress/completed
+-> overall_decision=pass|fail
+-> batch projections read quality_archive/*.json only
+```
+
+`semantic_consistency` is before manual warn review and is currently an external
+human calibration stage; a future model may implement the same external
+interface. Runtime errors, evidence failures, config drift and CAS conflicts set
+`pipeline_state.status=error`, append `runtime_errors`, and leave
+`overall_decision=null`; they are not quality fails. The only final decision
+values are `pass`, `fail`, and `null` while incomplete.
+
+`quality_archive/*.json` is the sole master source. Sidecars, overlays, CSV,
+XLSX, Markdown, events and cache are derived evidence/reconciliation only
+（sidecar 只作证据）; they cannot replace or overwrite a report verdict.
+
 ## 2. Module Ownership
 
 | Module | Owner Scope | Loads Heavy Models | Main Inputs | Main Outputs |
@@ -222,3 +253,38 @@ final_decision
 - `annotation_verify/` 不做 signal-quality checks。
 - `qc_common/` 只放稳定契约和纯工具。
 - Heavy model sidecars 可以放在 `tools/`，但必须明确标注为外部 workflow step。
+
+## 11. Canonical QC projection and migration commands
+
+```bash
+python tools/build_manual_review_queue.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/manual_review
+
+python tools/build_qc_json_projection.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/qc_projection \
+  --cache-dir sampled/XJGT_20260616/qc_cache \
+  --formats csv parquet xlsx markdown
+
+python tools/build_batch_qc_ledger.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/ledger \
+  --formats csv parquet xlsx markdown
+
+python tools/build_xjgt_acceptance_report.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/xjgt_report
+```
+
+All formal commands validate each JSON before projection. Cache reuse requires a
+source manifest matching relative report path, `report_revision` and SHA-256;
+otherwise rebuild it. Legacy sidecar flags are explicit reconciliation inputs
+only and cannot modify canonical rows.
+
+Report writers use read → identity/config/profile/next-module check → module-owned
+mutation → candidate/fail rebuild → revision + 1 → v2 schema → fsync/atomic
+replace. A stale revision is a CAS error and must not silently overwrite a
+concurrent writer. `asset_qc_report.v1` is read-only; the first v2 write uses
+`migrate_v1_to_v2()` and a new v2 report. Rollback is read-only/sidecar based and
+must not overwrite the master verdict.
