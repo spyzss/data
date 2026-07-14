@@ -287,7 +287,8 @@ def prepared_replacement_from_record(
 
     if not isinstance(record, FinalizingRecord):
         raise TypeError("record must be a FinalizingRecord")
-
+    if not isinstance(record.transaction_id, str) or not record.transaction_id:
+        raise Hdf5CommitError("finalizing record transaction_id must be non-empty")
     source = Path(record.source_path)
     staged = Path(record.staged_path)
     if not _is_managed_staged_path(source, staged, record.transaction_id):

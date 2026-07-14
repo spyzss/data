@@ -321,6 +321,24 @@ def test_relative_source_path_can_reconstruct_and_commit(
     assert _sha256(source) == prepared.new_sha256
 
 
+def test_reconstruction_requires_transaction_id(tmp_path: Path) -> None:
+    source = write_complex_hdf5(tmp_path / "asset-no-tx.hdf5")
+    prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-required")
+    record = FinalizingRecord(
+        source_path=prepared.source_path,
+        staged_path=prepared.staged_path,
+        old_sha256=prepared.old_sha256,
+        new_sha256=prepared.new_sha256,
+    )
+    before = prepared.staged_path.read_bytes()
+
+    with pytest.raises(Hdf5CommitError, match="transaction_id"):
+        prepared_replacement_from_record(record)
+
+    assert prepared.staged_path.read_bytes() == before
+    prepared.staged_path.unlink()
+
+
 def test_recovery_requests_rebuild_when_old_hash_has_no_staged_file(tmp_path: Path) -> None:
     source = write_complex_hdf5(tmp_path / "asset.hdf5")
     prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-rebuild")
