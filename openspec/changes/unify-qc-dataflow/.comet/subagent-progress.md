@@ -56,4 +56,6 @@
 - Task 17: complete (`8f2211f`, fixes `141b60c`, `7651e7d`), focused `21 passed`, full suite `594 passed, 1 skipped`; cache generation barriers, table hashes, manifest validation, corruption/stale rebuild and direct CLI verified
 - OpenSpec checkoff: 3.1–3.4, 4.1–4.4 complete
 - Review: Task17 final Thorough approval Ready; no Critical/Important findings
+- Task 18: complete (`3a815f7`), docs contract `2 passed`, `openspec validate --strict` passed; PRD/Schema/reviewer/migration docs now match v2 profiles and canonical archive flow
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.4, 5.1 complete
 - Current phase: build

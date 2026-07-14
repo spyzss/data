@@ -1431,7 +1431,7 @@ git commit -m "feat(qc): add rebuildable projection cache"
 - 文档必须使用与代码相同的版本、profile、pipeline status、module state、CLI 与目录名。
 - 迁移文档必须给出 v1 只读、首次 v2 写回、回滚到只读 sidecar 工具和禁止回退 master verdict 的操作步骤。
 
-- [ ] **Step 1: 添加文档契约测试**
+- [x] **Step 1: 添加文档契约测试**
 
 ```python
 def test_reviewer_docs_name_v2_profiles_and_single_source() -> None:
@@ -1445,13 +1445,13 @@ def test_docs_do_not_advertise_pass_sample_review() -> None:
     assert "仅累计 warn 进入人工质检" in text
 ```
 
-- [ ] **Step 2: 运行测试并确认旧文档缺少 v2/双 profile**
+- [x] **Step 2: 运行测试并确认旧文档缺少 v2/双 profile**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_docs_contract.py -q`
 
 Expected: FAIL，缺少 v2 版本或 `supplier_evaluation`。
 
-- [ ] **Step 3: 按已实现接口同步六份文档**
+- [x] **Step 3: 按已实现接口同步六份文档**
 
 每份文档必须写明以下精确流程：
 
@@ -1468,13 +1468,13 @@ Expected: FAIL，缺少 v2 版本或 `supplier_evaluation`。
 
 同时列出 Config 发布规则、v1 hash、evidence 相对路径、revision 冲突、runtime error 与质量 fail 的区别、新 CLI 完整示例和 sidecar 对账限制。
 
-- [ ] **Step 4: 运行文档契约与 OpenSpec 校验**
+- [x] **Step 4: 运行文档契约与 OpenSpec 校验**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_docs_contract.py -q && openspec validate unify-qc-dataflow --strict`
 
 Expected: PASS；OpenSpec 显示 change valid。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add docs/PRD-qc-gated-json.md docs/PRD-qc-unified-config.md docs/asset-qc-json-format.md ACCEPTANCE.md WORKFLOW_INTERFACE.md docs/qc-dataflow-migration.md tests/test_qc_docs_contract.py

@@ -29,7 +29,7 @@
 
 ## 5. 文档与端到端验证
 
-- [ ] 5.1 同步 PRD、统一配置、Schema 文档和 reviewer 指南中的双 profile 与唯一事实源规则
+- [x] 5.1 同步 PRD、统一配置、Schema 文档和 reviewer 指南中的双 profile 与唯一事实源规则
 - [ ] 5.2 使用 pass、warn、hard fail、runtime error 四类 fixture 验证单资产完整 revision 轨迹
 - [ ] 5.3 使用同一批输入端到端验证 acceptance 截断与 supplier_evaluation 全流程的差异
 - [ ] 5.4 运行全量测试并记录旧 sidecar 到 QC JSON 的迁移与回滚说明
