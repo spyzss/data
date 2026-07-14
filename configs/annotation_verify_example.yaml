@@ -1,0 +1,8 @@
+output_dir: outputs/annotation_verify_example
+enabled_checks:
+  - instruction_consistency
+overwrite: false
+
+instruction_consistency:
+  sample_frames: 8
+  model_name: null

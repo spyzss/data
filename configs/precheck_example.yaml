@@ -1,0 +1,121 @@
+# Example precheck config. input_paths may be supplier HDF5 files or directories.
+# Directories are auto-detected by precheck/adapters/auto.py.
+
+output_dir: outputs/precheck_example
+overwrite: false
+fps: 29.97
+
+input_paths:
+  - /path/to/supplier_hdf5_directory
+  # - /path/to/episode_000001.hdf5
+
+enabled_checks:
+  - text_integrity
+  - quality_score
+  - keypoint_missing
+  - keypoint_morphology
+  - keypoint_temporal
+  - skeleton_quality_score
+  - composite_frame_verdict
+
+text_integrity:
+  required_fields:
+    - scene
+    - task
+    - text_en
+
+quality_score:
+  pass_threshold: 0.90
+
+keypoint_missing:
+  sides:
+    - left
+    - right
+  joint_names: null
+  fps: null
+  window_seconds: 10.0
+  allowed_missing_seconds: 1.0
+
+keypoint_temporal:
+  sides:
+    - left
+    - right
+  joint_names: null
+  fps: null
+  project_2d: true
+  min_angle_degrees: 5.0
+  max_angle_degrees: 175.0
+
+keypoint_morphology:
+  sides:
+    - left
+    - right
+  duplicate_joint_distance_m: 0.00001
+  min_palm_scale_m: 0.0001
+  max_bone_length_ratio_spread_review: 3.0
+  max_bone_length_ratio_spread_fail: 8.0
+  max_normalized_bone_length_review: 3.0
+  max_normalized_bone_length_fail: 6.0
+  max_zero_length_bone_count_review: 1
+  max_zero_length_bone_count_fail: 2
+  max_duplicate_joint_pair_count_review: 1
+  max_duplicate_joint_pair_count_fail: 3
+  min_joint_angle_deg_review: 5.0
+  min_joint_angle_deg_fail: 1.0
+  max_joint_angle_violation_fraction_review: 0.15
+  max_joint_angle_violation_fraction_fail: 0.40
+
+skeleton_quality_score:
+  # any_threshold preserves the original behavior. temporal_triage hard-flags
+  # strong temporal failures and routes moderate/rotation-only frames to mask review.
+  decision_mode: any_threshold
+  joint_angle_change_deg_max_threshold: 10.0
+  rotation_delta_max_threshold: 0.45
+  joint_acceleration_m_s2_max_threshold: 15.0
+  joint_displacement_m_max_threshold: 0.05
+  hard_exceeded_metric_count: 3
+  strong_acceleration_ratio: 2.5
+  strong_displacement_ratio: 1.8
+  rotation_mask_review_ratio: 1.0
+  promote_sustained_review: false
+  sustained_review_min_frames: 6
+  reject_missing_keypoints: true
+  reject_low_quality_hand: false
+  allowed_missing_keypoints_per_hand: 0
+  # Projection review is skipped unless image size and intrinsics are available
+  # from ClipInputs or these projection_* fields.
+  projection_enabled: true
+  projection_image_width: null
+  projection_image_height: null
+  projection_fx: null
+  projection_fy: null
+  projection_cx: null
+  projection_cy: null
+  projection_border_margin_px: 20.0
+  projection_near_border_count_threshold: 6
+  projection_outside_count_threshold: 1
+  projection_center_jump_px_threshold: 120.0
+  projection_bbox_area_change_ratio_threshold: 3.0
+  candidate_gap_close_frames: 2
+  candidate_min_seed_run_frames: 3
+  candidate_pre_context_frames: 10
+  candidate_post_context_frames: 10
+  candidate_merge_overlapping_only: true
+  pass_threshold: 0.90
+
+composite_frame_verdict:
+  joint_angle_change_deg_max_threshold: 10.0
+  rotation_delta_max_threshold: 0.45
+  joint_acceleration_m_s2_max_threshold: 15.0
+  joint_displacement_m_max_threshold: 0.05
+  pass_threshold: 0.90
+
+mask_containment:
+  sides:
+    - left
+    - right
+  joint_names: null
+
+overexposure:
+  near_saturation: 250
+  fraction_threshold: null

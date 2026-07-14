@@ -1,0 +1,224 @@
+# Marmalade QC Workflow Interface
+
+本文档是当前仓库对外接口的主入口。`README.md`、`QUICKSTART.md`、`STRUCTURE.md` 和各实现说明都应服从这里的 workflow contract。
+
+## 1. Workflow
+
+外部编排可以按下面顺序执行：
+
+```text
+supplier data / raw video
+-> precheck
+-> optional SAM3 keypoint containment sidecar
+-> annotation
+-> annotation_verify
+-> batch ledger / human review
+```
+
+注意：这个顺序是外部 workflow，不得硬编码进任何 root module。每个 root module 都必须能独立运行或被独立测试。
+
+## 2. Module Ownership
+
+| Module | Owner Scope | Loads Heavy Models | Main Inputs | Main Outputs |
+| --- | --- | --- | --- | --- |
+| `precheck/` | 数据可信度、HDF5 文本、`quality_hand`、骨骼点几何、基础画质、mask containment 消费端 | 否 | HDF5、optional frames、optional masks、camera intrinsics | `check_results.json`、`clip_aggregates.json`、parquet/csv fallback |
+| `tools/sam3_keypoint_containment.py` | 云端验收 sidecar：抽样 mp4、调用 SAM3、投影 HDF5 手部骨骼点、计算 inside ratio | 是，SAM3 | HDF5 + mp4 + SAM3 model | `frame_keypoint_containment.json`、`clip_keypoint_containment.json` |
+| `annotation/` | 视觉标注：discovery、SAM3 segmentation、DA3 depth、storage、annotation QC | 是，SAM3 / DA3 | LeRobot dataset / RGB frames / instruction | masks parquet、depth PNG+JSON、sampling manifest、QC images |
+| `annotation_verify/` | 语义一致性验证契约；当前 VLM 是 stub | 目前否 | `ClipInputs` frames/instruction 或未来外部注入 | `check_results.json`、`clip_aggregates.json`、parquet/csv fallback |
+| `qc_common/` | 跨模块共享契约和纯工具 | 否 | 无 runtime workflow input | `ClipInputs`、`CheckResult`、keypoint topology、registry、IO helpers |
+
+## 3. Shared Keys
+
+所有可对齐的结果都必须使用：
+
+```text
+(episode_idx, frame_idx)
+```
+
+约定：
+
+- frame-level row：真实 `frame_idx`。
+- clip-level summary row：`frame_idx = -1`。
+- batch-level 统计：不能覆盖 frame/clip row，应另写 batch ledger。
+
+## 4. Precheck Interface
+
+入口：
+
+```bash
+python run_precheck.py configs/precheck_example.yaml
+```
+
+输入配置：
+
+```yaml
+output_dir: outputs/precheck_example
+input_paths:
+  - /path/to/supplier_hdf5_directory
+  # or:
+  # - /path/to/episode_000001.hdf5
+enabled_checks:
+  - text_integrity
+  - quality_score
+  - keypoint_missing
+  - keypoint_temporal
+  - skeleton_quality_score
+  - composite_frame_verdict
+```
+
+`input_paths` 可以是文件或目录。precheck 输入层会自动识别：
+
+- `.h5` / `.hdf5` 文件或目录：使用 supplier HDF5 adapter。
+- LeRobot/parquet 风格目录：目前会识别并提示 adapter 未实现。
+- CSV/video bundle：目前会识别并提示 adapter 未实现。
+
+输出：
+
+```text
+<output_dir>/check_results.json
+<output_dir>/clip_aggregates.json
+<output_dir>/check_results.parquet or check_results.csv
+```
+
+`check_results.json` 记录结构：
+
+```json
+{
+  "check": "skeleton_quality_score",
+  "episode_idx": 0,
+  "frame_idx": 123,
+  "metrics": {
+    "joint_angle_change_deg_max": 3.2,
+    "rotation_delta_max": null,
+    "joint_acceleration_m_s2_max": 8.4,
+    "joint_displacement_m_max": 0.012,
+    "skeleton_score": 1.0
+  },
+  "flag": null,
+  "reason": "temporal skeleton geometry within thresholds"
+}
+```
+
+## 5. SAM3 Keypoint Containment Sidecar
+
+这个脚本是云端验收工具，不是 `precheck/checks`，因为它会加载 SAM3。
+
+入口：
+
+```bash
+python tools/sam3_keypoint_containment.py \
+  --hdf5-dir /path/to/hdf5 \
+  --video-dir /path/to/mp4 \
+  --sam3-model /path/to/sam3 \
+  --output-dir outputs/sam3_keypoint_containment \
+  --sample-fraction 0.10 \
+  --projection-mode auto
+```
+
+输出：
+
+```text
+<output_dir>/frame_keypoint_containment.json
+<output_dir>/clip_keypoint_containment.json
+<output_dir>/run_manifest.json
+```
+
+核心 clip metric：
+
+```text
+clip_keypoint_inside_ratio = inside_keypoints / total_expected_keypoints
+valid_projected_inside_ratio = inside_keypoints / valid_projected_keypoints
+```
+
+该 sidecar 可以用于准入口抽检；后续如果要接入 `precheck/mask_containment.py`，应通过 `ClipInputs.masks` 或外部 adapter 注入 mask，而不是让 precheck 直接 import SAM3。
+
+## 6. Annotation Interface
+
+入口：
+
+```bash
+python run_annotate.py configs/anygrasp_full.yaml
+python run_annotate.py configs/seg_only.yaml --stage segmentation
+python run_annotate.py configs/depth_only.yaml --stage depth
+```
+
+输出以 `(episode_idx, frame_idx)` 对齐：
+
+```text
+masks.parquet
+depth/<camera>/episode_<idx>/frame_<idx>.png
+depth/<camera>/episode_<idx>/frame_<idx>.json
+sampling_manifest.parquet
+qc/*.png
+```
+
+Annotation 不读取 precheck verdict，也不假设 precheck 已运行。
+
+## 7. Annotation Verify Interface
+
+当前是 semantic verification stub：
+
+```bash
+python run_annotation_verify.py configs/annotation_verify_example.yaml
+```
+
+输出与 `precheck` 保持同形：
+
+```text
+<output_dir>/check_results.json
+<output_dir>/clip_aggregates.json
+<output_dir>/check_results.parquet or check_results.csv
+```
+
+当前 `instruction_consistency` 是 clip-level row，使用 `frame_idx = -1`。
+
+未来接 VLM 时仍需保持边界：只做 instruction/video semantic consistency，不做 signal-quality、骨骼点、mask containment 或 annotation 修复。
+
+## 8. Batch Ledger Contract
+
+批次台账应在外部聚合以下 JSON/parquet：
+
+- `precheck/check_results.json`
+- `precheck/clip_aggregates.json`
+- `sam3_keypoint_containment/clip_keypoint_containment.json`
+- annotation masks/depth manifests
+- `annotation_verify/check_results.json`
+- `annotation_verify/clip_aggregates.json`
+
+建议输出字段：
+
+```text
+batch_id
+episode_idx
+asset_id / source_file
+precheck_pass
+skeleton_quality_pass_ratio
+sam3_keypoint_inside_ratio
+text_integrity_flag
+quality_hand_pass_ratio
+annotation_outputs_available
+semantic_verify_flag
+human_review_status
+final_decision
+```
+
+## 9. Test Strategy
+
+测试也按模块边界组织：
+
+| Test Type | Allowed Location | Contract |
+| --- | --- | --- |
+| Module smoke test | `tests/` | 直接构造 `ClipInputs` 或模块 config，只验证单个 module 的 runner/check/contract。 |
+| Temporary coupled workflow test | `tests/` or `tools/` | 可以按 `precheck -> sidecar -> annotation -> verify` 串联，但必须通过文件/config/JSON 输出连接，不得在 root modules 之间互相 import runtime internals。 |
+| Cloud GPU containment test | `tools/sam3_keypoint_containment.py` | 允许加载 SAM3；输出 JSON 给台账或后续 adapter 消费。 |
+| Production runner behavior | root module runners | 保持独立，不假设其他 module 已经运行。 |
+
+临时耦合测试可以存在，但它是测试/验收脚本，不是架构约束。测试通过不代表可以把 workflow 顺序写进 `precheck/`、`annotation/` 或 `annotation_verify/`。
+
+## 10. Boundary Rules
+
+- `precheck/` 不加载 SAM3、DA3、VLM。
+- `annotation/` 不 import `precheck/` 或 `annotation_verify/` runtime internals。
+- `annotation_verify/` 不做 signal-quality checks。
+- `qc_common/` 只放稳定契约和纯工具。
+- Heavy model sidecars 可以放在 `tools/`，但必须明确标注为外部 workflow step。

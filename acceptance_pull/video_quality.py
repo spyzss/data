@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import shutil
 import subprocess
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -13,14 +13,15 @@ from typing import Any
 import cv2
 import h5py
 import numpy as np
-from qc_common.config import load_qc_acceptance_config
-from qc_common.report import load_asset_qc_report, write_asset_qc_report
+import yaml
 
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi"}
 LAPLACIAN_LOW_DETAIL_THRESHOLD = 100.0
 DARK_PIXEL_Y_THRESHOLD = 20
 OVER_EXPOSED_PIXEL_Y_THRESHOLD = 245
+
+
 class AlignmentMode(StrEnum):
     IGNORE = "ignore"
     WARN = "warn"
@@ -30,6 +31,8 @@ class AlignmentMode(StrEnum):
 @dataclass(frozen=True)
 class PipelineConfig:
     stop_before_mask_if_fail: bool = True
+    run_hand_roi: bool = False
+    hand_roi_source: str = "hdf5_keypoints"
     do_keypoint_quality_check: bool = False
     do_keypoint_mask_matching: bool = False
     do_keypoint_temporal_check: bool = False
@@ -111,16 +114,16 @@ class SharpnessGlobalConfig:
     normalize_before_compute: bool = True
     target_short_side: int = 720
     no_upscale: bool = True
-    laplacian_p10_pass: float = 15.0
+    laplacian_p10_pass: float = 35.0
     laplacian_p10_warn: float = 0.0
-    laplacian_median_pass: float = 20.0
+    laplacian_median_pass: float = 50.0
     laplacian_median_warn: float = 0.0
-    laplacian_under_100_ratio_pass: float = 1.00
+    laplacian_under_100_ratio_pass: float = 0.50
     laplacian_under_100_ratio_warn: float = 1.00
-    tenengrad_p10_pass: float = 6.0
-    tenengrad_p10_warn: float = 4.0
-    tenengrad_median_pass: float = 7.0
-    tenengrad_median_warn: float = 4.0
+    tenengrad_p10_pass: float = 12.0
+    tenengrad_p10_warn: float = 6.0
+    tenengrad_median_pass: float = 13.0
+    tenengrad_median_warn: float = 8.0
 
 
 @dataclass(frozen=True)
@@ -131,9 +134,6 @@ class FreezeConfig:
     hist_diff_max: float = 0.01
     ssim_min: float = 0.995
     phash_hamming_max: int = 4
-    freeze_candidate_window_sec: float = 0.5
-    confirmed_freeze_window_sec: float = 1.0
-    adjacent_near_duplicate_ratio_warn: float = 0.90
     frozen_frame_ratio_pass: float = 0.05
     frozen_frame_ratio_warn: float = 0.10
     min_interval_frames: int = 6
@@ -158,8 +158,6 @@ class FreezeConfig:
         "交互",
     )
     critical_window_interval_duration_ms_fail: float = 100.0
-    video_state_conflict_noncritical_duration_ms_fail: float = 1000.0
-    video_state_conflict_critical_duration_ms_fail: float = 500.0
 
 
 @dataclass(frozen=True)
@@ -179,10 +177,44 @@ class Hdf5AlignmentConfig:
 
 
 @dataclass(frozen=True)
+class HandRoiSevereFailConfig:
+    enabled: bool = True
+    require_both_lap_and_ten_fail: bool = True
+    laplacian_p10_fail: float = 20.0
+    tenengrad_p10_fail: float = 6.0
+    blur_bad_frame_ratio_fail: float = 0.90
+
+
+@dataclass(frozen=True)
+class HandRoiConfig:
+    enabled: bool = False
+    mode: str = "warn_except_severe_fail"
+    use_keypoints_as_bbox_only: bool = True
+    min_valid_points_for_bbox: int = 8
+    bbox_expand_scale: float = 1.8
+    min_roi_width_px: int = 64
+    min_roi_height_px: int = 64
+    min_roi_area_ratio: float = 0.002
+    roi_target_short_side: int = 256
+    no_upscale_if_roi_too_small: bool = True
+    available_ratio_pass: float = 0.70
+    available_ratio_warn: float = 0.40
+    laplacian_p10_pass: float = 80.0
+    laplacian_p10_warn: float = 20.0
+    laplacian_median_pass: float = 120.0
+    laplacian_median_warn: float = 40.0
+    tenengrad_p10_pass: float = 12.0
+    tenengrad_p10_warn: float = 6.0
+    tenengrad_median_pass: float = 14.0
+    tenengrad_median_warn: float = 8.0
+    blur_bad_frame_ratio_pass: float = 0.50
+    blur_bad_frame_ratio_warn: float = 0.90
+    severe_fail: HandRoiSevereFailConfig = field(default_factory=HandRoiSevereFailConfig)
+
+
+@dataclass(frozen=True)
 class VideoQualityConfig:
-    module_version: str = ""
-    qc_config_reference: dict[str, str] = field(default_factory=dict)
-    next_module: str = ""
+    threshold_version: str = "video_prefilter_v0.3.0"
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     fps: FpsConfig = field(default_factory=FpsConfig)
     resolution: ResolutionConfig = field(default_factory=ResolutionConfig)
@@ -193,6 +225,7 @@ class VideoQualityConfig:
     freeze: FreezeConfig = field(default_factory=FreezeConfig)
     defects: DefectDurationConfig = field(default_factory=DefectDurationConfig)
     hdf5_alignment: Hdf5AlignmentConfig = field(default_factory=Hdf5AlignmentConfig)
+    hand_roi: HandRoiConfig = field(default_factory=HandRoiConfig)
 
     @property
     def sample_count(self) -> int:
@@ -233,18 +266,18 @@ class FrameTimestamps:
 
 
 @dataclass(frozen=True)
-class FreezeScan:
-    frozen_intervals: tuple[FrozenInterval, ...]
-    adjacent_near_duplicate_count: int
-    adjacent_near_duplicate_ratio: float
-    freeze_candidate_intervals: tuple[FrozenInterval, ...]
-    freeze_candidate_frame_count: int
-    freeze_candidate_duration_sec: float
-    freeze_candidate_ratio: float
-    confirmed_freeze_frame_count: int
-    confirmed_freeze_duration_sec: float
-    confirmed_freeze_ratio: float
-    max_confirmed_freeze_sec: float
+class HandRoiMetrics:
+    enabled: bool
+    source: str
+    sampled_frame_count: int
+    available_frame_count: int
+    available_ratio: float
+    laplacian_p10: float
+    laplacian_median: float
+    tenengrad_p10: float
+    tenengrad_median: float
+    blur_bad_frame_ratio: float
+    unavailable_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -284,14 +317,6 @@ class VideoMetrics:
     tenengrad_median: float
     tenengrad_mean: float
     sharpness_scale_short_side: int
-    adjacent_near_duplicate_count: int
-    adjacent_near_duplicate_ratio: float
-    freeze_candidate_ratio: float
-    freeze_candidate_frame_count: int
-    freeze_candidate_duration_sec: float
-    confirmed_freeze_ratio: float
-    confirmed_freeze_frame_count: int
-    confirmed_freeze_duration_sec: float
     frozen_frame_ratio: float
     max_consecutive_frozen_sec: float
     frozen_intervals: tuple[FrozenInterval, ...]
@@ -306,23 +331,8 @@ class VideoMetrics:
     expected_interval_ms: float
     drop_interval_ms: float
     max_gap_fail_ms: float
+    hand_roi: HandRoiMetrics | None = None
     errors: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class IssueDetail:
-    issue_id: str
-    code: str
-    severity: str
-    module: str
-    issue_type: str
-    metric: str | None = None
-    observed_value: Any | None = None
-    operator: str | None = None
-    boundary_value: Any | None = None
-    rule_id: str = ""
-    needs_manual_review: bool = False
-    context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -331,8 +341,6 @@ class QualityEvaluation:
     passed: bool
     reasons: tuple[str, ...]
     warn_reasons: tuple[str, ...] = ()
-    reason_details: tuple[IssueDetail, ...] = ()
-    warn_reason_details: tuple[IssueDetail, ...] = ()
     should_run_mask_qc: bool = True
 
 
@@ -358,6 +366,16 @@ class VideoQualityResult:
     metrics: VideoMetrics
     alignment: Hdf5Alignment
     evaluation: QualityEvaluation
+
+
+@dataclass(frozen=True)
+class VideoFrameRangeAnalysis:
+    """Video metrics plus the decode accounting for one logical frame range."""
+
+    metrics: VideoMetrics
+    source_video_frame_count: int
+    decoded_frame_count: int
+    sampled_local_frame_indices: tuple[int, ...]
 
 
 def _to_plain(value: Any) -> Any:
@@ -395,38 +413,70 @@ def _merge_dataclass(default_obj: Any, raw: dict[str, Any], section: str) -> Any
             values[item.name] = _merge_dataclass(current, incoming or {}, f"{section}.{item.name}")
         elif isinstance(current, AlignmentMode):
             values[item.name] = AlignmentMode(str(incoming).lower())
-        elif isinstance(current, tuple):
-            values[item.name] = tuple(incoming)
         else:
             values[item.name] = incoming
 
     return type(default_obj)(**values)
 
 
+def _apply_legacy_config(raw: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(raw)
+    if "sample_count" in migrated:
+        migrated.setdefault("decode", {})["max_sample_frames"] = int(migrated.pop("sample_count"))
+    if "alignment_mode" in migrated:
+        migrated.setdefault("hdf5_alignment", {})["mode"] = migrated.pop("alignment_mode")
+    if "thresholds" in migrated:
+        thresholds = migrated.pop("thresholds") or {}
+        decode = migrated.setdefault("decode", {})
+        exposure = migrated.setdefault("exposure", {})
+        black = exposure.setdefault("black", {})
+        over_dark = exposure.setdefault("over_dark", {})
+        over_exposed = exposure.setdefault("over_exposed", {})
+        sharpness = migrated.setdefault("sharpness_global", {})
+        freeze = migrated.setdefault("freeze", {})
+        hdf5_alignment = migrated.setdefault("hdf5_alignment", {})
+
+        if "min_sample_decode_ratio" in thresholds:
+            decode["sample_decode_ratio_pass"] = thresholds["min_sample_decode_ratio"]
+        if "max_black_frame_ratio" in thresholds:
+            black["ratio_warn"] = thresholds["max_black_frame_ratio"]
+        if "max_mean_over_dark_ratio" in thresholds:
+            over_dark["ratio_warn"] = thresholds["max_mean_over_dark_ratio"]
+        if "max_mean_over_exposed_ratio" in thresholds:
+            over_exposed["ratio_warn"] = thresholds["max_mean_over_exposed_ratio"]
+        if "min_laplacian_p10" in thresholds:
+            sharpness["laplacian_p10_pass"] = thresholds["min_laplacian_p10"]
+        if "min_laplacian_median" in thresholds:
+            sharpness["laplacian_median_pass"] = thresholds["min_laplacian_median"]
+        if "max_laplacian_under_100_ratio" in thresholds:
+            sharpness["laplacian_under_100_ratio_pass"] = thresholds["max_laplacian_under_100_ratio"]
+        if "min_tenengrad_p10" in thresholds:
+            sharpness["tenengrad_p10_pass"] = thresholds["min_tenengrad_p10"]
+        if "min_tenengrad_median" in thresholds:
+            sharpness["tenengrad_median_pass"] = thresholds["min_tenengrad_median"]
+        if "max_frozen_frame_ratio" in thresholds:
+            freeze["frozen_frame_ratio_warn"] = thresholds["max_frozen_frame_ratio"]
+        if "fail_on_hdf5_frame_mismatch" in thresholds and not thresholds["fail_on_hdf5_frame_mismatch"]:
+            hdf5_alignment["mode"] = AlignmentMode.WARN.value
+
+    return migrated
+
+
 def load_video_quality_config(path: Path | None) -> VideoQualityConfig:
-    loaded = load_qc_acceptance_config(path)
-    module = loaded.raw["modules"]["video_quality"]
-    parameters = loaded.module_parameters("video_quality")
-    pipeline_modules = list(loaded.raw["pipeline"]["modules"])
-    module_index = pipeline_modules.index("video_quality")
-    next_module = (
-        pipeline_modules[module_index + 1]
-        if module_index + 1 < len(pipeline_modules)
-        else str(loaded.raw["pipeline"]["terminal_module"])
-    )
     default = VideoQualityConfig()
+    if path is None:
+        return default
+
+    with path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    raw = _apply_legacy_config(raw)
+
     known = {item.name for item in fields(default)}
-    unknown = sorted(set(parameters) - known)
+    unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(f"unknown video quality config key: {unknown[0]}")
 
-    config = _merge_dataclass(default, parameters, "video_quality")
-    config = replace(
-        config,
-        module_version=str(module["module_version"]),
-        qc_config_reference=loaded.json_reference(),
-        next_module=next_module,
-    )
+    config = _merge_dataclass(default, raw, "video_quality")
     if config.decode.max_sample_frames < 1:
         raise ValueError("decode.max_sample_frames must be >= 1")
     return config
@@ -622,7 +672,12 @@ def _select_frame_timestamps(path: Path, frame_count: int) -> FrameTimestamps | 
     )
 
 
-def _timeline_metrics(path: Path, frame_count: int, fps: float, config: TimelineConfig) -> dict[str, float | int | bool | str]:
+def _timeline_metrics_from_timestamps(
+    frame_count: int,
+    fps: float,
+    config: TimelineConfig,
+    timestamp_result: FrameTimestamps | None,
+) -> dict[str, float | int | bool | str]:
     expected_interval_ms = 1000.0 / fps if fps > 0 else 0.0
     drop_interval_ms = max(
         expected_interval_ms * config.drop_interval_factor,
@@ -644,7 +699,6 @@ def _timeline_metrics(path: Path, frame_count: int, fps: float, config: Timeline
             "max_gap_fail_ms": max_gap_fail_ms,
         }
 
-    timestamp_result = _select_frame_timestamps(path, frame_count)
     if timestamp_result is None:
         intervals = [expected_interval_ms] * max(0, frame_count - 1)
         pts_monotonic_valid = True
@@ -680,6 +734,20 @@ def _timeline_metrics(path: Path, frame_count: int, fps: float, config: Timeline
         "drop_interval_ms": drop_interval_ms,
         "max_gap_fail_ms": max_gap_fail_ms,
     }
+
+
+def _timeline_metrics(
+    path: Path,
+    frame_count: int,
+    fps: float,
+    config: TimelineConfig,
+) -> dict[str, float | int | bool | str]:
+    return _timeline_metrics_from_timestamps(
+        frame_count,
+        fps,
+        config,
+        _select_frame_timestamps(path, frame_count),
+    )
 
 
 def _keypoint_dataset_has_points(dataset: h5py.Dataset) -> bool:
@@ -745,7 +813,7 @@ def _read_transform_keypoint_data(handle: h5py.File) -> Hdf5KeypointData | None:
         return None
     return Hdf5KeypointData(
         points=_project_camera_points(translations, intrinsic),
-        source="hdf5_transform_keypoints",
+        source="hdf5_transform_keypoints_bbox",
     )
 
 
@@ -759,7 +827,7 @@ def _read_keypoint_data(path: Path) -> Hdf5KeypointData | None:
                 if candidate in handle and isinstance(handle[candidate], h5py.Dataset):
                     dataset = handle[candidate]
                     if _keypoint_dataset_has_points(dataset):
-                        return Hdf5KeypointData(np.asarray(dataset[()]), "hdf5_keypoints")
+                        return Hdf5KeypointData(np.asarray(dataset[()]), "hdf5_keypoints_bbox")
 
             found: Hdf5KeypointData | None = None
 
@@ -773,12 +841,135 @@ def _read_keypoint_data(path: Path) -> Hdf5KeypointData | None:
                     and isinstance(obj, h5py.Dataset)
                     and _keypoint_dataset_has_points(obj)
                 ):
-                    found = Hdf5KeypointData(np.asarray(obj[()]), "hdf5_keypoints")
+                    found = Hdf5KeypointData(np.asarray(obj[()]), "hdf5_keypoints_bbox")
 
             handle.visititems(visit)
             return found or _read_transform_keypoint_data(handle)
     except OSError:
         return None
+
+
+def _points_for_frame(keypoints: np.ndarray, frame_index: int, width: int, height: int) -> np.ndarray | None:
+    if frame_index >= keypoints.shape[0]:
+        return None
+    points = np.asarray(keypoints[frame_index], dtype=np.float64)
+    if points.size == 0 or points.shape[-1] < 2:
+        return None
+    points = points.reshape(-1, points.shape[-1])[:, :2]
+    finite = np.isfinite(points[:, 0]) & np.isfinite(points[:, 1])
+    points = points[finite]
+    if points.size == 0:
+        return None
+    if np.nanmax(np.abs(points)) <= 1.5:
+        points = points * np.array([width, height], dtype=np.float64)
+    return points
+
+
+def _expanded_bbox(points: np.ndarray, scale: float, width: int, height: int) -> tuple[int, int, int, int]:
+    x1, y1 = np.min(points, axis=0)
+    x2, y2 = np.max(points, axis=0)
+    center_x = (x1 + x2) / 2.0
+    center_y = (y1 + y2) / 2.0
+    half_width = max(1.0, (x2 - x1) * scale / 2.0)
+    half_height = max(1.0, (y2 - y1) * scale / 2.0)
+    left = max(0, int(np.floor(center_x - half_width)))
+    top = max(0, int(np.floor(center_y - half_height)))
+    right = min(width, int(np.ceil(center_x + half_width)))
+    bottom = min(height, int(np.ceil(center_y + half_height)))
+    return left, top, right, bottom
+
+
+def _compute_hand_roi_metrics(
+    path: Path,
+    hdf5_path: Path | None,
+    indexes: list[int],
+    width: int,
+    height: int,
+    config: HandRoiConfig,
+) -> HandRoiMetrics | None:
+    if not config.enabled or hdf5_path is None or not hdf5_path.is_file() or not indexes:
+        return None
+
+    keypoint_data = _read_keypoint_data(hdf5_path)
+    if keypoint_data is None:
+        return HandRoiMetrics(
+            enabled=True,
+            source="hdf5_keypoints_bbox",
+            sampled_frame_count=len(indexes),
+            available_frame_count=0,
+            available_ratio=0.0,
+            laplacian_p10=0.0,
+            laplacian_median=0.0,
+            tenengrad_p10=0.0,
+            tenengrad_median=0.0,
+            blur_bad_frame_ratio=1.0,
+            unavailable_reasons=("keypoint_dataset_missing",),
+        )
+
+    capture = cv2.VideoCapture(str(path))
+    laplacian_values: list[float] = []
+    tenengrad_values: list[float] = []
+    blur_bad_values: list[float] = []
+    unavailable_reasons: list[str] = []
+    available = 0
+    try:
+        for index in indexes:
+            points = _points_for_frame(keypoint_data.points, index, width, height)
+            if points is None or len(points) < config.min_valid_points_for_bbox:
+                unavailable_reasons.append("not_enough_keypoints")
+                continue
+
+            left, top, right, bottom = _expanded_bbox(points, config.bbox_expand_scale, width, height)
+            roi_width = right - left
+            roi_height = bottom - top
+            roi_area_ratio = (roi_width * roi_height) / max(1, width * height)
+            if (
+                roi_width < config.min_roi_width_px
+                or roi_height < config.min_roi_height_px
+                or roi_area_ratio < config.min_roi_area_ratio
+            ):
+                unavailable_reasons.append("roi_too_small")
+                continue
+
+            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                unavailable_reasons.append("roi_frame_decode_failed")
+                continue
+
+            roi = frame[top:bottom, left:right]
+            if roi.size == 0:
+                unavailable_reasons.append("roi_empty")
+                continue
+
+            laplacian, tenengrad, _scale = _sharpness_for_frame(
+                roi,
+                config.roi_target_short_side,
+                config.no_upscale_if_roi_too_small,
+            )
+            laplacian_values.append(laplacian)
+            tenengrad_values.append(tenengrad)
+            blur_bad_values.append(
+                1.0 if laplacian < config.laplacian_p10_warn or tenengrad < config.tenengrad_p10_warn else 0.0
+            )
+            available += 1
+    finally:
+        capture.release()
+
+    sampled = len(indexes)
+    return HandRoiMetrics(
+        enabled=True,
+        source=keypoint_data.source,
+        sampled_frame_count=sampled,
+        available_frame_count=available,
+        available_ratio=available / sampled if sampled else 0.0,
+        laplacian_p10=_percentile(laplacian_values, 10),
+        laplacian_median=_percentile(laplacian_values, 50),
+        tenengrad_p10=_percentile(tenengrad_values, 10),
+        tenengrad_median=_percentile(tenengrad_values, 50),
+        blur_bad_frame_ratio=float(np.mean(blur_bad_values)) if blur_bad_values else 1.0,
+        unavailable_reasons=tuple(dict.fromkeys(unavailable_reasons)),
+    )
 
 
 def _ssim_score(left: np.ndarray, right: np.ndarray) -> float:
@@ -808,22 +999,6 @@ def _phash_bits(gray: np.ndarray) -> np.ndarray:
 
 def _phash_hamming(left: np.ndarray, right: np.ndarray) -> int:
     return int(np.count_nonzero(_phash_bits(left) != _phash_bits(right)))
-
-
-def _near_duplicate_pair_metrics(left: np.ndarray, right: np.ndarray, config: FreezeConfig) -> dict[str, float | bool]:
-    diff = float(np.mean(cv2.absdiff(left, right)))
-    hist_diff = _chi_square_hist_diff(left, right)
-    ssim = _ssim_score(left, right)
-    phash_hamming = _phash_hamming(left, right)
-    auxiliary_match = ssim >= config.ssim_min or phash_hamming <= config.phash_hamming_max
-    near_duplicate = diff < config.frame_diff_mean_abs_max and hist_diff < config.hist_diff_max and auxiliary_match
-    return {
-        "frame_diff": diff,
-        "hist_diff": hist_diff,
-        "ssim": ssim,
-        "phash_hamming": float(phash_hamming),
-        "near_duplicate": near_duplicate,
-    }
 
 
 def _make_frozen_interval(
@@ -865,130 +1040,105 @@ def _make_frozen_interval(
     )
 
 
-def _merge_duplicate_ranges(
-    ranges: list[tuple[int, int, dict[str, float]]],
+def _scan_frozen_frame_sequence(
+    indexed_frames: Iterable[tuple[int, np.ndarray]],
     fps: float,
-) -> tuple[FrozenInterval, ...]:
-    if not ranges:
-        return ()
+    config: FreezeConfig,
+) -> tuple[tuple[FrozenInterval, ...], int, int]:
+    if not config.enabled:
+        return (), 0, 0
 
-    merged: list[FrozenInterval] = []
-    current_start, current_end, first_metrics = ranges[0]
-    current_metrics = [first_metrics]
-    for start, end, metrics in ranges[1:]:
-        if start <= current_end + 1:
-            current_end = max(current_end, end)
-            current_metrics.append(metrics)
-            continue
-        merged.append(_make_frozen_interval(current_start, current_end, fps, current_metrics))
-        current_start = start
-        current_end = end
-        current_metrics = [metrics]
-    merged.append(_make_frozen_interval(current_start, current_end, fps, current_metrics))
-    return tuple(merged)
+    intervals: list[FrozenInterval] = []
+    frozen_pairs = 0
+    max_run_frames = 0
+    previous_gray: np.ndarray | None = None
+    current_run_start: int | None = None
+    current_run_end: int | None = None
+    current_run_metrics: list[dict[str, float]] = []
+
+    def finish_run() -> None:
+        nonlocal current_run_start, current_run_end, current_run_metrics, max_run_frames
+        if current_run_start is None or current_run_end is None:
+            return
+        run_frame_count = current_run_end - current_run_start + 1
+        max_run_frames = max(max_run_frames, run_frame_count)
+        interval = _make_frozen_interval(current_run_start, current_run_end, fps, current_run_metrics)
+        if run_frame_count >= config.min_interval_frames and interval.duration_ms >= config.min_interval_duration_ms:
+            intervals.append(interval)
+        current_run_start = None
+        current_run_end = None
+        current_run_metrics = []
+
+    previous_index: int | None = None
+    for frame_index, frame in indexed_frames:
+        freeze_frame, _freeze_scale = _resize_keep_aspect(
+            frame,
+            config.downscale_short_side,
+            no_upscale=True,
+        )
+        freeze_gray = cv2.cvtColor(freeze_frame, cv2.COLOR_BGR2GRAY)
+        if previous_gray is not None and previous_index is not None:
+            if frame_index != previous_index + 1:
+                finish_run()
+            diff = float(np.mean(cv2.absdiff(previous_gray, freeze_gray)))
+            hist_diff = _chi_square_hist_diff(previous_gray, freeze_gray)
+            ssim = _ssim_score(previous_gray, freeze_gray)
+            phash_hamming = _phash_hamming(previous_gray, freeze_gray)
+            auxiliary_match = (
+                ssim >= config.ssim_min
+                or phash_hamming <= config.phash_hamming_max
+            )
+            if (
+                diff < config.frame_diff_mean_abs_max
+                and hist_diff < config.hist_diff_max
+                and auxiliary_match
+            ):
+                frozen_pairs += 1
+                if current_run_start is None:
+                    current_run_start = previous_index
+                    current_run_metrics = []
+                current_run_end = frame_index
+                current_run_metrics.append(
+                    {
+                        "frame_diff": diff,
+                        "hist_diff": hist_diff,
+                        "ssim": ssim,
+                        "phash_hamming": float(phash_hamming),
+                    }
+                )
+            else:
+                finish_run()
+        previous_gray = freeze_gray
+        previous_index = frame_index
+    finish_run()
+
+    return tuple(intervals), frozen_pairs, max_run_frames
 
 
 def _scan_frozen_intervals(
     path: Path,
     fps: float,
     config: FreezeConfig,
-) -> FreezeScan:
-    empty = FreezeScan(
-        frozen_intervals=(),
-        adjacent_near_duplicate_count=0,
-        adjacent_near_duplicate_ratio=0.0,
-        freeze_candidate_intervals=(),
-        freeze_candidate_frame_count=0,
-        freeze_candidate_duration_sec=0.0,
-        freeze_candidate_ratio=0.0,
-        confirmed_freeze_frame_count=0,
-        confirmed_freeze_duration_sec=0.0,
-        confirmed_freeze_ratio=0.0,
-        max_confirmed_freeze_sec=0.0,
-    )
+) -> tuple[tuple[FrozenInterval, ...], int, int]:
     if not config.enabled:
-        return empty
+        return (), 0, 0
 
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
-        return empty
-
-    candidate_step = max(1, round(fps * config.freeze_candidate_window_sec)) if fps > 0 else 1
-    confirmed_step = max(1, round(fps * config.confirmed_freeze_window_sec)) if fps > 0 else 1
-    max_step = max(1, candidate_step, confirmed_step)
-    gray_buffer: list[tuple[int, np.ndarray]] = []
-    frame_index = 0
-    adjacent_near_duplicate_count = 0
-    candidate_ranges: list[tuple[int, int, dict[str, float]]] = []
-    confirmed_ranges: list[tuple[int, int, dict[str, float]]] = []
-
-    def previous_gray_for_step(step: int) -> tuple[int, np.ndarray] | None:
-        target_index = frame_index - step
-        for buffered_index, buffered_gray in reversed(gray_buffer):
-            if buffered_index == target_index:
-                return buffered_index, buffered_gray
-            if buffered_index < target_index:
-                break
-        return None
-
+        return (), 0, 0
     try:
-        while True:
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                break
+        def decoded_frames() -> Iterable[tuple[int, np.ndarray]]:
+            frame_index = 0
+            while True:
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    return
+                yield frame_index, frame
+                frame_index += 1
 
-            freeze_frame, _freeze_scale = _resize_keep_aspect(frame, config.downscale_short_side, no_upscale=True)
-            freeze_gray = cv2.cvtColor(freeze_frame, cv2.COLOR_BGR2GRAY)
-            previous_adjacent = previous_gray_for_step(1)
-            if previous_adjacent is not None:
-                _previous_index, previous_gray = previous_adjacent
-                adjacent_metrics = _near_duplicate_pair_metrics(previous_gray, freeze_gray, config)
-                if adjacent_metrics["near_duplicate"]:
-                    adjacent_near_duplicate_count += 1
-
-            previous_candidate = previous_gray_for_step(candidate_step)
-            if previous_candidate is not None:
-                previous_index, previous_gray = previous_candidate
-                candidate_metrics = _near_duplicate_pair_metrics(previous_gray, freeze_gray, config)
-                if candidate_metrics["near_duplicate"]:
-                    candidate_ranges.append((previous_index, frame_index, candidate_metrics))
-
-            previous_confirmed = previous_gray_for_step(confirmed_step)
-            if previous_confirmed is not None:
-                previous_index, previous_gray = previous_confirmed
-                confirmed_metrics = _near_duplicate_pair_metrics(previous_gray, freeze_gray, config)
-                if confirmed_metrics["near_duplicate"]:
-                    confirmed_ranges.append((previous_index, frame_index, confirmed_metrics))
-
-            gray_buffer.append((frame_index, freeze_gray))
-            if len(gray_buffer) > max_step + 1:
-                gray_buffer.pop(0)
-            frame_index += 1
+        return _scan_frozen_frame_sequence(decoded_frames(), fps, config)
     finally:
         capture.release()
-
-    if frame_index <= 0:
-        return empty
-
-    candidate_intervals = _merge_duplicate_ranges(candidate_ranges, fps)
-    confirmed_intervals = _merge_duplicate_ranges(confirmed_ranges, fps)
-    candidate_frame_count = sum(interval.frame_count for interval in candidate_intervals)
-    confirmed_frame_count = sum(interval.frame_count for interval in confirmed_intervals)
-    return FreezeScan(
-        frozen_intervals=confirmed_intervals,
-        adjacent_near_duplicate_count=adjacent_near_duplicate_count,
-        adjacent_near_duplicate_ratio=(
-            adjacent_near_duplicate_count / (frame_index - 1) if frame_index > 1 else 0.0
-        ),
-        freeze_candidate_intervals=candidate_intervals,
-        freeze_candidate_frame_count=candidate_frame_count,
-        freeze_candidate_duration_sec=sum(interval.duration_sec for interval in candidate_intervals),
-        freeze_candidate_ratio=candidate_frame_count / frame_index,
-        confirmed_freeze_frame_count=confirmed_frame_count,
-        confirmed_freeze_duration_sec=sum(interval.duration_sec for interval in confirmed_intervals),
-        confirmed_freeze_ratio=confirmed_frame_count / frame_index,
-        max_confirmed_freeze_sec=max((interval.duration_sec for interval in confirmed_intervals), default=0.0),
-    )
 
 
 def _keypoint_motion_signal(
@@ -1165,14 +1315,6 @@ def _empty_metrics(path: Path, errors: tuple[str, ...]) -> VideoMetrics:
         tenengrad_median=0.0,
         tenengrad_mean=0.0,
         sharpness_scale_short_side=0,
-        adjacent_near_duplicate_count=0,
-        adjacent_near_duplicate_ratio=0.0,
-        freeze_candidate_ratio=0.0,
-        freeze_candidate_frame_count=0,
-        freeze_candidate_duration_sec=0.0,
-        confirmed_freeze_ratio=0.0,
-        confirmed_freeze_frame_count=0,
-        confirmed_freeze_duration_sec=0.0,
         frozen_frame_ratio=0.0,
         max_consecutive_frozen_sec=0.0,
         frozen_intervals=(),
@@ -1191,156 +1333,342 @@ def _empty_metrics(path: Path, errors: tuple[str, ...]) -> VideoMetrics:
     )
 
 
-def analyze_video(path: Path, config: VideoQualityConfig, hdf5_path: Path | None = None) -> VideoMetrics:
+def _build_video_metrics(
+    *,
+    path: Path,
+    frame_count: int,
+    fps: float,
+    width: int,
+    height: int,
+    sampled_frame_count: int,
+    sampled_frames: list[np.ndarray],
+    frozen_intervals: tuple[FrozenInterval, ...],
+    frozen_pairs: int,
+    max_frozen_run_frames: int,
+    timeline: dict[str, float | int | bool | str],
+    hand_roi: HandRoiMetrics | None,
+    config: VideoQualityConfig,
+    errors: list[str],
+) -> VideoMetrics:
+    brightness_values: list[float] = []
+    black_values: list[float] = []
+    dark_values: list[float] = []
+    exposed_values: list[float] = []
+    exposure_defect_values: list[float] = []
+    blur_values: list[float] = []
+    tenengrad_values: list[float] = []
+    scale_values: list[int] = []
+    for frame in sampled_frames:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness = float(np.mean(gray))
+        dark_pixel_ratio = float(np.mean(gray < DARK_PIXEL_Y_THRESHOLD))
+        over_exposed_pixel_ratio = float(
+            np.mean(gray > OVER_EXPOSED_PIXEL_Y_THRESHOLD)
+        )
+        brightness_values.append(brightness)
+        black_frame = (
+            brightness < config.exposure.black.mean_y_max
+            or dark_pixel_ratio > config.exposure.black.dark_pixel_ratio_min
+        )
+        over_dark_frame = (
+            brightness < config.exposure.over_dark.mean_y_max
+            or dark_pixel_ratio > config.exposure.over_dark.dark_pixel_ratio_min
+        )
+        over_exposed_frame = (
+            brightness > config.exposure.over_exposed.mean_y_min
+            or over_exposed_pixel_ratio
+            > config.exposure.over_exposed.over_exposed_pixel_ratio_min
+        )
+        black_values.append(1.0 if black_frame else 0.0)
+        dark_values.append(1.0 if over_dark_frame else 0.0)
+        exposed_values.append(1.0 if over_exposed_frame else 0.0)
+        exposure_defect_values.append(
+            1.0 if black_frame or over_dark_frame or over_exposed_frame else 0.0
+        )
+        laplacian, tenengrad, scale_short_side = _sharpness_for_frame(
+            frame,
+            config.sharpness_global.target_short_side,
+            config.sharpness_global.no_upscale,
+        )
+        blur_values.append(laplacian)
+        tenengrad_values.append(tenengrad)
+        scale_values.append(scale_short_side)
+
+    decoded_samples = len(sampled_frames)
+    if sampled_frame_count and decoded_samples == 0:
+        errors.append("no_sample_frames_decoded")
+    black_frame_ratio = float(np.mean(black_values)) if black_values else 1.0
+    exposure_defect_frame_ratio = (
+        float(np.mean(exposure_defect_values))
+        if exposure_defect_values
+        else 1.0
+    )
+    frozen_frame_ratio = (
+        frozen_pairs / (frame_count - 1)
+        if frame_count > 1 and config.freeze.enabled
+        else 0.0
+    )
+    defect_duration_ratio = min(
+        1.0,
+        exposure_defect_frame_ratio
+        + frozen_frame_ratio
+        + float(timeline["drop_frame_ratio"]),
+    )
+    laplacian_under_100_ratio = (
+        float(
+            np.mean(
+                np.asarray(blur_values, dtype=np.float64)
+                < LAPLACIAN_LOW_DETAIL_THRESHOLD
+            )
+        )
+        if blur_values
+        else 1.0
+    )
+    display_width = width
+    display_height = height
+    short_side = min(width, height) if width and height else 0
+    long_side = max(width, height) if width and height else 0
+    metadata_read_ok = frame_count > 0 and fps > 0 and width > 0 and height > 0
+    return VideoMetrics(
+        path=path,
+        asset_id=asset_id_from_video(path),
+        opened=True,
+        video_stream_present=frame_count > 0,
+        codec_readable=metadata_read_ok,
+        metadata_read_ok=metadata_read_ok,
+        frame_count=frame_count,
+        fps=fps,
+        duration_seconds=frame_count / fps if frame_count > 0 and fps > 0 else 0.0,
+        width=width,
+        height=height,
+        display_width=display_width,
+        display_height=display_height,
+        short_side=short_side,
+        long_side=long_side,
+        sampled_frame_count=sampled_frame_count,
+        decoded_sample_count=decoded_samples,
+        sample_decode_ratio=(
+            decoded_samples / sampled_frame_count if sampled_frame_count else 0.0
+        ),
+        mean_brightness=(
+            float(np.mean(brightness_values)) if brightness_values else 0.0
+        ),
+        black_frame_ratio=black_frame_ratio,
+        black_frame_count_estimate=(
+            int(round(black_frame_ratio * frame_count)) if frame_count > 0 else 0
+        ),
+        exposure_defect_frame_ratio=exposure_defect_frame_ratio,
+        defect_duration_ratio=defect_duration_ratio,
+        mean_over_dark_ratio=float(np.mean(dark_values)) if dark_values else 1.0,
+        mean_over_exposed_ratio=(
+            float(np.mean(exposed_values)) if exposed_values else 0.0
+        ),
+        laplacian_min=float(min(blur_values)) if blur_values else 0.0,
+        laplacian_p10=_percentile(blur_values, 10),
+        laplacian_median=_percentile(blur_values, 50),
+        mean_blur_laplacian_var=(
+            float(np.mean(blur_values)) if blur_values else 0.0
+        ),
+        laplacian_p90=_percentile(blur_values, 90),
+        laplacian_under_100_ratio=laplacian_under_100_ratio,
+        tenengrad_p10=_percentile(tenengrad_values, 10),
+        tenengrad_median=_percentile(tenengrad_values, 50),
+        tenengrad_mean=(
+            float(np.mean(tenengrad_values)) if tenengrad_values else 0.0
+        ),
+        sharpness_scale_short_side=(
+            max(scale_values) if scale_values else short_side
+        ),
+        frozen_frame_ratio=frozen_frame_ratio,
+        max_consecutive_frozen_sec=(
+            max_frozen_run_frames / fps if fps > 0 else 0.0
+        ),
+        frozen_intervals=frozen_intervals,
+        pts_monotonic_valid=bool(timeline["pts_monotonic_valid"]),
+        drop_frame_ratio=float(timeline["drop_frame_ratio"]),
+        drop_detection_source=str(timeline["drop_detection_source"]),
+        drop_detection_reliable=bool(timeline["drop_detection_reliable"]),
+        estimated_missing_frames=int(timeline["estimated_missing_frames"]),
+        observed_frame_interval_count=int(timeline["observed_frame_interval_count"]),
+        frame_interval_p99_ms=float(timeline["frame_interval_p99_ms"]),
+        max_frame_gap_ms=float(timeline["max_frame_gap_ms"]),
+        expected_interval_ms=float(timeline["expected_interval_ms"]),
+        drop_interval_ms=float(timeline["drop_interval_ms"]),
+        max_gap_fail_ms=float(timeline["max_gap_fail_ms"]),
+        hand_roi=hand_roi,
+        errors=tuple(errors),
+    )
+
+
+def analyze_video(
+    path: Path,
+    config: VideoQualityConfig,
+    hdf5_path: Path | None = None,
+) -> VideoMetrics:
     capture = cv2.VideoCapture(str(path))
     try:
         if not capture.isOpened():
             return _empty_metrics(path, ("cannot_open_video",))
-
         frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = float(capture.get(cv2.CAP_PROP_FPS))
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         duration = frame_count / fps if frame_count > 0 and fps > 0 else 0.0
-        display_width = width
-        display_height = height
-        short_side = min(display_width, display_height) if display_width and display_height else 0
-        long_side = max(display_width, display_height) if display_width and display_height else 0
         indexes = _sample_indexes(frame_count, fps, duration, config.decode)
-        timeline = _timeline_metrics(path, frame_count, fps, config.timeline)
-
-        brightness_values: list[float] = []
-        black_values: list[float] = []
-        dark_values: list[float] = []
-        exposed_values: list[float] = []
-        exposure_defect_values: list[float] = []
-        blur_values: list[float] = []
-        tenengrad_values: list[float] = []
-        scale_values: list[int] = []
+        sampled_frames: list[np.ndarray] = []
         errors: list[str] = []
-
         for index in indexes:
             capture.set(cv2.CAP_PROP_POS_FRAMES, index)
             ok, frame = capture.read()
             if not ok or frame is None:
                 errors.append(f"sample_decode_failed:{index}")
-                continue
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            brightness = float(np.mean(gray))
-            dark_pixel_ratio = float(np.mean(gray < DARK_PIXEL_Y_THRESHOLD))
-            over_exposed_pixel_ratio = float(np.mean(gray > OVER_EXPOSED_PIXEL_Y_THRESHOLD))
-            brightness_values.append(brightness)
-            black_frame = (
-                brightness < config.exposure.black.mean_y_max
-                or dark_pixel_ratio > config.exposure.black.dark_pixel_ratio_min
-            )
-            over_dark_frame = (
-                brightness < config.exposure.over_dark.mean_y_max
-                or dark_pixel_ratio > config.exposure.over_dark.dark_pixel_ratio_min
-            )
-            over_exposed_frame = (
-                brightness > config.exposure.over_exposed.mean_y_min
-                or over_exposed_pixel_ratio > config.exposure.over_exposed.over_exposed_pixel_ratio_min
-            )
-            black_values.append(1.0 if black_frame else 0.0)
-            dark_values.append(1.0 if over_dark_frame else 0.0)
-            exposed_values.append(1.0 if over_exposed_frame else 0.0)
-            exposure_defect_values.append(1.0 if black_frame or over_dark_frame or over_exposed_frame else 0.0)
-
-            laplacian, tenengrad, scale_short_side = _sharpness_for_frame(
-                frame,
-                config.sharpness_global.target_short_side,
-                config.sharpness_global.no_upscale,
-            )
-            blur_values.append(laplacian)
-            tenengrad_values.append(tenengrad)
-            scale_values.append(scale_short_side)
-
-        decoded = len(brightness_values)
-        sampled = len(indexes)
-        if sampled and decoded == 0:
-            errors.append("no_sample_frames_decoded")
-        black_frame_ratio = float(np.mean(black_values)) if black_values else 1.0
-        black_frame_count_estimate = int(round(black_frame_ratio * frame_count)) if frame_count > 0 else 0
-        exposure_defect_frame_ratio = float(np.mean(exposure_defect_values)) if exposure_defect_values else 1.0
-        freeze_scan = _scan_frozen_intervals(path, fps, config.freeze)
-        frozen_intervals = _annotate_frozen_intervals_with_hdf5(
-            freeze_scan.frozen_intervals,
-            hdf5_path,
-            config.freeze,
-        )
-        frozen_frame_ratio = freeze_scan.confirmed_freeze_ratio
-        defect_duration_ratio = min(
-            1.0,
-            exposure_defect_frame_ratio + frozen_frame_ratio + float(timeline["drop_frame_ratio"]),
-        )
-        laplacian_under_100_ratio = (
-            float(np.mean(np.array(blur_values) < LAPLACIAN_LOW_DETAIL_THRESHOLD)) if blur_values else 1.0
-        )
-        metadata_read_ok = frame_count > 0 and fps > 0 and width > 0 and height > 0
-        return VideoMetrics(
-            path=path,
-            asset_id=asset_id_from_video(path),
-            opened=True,
-            video_stream_present=frame_count > 0,
-            codec_readable=metadata_read_ok,
-            metadata_read_ok=metadata_read_ok,
-            frame_count=frame_count,
-            fps=fps,
-            duration_seconds=duration,
-            width=width,
-            height=height,
-            display_width=display_width,
-            display_height=display_height,
-            short_side=short_side,
-            long_side=long_side,
-            sampled_frame_count=sampled,
-            decoded_sample_count=decoded,
-            sample_decode_ratio=decoded / sampled if sampled else 0.0,
-            mean_brightness=float(np.mean(brightness_values)) if brightness_values else 0.0,
-            black_frame_ratio=black_frame_ratio,
-            black_frame_count_estimate=black_frame_count_estimate,
-            exposure_defect_frame_ratio=exposure_defect_frame_ratio,
-            defect_duration_ratio=defect_duration_ratio,
-            mean_over_dark_ratio=float(np.mean(dark_values)) if dark_values else 1.0,
-            mean_over_exposed_ratio=float(np.mean(exposed_values)) if exposed_values else 0.0,
-            laplacian_min=float(min(blur_values)) if blur_values else 0.0,
-            laplacian_p10=_percentile(blur_values, 10),
-            laplacian_median=_percentile(blur_values, 50),
-            mean_blur_laplacian_var=float(np.mean(blur_values)) if blur_values else 0.0,
-            laplacian_p90=_percentile(blur_values, 90),
-            laplacian_under_100_ratio=laplacian_under_100_ratio,
-            tenengrad_p10=_percentile(tenengrad_values, 10),
-            tenengrad_median=_percentile(tenengrad_values, 50),
-            tenengrad_mean=float(np.mean(tenengrad_values)) if tenengrad_values else 0.0,
-            sharpness_scale_short_side=max(scale_values) if scale_values else short_side,
-            adjacent_near_duplicate_count=freeze_scan.adjacent_near_duplicate_count,
-            adjacent_near_duplicate_ratio=freeze_scan.adjacent_near_duplicate_ratio,
-            freeze_candidate_ratio=freeze_scan.freeze_candidate_ratio,
-            freeze_candidate_frame_count=freeze_scan.freeze_candidate_frame_count,
-            freeze_candidate_duration_sec=freeze_scan.freeze_candidate_duration_sec,
-            confirmed_freeze_ratio=frozen_frame_ratio,
-            confirmed_freeze_frame_count=freeze_scan.confirmed_freeze_frame_count,
-            confirmed_freeze_duration_sec=freeze_scan.confirmed_freeze_duration_sec,
-            frozen_frame_ratio=frozen_frame_ratio,
-            max_consecutive_frozen_sec=freeze_scan.max_confirmed_freeze_sec,
-            frozen_intervals=frozen_intervals,
-            pts_monotonic_valid=bool(timeline["pts_monotonic_valid"]),
-            drop_frame_ratio=float(timeline["drop_frame_ratio"]),
-            drop_detection_source=str(timeline["drop_detection_source"]),
-            drop_detection_reliable=bool(timeline["drop_detection_reliable"]),
-            estimated_missing_frames=int(timeline["estimated_missing_frames"]),
-            observed_frame_interval_count=int(timeline["observed_frame_interval_count"]),
-            frame_interval_p99_ms=float(timeline["frame_interval_p99_ms"]),
-            max_frame_gap_ms=float(timeline["max_frame_gap_ms"]),
-            expected_interval_ms=float(timeline["expected_interval_ms"]),
-            drop_interval_ms=float(timeline["drop_interval_ms"]),
-            max_gap_fail_ms=float(timeline["max_gap_fail_ms"]),
-            errors=tuple(errors),
-        )
+            else:
+                sampled_frames.append(frame)
     finally:
         capture.release()
+
+    timeline = _timeline_metrics(path, frame_count, fps, config.timeline)
+    frozen_intervals, frozen_pairs, max_frozen_run_frames = _scan_frozen_intervals(
+        path,
+        fps,
+        config.freeze,
+    )
+    frozen_intervals = _annotate_frozen_intervals_with_hdf5(
+        frozen_intervals,
+        hdf5_path,
+        config.freeze,
+    )
+    hand_roi = _compute_hand_roi_metrics(
+        path,
+        hdf5_path,
+        indexes,
+        width,
+        height,
+        config.hand_roi,
+    )
+    return _build_video_metrics(
+        path=path,
+        frame_count=frame_count,
+        fps=fps,
+        width=width,
+        height=height,
+        sampled_frame_count=len(indexes),
+        sampled_frames=sampled_frames,
+        frozen_intervals=frozen_intervals,
+        frozen_pairs=frozen_pairs,
+        max_frozen_run_frames=max_frozen_run_frames,
+        timeline=timeline,
+        hand_roi=hand_roi,
+        config=config,
+        errors=errors,
+    )
+
+
+def analyze_video_frame_range(
+    path: Path,
+    config: VideoQualityConfig,
+    start_frame: int,
+    end_frame: int,
+    hdf5_path: Path | None = None,
+) -> VideoFrameRangeAnalysis:
+    """Analyze one inclusive logical clip without creating a split video file."""
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise ValueError(f"cannot open source video: {path}")
+    try:
+        source_frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if start_frame < 0:
+            raise ValueError("start_frame must be >= 0")
+        if end_frame < start_frame:
+            raise ValueError("end_frame must be >= start_frame")
+        if end_frame >= source_frame_count:
+            raise ValueError(
+                f"end_frame {end_frame} outside source frame count {source_frame_count}"
+            )
+
+        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        indexed_frames: list[tuple[int, np.ndarray]] = []
+        timestamps_ms: list[float] = []
+        errors: list[str] = []
+        for source_frame_idx in range(start_frame, end_frame + 1):
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                errors.append(f"range_decode_failed:{source_frame_idx}")
+                break
+            indexed_frames.append((source_frame_idx, frame))
+            timestamps_ms.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)))
+    finally:
+        capture.release()
+
+    clip_frame_count = end_frame - start_frame + 1
+    duration = clip_frame_count / fps if fps > 0 else 0.0
+    sample_local_indexes = _sample_indexes(
+        clip_frame_count,
+        fps,
+        duration,
+        config.decode,
+    )
+    frame_by_source = dict(indexed_frames)
+    sampled_frames = [
+        frame_by_source[start_frame + local_frame_idx]
+        for local_frame_idx in sample_local_indexes
+        if start_frame + local_frame_idx in frame_by_source
+    ]
+    timestamp_result = (
+        FrameTimestamps(tuple(timestamps_ms), "opencv_range", False)
+        if _timestamps_are_usable(tuple(timestamps_ms))
+        else None
+    )
+    timeline = _timeline_metrics_from_timestamps(
+        clip_frame_count,
+        fps,
+        config.timeline,
+        timestamp_result,
+    )
+    frozen_intervals, frozen_pairs, max_frozen_run_frames = (
+        _scan_frozen_frame_sequence(indexed_frames, fps, config.freeze)
+    )
+    frozen_intervals = _annotate_frozen_intervals_with_hdf5(
+        frozen_intervals,
+        hdf5_path,
+        config.freeze,
+    )
+    sampled_source_indexes = [
+        start_frame + local_frame_idx for local_frame_idx in sample_local_indexes
+    ]
+    hand_roi = _compute_hand_roi_metrics(
+        path,
+        hdf5_path,
+        sampled_source_indexes,
+        width,
+        height,
+        config.hand_roi,
+    )
+    metrics = _build_video_metrics(
+        path=path,
+        frame_count=clip_frame_count,
+        fps=fps,
+        width=width,
+        height=height,
+        sampled_frame_count=len(sample_local_indexes),
+        sampled_frames=sampled_frames,
+        frozen_intervals=frozen_intervals,
+        frozen_pairs=frozen_pairs,
+        max_frozen_run_frames=max_frozen_run_frames,
+        timeline=timeline,
+        hand_roi=hand_roi,
+        config=config,
+        errors=errors,
+    )
+    return VideoFrameRangeAnalysis(
+        metrics=metrics,
+        source_video_frame_count=source_frame_count,
+        decoded_frame_count=len(indexed_frames),
+        sampled_local_frame_indices=tuple(sample_local_indexes),
+    )
 
 
 def hdf5_path_for_video(video_path: Path, batch_dir: Path) -> Path:
@@ -1419,372 +1747,7 @@ def _alignment_exceeds(alignment: Hdf5Alignment, frame_limit: int, ratio_limit: 
     )
 
 
-def _issue_type_for_code(code: str) -> str:
-    if code in {
-        "video_not_opened",
-        "cannot_open_video",
-        "video_stream_missing",
-        "codec_unreadable",
-        "metadata_unreadable",
-        "no_sample_frames_decoded",
-    }:
-        return "video_unreadable"
-    if code.startswith("fps_"):
-        return "low_fps"
-    if code in {"short_side_below_min", "long_side_below_min"}:
-        return "low_resolution"
-    if code.startswith(("drop_frame_", "frame_interval_", "max_frame_gap_", "pts_monotonic_")):
-        return "timeline_discontinuity"
-    if code.startswith("sample_decode_"):
-        return "decode_incomplete"
-    if code.startswith("black_frame_"):
-        return "black_frame"
-    if code.startswith("defect_duration_"):
-        return "visual_defect_duration"
-    if code.startswith("mean_over_dark_"):
-        return "over_dark"
-    if code.startswith("mean_over_exposed_"):
-        return "over_exposed"
-    if code.startswith(("laplacian_", "tenengrad_")):
-        return "low_sharpness"
-    if code == "adjacent_near_duplicate_ratio_warn":
-        return "low_motion"
-    if code.startswith(("frozen_frame_", "max_consecutive_frozen_")):
-        return "freeze"
-    if code.startswith("video_state_conflict"):
-        return "video_state_conflict"
-    if code.startswith("hdf5_"):
-        return "hdf5_alignment"
-    return "video_quality"
-
-
-def _detail(
-    code: str,
-    severity: str,
-    *,
-    metric: str | None = None,
-    value: Any | None = None,
-    pass_threshold: Any | None = None,
-    fail_threshold: Any | None = None,
-    comparison: str | None = None,
-    rule_id: str | None = None,
-    context: dict[str, Any] | None = None,
-) -> IssueDetail:
-    boundary_value = fail_threshold if severity == "fail" and fail_threshold is not None else pass_threshold
-    return IssueDetail(
-        issue_id=f"video_quality:{code}:001",
-        code=code,
-        severity=severity,
-        module="video_quality",
-        issue_type=_issue_type_for_code(code),
-        metric=metric,
-        observed_value=value,
-        operator=comparison,
-        boundary_value=boundary_value,
-        rule_id=rule_id or f"video_quality.{code}",
-        needs_manual_review=severity == "warn",
-        context=context or {},
-    )
-
-
-def _reason_details_for_codes(
-    codes: tuple[str, ...],
-    severity: str,
-    metrics: VideoMetrics,
-    config: VideoQualityConfig,
-    alignment: object | None,
-) -> tuple[IssueDetail, ...]:
-    details: list[IssueDetail] = []
-    def add(
-        code: str,
-        *,
-        metric: str | None = None,
-        value: Any | None = None,
-        pass_threshold: Any | None = None,
-        fail_threshold: Any | None = None,
-        comparison: str | None = None,
-        context: dict[str, Any] | None = None,
-    ) -> None:
-        details.append(
-            _detail(
-                code,
-                severity,
-                metric=metric,
-                value=value,
-                pass_threshold=pass_threshold,
-                fail_threshold=fail_threshold,
-                comparison=comparison,
-                context=context,
-            )
-        )
-
-    conflict_intervals = [interval for interval in metrics.frozen_intervals if interval.motion_conflict]
-    critical_conflicts = [interval for interval in conflict_intervals if interval.critical_window]
-    noncritical_conflicts = [interval for interval in conflict_intervals if not interval.critical_window]
-    conflict_context = {
-        "motion_conflict_interval_count": len(conflict_intervals),
-        "critical_motion_conflict_count": len(critical_conflicts),
-        "noncritical_motion_conflict_count": len(noncritical_conflicts),
-        "max_motion_conflict_duration_ms": max((interval.duration_ms for interval in conflict_intervals), default=0.0),
-    }
-
-    for code in codes:
-        if code == "video_not_opened":
-            add(code, metric="video_basic.video_open_ok", value=metrics.opened, pass_threshold=True, comparison="==")
-        elif code == "video_stream_missing":
-            add(
-                code,
-                metric="video_basic.video_stream_present",
-                value=metrics.video_stream_present,
-                pass_threshold=True,
-                comparison="==",
-            )
-        elif code == "codec_unreadable":
-            add(code, metric="video_basic.codec_readable", value=metrics.codec_readable, pass_threshold=True, comparison="==")
-        elif code == "metadata_unreadable":
-            add(
-                code,
-                metric="video_basic.metadata_read_ok",
-                value=metrics.metadata_read_ok,
-                pass_threshold=True,
-                comparison="==",
-            )
-        elif code in {"fps_below_min", "fps_below_pass"}:
-            add(
-                code,
-                metric="video_basic.fps",
-                value=metrics.fps,
-                pass_threshold=config.fps.min_fps_pass,
-                fail_threshold=config.fps.min_fps_fail,
-                comparison="<",
-            )
-        elif code == "fps_below_expected":
-            expected_threshold = None if config.fps.expected_fps is None else config.fps.expected_fps * 0.95
-            add(
-                code,
-                metric="video_basic.fps",
-                value=metrics.fps,
-                pass_threshold=expected_threshold,
-                comparison="<",
-                context={"expected_fps": config.fps.expected_fps},
-            )
-        elif code == "short_side_below_min":
-            add(
-                code,
-                metric="video_basic.short_side",
-                value=metrics.short_side,
-                pass_threshold=config.resolution.min_short_side_fail,
-                comparison="<",
-            )
-        elif code == "long_side_below_min":
-            add(
-                code,
-                metric="video_basic.long_side",
-                value=metrics.long_side,
-                pass_threshold=config.resolution.min_long_side_fail,
-                comparison="<",
-            )
-        elif code == "pts_monotonic_invalid":
-            add(
-                code,
-                metric="timeline_metrics.pts_monotonic_valid",
-                value=metrics.pts_monotonic_valid,
-                pass_threshold=True,
-                comparison="==",
-            )
-        elif code in {"drop_frame_ratio_above_max", "drop_frame_ratio_warn"}:
-            add(
-                code,
-                metric="timeline_metrics.drop_frame_ratio",
-                value=metrics.drop_frame_ratio,
-                pass_threshold=config.timeline.drop_frame_ratio_pass,
-                fail_threshold=config.timeline.drop_frame_ratio_warn,
-                comparison=">",
-                context={"estimated_missing_frames": metrics.estimated_missing_frames},
-            )
-        elif code in {"frame_interval_p99_ms_above_max", "frame_interval_p99_ms_warn"}:
-            add(
-                code,
-                metric="timeline_metrics.frame_interval_p99_ms",
-                value=metrics.frame_interval_p99_ms,
-                pass_threshold=metrics.drop_interval_ms,
-                fail_threshold=metrics.expected_interval_ms * 2 if metrics.expected_interval_ms > 0 else None,
-                comparison=">",
-                context={"expected_interval_ms": metrics.expected_interval_ms},
-            )
-        elif code == "max_frame_gap_ms_above_max":
-            add(
-                code,
-                metric="timeline_metrics.max_frame_gap_ms",
-                value=metrics.max_frame_gap_ms,
-                fail_threshold=metrics.max_gap_fail_ms,
-                comparison=">",
-            )
-        elif code in {"sample_decode_ratio_below_min", "sample_decode_ratio_warn"}:
-            add(
-                code,
-                metric="decode_metrics.sample_decode_ratio",
-                value=metrics.sample_decode_ratio,
-                pass_threshold=config.decode.sample_decode_ratio_pass,
-                fail_threshold=config.decode.sample_decode_ratio_warn,
-                comparison="<",
-            )
-        elif code in {"black_frame_ratio_above_max", "black_frame_ratio_warn"}:
-            add(
-                code,
-                metric="exposure_metrics.black_frame_ratio",
-                value=metrics.black_frame_ratio,
-                pass_threshold=config.exposure.black.ratio_pass,
-                fail_threshold=config.exposure.black.ratio_warn,
-                comparison=">",
-                context={"black_frame_count_estimate": metrics.black_frame_count_estimate},
-            )
-        elif code == "black_frame_count_above_max":
-            add(
-                code,
-                metric="exposure_metrics.black_frame_count_estimate",
-                value=metrics.black_frame_count_estimate,
-                fail_threshold=config.exposure.black.max_frame_count_fail,
-                comparison=">",
-            )
-        elif code in {"defect_duration_ratio_above_max", "defect_duration_ratio_warn"}:
-            add(
-                code,
-                metric="defect_metrics.defect_duration_ratio",
-                value=metrics.defect_duration_ratio,
-                pass_threshold=config.defects.duration_ratio_warn,
-                fail_threshold=config.defects.max_duration_ratio_fail,
-                comparison=">",
-                context={
-                    "exposure_defect_frame_ratio": metrics.exposure_defect_frame_ratio,
-                    "frozen_frame_ratio": metrics.frozen_frame_ratio,
-                    "drop_frame_ratio": metrics.drop_frame_ratio,
-                },
-            )
-        elif code in {"mean_over_dark_ratio_above_max", "mean_over_dark_ratio_warn"}:
-            add(
-                code,
-                metric="exposure_metrics.mean_over_dark_ratio",
-                value=metrics.mean_over_dark_ratio,
-                pass_threshold=config.exposure.over_dark.ratio_pass,
-                fail_threshold=config.exposure.over_dark.ratio_warn,
-                comparison=">",
-            )
-        elif code in {"mean_over_exposed_ratio_above_max", "mean_over_exposed_ratio_warn"}:
-            add(
-                code,
-                metric="exposure_metrics.mean_over_exposed_ratio",
-                value=metrics.mean_over_exposed_ratio,
-                pass_threshold=config.exposure.over_exposed.ratio_pass,
-                fail_threshold=config.exposure.over_exposed.ratio_warn,
-                comparison=">",
-            )
-        elif code in {"laplacian_p10_below_min", "laplacian_p10_warn"}:
-            add(
-                code,
-                metric="sharpness_global.laplacian_p10",
-                value=metrics.laplacian_p10,
-                pass_threshold=config.sharpness_global.laplacian_p10_pass,
-                fail_threshold=config.sharpness_global.laplacian_p10_warn,
-                comparison="<",
-            )
-        elif code in {"laplacian_median_below_min", "laplacian_median_warn"}:
-            add(
-                code,
-                metric="sharpness_global.laplacian_median",
-                value=metrics.laplacian_median,
-                pass_threshold=config.sharpness_global.laplacian_median_pass,
-                fail_threshold=config.sharpness_global.laplacian_median_warn,
-                comparison="<",
-            )
-        elif code in {"laplacian_under_100_ratio_above_max", "laplacian_under_100_ratio_warn"}:
-            add(
-                code,
-                metric="sharpness_global.laplacian_under_100_ratio",
-                value=metrics.laplacian_under_100_ratio,
-                pass_threshold=config.sharpness_global.laplacian_under_100_ratio_pass,
-                fail_threshold=config.sharpness_global.laplacian_under_100_ratio_warn,
-                comparison=">",
-            )
-        elif code in {"tenengrad_p10_below_min", "tenengrad_p10_warn"}:
-            add(
-                code,
-                metric="sharpness_global.tenengrad_p10",
-                value=metrics.tenengrad_p10,
-                pass_threshold=config.sharpness_global.tenengrad_p10_pass,
-                fail_threshold=config.sharpness_global.tenengrad_p10_warn,
-                comparison="<",
-            )
-        elif code in {"tenengrad_median_below_min", "tenengrad_median_warn"}:
-            add(
-                code,
-                metric="sharpness_global.tenengrad_median",
-                value=metrics.tenengrad_median,
-                pass_threshold=config.sharpness_global.tenengrad_median_pass,
-                fail_threshold=config.sharpness_global.tenengrad_median_warn,
-                comparison="<",
-            )
-        elif code == "adjacent_near_duplicate_ratio_warn":
-            add(
-                code,
-                metric="freeze_metrics.adjacent_near_duplicate_ratio",
-                value=metrics.adjacent_near_duplicate_ratio,
-                pass_threshold=config.freeze.adjacent_near_duplicate_ratio_warn,
-                comparison=">",
-            )
-        elif code in {"frozen_frame_ratio_above_max", "frozen_frame_ratio_warn"}:
-            add(
-                code,
-                metric="freeze_metrics.frozen_frame_ratio",
-                value=metrics.frozen_frame_ratio,
-                pass_threshold=config.freeze.frozen_frame_ratio_pass,
-                fail_threshold=config.freeze.frozen_frame_ratio_warn,
-                comparison=">",
-                context={"confirmed_freeze_frame_count": metrics.confirmed_freeze_frame_count},
-            )
-        elif code in {"max_consecutive_frozen_sec_above_max", "max_consecutive_frozen_sec_warn"}:
-            add(
-                code,
-                metric="freeze_metrics.max_consecutive_frozen_sec",
-                value=metrics.max_consecutive_frozen_sec,
-                pass_threshold=config.freeze.max_consecutive_frozen_sec_pass,
-                fail_threshold=config.freeze.max_consecutive_frozen_sec_fail,
-                comparison=">",
-            )
-        elif code in {"video_state_conflict", "video_state_conflict_warn"}:
-            add(code, metric="freeze_metrics.frozen_intervals.motion_conflict", value=True, comparison="==", context=conflict_context)
-        elif code in {"hdf5_missing", "hdf5_unreadable"} and isinstance(alignment, Hdf5Alignment):
-            add(code, metric="hdf5_alignment.status", value=alignment.status, pass_threshold="matched", comparison="==")
-        elif code in {"hdf5_frame_count_mismatch", "hdf5_frame_count_mismatch_warn"} and isinstance(
-            alignment, Hdf5Alignment
-        ):
-            add(
-                code,
-                metric="hdf5_alignment.frame_count_delta",
-                value=alignment.frame_count_delta,
-                pass_threshold=config.hdf5_alignment.max_delta_frames_pass,
-                fail_threshold=config.hdf5_alignment.max_delta_frames_warn,
-                comparison=">",
-                context={
-                    "video_frame_count": metrics.frame_count,
-                    "hdf5_frame_count": alignment.hdf5_frame_count,
-                    "frame_count_delta_ratio": alignment.frame_count_delta_ratio,
-                },
-            )
-        else:
-            add(code)
-
-    return tuple(details)
-
-
-def _make_evaluation(
-    fail_reasons: list[str],
-    warn_reasons: list[str],
-    *,
-    metrics: VideoMetrics,
-    config: VideoQualityConfig,
-    alignment: object | None,
-) -> QualityEvaluation:
+def _make_evaluation(fail_reasons: list[str], warn_reasons: list[str]) -> QualityEvaluation:
     unique_fail = tuple(dict.fromkeys(fail_reasons))
     unique_warn = tuple(reason for reason in dict.fromkeys(warn_reasons) if reason not in unique_fail)
     decision = "fail" if unique_fail else "warn" if unique_warn else "pass"
@@ -1794,8 +1757,6 @@ def _make_evaluation(
         passed=should_run_mask_qc,
         reasons=unique_fail,
         warn_reasons=unique_warn,
-        reason_details=_reason_details_for_codes(unique_fail, "fail", metrics, config, alignment),
-        warn_reason_details=_reason_details_for_codes(unique_warn, "warn", metrics, config, alignment),
         should_run_mask_qc=should_run_mask_qc,
     )
 
@@ -1956,8 +1917,6 @@ def evaluate_video_quality(
     )
 
     if config.freeze.enabled:
-        if metrics.adjacent_near_duplicate_ratio > config.freeze.adjacent_near_duplicate_ratio_warn:
-            warn.append("adjacent_near_duplicate_ratio_warn")
         _add_threshold_reason(
             fail,
             warn,
@@ -1972,18 +1931,14 @@ def evaluate_video_quality(
             fail.append("max_consecutive_frozen_sec_above_max")
         elif metrics.max_consecutive_frozen_sec > config.freeze.max_consecutive_frozen_sec_pass:
             warn.append("max_consecutive_frozen_sec_warn")
-        for interval in metrics.frozen_intervals:
-            if not interval.motion_conflict:
-                continue
-            duration_limit = (
-                config.freeze.video_state_conflict_critical_duration_ms_fail
-                if interval.critical_window
-                else config.freeze.video_state_conflict_noncritical_duration_ms_fail
-            )
-            if interval.duration_ms >= duration_limit:
-                fail.append("video_state_conflict")
-            else:
-                warn.append("video_state_conflict_warn")
+        if any(interval.motion_conflict for interval in metrics.frozen_intervals):
+            fail.append("freeze_with_motion_conflict")
+        if any(
+            interval.critical_window
+            and interval.duration_ms >= config.freeze.critical_window_interval_duration_ms_fail
+            for interval in metrics.frozen_intervals
+        ):
+            fail.append("frozen_interval_in_critical_window")
 
     if isinstance(alignment, Hdf5Alignment) and config.hdf5_alignment.mode != AlignmentMode.IGNORE:
         if alignment.status == "missing":
@@ -2006,7 +1961,93 @@ def evaluate_video_quality(
             elif severe or warning:
                 warn.append("hdf5_frame_count_mismatch_warn")
 
-    return _make_evaluation(fail, warn, metrics=metrics, config=config, alignment=alignment)
+    roi = metrics.hand_roi
+    if roi is not None and config.hand_roi.enabled:
+        hand_roi_warn_only = config.hand_roi.mode == "warn_except_severe_fail"
+
+        def add_hand_roi_quality_reason(
+            value: float,
+            pass_limit: float,
+            warn_limit: float,
+            fail_reason: str,
+            warn_reason: str,
+            higher_is_bad: bool,
+        ) -> None:
+            if hand_roi_warn_only:
+                warn_triggered = value > pass_limit if higher_is_bad else value < pass_limit
+                if warn_triggered:
+                    warn.append(warn_reason)
+                return
+            _add_threshold_reason(
+                fail,
+                warn,
+                value,
+                pass_limit,
+                warn_limit,
+                fail_reason,
+                warn_reason,
+                higher_is_bad=higher_is_bad,
+            )
+
+        if roi.available_ratio < config.hand_roi.available_ratio_warn:
+            warn.append("hand_roi_available_ratio_below_min")
+        elif roi.available_ratio < config.hand_roi.available_ratio_pass:
+            warn.append("hand_roi_available_ratio_warn")
+
+        if roi.available_frame_count > 0:
+            severe = config.hand_roi.severe_fail
+            if severe.enabled:
+                lap_fail = roi.laplacian_p10 < severe.laplacian_p10_fail
+                ten_fail = roi.tenengrad_p10 < severe.tenengrad_p10_fail
+                if severe.require_both_lap_and_ten_fail and lap_fail and ten_fail:
+                    fail.append("hand_roi_severe_blur")
+                elif not severe.require_both_lap_and_ten_fail and (lap_fail or ten_fail):
+                    fail.append("hand_roi_severe_blur")
+                if roi.blur_bad_frame_ratio > severe.blur_bad_frame_ratio_fail:
+                    fail.append("hand_roi_blur_bad_frame_ratio_above_max")
+
+            add_hand_roi_quality_reason(
+                roi.laplacian_p10,
+                config.hand_roi.laplacian_p10_pass,
+                config.hand_roi.laplacian_p10_warn,
+                "hand_roi_laplacian_p10_below_min",
+                "hand_roi_laplacian_p10_warn",
+                higher_is_bad=False,
+            )
+            add_hand_roi_quality_reason(
+                roi.laplacian_median,
+                config.hand_roi.laplacian_median_pass,
+                config.hand_roi.laplacian_median_warn,
+                "hand_roi_laplacian_median_below_min",
+                "hand_roi_laplacian_median_warn",
+                higher_is_bad=False,
+            )
+            add_hand_roi_quality_reason(
+                roi.tenengrad_p10,
+                config.hand_roi.tenengrad_p10_pass,
+                config.hand_roi.tenengrad_p10_warn,
+                "hand_roi_tenengrad_p10_below_min",
+                "hand_roi_tenengrad_p10_warn",
+                higher_is_bad=False,
+            )
+            add_hand_roi_quality_reason(
+                roi.tenengrad_median,
+                config.hand_roi.tenengrad_median_pass,
+                config.hand_roi.tenengrad_median_warn,
+                "hand_roi_tenengrad_median_below_min",
+                "hand_roi_tenengrad_median_warn",
+                higher_is_bad=False,
+            )
+            add_hand_roi_quality_reason(
+                roi.blur_bad_frame_ratio,
+                config.hand_roi.blur_bad_frame_ratio_pass,
+                config.hand_roi.blur_bad_frame_ratio_warn,
+                "hand_roi_blur_bad_frame_ratio_above_max",
+                "hand_roi_blur_bad_frame_ratio_warn",
+                higher_is_bad=True,
+            )
+
+    return _make_evaluation(fail, warn)
 
 
 def _hdf5_object_path(name: str) -> str:
@@ -2078,13 +2119,30 @@ def read_hdf5_text_fields(path: Path | None) -> dict[str, dict[str, Any]]:
 
 
 def _evaluation_json(evaluation: QualityEvaluation) -> dict[str, Any]:
-    issues = (*evaluation.reason_details, *evaluation.warn_reason_details)
     return {
         "decision": evaluation.decision,
+        "passed": evaluation.passed,
         "reasons": list(evaluation.reasons),
         "warn_reasons": list(evaluation.warn_reasons),
-        "issue_ids": [issue.issue_id for issue in issues],
         "should_run_mask_qc": evaluation.should_run_mask_qc,
+    }
+
+
+def _hand_roi_json(metrics: HandRoiMetrics | None) -> dict[str, Any] | None:
+    if metrics is None:
+        return None
+    return {
+        "enabled": metrics.enabled,
+        "source": metrics.source,
+        "hand_roi_available_ratio": metrics.available_ratio,
+        "hand_roi_available_frame_count": metrics.available_frame_count,
+        "hand_roi_sampled_frame_count": metrics.sampled_frame_count,
+        "hand_roi_laplacian_p10": metrics.laplacian_p10,
+        "hand_roi_laplacian_median": metrics.laplacian_median,
+        "hand_roi_tenengrad_p10": metrics.tenengrad_p10,
+        "hand_roi_tenengrad_median": metrics.tenengrad_median,
+        "hand_roi_blur_bad_frame_ratio": metrics.blur_bad_frame_ratio,
+        "unavailable_reasons": list(metrics.unavailable_reasons),
     }
 
 
@@ -2135,13 +2193,9 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
     metrics = result.metrics
     alignment = result.alignment
     hdf5_exists = alignment.hdf5_path.is_file() if alignment.hdf5_path is not None else False
+    failed_modules = [] if result.evaluation.passed else ["video_quality"]
     evaluation = _evaluation_json(result.evaluation)
     batch_dir = _infer_batch_dir(metrics, alignment)
-    issues = (*result.evaluation.reason_details, *result.evaluation.warn_reason_details)
-    fail_issue_ids = [issue.issue_id for issue in result.evaluation.reason_details]
-    warn_issue_ids = [issue.issue_id for issue in result.evaluation.warn_reason_details]
-    failed = result.evaluation.decision == "fail"
-    next_module = "batch_statistics" if failed else config.next_module
 
     video_basic = {
         "video_open_ok": metrics.opened,
@@ -2197,16 +2251,6 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
         "tenengrad_mean": metrics.tenengrad_mean,
     }
     freeze_metrics = {
-        "adjacent_near_duplicate_count": metrics.adjacent_near_duplicate_count,
-        "adjacent_near_duplicate_ratio": metrics.adjacent_near_duplicate_ratio,
-        "freeze_candidate_window_sec": config.freeze.freeze_candidate_window_sec,
-        "freeze_candidate_frame_count": metrics.freeze_candidate_frame_count,
-        "freeze_candidate_duration_sec": metrics.freeze_candidate_duration_sec,
-        "freeze_candidate_ratio": metrics.freeze_candidate_ratio,
-        "confirmed_freeze_window_sec": config.freeze.confirmed_freeze_window_sec,
-        "confirmed_freeze_frame_count": metrics.confirmed_freeze_frame_count,
-        "confirmed_freeze_duration_sec": metrics.confirmed_freeze_duration_sec,
-        "confirmed_freeze_ratio": metrics.confirmed_freeze_ratio,
         "frozen_frame_ratio": metrics.frozen_frame_ratio,
         "max_consecutive_frozen_sec": metrics.max_consecutive_frozen_sec,
         "frozen_interval_min_frames": config.freeze.min_interval_frames,
@@ -2237,24 +2281,11 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
         "frame_count_match": alignment.frame_count_match,
         "reason": alignment.reason,
     }
+    hand_roi_metrics = _hand_roi_json(metrics.hand_roi)
+
     return {
         "schema_version": "asset_qc_report.v1",
-        "qc_config": dict(config.qc_config_reference),
         "asset_id": metrics.asset_id,
-        "report_revision": 1,
-        "pipeline_state": {
-            "status": "stopped" if failed else "running",
-            "last_completed_module": "video_quality",
-            "next_module": next_module,
-        },
-        "overall_decision": "fail" if failed else None,
-        "issues": _to_plain(issues),
-        "manual_review": {
-            "required": False if failed else None,
-            "state": "skipped_due_to_fail" if failed else "not_evaluated",
-            "candidate_issue_ids": [] if failed else warn_issue_ids,
-            "failures_for_batch_stats_issue_ids": fail_issue_ids,
-        },
         "source_files": {
             "video": {
                 "path": _archive_path(metrics.path, batch_dir),
@@ -2266,29 +2297,22 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
                 "exists": hdf5_exists,
             },
         },
+        "qc_summary": {
+            "status": result.evaluation.decision,
+            "passed": result.evaluation.passed,
+            "completed_modules": ["video_quality"],
+            "failed_modules": failed_modules,
+            "reasons": list(result.evaluation.reasons),
+            "warn_reasons": list(result.evaluation.warn_reasons),
+            "should_run_mask_qc": result.evaluation.should_run_mask_qc,
+        },
+        "hdf5_text_info": {
+            "alignment": hdf5_alignment,
+            "text_fields": read_hdf5_text_fields(alignment.hdf5_path),
+        },
         "video_quality": {
             "stage": "video_prefilter",
-            "module_version": config.module_version,
-            "flow": {
-                "entry_gate": {
-                    "state": "ready",
-                    "eligible": True,
-                    "blocked_by_module": None,
-                    "required_inputs": ["source_files.video.path"],
-                    "missing_inputs": [],
-                    "upstream_continue": True,
-                },
-                "result_gate": {
-                    "verdict": result.evaluation.decision,
-                    "has_fail": failed,
-                    "has_warn": bool(result.evaluation.warn_reasons),
-                },
-                "exit_gate": {
-                    "state": "stop_qc" if failed else "continue",
-                    "continue_to_next_module": not failed,
-                    "next_module": next_module,
-                },
-            },
+            "threshold_version": config.threshold_version,
             "evaluation": evaluation,
             "metadata": {
                 "opened": metrics.opened,
@@ -2316,7 +2340,9 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
                 "freeze_metrics": freeze_metrics,
                 "defect_metrics": defect_metrics,
                 "hdf5_alignment": hdf5_alignment,
+                "hand_roi_metrics": hand_roi_metrics,
             },
+            "thresholds": config.to_dict(),
             "errors": list(metrics.errors),
         },
         "reference_quality": {
@@ -2328,60 +2354,6 @@ def asset_qc_result_to_json(result: VideoQualityResult, config: VideoQualityConf
     }
 
 
-def _merge_video_quality_report(
-    existing: dict[str, Any] | None,
-    generated: dict[str, Any],
-) -> dict[str, Any]:
-    if existing is None:
-        return generated
-
-    if existing.get("asset_id") not in {None, generated["asset_id"]}:
-        raise ValueError(
-            f"asset_id mismatch: existing={existing.get('asset_id')} generated={generated['asset_id']}"
-        )
-    existing_config = existing.get("qc_config")
-    if existing_config is not None and existing_config != generated["qc_config"]:
-        raise ValueError("existing asset report uses a different qc_config")
-
-    merged = copy.deepcopy(existing)
-    preserved_issues = [
-        issue
-        for issue in merged.get("issues", [])
-        if isinstance(issue, dict) and issue.get("module") != "video_quality"
-    ]
-    generated_issues = list(generated["issues"])
-    existing_manual = merged.get("manual_review", {})
-    if not isinstance(existing_manual, dict):
-        raise ValueError("manual_review must be an object")
-
-    merged.update(
-        {
-            key: copy.deepcopy(value)
-            for key, value in generated.items()
-            if key not in {"source_files", "issues", "manual_review", "report_revision"}
-        }
-    )
-    source_files = copy.deepcopy(existing.get("source_files", {}))
-    if not isinstance(source_files, dict):
-        raise ValueError("source_files must be an object")
-    source_files.update(copy.deepcopy(generated["source_files"]))
-    merged["source_files"] = source_files
-    merged["issues"] = preserved_issues + generated_issues
-
-    manual_review = copy.deepcopy(existing_manual)
-    manual_review.update(copy.deepcopy(generated["manual_review"]))
-    for field_name in ("candidate_issue_ids", "failures_for_batch_stats_issue_ids"):
-        preserved_ids = [
-            issue_id
-            for issue_id in existing_manual.get(field_name, [])
-            if not str(issue_id).startswith("video_quality:")
-        ]
-        manual_review[field_name] = preserved_ids + list(generated["manual_review"][field_name])
-    merged["manual_review"] = manual_review
-    merged["report_revision"] = int(existing.get("report_revision", 0)) + 1
-    return merged
-
-
 def write_per_asset_qc_json_reports(
     quality_archive_dir: Path,
     results: list[VideoQualityResult],
@@ -2390,11 +2362,10 @@ def write_per_asset_qc_json_reports(
     quality_archive_dir.mkdir(parents=True, exist_ok=True)
     for result in results:
         path = quality_archive_dir / f"{result.metrics.asset_id}.json"
-        existing = load_asset_qc_report(path)
-        expected_revision = 0 if existing is None else int(existing.get("report_revision", 0))
-        generated = asset_qc_result_to_json(result, config)
-        report = _merge_video_quality_report(existing, generated)
-        write_asset_qc_report(path, report, expected_revision=expected_revision)
+        path.write_text(
+            json.dumps(asset_qc_result_to_json(result, config), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
 def run_video_quality_check(
