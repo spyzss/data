@@ -305,6 +305,22 @@ def test_reconstruction_rejects_foreign_stage_without_touching_it(
     assert foreign.read_bytes() == before
 
 
+def test_relative_source_path_can_reconstruct_and_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = write_complex_hdf5(Path("asset-relative.hdf5"))
+    prepared = prepare_hdf5_replacement(
+        source, DATASET_PATH, UPDATED, "tx-relative"
+    )
+    record = _prepared_record(prepared)
+
+    reconstructed = prepared_replacement_from_record(record)
+    commit_hdf5_replacement(reconstructed)
+
+    assert _sha256(source) == prepared.new_sha256
+
+
 def test_recovery_requests_rebuild_when_old_hash_has_no_staged_file(tmp_path: Path) -> None:
     source = write_complex_hdf5(tmp_path / "asset.hdf5")
     prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-rebuild")

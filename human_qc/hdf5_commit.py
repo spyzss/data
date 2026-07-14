@@ -555,7 +555,12 @@ def _is_managed_staged_path(
 
     source = Path(source)
     staged = Path(staged)
-    if source.parent != staged.parent or source == staged:
+    try:
+        if source.parent.resolve() != staged.parent.resolve():
+            return False
+        if source.resolve() == staged.resolve():
+            return False
+    except OSError:
         return False
     if staged.is_symlink():
         return False
