@@ -267,6 +267,57 @@ def test_orchestrator_runs_in_config_order_and_retains_external_pause(
     assert second.report["execution"]["updated_at"] == "2026-07-14T00:00:00Z"
 
 
+def test_orchestrator_resumes_nested_source_lists_after_json_round_trip(
+    tmp_path: Path,
+) -> None:
+    modules = ["hdf5_text_info", "semantic_consistency"]
+    config = _config(tmp_path, modules)
+    source_files = {
+        "video": {
+            "path": "video/clip.mp4",
+            "segments": [[0, 1], [2, 3]],
+            "labels": [{"name": "clip", "frames": [0, 1]}],
+        }
+    }
+    context = AssetContext(
+        asset_id="asset-a",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-a.json",
+        source_files=source_files,
+    )
+    calls: list[str] = []
+    registry = _registry(
+        calls,
+        config,
+        {"hdf5_text_info": "pass"},
+    )
+
+    first = run_asset(
+        context,
+        config=config,
+        profile="acceptance",
+        registry=registry,
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
+
+    assert first.status == "awaiting_external"
+    assert first.report["source_files"] == source_files
+    assert first.report["report_revision"] == 2
+
+    calls.clear()
+    second = run_asset(
+        context,
+        config=first.config,
+        profile="acceptance",
+        registry=registry,
+        now=lambda: "2026-07-14T01:00:00Z",
+    )
+
+    assert calls == []
+    assert second.status == "awaiting_external"
+    assert second.report["report_revision"] == first.report["report_revision"]
+
+
 def test_module_states_distinguish_completed_skipped_and_awaiting_external(
     tmp_path: Path,
 ) -> None:
@@ -1056,6 +1107,18 @@ def test_asset_context_recursively_freezes_source_files_and_metadata(
             "details": {"labels": ["primary"], "nested": {"count": 1}},
         }
     }
+
+
+def test_asset_context_rejects_non_json_source_values(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(TypeError, match="source_files.*JSON"):
+        AssetContext(
+            "asset-a",
+            tmp_path,
+            tmp_path / "quality_archive" / "asset-a.json",
+            {"video": {"path": "video/clip.mp4", "labels": {"primary"}}},
+        )
 
 
 def test_asset_context_rejects_asset_ids_that_escape_report_filename(

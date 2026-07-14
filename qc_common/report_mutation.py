@@ -15,7 +15,7 @@ from qc_common.report import (
 )
 from qc_common.report_migration import migrate_v1_to_v2
 from qc_common.schema import validate_asset_qc_report
-from qc_pipeline.context import AssetContext
+from qc_pipeline.context import AssetContext, _thaw
 
 
 class ModuleOrderError(RuntimeError):
@@ -51,7 +51,7 @@ def initialize_v2_report(
             "stop_reason": None,
         },
         "overall_decision": None,
-        "source_files": copy.deepcopy(dict(context.source_files)),
+        "source_files": _thaw(context.source_files),
         "issues": [],
         "runtime_errors": [],
         "manual_review": {
@@ -101,7 +101,7 @@ def _assert_report_identity(
         raise ValueError(
             f"asset_id mismatch: {report.get('asset_id')} != {context.asset_id}"
         )
-    if report.get("source_files") != dict(context.source_files):
+    if _thaw(report.get("source_files")) != _thaw(context.source_files):
         raise ValueError("source_files mismatch between report and AssetContext")
     _assert_config_reference(report, config, profile)
 

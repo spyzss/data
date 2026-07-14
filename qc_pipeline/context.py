@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,18 @@ def _freeze(value: Any) -> Any:
         return tuple(_freeze(item) for item in value)
     if isinstance(value, set):
         return frozenset(_freeze(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _thaw(value: Any) -> Any:
+    """Return a mutable copy of a recursively frozen report-bound value."""
+    if isinstance(value, Mapping):
+        return {
+            copy.deepcopy(key): _thaw(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return [_thaw(item) for item in value]
     return copy.deepcopy(value)
 
 
@@ -106,6 +119,12 @@ class AssetContext:
                 raise ValueError(
                     f"source_files.{source_name}.path must stay inside batch_root"
                 ) from None
+        try:
+            json.dumps(_thaw(source_files), ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "source_files must contain JSON-compatible values"
+            ) from exc
 
         if self.source_range is not None:
             start, end = self.source_range
