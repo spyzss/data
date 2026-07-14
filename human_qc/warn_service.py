@@ -298,6 +298,8 @@ class WarnReviewService:
         self._assert_semantic_ready(report)
         self._assert_manual_cursor(report)
         manual, candidates, selected = self._ids(report)
+        if manual.get("state") in {"completed", "not_required", "skipped_due_to_fail"}:
+            raise WarnStateError("warn review is in a terminal state")
         issue_id = _non_empty(issue_id, "issue_id")
         if issue_id not in candidates:
             raise WarnStateError(f"issue {issue_id} is not a candidate")
@@ -377,6 +379,13 @@ class WarnReviewService:
         reviews = manual.get("issue_reviews", {})
         if not isinstance(reviews, Mapping):
             raise WarnStateError("manual_review.issue_reviews must be an object")
+        issues = self._issues(report)
+        missing_issues = [issue_id for issue_id in selected if issue_id not in issues]
+        if missing_issues:
+            raise WarnStateError(
+                "selected issue IDs are missing from report issues: "
+                + ", ".join(missing_issues)
+            )
         if selected and not set(selected).issubset(reviews):
             raise WarnStateError("every selected issue requires a verdict before completion")
         for issue_id in selected:
