@@ -168,12 +168,17 @@ def encode_canonical_payload(
             raise SubtaskSourceError(f"root field {field!r} is missing")
         root[field] = deepcopy(loaded.root_payload[field])
 
-    # The timeline is the working source of truth for metadata after a review
-    # edit.  The source adapter has already validated both values, so this
-    # preserves the exact numeric type where practical while preventing stale
-    # source metadata from overriding the working timeline.
-    root["fps"] = timeline.fps
-    root["frame_count"] = timeline.frame_count
+    # Timeline edits may move boundaries, but they must not silently change the
+    # source asset's metadata.  Reject a foreign timeline before any payload is
+    # emitted, and keep the validated root values exactly as loaded.
+    try:
+        fps_matches = float(root["fps"]) == float(timeline.fps)
+    except (TypeError, ValueError, OverflowError):
+        fps_matches = False
+    if not fps_matches or root["frame_count"] != timeline.frame_count:
+        raise SubtaskSourceError(
+            "timeline metadata does not match loaded root metadata"
+        )
 
     annotations: list[dict[str, Any]] = []
     for segment in timeline.segments:

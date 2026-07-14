@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 import hashlib
 import json
@@ -14,6 +15,7 @@ from human_qc.source_adapters import (
     Hdf5ScalarJsonSubtaskAdapter,
     encode_canonical_payload,
 )
+from human_qc.timeline import SharedBoundaryTimeline
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "human_qc" / "subtasks_closed.json"
@@ -153,6 +155,8 @@ def test_encoder_recomputes_closed_frames_and_times_after_boundary_edit(
 
     encoded = encode_canonical_payload(loaded, moved)
 
+    assert encoded["fps"] == loaded.root_payload["fps"] == 30.0
+    assert encoded["frame_count"] == loaded.root_payload["frame_count"] == 195
     assert [
         (row["start_frame"], row["end_frame"])
         for row in encoded["annotations"]
@@ -161,6 +165,24 @@ def test_encoder_recomputes_closed_frames_and_times_after_boundary_edit(
     assert encoded["annotations"][0]["end_time_sec"] == pytest.approx(59 / 30.0)
     assert encoded["annotations"][1]["start_time_sec"] == pytest.approx(2.0)
     assert encoded["annotations"][1]["end_time_sec"] == pytest.approx(122 / 30.0)
+
+
+def test_encoder_rejects_timeline_with_foreign_root_metadata(tmp_path: Path) -> None:
+    source = write_scalar_json_hdf5(tmp_path / "617856.hdf5", read_fixture())
+    loaded = Hdf5ScalarJsonSubtaskAdapter().load(source)
+    foreign_segment = replace(
+        loaded.timeline.segments[0],
+        start_frame=0,
+        end_frame_exclusive=10,
+    )
+    foreign_timeline = SharedBoundaryTimeline(
+        frame_count=10,
+        fps=60.0,
+        segments=(foreign_segment,),
+    )
+
+    with pytest.raises(ValueError, match="metadata"):
+        encode_canonical_payload(loaded, foreign_timeline)
 
 
 def test_loaded_segments_do_not_alias_source_records(tmp_path: Path) -> None:
