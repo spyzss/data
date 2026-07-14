@@ -1,0 +1,16 @@
+{
+  "change": "unify-qc-dataflow",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "5b7e3f9faa26b3ba9a0a723d8cc70bd5d4861de63c7f23dcad825a65dbadb8b6",
+  "files": [
+    { "path": "openspec/changes/unify-qc-dataflow/proposal.md", "sha256": "38b03a1e73484a97757a3076ce0dc9a462e5aaff4cdac9581bd7d1e6b5ec1bf8" },
+    { "path": "openspec/changes/unify-qc-dataflow/design.md", "sha256": "46515ea8f05f7d23a7d3374e3688efe331957cdbc58aed58eb467782e1f6b07f" },
+    { "path": "openspec/changes/unify-qc-dataflow/tasks.md", "sha256": "7c7442a62003908bae267899022e6faf3ac22853040ad2e6d2c93d411624cb38" },
+    { "path": "openspec/changes/unify-qc-dataflow/specs/asset-qc-module-contract/spec.md", "sha256": "21f4b25e541630ccb1088eed2427054af83ed4539eaccfc380a61a51bf5a968d" },
+    { "path": "openspec/changes/unify-qc-dataflow/specs/qc-json-batch-aggregation/spec.md", "sha256": "2c3abc07c223048cbc15ee56cdd01fa35c4b7ae9369568ad16dca32e066969cb" },
+    { "path": "openspec/changes/unify-qc-dataflow/specs/qc-pipeline-execution/spec.md", "sha256": "449342f9c1d450aff2100d63462f80b1f8241a3b7fd3b8b575684835d16511a7" }
+  ]
+}
