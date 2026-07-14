@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import pytest
 
@@ -22,6 +23,33 @@ BASE = {
     "hand_side": "left",
     "evidence_kind": "clip",
 }
+
+
+def make_issue(*, severity: Any = "warn") -> Issue:
+    return Issue(
+        issue_id="issue-1",
+        code="review",
+        severity=severity,
+        module="semantic_review",
+        issue_type="semantic",
+        metric="external_payload",
+        observed_value=None,
+        operator="manual_review",
+        boundary_value=None,
+        rule_id="semantic_review.external_payload",
+        needs_manual_review=True,
+    )
+
+
+def make_module_result(
+    *, verdict: Any = "pass", metrics: Any = None
+) -> ModuleResult:
+    return ModuleResult(
+        module="semantic_review",
+        verdict=verdict,
+        evaluation={},
+        metrics={} if metrics is None else metrics,
+    )
 
 
 def test_issue_id_is_repeatable_and_reason_independent() -> None:
@@ -198,3 +226,71 @@ def test_optional_contract_fields_remain_explicit() -> None:
     }
     assert issue.to_dict()["context"] == {}
     assert issue.to_dict()["evidence_ids"] == []
+
+
+@pytest.mark.parametrize("verdict", ["pass", "warn", "fail", "skipped"])
+def test_module_result_accepts_every_valid_verdict(verdict: str) -> None:
+    result = make_module_result(verdict=verdict)
+
+    assert result.verdict == verdict
+
+
+def test_module_result_rejects_invalid_verdict() -> None:
+    with pytest.raises(ValueError, match="verdict must be one of"):
+        make_module_result(verdict="unknown")
+
+
+@pytest.mark.parametrize("severity", ["warn", "fail"])
+def test_issue_accepts_every_valid_severity(severity: str) -> None:
+    issue = make_issue(severity=severity)
+
+    assert issue.severity == severity
+
+
+def test_issue_rejects_invalid_severity() -> None:
+    with pytest.raises(ValueError, match="severity must be one of"):
+        make_issue(severity="pass")
+
+
+@pytest.mark.parametrize(
+    ("bad_value", "error_type", "message"),
+    [
+        (
+            Path("evidence/a.png"),
+            TypeError,
+            "unsupported JSON value type: PosixPath",
+        ),
+        ({"unordered"}, TypeError, "unsupported JSON value type: set"),
+        (b"binary", TypeError, "unsupported JSON value type: bytes"),
+        ({1: "not-a-string-key"}, TypeError, "mapping keys must be strings"),
+        (float("nan"), ValueError, "non-finite float"),
+        (float("inf"), ValueError, "non-finite float"),
+        (float("-inf"), ValueError, "non-finite float"),
+    ],
+)
+def test_to_dict_rejects_nested_non_json_values(
+    bad_value: object,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    result = make_module_result(metrics={"outer": [{"bad": bad_value}]})
+
+    with pytest.raises(error_type, match=message):
+        result.to_dict()
+
+
+def test_to_dict_accepts_all_json_native_values_recursively() -> None:
+    result = make_module_result(
+        metrics={
+            "native": [None, False, 7, 1.25, "value"],
+            "ordered_tuple": ("first", "second"),
+        }
+    )
+
+    payload = result.to_dict()
+
+    assert payload["metrics"] == {
+        "native": [None, False, 7, 1.25, "value"],
+        "ordered_tuple": ["first", "second"],
+    }
+    assert json.loads(json.dumps(payload, allow_nan=False)) == payload

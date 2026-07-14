@@ -7,11 +7,14 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Literal
 
 
 Verdict = Literal["pass", "warn", "fail", "skipped"]
+_VERDICTS = ("pass", "warn", "fail", "skipped")
+_ISSUE_SEVERITIES = ("warn", "fail")
 
 
 def _to_json_safe(value: Any) -> Any:
@@ -23,10 +26,24 @@ def _to_json_safe(value: Any) -> Any:
     if isinstance(value, Enum):
         return _to_json_safe(value.value)
     if isinstance(value, Mapping):
-        return {key: _to_json_safe(item) for key, item in value.items()}
+        converted: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    "mapping keys must be strings, "
+                    f"got {type(key).__name__}"
+                )
+            converted[key] = _to_json_safe(item)
+        return converted
     if isinstance(value, (list, tuple)):
         return [_to_json_safe(item) for item in value]
-    return value
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite float is not JSON-safe: {value!r}")
+        return value
+    raise TypeError(f"unsupported JSON value type: {type(value).__name__}")
 
 
 @dataclass(frozen=True)
@@ -62,6 +79,13 @@ class Issue:
     context: Mapping[str, Any] = field(default_factory=dict)
     evidence_ids: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        if self.severity not in _ISSUE_SEVERITIES:
+            raise ValueError(
+                f"severity must be one of {_ISSUE_SEVERITIES}, "
+                f"got {self.severity!r}"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         return _to_json_safe(self)
 
@@ -75,6 +99,12 @@ class ModuleResult:
     issues: tuple[Issue, ...] = ()
     evidence: tuple[EvidenceRef, ...] = ()
     runtime: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.verdict not in _VERDICTS:
+            raise ValueError(
+                f"verdict must be one of {_VERDICTS}, got {self.verdict!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return _to_json_safe(self)
