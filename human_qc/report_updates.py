@@ -206,7 +206,10 @@ def _manual_verdict(report: Mapping[str, Any]) -> str | None:
         return None
     if not set(reviews).issubset(selected_set):
         return None
-    if state == "not_required" and not candidate_set:
+    # The automatic router may have produced candidates that the reviewer
+    # selected none of.  In that case no human task exists and the manual
+    # stage is explicitly not required; candidate generation remains intact.
+    if state == "not_required" and not selected_set:
         return "pass"
     if state != "completed" or not selected_set.issubset(set(reviews)):
         return None
@@ -260,8 +263,9 @@ def reduce_overall_decision(report: Mapping[str, Any]) -> str | None:
     manual = report.get("manual_review")
     if isinstance(manual, Mapping):
         candidates = manual.get("candidate_issue_ids", [])
+        selected = manual.get("selected_issue_ids", [])
         state = manual.get("state")
-        if candidates and manual_verdict is None:
+        if candidates and selected and manual_verdict is None:
             return None
         if not candidates and state not in {
             "not_required",
