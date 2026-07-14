@@ -1,10 +1,68 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
+
+
+class _FrozenMapping(Mapping[str, Any]):
+    """A recursively frozen mapping that remains deepcopy-compatible."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: Mapping[str, Any]) -> None:
+        object.__setattr__(self, "_data", MappingProxyType(dict(data)))
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return repr(dict(self._data))
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        """Thaw only the caller's copy; the context remains immutable."""
+        copied = {
+            copy.deepcopy(key, memo): copy.deepcopy(value, memo)
+            for key, value in self._data.items()
+        }
+        memo[id(self)] = copied
+        return copied
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, _FrozenMapping):
+        return value
+    if isinstance(value, Mapping):
+        return _FrozenMapping(
+            {key: _freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def validate_asset_id(asset_id: str) -> None:
+    if not isinstance(asset_id, str) or not asset_id.strip():
+        raise ValueError("asset_id must not be empty")
+    if (
+        asset_id in {".", ".."}
+        or "/" in asset_id
+        or "\\" in asset_id
+    ):
+        raise ValueError("asset_id must be a safe filename component")
 
 
 @dataclass(frozen=True)
@@ -17,8 +75,7 @@ class AssetContext:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.asset_id:
-            raise ValueError("asset_id must not be empty")
+        validate_asset_id(self.asset_id)
 
         batch_root = self.batch_root.resolve()
         report_path = self.report_path.resolve()
@@ -27,7 +84,9 @@ class AssetContext:
         except ValueError:
             raise ValueError("report_path must be inside batch_root") from None
 
-        source_files = copy.deepcopy(dict(self.source_files))
+        source_files = _freeze(self.source_files)
+        if not isinstance(source_files, Mapping):
+            raise TypeError("source_files must be a mapping")
         for source_name, source in source_files.items():
             if not isinstance(source, Mapping) or source.get("path") is None:
                 continue
@@ -58,10 +117,10 @@ class AssetContext:
         object.__setattr__(
             self,
             "source_files",
-            MappingProxyType(source_files),
+            source_files,
         )
         object.__setattr__(
             self,
             "metadata",
-            MappingProxyType(copy.deepcopy(dict(self.metadata))),
+            _freeze(self.metadata),
         )

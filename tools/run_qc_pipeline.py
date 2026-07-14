@@ -17,12 +17,19 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from qc_common.config import LoadedQcConfig, load_qc_acceptance_config  # noqa: E402
+from qc_common.contracts import RuntimeErrorRecord  # noqa: E402
 from qc_common.module_registry import ModuleRegistry  # noqa: E402
-from qc_pipeline.context import AssetContext  # noqa: E402
+from qc_common.report import load_asset_qc_report  # noqa: E402
+from qc_common.report_mutation import (  # noqa: E402
+    initialize_v2_report,
+    record_runtime_error,
+)
+from qc_pipeline.context import AssetContext, validate_asset_id  # noqa: E402
 from qc_pipeline.orchestrator import (  # noqa: E402
     RunOutcome,
     build_default_registry,
     run_asset,
+    utc_now,
 )
 from tools.run_manifest_precheck import read_manifest  # noqa: E402
 
@@ -51,6 +58,88 @@ def _integer(value: Any, field: str) -> int:
     if not math.isfinite(numeric) or not numeric.is_integer():
         raise ValueError(f"{field} must be an integer")
     return int(numeric)
+
+
+def _batch_error_outcome(
+    context: AssetContext,
+    *,
+    config: LoadedQcConfig,
+    profile: str,
+    error: BaseException,
+) -> RunOutcome:
+    """Return a structured per-asset error without cancelling sibling workers."""
+    timestamp = utc_now()
+    module = config.pipeline_modules[0] if config.pipeline_modules else "batch_worker"
+    message = f"{type(error).__name__}: {error}".strip()
+    try:
+        current = load_asset_qc_report(context.report_path)
+    except Exception:
+        current = None
+    try:
+        expected_revision = (
+            int(current.get("report_revision", 0))
+            if isinstance(current, dict)
+            else 0
+        )
+    except (TypeError, ValueError):
+        expected_revision = 0
+    try:
+        report = record_runtime_error(
+            context.report_path,
+            module=module,
+            error_type="batch_worker_error",
+            message=message,
+            expected_revision=expected_revision,
+            context=context,
+            config=config,
+            profile=profile,
+            now=timestamp,
+        )
+        return RunOutcome(report, (), "error", config)
+    except Exception:
+        # A malformed or otherwise unreadable report must not erase evidence or
+        # escape the batch. Return a valid in-memory error outcome instead.
+        if (
+            isinstance(current, dict)
+            and current.get("schema_version") == "asset_qc_report.v2"
+            and isinstance(current.get("execution"), dict)
+            and isinstance(current.get("pipeline_state"), dict)
+        ):
+            report = copy.deepcopy(current)
+            report["report_revision"] = expected_revision + 1
+        else:
+            report = initialize_v2_report(context, config, profile, timestamp)
+            report["report_revision"] = 1
+        runtime_error = RuntimeErrorRecord(
+            module,
+            "batch_worker_error",
+            message,
+            timestamp,
+        ).to_dict()
+        runtime_errors = report.get("runtime_errors")
+        if not isinstance(runtime_errors, list):
+            runtime_errors = []
+        runtime_errors.append(runtime_error)
+        report["runtime_errors"] = runtime_errors
+        execution = report["execution"]
+        module_states = execution.get("module_states")
+        if not isinstance(module_states, dict):
+            module_states = {}
+        module_states[module] = {
+            "state": "runtime_error",
+            "reason": "batch_worker_error",
+        }
+        execution["module_states"] = module_states
+        pipeline_state = report["pipeline_state"]
+        pipeline_state.update(
+            {
+                "status": "error",
+                "next_module": module,
+                "stop_reason": "batch_worker_error",
+            }
+        )
+        report["overall_decision"] = None
+        return RunOutcome(report, (), "error", config)
 
 
 def _path_inside_batch(
@@ -90,6 +179,7 @@ def contexts_from_manifest(
         asset_id = _text(row.get("asset_id"))
         if not asset_id:
             raise ValueError(f"manifest row {row_index} missing asset_id")
+        validate_asset_id(asset_id)
         if asset_id in seen:
             raise ValueError(f"duplicate asset_id: {asset_id}")
         seen.add(asset_id)
@@ -154,10 +244,19 @@ def run_batch(
         raise ValueError("max_workers must be >= 1")
     context_list = list(contexts)
     seen: set[str] = set()
+    report_paths: dict[Path, str] = {}
     for context in context_list:
         if context.asset_id in seen:
             raise ValueError(f"duplicate asset_id: {context.asset_id}")
         seen.add(context.asset_id)
+        resolved_report_path = context.report_path.resolve()
+        previous_asset = report_paths.get(resolved_report_path)
+        if previous_asset is not None:
+            raise ValueError(
+                "duplicate report_path for assets "
+                f"{previous_asset} and {context.asset_id}: {resolved_report_path}"
+            )
+        report_paths[resolved_report_path] = context.asset_id
     if not resume:
         existing = [
             context.asset_id
@@ -186,13 +285,22 @@ def run_batch(
 
     outcomes: dict[str, RunOutcome] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_to_asset = {
-            pool.submit(run_one, context): context.asset_id
+        future_to_context = {
+            pool.submit(run_one, context): context
             for context in context_list
         }
-        for future in as_completed(future_to_asset):
-            asset_id = future_to_asset[future]
-            outcomes[asset_id] = future.result()
+        for future in as_completed(future_to_context):
+            context = future_to_context[future]
+            asset_id = context.asset_id
+            try:
+                outcomes[asset_id] = future.result()
+            except Exception as exc:
+                outcomes[asset_id] = _batch_error_outcome(
+                    context,
+                    config=config,
+                    profile=profile,
+                    error=exc,
+                )
     return outcomes
 
 

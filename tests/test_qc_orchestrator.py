@@ -970,6 +970,73 @@ def test_asset_context_rejects_report_and_sources_outside_batch(
         )
 
 
+def test_asset_context_recursively_freezes_source_files_and_metadata(
+    tmp_path: Path,
+) -> None:
+    source_files = {
+        "video": {
+            "path": "video/clip.mp4",
+            "details": {"labels": ["primary"], "nested": {"count": 1}},
+        }
+    }
+    metadata = {
+        "manifest_row": {"nested": {"supplier": "demo"}},
+        "items": [{"value": 1}],
+    }
+
+    context = AssetContext(
+        "asset-a",
+        tmp_path,
+        tmp_path / "quality_archive" / "asset-a.json",
+        source_files,
+        metadata=metadata,
+    )
+
+    source_files["video"]["path"] = "../outside.mp4"
+    source_files["video"]["details"]["nested"]["count"] = 99
+    metadata["manifest_row"]["nested"]["supplier"] = "changed"
+    metadata["items"][0]["value"] = 99
+
+    assert context.source_files["video"]["path"] == "video/clip.mp4"
+    assert context.source_files["video"]["details"]["nested"]["count"] == 1
+    assert context.metadata["manifest_row"]["nested"]["supplier"] == "demo"
+    assert context.metadata["items"][0]["value"] == 1
+    with pytest.raises(TypeError):
+        context.source_files["video"]["path"] = "../outside.mp4"
+    with pytest.raises(TypeError):
+        context.source_files["video"]["details"]["nested"]["count"] = 2
+    with pytest.raises(TypeError):
+        context.metadata["manifest_row"]["nested"]["supplier"] = "changed"
+    with pytest.raises(TypeError):
+        context.metadata["items"][0]["value"] = 2
+
+    report = initialize_v2_report(
+        context,
+        _config(tmp_path, ["hdf5_text_info"]),
+        "acceptance",
+        "2026-07-14T00:00:00Z",
+    )
+    assert json.loads(json.dumps(report))["source_files"] == {
+        "video": {
+            "path": "video/clip.mp4",
+            "details": {"labels": ["primary"], "nested": {"count": 1}},
+        }
+    }
+
+
+def test_asset_context_rejects_asset_ids_that_escape_report_filename(
+    tmp_path: Path,
+) -> None:
+    for asset_id in ("../escape", "nested/asset", "nested\\asset", ".", ".."):
+        with pytest.raises(ValueError, match="safe filename"):
+            AssetContext(
+                asset_id,
+                tmp_path,
+                tmp_path / "quality_archive" / "safe.json",
+                {},
+            )
+
+
 def test_default_registry_exposes_only_enabled_automatic_implementations(
     tmp_path: Path,
 ) -> None:
@@ -1090,6 +1157,33 @@ def test_batch_rejects_duplicate_asset_ids_before_building_registries(
     assert built == []
 
 
+def test_batch_rejects_distinct_assets_with_duplicate_resolved_report_paths(
+    tmp_path: Path,
+) -> None:
+    from tools.run_qc_pipeline import run_batch
+
+    config = _config(tmp_path, ["hdf5_text_info"])
+    first = _context(tmp_path, "first")
+    second = AssetContext(
+        "second",
+        tmp_path,
+        first.report_path,
+        {"video": {"path": "video/clip.mp4"}},
+    )
+    built: list[str] = []
+
+    with pytest.raises(ValueError, match="duplicate report_path"):
+        run_batch(
+            [first, second],
+            config=config,
+            profile="acceptance",
+            registry_factory=lambda context: built.append(context.asset_id),
+            max_workers=2,
+        )
+
+    assert built == []
+
+
 def test_manifest_rejects_duplicate_ids_before_source_validation(
     tmp_path: Path,
 ) -> None:
@@ -1195,6 +1289,67 @@ def test_batch_keeps_other_assets_running_when_one_runner_errors(
         "process_error"
     )
     assert outcomes["good"].report is not outcomes["bad"].report
+
+
+def test_batch_isolates_registry_factory_failure_from_other_assets(
+    tmp_path: Path,
+) -> None:
+    from tools.run_qc_pipeline import run_batch
+
+    module = "hdf5_text_info"
+    config = _config(tmp_path, [module])
+    contexts = [_context(tmp_path, "good"), _context(tmp_path, "bad")]
+
+    def registry_factory(context: AssetContext) -> ModuleRegistry:
+        if context.asset_id == "bad":
+            raise RuntimeError("factory-broken")
+        return _registry([], config, {module: "pass"})
+
+    outcomes = run_batch(
+        contexts,
+        config=config,
+        profile="supplier_evaluation",
+        registry_factory=registry_factory,
+        max_workers=2,
+    )
+
+    assert outcomes["good"].status == "completed"
+    assert outcomes["bad"].status == "error"
+    assert outcomes["bad"].report["asset_id"] == "bad"
+    assert outcomes["bad"].report["runtime_errors"][0]["module"] == module
+    assert outcomes["bad"].report["runtime_errors"][0]["error_type"] == (
+        "batch_worker_error"
+    )
+    assert "factory-broken" in outcomes["bad"].report["runtime_errors"][0]["message"]
+
+
+def test_batch_isolates_malformed_report_from_other_assets(
+    tmp_path: Path,
+) -> None:
+    from tools.run_qc_pipeline import run_batch
+
+    module = "hdf5_text_info"
+    config = _config(tmp_path, [module])
+    bad = _context(tmp_path, "bad")
+    bad.report_path.parent.mkdir(parents=True, exist_ok=True)
+    bad.report_path.write_text("not-json", encoding="utf-8")
+    good = _context(tmp_path, "good")
+
+    outcomes = run_batch(
+        [good, bad],
+        config=config,
+        profile="supplier_evaluation",
+        registry_factory=lambda context: _registry([], config, {module: "pass"}),
+        max_workers=2,
+    )
+
+    assert outcomes["good"].status == "completed"
+    assert outcomes["bad"].status == "error"
+    assert outcomes["bad"].report["runtime_errors"][0]["error_type"] == (
+        "batch_worker_error"
+    )
+    assert "JSONDecodeError" in outcomes["bad"].report["runtime_errors"][0]["message"]
+    assert bad.report_path.read_text(encoding="utf-8") == "not-json"
 
 
 def test_cli_accepts_required_batch_and_resume_options(tmp_path: Path) -> None:
