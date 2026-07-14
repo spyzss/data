@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import fields
 from numbers import Real
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, NamedTuple, TypeVar, cast
 
 from precheck.config import (
     CompositeFrameVerdictConfig,
@@ -38,6 +38,17 @@ _PRECHECK_NAME_BY_MODULE = {
     "composite_frame_verdict": "composite_frame_verdict",
 }
 _ConfigType = TypeVar("_ConfigType")
+
+
+class _PresenceFailure(NamedTuple):
+    side: str
+    frame: int
+    severity: Verdict
+    rule: Mapping[str, Any]
+    metric: str
+    observed: Any
+    operator: str
+    boundary: Any
 
 
 def _worst(*verdicts: Verdict) -> Verdict:
@@ -107,11 +118,16 @@ def _issue_from_row(
     operator: str,
     boundary_value: Any,
     hand_side: str | None = None,
+    frame_range: tuple[int | None, int | None] | None = None,
+    evidence_kind: str = "check_result",
 ) -> Issue:
     if severity not in {"warn", "fail"}:
         raise ValueError(f"issue severity must be warn or fail, got {severity!r}")
-    start_frame = row.frame_idx if row.frame_idx >= 0 else None
-    end_frame = start_frame
+    if frame_range is None:
+        start_frame = row.frame_idx if row.frame_idx >= 0 else None
+        end_frame = start_frame
+    else:
+        start_frame, end_frame = frame_range
     issue_type = rule_id.rsplit(".", 1)[-1]
     coordinate_system = "source_inclusive"
     return Issue(
@@ -124,7 +140,7 @@ def _issue_from_row(
             start_frame=start_frame,
             end_frame=end_frame,
             hand_side=hand_side,
-            evidence_kind="check_result",
+            evidence_kind=evidence_kind,
         ),
         code=issue_type,
         severity=cast(Any, severity),
@@ -382,6 +398,300 @@ def adapt_quality_hand(
     )
 
 
+def _contiguous_ranges(frames: Sequence[int]) -> tuple[tuple[int, int], ...]:
+    ranges: list[list[int]] = []
+    for frame in sorted(set(int(value) for value in frames)):
+        if not ranges or frame > ranges[-1][1] + 1:
+            ranges.append([frame, frame])
+        else:
+            ranges[-1][1] = frame
+    return tuple((start, end) for start, end in ranges)
+
+
+def adapt_keypoint_presence(
+    *,
+    asset_id: str,
+    source_relative_path: str,
+    results: Sequence[CheckResult],
+    config: LoadedQcConfig,
+) -> ModuleResult:
+    """Adapt legacy per-frame keypoint-presence observations."""
+    relevant_rows = [
+        row
+        for row in results
+        if row.check in {"keypoint_missing", "skeleton_quality_score"}
+    ]
+
+    def explicitly_missing_keypoint_field(row: CheckResult) -> bool:
+        metrics = row.metrics
+        if "keypoint_field_present" in metrics:
+            return metrics["keypoint_field_present"] is False or metrics[
+                "keypoint_field_present"
+            ] == 0
+        return bool(
+            metrics.get("missing_keypoint_field")
+            or metrics.get("keypoint_field_missing")
+        )
+
+    missing_row = next(
+        (row for row in relevant_rows if explicitly_missing_keypoint_field(row)),
+        None,
+    )
+    if missing_row is not None:
+        missing_rule = _rule(
+            config,
+            "keypoint_presence",
+            "missing_keypoint_field",
+        )
+        issue = _issue_from_row(
+            asset_id=asset_id,
+            module="keypoint_presence",
+            source_relative_path=source_relative_path,
+            rule_id=str(missing_rule["rule_id"]),
+            row=missing_row,
+            severity=_rule_verdict(missing_rule),
+            needs_manual_review=False,
+            metric="keypoint_field_present",
+            observed_value=False,
+            operator="!=",
+            boundary_value=True,
+            hand_side=None,
+            frame_range=(None, None),
+        )
+        return ModuleResult(
+            module="keypoint_presence",
+            verdict=issue.severity,
+            evaluation={
+                "decision": issue.severity,
+                "checked_frame_count": 0,
+                "invalid_frame_count": 0,
+                "invalid_frame_ratio": 0.0,
+            },
+            metrics={"invalid_frame_ranges": ()},
+            issues=(issue,),
+        )
+
+    rows = [row for row in relevant_rows if row.frame_idx >= 0]
+    if not rows:
+        return ModuleResult(
+            module="keypoint_presence",
+            verdict="skipped",
+            evaluation={
+                "decision": "skipped",
+                "reason": "source_signal_not_provided",
+            },
+            metrics={},
+        )
+
+    parameters = config.module_parameters("keypoint_presence")
+    expected_count = float(parameters["expected_keypoints_per_hand"])
+    count_warn_boundary = float(parameters["min_valid_points_per_hand_warn"])
+    count_fail_boundary = float(parameters["min_valid_points_per_hand_fail"])
+    ratio_warn_boundary = float(parameters["missing_frame_ratio_warn"])
+    ratio_fail_boundary = float(parameters["missing_frame_ratio_fail"])
+    count_rule = _rule(config, "keypoint_presence", "too_few_valid_points")
+    ratio_rule = _rule(config, "keypoint_presence", "high_missing_frame_ratio")
+    nonfinite_rule = _rule(config, "keypoint_presence", "nan_or_inf")
+    observations: dict[tuple[str, int], dict[str, Any]] = {}
+    invalid_frames_by_hand = {"left": set(), "right": set()}
+    minimum_counts: dict[str, float] = {}
+
+    for row in rows:
+        for side in ("left", "right"):
+            observed = observations.setdefault(
+                (side, row.frame_idx),
+                {"counts": [], "ratios": [], "missing": False, "quality_low": False},
+            )
+            count = row.metrics.get(f"valid_keypoint_count_{side}")
+            if isinstance(count, Real):
+                observed["counts"].append(float(count))
+            ratio = row.metrics.get(f"missing_fraction_in_10s_window_{side}")
+            if isinstance(ratio, Real) and math.isfinite(float(ratio)):
+                observed["ratios"].append(float(ratio))
+            missing = row.metrics.get(f"missing_keypoint_count_{side}")
+            observed["missing"] |= isinstance(missing, Real) and float(missing) > 0
+            observed["quality_low"] |= bool(
+                row.metrics.get(f"quality_low_{side}", 0.0)
+            )
+
+    selected: dict[tuple[str, int], _PresenceFailure] = {}
+    for side in ("left", "right"):
+        count_metric = f"valid_keypoint_count_{side}"
+        ratio_metric = f"missing_fraction_in_10s_window_{side}"
+        side_observations = {
+            frame: observed
+            for (observed_side, frame), observed in observations.items()
+            if observed_side == side
+        }
+        finite_counts = [
+            value
+            for observed in side_observations.values()
+            for value in observed["counts"]
+            if math.isfinite(value)
+        ]
+        if finite_counts:
+            minimum_counts[side] = min(finite_counts)
+        side_structured_frames = {
+            frame
+            for frame, observed in side_observations.items()
+            if observed["counts"] or observed["missing"]
+        }
+        side_detector_invalid_frames = {
+            frame
+            for frame, observed in side_observations.items()
+            if observed["missing"]
+            or any(
+                not math.isfinite(value) or value < expected_count
+                for value in observed["counts"]
+            )
+        }
+        side_invalid_ratio = (
+            len(side_detector_invalid_frames) / len(side_structured_frames)
+            if side_structured_frames
+            else 0.0
+        )
+        for frame, observed in side_observations.items():
+            counts = observed["counts"]
+            nonfinite_counts = [value for value in counts if not math.isfinite(value)]
+            finite_frame_counts = [value for value in counts if math.isfinite(value)]
+            count = min(finite_frame_counts, default=expected_count)
+            explicit_ratio = max(observed["ratios"], default=-math.inf)
+            aggregate_ratio = (
+                side_invalid_ratio
+                if frame in side_detector_invalid_frames
+                else -math.inf
+            )
+            ratio = max(explicit_ratio, aggregate_ratio)
+            failure: _PresenceFailure | None = None
+            if nonfinite_counts and parameters["nan_or_inf_fail"]:
+                failure = _PresenceFailure(
+                    side, frame, "fail", nonfinite_rule, count_metric,
+                    _json_safe_observed(nonfinite_counts[0]), "is_finite", True,
+                )
+            elif count < count_fail_boundary:
+                failure = _PresenceFailure(
+                    side, frame, "fail", count_rule, count_metric, count,
+                    "<", count_fail_boundary,
+                )
+            elif ratio >= ratio_fail_boundary:
+                metric = ratio_metric if explicit_ratio >= aggregate_ratio else f"invalid_frame_ratio_{side}"
+                failure = _PresenceFailure(
+                    side, frame, "fail", ratio_rule, metric, ratio,
+                    ">=", ratio_fail_boundary,
+                )
+            elif count < count_warn_boundary:
+                failure = _PresenceFailure(
+                    side, frame, "warn", count_rule, count_metric, count,
+                    "<", count_warn_boundary,
+                )
+            elif ratio >= ratio_warn_boundary:
+                metric = ratio_metric if explicit_ratio >= aggregate_ratio else f"invalid_frame_ratio_{side}"
+                failure = _PresenceFailure(
+                    side, frame, "warn", ratio_rule, metric, ratio,
+                    ">=", ratio_warn_boundary,
+                )
+            if failure is not None:
+                selected[(side, frame)] = failure
+            if observed["quality_low"] or observed["ratios"] and max(observed["ratios"]) >= ratio_warn_boundary:
+                invalid_frames_by_hand[side].add(frame)
+        invalid_frames_by_hand[side].update(side_detector_invalid_frames)
+
+    checked_frames = {row.frame_idx for row in rows}
+    invalid_frames = set().union(*invalid_frames_by_hand.values())
+    invalid_frames.update(
+        row.frame_idx
+        for row in rows
+        if (
+            row.check == "skeleton_quality_score"
+            and bool(row.metrics.get("keypoint_presence_invalid", 0.0))
+        )
+        or (row.check == "keypoint_missing" and row.flag is True)
+    )
+
+    grouped: dict[tuple[Any, ...], list[_PresenceFailure]] = {}
+    for failure in selected.values():
+        key = (
+            failure.side,
+            failure.severity,
+            str(failure.rule["rule_id"]),
+            failure.metric,
+            failure.operator,
+            str(failure.boundary),
+        )
+        grouped.setdefault(key, []).append(failure)
+
+    issues: list[Issue] = []
+    for compatible_failures in grouped.values():
+        example = compatible_failures[0]
+        by_frame = {failure.frame: failure for failure in compatible_failures}
+        for start_frame, end_frame in _contiguous_ranges(tuple(by_frame)):
+            observed_values = [
+                by_frame[frame].observed
+                for frame in range(start_frame, end_frame + 1)
+            ]
+            if example.operator == "<":
+                observed_value = min(observed_values)
+            elif example.operator == ">=":
+                observed_value = max(observed_values)
+            else:
+                unique_values = sorted(set(observed_values))
+                observed_value = (
+                    unique_values[0]
+                    if len(unique_values) == 1
+                    else unique_values
+                )
+            issues.append(
+                _issue_from_row(
+                    asset_id=asset_id,
+                    module="keypoint_presence",
+                    source_relative_path=source_relative_path,
+                    rule_id=str(example.rule["rule_id"]),
+                    row=rows[0],
+                    severity=example.severity,
+                    needs_manual_review=example.severity == "warn",
+                    metric=example.metric,
+                    observed_value=observed_value,
+                    operator=example.operator,
+                    boundary_value=example.boundary,
+                    hand_side=example.side,
+                    frame_range=(start_frame, end_frame),
+                )
+            )
+
+    issues.sort(
+        key=lambda issue: (
+            int(issue.context["start_frame"]),
+            int(issue.context["end_frame"]),
+            str(issue.context["hand_side"]),
+            issue.rule_id,
+            issue.severity,
+        )
+    )
+    verdict = _worst("pass", *(issue.severity for issue in issues))
+    return ModuleResult(
+        module="keypoint_presence",
+        verdict=verdict,
+        evaluation={
+            "decision": verdict,
+            "checked_frame_count": len(checked_frames),
+            "invalid_frame_count": len(invalid_frames),
+            "invalid_frame_ratio": len(invalid_frames) / len(checked_frames),
+        },
+        metrics={
+            **{
+                f"min_valid_keypoint_count_{side}": value
+                for side, value in minimum_counts.items()
+            },
+            "invalid_frame_ranges": _contiguous_ranges(tuple(invalid_frames)),
+            "invalid_frame_ranges_by_hand": {
+                side: _contiguous_ranges(tuple(side_frames))
+                for side, side_frames in invalid_frames_by_hand.items()
+            },
+        },
+        issues=tuple(issues),
+    )
+
+
 def _config_from_parameters(
     cls: type[_ConfigType],
     parameters: Mapping[str, Any],
@@ -437,7 +747,9 @@ def precheck_config_from_unified(
 
 
 __all__ = [
+    "_contiguous_ranges",
     "adapt_hdf5_text_info",
+    "adapt_keypoint_presence",
     "adapt_quality_hand",
     "precheck_config_from_unified",
 ]

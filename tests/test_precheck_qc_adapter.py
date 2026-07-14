@@ -16,7 +16,9 @@ from precheck.config import (
 )
 from qc_common.types import CheckResult
 from qc_pipeline.adapters.precheck import (
+    _contiguous_ranges,
     adapt_hdf5_text_info,
+    adapt_keypoint_presence,
     adapt_quality_hand,
     precheck_config_from_unified,
 )
@@ -257,6 +259,295 @@ def test_quality_hand_issue_ids_are_stable() -> None:
     second = adapt_quality_hand(**kwargs)
 
     assert first.issues[0].issue_id == second.issues[0].issue_id
+
+
+def test_presence_merges_contiguous_invalid_frames_into_one_issue() -> None:
+    rows = [
+        CheckResult(
+            "skeleton_quality_score",
+            0,
+            frame,
+            {
+                "keypoint_presence_invalid": 1.0,
+                "valid_keypoint_count_left": 7.0,
+                "valid_keypoint_count_right": 21.0,
+            },
+            True,
+            "presence invalid",
+        )
+        for frame in (10, 11, 12)
+    ]
+
+    result = adapt_keypoint_presence(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "fail"
+    assert len(result.issues) == 1
+    assert result.issues[0].context == {
+        "coordinate_system": "source_inclusive",
+        "start_frame": 10,
+        "end_frame": 12,
+        "hand_side": "left",
+    }
+    repeated = adapt_keypoint_presence(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+    assert repeated.issues[0].issue_id == result.issues[0].issue_id
+
+
+@pytest.mark.parametrize(
+    ("invalid_value", "serialized"),
+    [(float("nan"), "nan"), (float("inf"), "inf")],
+)
+def test_presence_nonfinite_valid_count_maps_to_hard_fail(
+    invalid_value: float,
+    serialized: str,
+) -> None:
+    row = CheckResult(
+        "skeleton_quality_score",
+        0,
+        5,
+        {
+            "keypoint_presence_invalid": 1.0,
+            "valid_keypoint_count_left": invalid_value,
+            "valid_keypoint_count_right": 21.0,
+        },
+        True,
+        "presence invalid",
+    )
+
+    result = adapt_keypoint_presence(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[row],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "fail"
+    assert result.issues[0].rule_id == "keypoint_presence.nan_or_inf"
+    assert result.issues[0].observed_value == serialized
+    assert result.issues[0].context["hand_side"] == "left"
+
+
+def test_presence_missing_ratio_warn_becomes_manual_candidate() -> None:
+    rows = [
+        CheckResult(
+            "keypoint_missing",
+            0,
+            frame,
+            {
+                "quality_low_left": 1.0,
+                "quality_low_right": 0.0,
+                "missing_fraction_in_10s_window_left": 0.1,
+                "missing_fraction_in_10s_window_right": 0.0,
+            },
+            True,
+            "missing ratio above warn boundary",
+        )
+        for frame in (20, 21)
+    ]
+
+    result = adapt_keypoint_presence(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "warn"
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_id == "keypoint_presence.high_missing_frame_ratio"
+    assert result.issues[0].needs_manual_review is True
+    assert result.issues[0].context == {
+        "coordinate_system": "source_inclusive",
+        "start_frame": 20,
+        "end_frame": 21,
+        "hand_side": "left",
+    }
+
+
+def test_presence_keeps_only_worst_compatible_failure_per_frame() -> None:
+    rows = [
+        CheckResult(
+            "skeleton_quality_score",
+            0,
+            10,
+            {
+                "keypoint_presence_invalid": 1.0,
+                "valid_keypoint_count_left": 9.0,
+                "valid_keypoint_count_right": 21.0,
+            },
+            True,
+            "count warning",
+        ),
+        CheckResult(
+            "keypoint_missing",
+            0,
+            10,
+            {
+                "quality_low_left": 1.0,
+                "quality_low_right": 0.0,
+                "missing_fraction_in_10s_window_left": 0.25,
+                "missing_fraction_in_10s_window_right": 0.0,
+            },
+            True,
+            "ratio failure",
+        ),
+    ]
+
+    result = adapt_keypoint_presence(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "fail"
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_id == "keypoint_presence.high_missing_frame_ratio"
+    assert result.issues[0].context["start_frame"] == 10
+    assert result.issues[0].context["end_frame"] == 10
+
+
+def test_presence_only_merges_contiguous_compatible_failures() -> None:
+    rows = [
+        CheckResult(
+            "skeleton_quality_score",
+            0,
+            frame,
+            {
+                "keypoint_presence_invalid": 1.0,
+                "valid_keypoint_count_left": count,
+                "valid_keypoint_count_right": 21.0,
+            },
+            True,
+            "presence invalid",
+        )
+        for frame, count in ((12, 7.0), (10, 7.0), (11, 9.0))
+    ]
+    rows.extend(
+        CheckResult(
+            "skeleton_quality_score",
+            0,
+            frame,
+            {
+                "keypoint_presence_invalid": 0.0,
+                "valid_keypoint_count_left": 21.0,
+                "valid_keypoint_count_right": 21.0,
+            },
+            None,
+            "presence valid",
+        )
+        for frame in range(20)
+        if frame not in {10, 11, 12}
+    )
+
+    result = adapt_keypoint_presence(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert [issue.context["start_frame"] for issue in result.issues] == [
+        10,
+        11,
+        12,
+    ]
+    assert [issue.severity for issue in result.issues] == ["fail", "warn", "fail"]
+    assert all(
+        issue.context["start_frame"] == issue.context["end_frame"]
+        for issue in result.issues
+    )
+
+
+def test_presence_explicit_missing_keypoint_field_maps_to_hard_fail() -> None:
+    result = adapt_keypoint_presence(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[
+            CheckResult(
+                "skeleton_quality_score",
+                0,
+                -1,
+                {"keypoint_field_present": 0.0},
+                True,
+                "explicit source structure signal",
+            )
+        ],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "fail"
+    assert result.issues[0].rule_id == "keypoint_presence.missing_keypoint_field"
+    assert result.issues[0].needs_manual_review is False
+    assert result.issues[0].context == {
+        "coordinate_system": "source_inclusive",
+        "start_frame": None,
+        "end_frame": None,
+        "hand_side": None,
+    }
+
+
+def test_presence_uses_detector_invalid_frame_ratio_for_warn() -> None:
+    rows = [
+        CheckResult(
+            "skeleton_quality_score",
+            0,
+            frame,
+            {
+                "keypoint_presence_invalid": float(frame in {3, 4}),
+                "valid_keypoint_count_left": 20.0 if frame in {3, 4} else 21.0,
+                "valid_keypoint_count_right": 21.0,
+            },
+            True if frame in {3, 4} else None,
+            "per-frame presence",
+        )
+        for frame in range(20)
+    ]
+
+    result = adapt_keypoint_presence(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "warn"
+    assert result.evaluation["checked_frame_count"] == 20
+    assert result.evaluation["invalid_frame_count"] == 2
+    assert result.evaluation["invalid_frame_ratio"] == pytest.approx(0.1)
+    assert result.metrics["invalid_frame_ranges_by_hand"] == {
+        "left": ((3, 4),),
+        "right": (),
+    }
+    assert result.issues[0].rule_id == "keypoint_presence.high_missing_frame_ratio"
+    assert result.issues[0].context["start_frame"] == 3
+    assert result.issues[0].context["end_frame"] == 4
+
+
+def test_presence_does_not_infer_missing_keypoints_from_absent_quality_hand() -> None:
+    result = adapt_keypoint_presence(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "skipped"
+    assert result.evaluation["reason"] == "source_signal_not_provided"
+    assert result.issues == ()
+
+
+def test_contiguous_ranges_sorts_deduplicates_and_preserves_gaps() -> None:
+    assert _contiguous_ranges((8, 5, 6, 6, 10)) == ((5, 6), (8, 8), (10, 10))
 
 
 def _expected_dataclass_values(cls: type[object], parameters: dict[str, object]) -> dict[str, object]:
