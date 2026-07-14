@@ -774,6 +774,8 @@ def write_pipeline_transition(
     overall_decision: str | None,
     now: str,
 ) -> dict[str, Any]:
+    if state == "error":
+        raise ValueError("error transitions must use record_runtime_error")
     loaded = load_asset_qc_report(path)
     if loaded is None:
         raise FileNotFoundError(path)
@@ -802,11 +804,6 @@ def write_pipeline_transition(
     if not isinstance(execution, dict):
         raise ValueError("execution must be an object")
     execution["updated_at"] = now
-    if state == "error" and stop_reason:
-        runtime_errors = report.get("runtime_errors")
-        if not isinstance(runtime_errors, list):
-            raise ValueError("runtime_errors must be an array")
-        runtime_errors.append({"module": module, "message": stop_reason})
 
     report["report_revision"] = expected_revision + 1
     profile = execution.get("profile")

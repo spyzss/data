@@ -31,7 +31,7 @@
     },
     "runtime_errors": {
       "type": "array",
-      "items": {"type": "object", "additionalProperties": true}
+      "items": {"$ref": "#/$defs/runtimeError"}
     },
     "manual_review": {"$ref": "#/$defs/manualReview"},
     "hdf5_text_info": {"type": "object"},
@@ -168,7 +168,48 @@
       "properties": {
         "profile": {"type": "string", "minLength": 1},
         "started_at": {"type": ["string", "null"]},
-        "updated_at": {"type": ["string", "null"]}
+        "updated_at": {"type": ["string", "null"]},
+        "module_states": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/moduleState"}
+        }
+      }
+    },
+    "moduleState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "enum": [
+            "completed",
+            "disabled",
+            "skipped",
+            "not_implemented",
+            "runtime_error",
+            "awaiting_external",
+            "skipped_due_to_fail"
+          ]
+        },
+        "reason": {"type": "string", "minLength": 1}
+      }
+    },
+    "runtimeError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "module",
+        "error_type",
+        "message",
+        "occurred_at",
+        "retryable"
+      ],
+      "properties": {
+        "module": {"type": "string", "minLength": 1},
+        "error_type": {"type": "string", "minLength": 1},
+        "message": {"type": "string", "minLength": 1},
+        "occurred_at": {"type": "string", "minLength": 1},
+        "retryable": {"type": "boolean"}
       }
     },
     "pipelineState": {
