@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -212,7 +213,12 @@ def _module_block(
     exit_state: str,
     continue_to_next: bool,
     next_module: str | None,
+    continued_after_fail: bool,
 ) -> dict[str, Any]:
+    runtime = copy.deepcopy(dict(result.runtime))
+    runtime.pop("continued_after_fail", None)
+    if continued_after_fail:
+        runtime["continued_after_fail"] = True
     return {
         "flow": {
             "entry_gate": {
@@ -237,7 +243,7 @@ def _module_block(
         "evaluation": copy.deepcopy(dict(result.evaluation)),
         "metrics": copy.deepcopy(dict(result.metrics)),
         "evidence": evidence,
-        "runtime": copy.deepcopy(dict(result.runtime)),
+        "runtime": runtime,
     }
 
 
@@ -341,6 +347,37 @@ def _has_machine_fail(
     return False
 
 
+def mark_remaining_skipped_due_to_fail(
+    report: dict[str, Any],
+    modules: Sequence[str],
+    *,
+    failed_module: str,
+) -> dict[str, Any]:
+    """Return a copy with all configured successors marked as fail-skipped."""
+    try:
+        failed_index = modules.index(failed_module)
+    except ValueError:
+        raise ValueError(
+            f"failed module is not in configured pipeline: {failed_module}"
+        ) from None
+
+    marked = copy.deepcopy(report)
+    execution = marked.get("execution")
+    if not isinstance(execution, dict):
+        raise ValueError("execution must be an object")
+    module_states = execution.setdefault("module_states", {})
+    if not isinstance(module_states, dict):
+        raise ValueError("execution.module_states must be an object")
+    for module in modules[failed_index + 1 :]:
+        module_states[module] = {"state": "skipped_due_to_fail"}
+
+    manual_review = marked.get("manual_review")
+    if not isinstance(manual_review, dict):
+        raise ValueError("manual_review must be an object")
+    manual_review["state"] = "skipped_due_to_fail"
+    return marked
+
+
 def apply_module_result(
     path: Path,
     *,
@@ -351,6 +388,7 @@ def apply_module_result(
     expected_revision: int,
     next_module: str | None,
     now: str,
+    mark_remaining_skipped_on_stop: bool = False,
 ) -> dict[str, Any]:
     _assert_same_report_path(path, context)
     profile_config = config.execution_profile(profile)
@@ -389,6 +427,7 @@ def apply_module_result(
     owned_issues = _preflight_owned_issues(result)
     evidence = _preflight_evidence(context, result)
     hard_stop = result.verdict == "fail" and profile_config["fail_action"] == "stop"
+    continued_after_fail = result.verdict == "fail" and not hard_stop
     continue_to_next = not hard_stop
     exit_state = "continue" if continue_to_next else "stop_qc"
     module_block = _module_block(
@@ -397,6 +436,7 @@ def apply_module_result(
         exit_state=exit_state,
         continue_to_next=continue_to_next,
         next_module=None if hard_stop else next_module,
+        continued_after_fail=continued_after_fail,
     )
     try:
         json.dumps(module_block, ensure_ascii=False, allow_nan=False)
@@ -447,6 +487,13 @@ def apply_module_result(
         )
     else:
         report["overall_decision"] = None
+
+    if hard_stop and mark_remaining_skipped_on_stop:
+        report = mark_remaining_skipped_due_to_fail(
+            report,
+            config.pipeline_modules,
+            failed_module=result.module,
+        )
 
     report["report_revision"] = expected_revision + 1
     write_asset_qc_report(

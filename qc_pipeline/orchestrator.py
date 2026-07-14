@@ -136,6 +136,7 @@ def run_asset(
             expected_revision=expected_revision,
             next_module=_successor(config.pipeline_modules, module_name),
             now=timestamp,
+            mark_remaining_skipped_on_stop=True,
         )
         executed.append(module_name)
         if report["pipeline_state"]["status"] in _TERMINAL_STATUSES:

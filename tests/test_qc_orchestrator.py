@@ -5,15 +5,17 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
 from qc_common.config import LoadedQcConfig
-from qc_common.contracts import ModuleResult
+from qc_common.contracts import Issue, ModuleResult
 from qc_common.module_registry import ModuleRegistry, ModuleUnavailableError
 from qc_common.report_mutation import (
     ConfigDriftError,
     apply_module_result,
+    mark_remaining_skipped_due_to_fail,
     record_awaiting_external,
 )
 from qc_pipeline.context import AssetContext
@@ -122,6 +124,65 @@ def _registry(
     return registry
 
 
+def _run_stub_pipeline(
+    tmp_path: Path,
+    *,
+    profile: str,
+    modules: list[str],
+    verdicts: dict[str, str],
+) -> tuple[dict[str, Any], list[str]]:
+    config = _config(tmp_path, modules)
+    calls: list[str] = []
+    registry = ModuleRegistry()
+    for module_name, verdict in verdicts.items():
+        implementation = str(config.module_config(module_name)["implementation"])
+
+        def run(
+            context: AssetContext,
+            loaded: LoadedQcConfig,
+            *,
+            module_name: str = module_name,
+            verdict: str = verdict,
+        ) -> ModuleResult:
+            assert loaded is config
+            calls.append(module_name)
+            issues = ()
+            if verdict == "fail":
+                issues = (
+                    Issue(
+                        f"{module_name}:failure:11111111111111111111",
+                        "failure",
+                        "fail",
+                        module_name,
+                        "test_failure",
+                        "failure_metric",
+                        1,
+                        ">",
+                        0,
+                        f"{module_name}.failure",
+                        False,
+                    ),
+                )
+            return ModuleResult(
+                module_name,
+                verdict,
+                {"decision": verdict},
+                {},
+                issues,
+            )
+
+        registry.register(implementation, run)
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile=profile,
+        registry=registry,
+        now=lambda: "2026-07-14T00:00:00Z",
+    )
+    return outcome.report, calls
+
+
 def test_registry_resolves_config_implementation_names() -> None:
     registry = ModuleRegistry()
     runner = lambda context, config: ModuleResult("quality_hand", "pass", {}, {})
@@ -185,6 +246,7 @@ def test_orchestrator_runs_in_config_order_and_retains_external_pause(
     }
     assert first.report["report_revision"] == 3
     assert "semantic_consistency" not in first.report
+    assert first.report["manual_review"]["state"] == "not_evaluated"
 
     calls.clear()
     second = run_asset(
@@ -199,6 +261,131 @@ def test_orchestrator_runs_in_config_order_and_retains_external_pause(
     assert second.status == "awaiting_external"
     assert second.report["report_revision"] == first.report["report_revision"]
     assert second.report["execution"]["updated_at"] == "2026-07-14T00:00:00Z"
+
+
+def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
+    modules = [
+        "hdf5_text_info",
+        "video_quality",
+        "sam3_containment",
+        "semantic_consistency",
+        "manual_review",
+    ]
+    verdicts = {
+        "hdf5_text_info": "pass",
+        "video_quality": "fail",
+        "sam3_containment": "pass",
+    }
+
+    acceptance, acceptance_calls = _run_stub_pipeline(
+        tmp_path / "acceptance",
+        profile="acceptance",
+        modules=modules,
+        verdicts=verdicts,
+    )
+    supplier, supplier_calls = _run_stub_pipeline(
+        tmp_path / "supplier",
+        profile="supplier_evaluation",
+        modules=modules,
+        verdicts=verdicts,
+    )
+
+    assert acceptance_calls == ["hdf5_text_info", "video_quality"]
+    assert supplier_calls == [
+        "hdf5_text_info",
+        "video_quality",
+        "sam3_containment",
+    ]
+    assert acceptance["video_quality"]["flow"]["result_gate"]["verdict"] == "fail"
+    assert supplier["video_quality"]["flow"]["result_gate"]["verdict"] == "fail"
+    assert acceptance["issues"] == supplier["issues"]
+    failure_ids = ["video_quality:failure:11111111111111111111"]
+    assert (
+        acceptance["manual_review"]["failures_for_batch_stats_issue_ids"]
+        == failure_ids
+    )
+    assert (
+        supplier["manual_review"]["failures_for_batch_stats_issue_ids"]
+        == failure_ids
+    )
+    assert acceptance["pipeline_state"]["status"] == "stopped"
+    assert acceptance["overall_decision"] == "fail"
+    assert acceptance["manual_review"]["state"] == "skipped_due_to_fail"
+    assert "sam3_containment" not in acceptance
+    assert "semantic_consistency" not in acceptance
+    assert acceptance["execution"]["module_states"] == {
+        "sam3_containment": {"state": "skipped_due_to_fail"},
+        "semantic_consistency": {"state": "skipped_due_to_fail"},
+        "manual_review": {"state": "skipped_due_to_fail"},
+    }
+    assert "continued_after_fail" not in acceptance["video_quality"]["runtime"]
+    assert supplier["video_quality"]["flow"]["exit_gate"]["state"] == "continue"
+    assert supplier["video_quality"]["runtime"]["continued_after_fail"] is True
+    assert supplier["sam3_containment"]["flow"]["result_gate"]["verdict"] == "pass"
+    assert "continued_after_fail" not in supplier["sam3_containment"]["runtime"]
+    assert supplier["pipeline_state"]["status"] == "awaiting_external"
+    assert "semantic_consistency" not in supplier
+    assert supplier["overall_decision"] is None
+    assert supplier["manual_review"]["state"] == "not_evaluated"
+    assert acceptance["report_revision"] == 2
+    assert supplier["report_revision"] == 4
+    acceptance_path = _context(tmp_path / "acceptance").report_path
+    supplier_path = _context(tmp_path / "supplier").report_path
+    assert json.loads(acceptance_path.read_text(encoding="utf-8")) == acceptance
+    assert json.loads(supplier_path.read_text(encoding="utf-8")) == supplier
+
+
+def test_fail_skip_marking_is_copy_on_write_and_config_ordered() -> None:
+    original = {
+        "execution": {"profile": "acceptance"},
+        "manual_review": {"state": "not_evaluated"},
+    }
+    before = copy.deepcopy(original)
+
+    marked = mark_remaining_skipped_due_to_fail(
+        original,
+        ("hdf5_text_info", "video_quality", "semantic_consistency"),
+        failed_module="hdf5_text_info",
+    )
+
+    assert original == before
+    assert marked["execution"]["module_states"] == {
+        "video_quality": {"state": "skipped_due_to_fail"},
+        "semantic_consistency": {"state": "skipped_due_to_fail"},
+    }
+    assert marked["manual_review"]["state"] == "skipped_due_to_fail"
+
+
+def test_supplier_profile_preserves_prior_fail_at_automatic_completion(
+    tmp_path: Path,
+) -> None:
+    report, calls = _run_stub_pipeline(
+        tmp_path,
+        profile="supplier_evaluation",
+        modules=["hdf5_text_info", "sam3_containment"],
+        verdicts={"hdf5_text_info": "fail", "sam3_containment": "pass"},
+    )
+
+    assert calls == ["hdf5_text_info", "sam3_containment"]
+    assert report["pipeline_state"]["status"] == "completed"
+    assert report["overall_decision"] == "fail"
+
+
+def test_unknown_profile_is_rejected_before_runner_work(tmp_path: Path) -> None:
+    config = _config(tmp_path, ["hdf5_text_info"])
+    context = _context(tmp_path)
+    calls: list[str] = []
+
+    with pytest.raises(ValueError, match="unknown execution profile"):
+        run_asset(
+            context,
+            config=config,
+            profile="unexpected",
+            registry=_registry(calls, config, {"hdf5_text_info": "pass"}),
+        )
+
+    assert calls == []
+    assert not context.report_path.exists()
 
 
 def test_fresh_asset_starts_at_first_configured_module(tmp_path: Path) -> None:
