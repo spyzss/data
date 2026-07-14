@@ -960,7 +960,7 @@ git commit -m "feat(qc): adapt sam3 containment evidence"
 - Produces: `build_default_registry(context: AssetContext, config: LoadedQcConfig, *, segmenter_factory: Callable | None = None) -> ModuleRegistry`，注册五个 precheck、统一 video 与 SAM3 runner；每个资产 worker 构建独立 registry。
 - Produces: `run_asset(context: AssetContext, *, config: LoadedQcConfig, profile: str, registry: ModuleRegistry, now: Callable[[], str] = utc_now) -> RunOutcome`。
 
-- [ ] **Step 1: 添加顺序、恢复、external pause 和 Config drift 测试**
+- [x] **Step 1: 添加顺序、恢复、external pause 和 Config drift 测试**
 
 ```python
 def test_orchestrator_resumes_from_next_module(tmp_path: Path) -> None:
@@ -980,13 +980,13 @@ def test_asset_context_rejects_report_outside_batch(tmp_path: Path) -> None:
         AssetContext("a", tmp_path / "batch", tmp_path / "outside.json", {}, None, {})
 ```
 
-- [ ] **Step 2: 运行测试并确认 orchestrator/registry 缺失**
+- [x] **Step 2: 运行测试并确认 orchestrator/registry 缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_pipeline.orchestrator'`。
 
-- [ ] **Step 3: 实现 registry 与恢复循环**
+- [x] **Step 3: 实现 registry 与恢复循环**
 
 ```python
 def run_asset(context, *, config, profile, registry, now=utc_now):
@@ -1016,13 +1016,13 @@ CLI 必须接受 `--batch-root`、`--manifest`、`--profile {acceptance,supplier
 
 `build_default_registry()` 的注册必须是实际 detector 调用，不是 sidecar reader：precheck runner 由 `precheck_config_from_unified()` 构造并将 CheckResult 交给 Tasks 5–8 adapter；video runner 调用 `analyze_video`/`analyze_video_frame_range` 后交给 Task 9 adapter；SAM3 runner 调用 manifest containment producer 后交给 Task 10 adapter。runner 只返回 `ModuleResult`，不得自行决定 next module 或 overall decision。
 
-- [ ] **Step 4: 运行 orchestrator、Config 与 mutation 测试**
+- [x] **Step 4: 运行 orchestrator、Config 与 mutation 测试**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py tests/test_qc_config_v2.py tests/test_report_mutation.py -q`
 
 Expected: PASS；恢复点来自 `next_module`，external 阶段不会被自动执行。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_common/module_registry.py qc_pipeline/context.py qc_pipeline/orchestrator.py tools/run_qc_pipeline.py tests/test_qc_orchestrator.py
@@ -1041,7 +1041,7 @@ git commit -m "feat(qc): add resumable asset orchestrator"
 - Produces: 相同 `ModuleResult.verdict="fail"` 在 acceptance 生成 `exit_gate.state="stop_qc"`，在 supplier evaluation 生成 `exit_gate.state="continue"` 与 `continued_after_fail=True`。
 - Produces: `mark_remaining_skipped_due_to_fail(report, modules, *, failed_module) -> dict[str, Any]`。
 
-- [ ] **Step 1: 添加同输入双 profile 状态轨迹测试**
+- [x] **Step 1: 添加同输入双 profile 状态轨迹测试**
 
 ```python
 def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
@@ -1059,13 +1059,13 @@ def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
     assert supplier["pipeline_state"]["status"] == "awaiting_external"
 ```
 
-- [ ] **Step 2: 运行双 profile 测试并确认 supplier 被错误截断**
+- [x] **Step 2: 运行双 profile 测试并确认 supplier 被错误截断**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py -k profiles -q`
 
 Expected: FAIL，supplier report 在 video fail 后没有执行 SAM3。
 
-- [ ] **Step 3: 将机器 verdict 与 exit action 分离**
+- [x] **Step 3: 将机器 verdict 与 exit action 分离**
 
 ```python
 profile_config = config.execution_profile(profile)
@@ -1076,13 +1076,13 @@ continued_after_fail = result.verdict == "fail" and not stop
 
 Acceptance 截断时 `pipeline_state={status: stopped, last_completed_module: failed_module, next_module: None, stop_reason: hard_fail}`、`overall_decision=fail`、`manual_review.state=skipped_due_to_fail`，并在 `execution.module_states` 给所有后续模块记录 `skipped_due_to_fail`。Supplier 模式保留 fail issue/candidate 统计引用，在每个相关 module runtime 写 `continued_after_fail: true`，到 external 阶段才暂停，最终依赖人工阶段完成后仍必须因自动 fail 得到 fail。
 
-- [ ] **Step 4: 验证双 profile 与稳定 issue 一致**
+- [x] **Step 4: 验证双 profile 与稳定 issue 一致**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py tests/test_report_mutation.py -q`
 
 Expected: PASS；两个 profile 的机器 issue ID、result verdict 相同，仅 exit/action/coverage 不同。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_pipeline/orchestrator.py qc_common/report_mutation.py tests/test_qc_orchestrator.py
@@ -1103,7 +1103,7 @@ git commit -m "feat(qc): apply dual execution profiles"
 - Produces: `record_runtime_error(path, *, module, error_type, message, expected_revision, context, config, profile, now) -> dict[str, Any]`。
 - Report `execution.module_states[module].state` 枚举：`completed|disabled|skipped|not_implemented|runtime_error|awaiting_external|skipped_due_to_fail`。
 
-- [ ] **Step 1: 添加四类状态与 runtime error 非质量结论测试**
+- [x] **Step 1: 添加四类状态与 runtime error 非质量结论测试**
 
 ```python
 def test_enabled_unregistered_module_is_error_not_pass(tmp_path: Path) -> None:
@@ -1119,13 +1119,13 @@ def test_disabled_module_is_recorded_without_module_pass_block(tmp_path: Path) -
     assert "effective_duration" not in report
 ```
 
-- [ ] **Step 2: 运行测试并确认状态混淆**
+- [x] **Step 2: 运行测试并确认状态混淆**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py -k "unregistered or disabled or runtime" -q`
 
 Expected: FAIL，缺少结构化 `module_states`/`runtime_errors`。
 
-- [ ] **Step 3: 实现结构化运行错误路径**
+- [x] **Step 3: 实现结构化运行错误路径**
 
 ```python
 runtime_error = {
@@ -1142,13 +1142,13 @@ report["overall_decision"] = None
 
 Disabled 模块只写 `module_states`；上游 skip 写 `skipped`；enabled 但 registry 缺失写 `not_implemented` + runtime error；runner exception、输入缺失、evidence/sidecar 写失败写 `runtime_error`。单资产异常由 batch worker 捕获并返回 error outcome，不取消其他 asset future。
 
-- [ ] **Step 4: 运行状态机、Schema 和批次隔离测试**
+- [x] **Step 4: 运行状态机、Schema 和批次隔离测试**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py tests/test_asset_qc_schema_v2.py -q`
 
 Expected: PASS；所有 error report 的 decision 为 null，disabled/unavailable 不产生 module pass block。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_common/contracts.py qc_common/module_registry.py qc_common/report_mutation.py qc_pipeline/orchestrator.py tests/test_qc_orchestrator.py

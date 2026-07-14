@@ -34,3 +34,15 @@
 - OpenSpec checkoff: 1.1–1.3 and 2.1–2.6 complete
 - Current phase: checkoff
 - Review: Thorough combined Task 8–10 approved after final round 2; no open findings
+- Task 11: implemented with concern (`2415890`), focused `118 passed`, full suite `517 passed, 1 skipped`; disabled-leading custom config deferred to Task 13
+- Task 12: implemented (`3b137f6`), full suite `521 passed, 1 skipped`
+- Task 13: implemented with concern (`df7d777`), focused `60 passed`, full suite `532 passed, 1 skipped`; combined review requires fixes
+- Current phase: implementing fixes
+- Review round 1A: Task 13 CAS/error-schema fixes committed (`0bc30cf`), focused `87 passed`, full suite `543 passed, 1 skipped`; Task 11 context/report/batch isolation and Task 12 trailing-disabled reducer remain
+- Review round 1B: Task 11 isolation fixes committed (`375d39e`), focused `39 passed`, full suite `548 passed, 1 skipped`; malformed-report bytes preserved with in-memory structured error outcome
+- Review round 1C: Task 12 supplier reducer fix committed (`401d9ce`), focused `56 passed`, full suite `549 passed, 1 skipped`; module result gates now participate in final reduction
+- Review round: Task 11–13 round 1 — `review-11-13-round1-final.md` found one Important nested source_files JSON identity/serialization mismatch
+- Review round 2 fix: Task 11 JSON identity normalization committed (`f0a2ea2`), focused `58 passed`, full suite `550 passed, 1 skipped`; nested non-JSON source values rejected explicitly
+- Review round 2: final Thorough approval in `.superpowers/sdd/review-11-13-round2-final.md`; focused `95 passed`, full suite `551 passed, 1 skipped`, no Critical/Important findings; one out-of-contract nested non-string-key Minor noted
+- OpenSpec checkoff: 3.1–3.4 complete; plan Task 11–13 implementation steps checked
+- Current phase: build

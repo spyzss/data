@@ -15,10 +15,10 @@
 
 ## 3. 统一编排与执行策略
 
-- [ ] 3.1 实现按版本化配置和 registry 运行的资产级 orchestrator，并支持从 `next_module` 恢复
-- [ ] 3.2 实现 acceptance profile 的 hard-fail 截断、后续阶段跳过和最终 fail
-- [ ] 3.3 实现 supplier_evaluation profile 的 fail 记录后继续、完整执行轨迹和最终 fail 保留
-- [ ] 3.4 对 disabled、skipped、not_implemented 和 runtime error 建立互不混淆的状态与测试
+- [x] 3.1 实现按版本化配置和 registry 运行的资产级 orchestrator，并支持从 `next_module` 恢复
+- [x] 3.2 实现 acceptance profile 的 hard-fail 截断、后续阶段跳过和最终 fail
+- [x] 3.3 实现 supplier_evaluation profile 的 fail 记录后继续、完整执行轨迹和最终 fail 保留
+- [x] 3.4 对 disabled、skipped、not_implemented 和 runtime error 建立互不混淆的状态与测试
 
 ## 4. 人工路由输入与批次投影
 
