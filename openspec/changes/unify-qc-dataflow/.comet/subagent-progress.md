@@ -45,4 +45,6 @@
 - Review round 2 fix: Task 11 JSON identity normalization committed (`f0a2ea2`), focused `58 passed`, full suite `550 passed, 1 skipped`; nested non-JSON source values rejected explicitly
 - Review round 2: final Thorough approval in `.superpowers/sdd/review-11-13-round2-final.md`; focused `95 passed`, full suite `551 passed, 1 skipped`, no Critical/Important findings; one out-of-contract nested non-string-key Minor noted
 - OpenSpec checkoff: 3.1–3.4 complete; plan Task 11–13 implementation steps checked
+- Task 14: complete (`ad2b500`, path hardening `164c0d9`, fix `e775638`), final Thorough review Ready in `.superpowers/sdd/review-task14-after-fix.md`; focused `20 passed`, full suite `561 passed, 1 skipped`, no findings
+- OpenSpec checkoff: 3.1–3.4 and 4.1 complete; plan Task 11–14 checked
 - Current phase: build

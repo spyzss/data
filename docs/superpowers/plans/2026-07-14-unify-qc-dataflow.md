@@ -1169,7 +1169,7 @@ git commit -m "feat(qc): separate runtime and quality states"
 - Produces: `project_warn_review_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]`。
 - Formal CLI: `python -m tools.build_manual_review_queue --quality-archive <dir> --output-dir <dir>`；旧 sidecar 参数保留为显式 `--legacy-*` 对账路径，不得成为默认。
 
-- [ ] **Step 1: 添加仅 warn 入队、all-pass/auto-fail 不入队测试**
+- [x] **Step 1: 添加仅 warn 入队、all-pass/auto-fail 不入队测试**
 
 ```python
 def test_review_queue_comes_only_from_candidate_issue_ids(tmp_path: Path) -> None:
@@ -1182,13 +1182,13 @@ def test_review_queue_comes_only_from_candidate_issue_ids(tmp_path: Path) -> Non
     assert rows[0]["window_end_frame"] == 20
 ```
 
-- [ ] **Step 2: 运行测试并确认投影模块缺失**
+- [x] **Step 2: 运行测试并确认投影模块缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_json_review_queue.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_reporting'`。
 
-- [ ] **Step 3: 实现候选 ID join 与正式 CLI**
+- [x] **Step 3: 实现候选 ID join 与正式 CLI**
 
 ```python
 def project_warn_review_rows(report):
@@ -1205,13 +1205,13 @@ def project_warn_review_rows(report):
 
 行必须包含 stable `review_id=issue_id`、supplier/asset、module/rule/reason、source-inclusive start/end、hand、machine verdict、metrics JSON、evidence/overlay 相对路径；禁止 pass-sample 抽样。候选引用不存在、重复或指向 fail 时整个资产投影失败并报 JSON path。
 
-- [ ] **Step 4: 运行新旧队列回归**
+- [x] **Step 4: 运行新旧队列回归**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_json_review_queue.py tests/test_manual_review_queue.py -q`
 
 Expected: PASS；新入口只读 QC JSON，旧 sidecar helper 仍可用于迁移对账测试。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_reporting/__init__.py qc_reporting/projection.py tools/build_manual_review_queue.py tests/test_qc_json_review_queue.py tests/test_manual_review_queue.py
