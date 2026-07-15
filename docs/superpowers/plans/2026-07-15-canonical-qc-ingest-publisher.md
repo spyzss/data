@@ -44,11 +44,11 @@ def semantic_fingerprint(episode: CanonicalQcEpisode) -> str: ...
 def source_fingerprint(source_files, *, source_schema_version, adapter_id, adapter_version) -> str: ...
 ```
 
-- [ ] Step 1: 写合法最小 episode fixture、数组只读、shape/dtype、valid/NaN、严格时间戳、标定、subtask 连续性和 optional hand quality 测试。
-- [ ] Step 2: 运行 `.venv/bin/python -m pytest tests/test_canonical_qc_contracts.py -q`，确认因 `canonical_qc` 缺失而失败。
-- [ ] Step 3: 实现 frozen dataclasses、稳定诊断异常、共享 Validator 和两种 fingerprint。
-- [ ] Step 4: 重跑测试，并运行 `.venv/bin/python -m pytest tests/test_qc_contracts.py tests/test_qc_config_v2.py -q`。
-- [ ] Step 5: `git diff --check`，提交 `feat(canonical): define strict QC episode contract`。
+- [x] Step 1: 写合法最小 episode fixture、数组只读、shape/dtype、valid/NaN、严格时间戳、标定、subtask 连续性和 optional hand quality 测试。
+- [x] Step 2: 运行 `.venv/bin/python -m pytest tests/test_canonical_qc_contracts.py -q`，确认因 `canonical_qc` 缺失而失败。
+- [x] Step 3: 实现 frozen dataclasses、稳定诊断异常、共享 Validator 和两种 fingerprint。
+- [x] Step 4: 重跑测试，并运行 `.venv/bin/python -m pytest tests/test_qc_contracts.py tests/test_qc_config_v2.py -q`。
+- [x] Step 5: `git diff --check`，提交 `feat(canonical): define strict QC episode contract`。
 
 ## Task 2: 实现视频探测和权威时间轴对齐
 
