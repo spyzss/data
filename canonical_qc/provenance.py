@@ -41,6 +41,7 @@ def source_fingerprint(
     source_schema_version: str,
     adapter_id: str,
     adapter_version: str,
+    main_video_source_frame_range: tuple[int, int] | None = None,
 ) -> str:
     """Hash source identity independent of input enumeration order."""
 
@@ -66,6 +67,7 @@ def source_fingerprint(
         "adapter_id": adapter_id,
         "adapter_version": adapter_version,
         "source_files": files,
+        "main_video_source_frame_range": main_video_source_frame_range,
     }
     return hashlib.sha256(_stable_json(payload)).hexdigest()
 
@@ -128,6 +130,7 @@ def semantic_fingerprint(episode: CanonicalQcEpisode) -> str:
             "pixel_format": video.pixel_format,
             "camera_id": video.camera_id,
             "camera_role": video.camera_role,
+            "source_frame_range": list(video.source_frame_range),
         },
         "observation": {
             "hand_keypoints_3d": _array_payload(

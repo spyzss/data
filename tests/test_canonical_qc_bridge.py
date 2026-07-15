@@ -7,9 +7,9 @@ import h5py
 import numpy as np
 import pytest
 
-from canonical_qc import CanonicalInputError, StandardHdf5Adapter
+from canonical_qc import CanonicalInputError, StandardHdf5Adapter, StandardLeRobotAdapter
 from canonical_qc.bridge import CanonicalQcBridge
-from tests.fixtures import write_standard_hdf5_episode
+from tests.fixtures import write_standard_hdf5_episode, write_standard_lerobot_dataset
 from tools.run_qc_pipeline import contexts_from_manifest
 
 
@@ -187,6 +187,26 @@ def test_manifest_entrypoint_builds_canonical_context_without_legacy_loading(tmp
     assert context.source_files["candidate_windows"]["path"] == "candidate-windows.json"
 
 
+def test_manifest_entrypoint_selects_exact_lerobot_episode(tmp_path: Path) -> None:
+    batch = tmp_path / "batch"
+    write_standard_lerobot_dataset(
+        batch / "dataset",
+        episodes=((3, "asset-three"), (7, "asset-seven")),
+    )
+    manifest = batch / "manifest.jsonl"
+    manifest.write_text(
+        '{"asset_id":"asset-seven","canonical_format":"lerobot",'
+        '"canonical_source_path":"dataset","episode_index":7}\n',
+        encoding="utf-8",
+    )
+
+    context = contexts_from_manifest(manifest, batch_root=batch)[0]
+
+    episode = context.metadata["canonical_episode"]
+    assert episode.identity.asset_id == "asset-seven"
+    assert episode.main_video.source_frame_range == (0, 3)
+
+
 def test_bridge_rejects_symlink_source_root(tmp_path: Path) -> None:
     source_root = tmp_path / "asset-001"
     write_standard_hdf5_episode(source_root)
@@ -207,7 +227,7 @@ def test_video_resolution_rejects_post_load_symlink_and_hash_drift(tmp_path: Pat
     video.rename(target)
     video.symlink_to(target.name)
 
-    with pytest.raises(CanonicalInputError, match="main_video.path"):
+    with pytest.raises(CanonicalInputError, match="provenance.source_files"):
         CanonicalQcBridge(symlink_episode, source_root=symlink_root).video_path()
 
     drift_root = tmp_path / "drift" / "asset-001"
@@ -216,7 +236,7 @@ def test_video_resolution_rejects_post_load_symlink_and_hash_drift(tmp_path: Pat
     with (drift_root / "main.mp4").open("ab") as stream:
         stream.write(b"drift")
 
-    with pytest.raises(CanonicalInputError, match="main_video"):
+    with pytest.raises(CanonicalInputError, match="provenance.source_files"):
         CanonicalQcBridge(drift_episode, source_root=drift_root).video_path()
 
 
@@ -243,6 +263,65 @@ def test_canonical_reserved_sources_override_supplemental_poison(tmp_path: Path)
     assert context.source_files["hdf5"]["path"] == "asset-001/asset-001.h5"
     assert "poison" not in context.source_files["canonical_provenance"]
     assert context.source_files["candidate_windows"]["path"] == "candidate.json"
+
+
+def test_asset_context_rejects_nonvideo_hdf5_provenance_drift(tmp_path: Path) -> None:
+    batch = tmp_path / "batch"
+    source_root = batch / "asset-001"
+    hdf5, _ = write_standard_hdf5_episode(source_root)
+    episode = StandardHdf5Adapter().load(source_root)
+    with hdf5.open("ab") as stream:
+        stream.write(b"drift")
+
+    with pytest.raises(CanonicalInputError, match="source"):
+        CanonicalQcBridge(episode, source_root=source_root).asset_context(
+            batch_root=batch,
+            report_path=batch / "quality_archive" / "asset-001.json",
+        )
+
+
+def test_asset_context_rejects_nonvideo_lerobot_provenance_drift(tmp_path: Path) -> None:
+    batch = tmp_path / "batch"
+    source_root = write_standard_lerobot_dataset(batch / "dataset")
+    episode = StandardLeRobotAdapter().load(source_root)
+    semantics = source_root / "meta" / "episode_semantics.jsonl"
+    with semantics.open("a", encoding="utf-8") as stream:
+        stream.write("\n")
+
+    with pytest.raises(CanonicalInputError, match="source"):
+        CanonicalQcBridge(episode, source_root=source_root).asset_context(
+            batch_root=batch,
+            report_path=batch / "quality_archive" / "asset-001.json",
+        )
+
+
+def test_in_memory_projections_do_not_rehash_large_source_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = tmp_path / "batch"
+    source_root = batch / "asset-001"
+    write_standard_hdf5_episode(source_root)
+    episode = StandardHdf5Adapter().load(source_root)
+    bridge = CanonicalQcBridge(episode, source_root=source_root)
+    bridge.asset_context(
+        batch_root=batch,
+        report_path=batch / "quality_archive" / "asset-001.json",
+    )
+    calls = 0
+    original = CanonicalQcBridge.verify_sources
+
+    def counting(self):
+        nonlocal calls
+        calls += 1
+        return original(self)
+
+    monkeypatch.setattr(CanonicalQcBridge, "verify_sources", counting)
+
+    bridge.clip_inputs()
+    bridge.semantic_payload()
+
+    assert calls == 0
 
 
 @pytest.mark.parametrize("source_range", [(-1, 1), (1, 1), (0, 4)])

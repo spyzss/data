@@ -58,6 +58,7 @@ def _provenance(
             source_schema_version=source_schema_version,
             adapter_id=adapter_id,
             adapter_version=adapter_version,
+            main_video_source_frame_range=(0, 3),
         ),
         adapter_id=adapter_id,
         adapter_version=adapter_version,
@@ -166,6 +167,64 @@ def test_video_source_range_is_strict_half_open_physical_placement(
 
     with pytest.raises(CanonicalInputError, match="main_video.source_frame_range"):
         validate_episode(malformed)
+
+
+def test_physical_video_range_participates_in_source_and_semantic_identity() -> None:
+    episode = make_episode()
+    shifted_range = (5, 8)
+    shifted_provenance = replace(
+        episode.provenance,
+        source_fingerprint=source_fingerprint(
+            episode.provenance.source_files,
+            source_schema_version=episode.identity.source_schema_version,
+            adapter_id=episode.provenance.adapter_id,
+            adapter_version=episode.provenance.adapter_version,
+            main_video_source_frame_range=shifted_range,
+        ),
+    )
+    shifted = replace(
+        episode,
+        provenance=shifted_provenance,
+        main_video=replace(
+            episode.main_video,
+            source_frame_range=shifted_range,
+        ),
+    )
+
+    validate_episode(shifted)
+    assert shifted.provenance.source_fingerprint != episode.provenance.source_fingerprint
+    assert semantic_fingerprint(shifted) != semantic_fingerprint(episode)
+
+    collision = replace(
+        episode,
+        main_video=replace(
+            episode.main_video,
+            source_frame_range=shifted_range,
+        ),
+    )
+    _assert_error(
+        collision,
+        code="source_fingerprint_mismatch",
+        field="provenance.source_fingerprint",
+    )
+
+    legacy_without_range = replace(
+        episode,
+        provenance=replace(
+            episode.provenance,
+            source_fingerprint=source_fingerprint(
+                episode.provenance.source_files,
+                source_schema_version=episode.identity.source_schema_version,
+                adapter_id=episode.provenance.adapter_id,
+                adapter_version=episode.provenance.adapter_version,
+            ),
+        ),
+    )
+    _assert_error(
+        legacy_without_range,
+        code="source_fingerprint_mismatch",
+        field="provenance.source_fingerprint",
+    )
 
 
 def _assert_error(

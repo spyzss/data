@@ -238,6 +238,7 @@ def _validate_provenance(episode: CanonicalQcEpisode) -> None:
         source_schema_version=episode.identity.source_schema_version,
         adapter_id=provenance.adapter_id,
         adapter_version=provenance.adapter_version,
+        main_video_source_frame_range=episode.main_video.source_frame_range,
     )
     if provenance.source_fingerprint != expected:
         _fail(
@@ -587,10 +588,10 @@ def validate_episode(episode: CanonicalQcEpisode) -> None:
     _contract_type(episode, CanonicalQcEpisode, "episode")
     _validate_contract_types(episode)
     _validate_identity(episode)
-    _validate_provenance(episode)
     _validate_time_axis(episode)
-    _validate_observation(episode)
     _validate_video(episode)
+    _validate_provenance(episode)
+    _validate_observation(episode)
     _validate_calibration(episode)
     _validate_semantics(episode)
     _validate_supplier_evidence(episode)

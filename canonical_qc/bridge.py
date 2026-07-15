@@ -99,6 +99,33 @@ class CanonicalQcBridge:
             _fail(field, "declared path must be a regular file")
         return resolved
 
+    def verify_sources(self) -> Mapping[str, Path]:
+        """Stream-verify every declared source without copying it."""
+        verified: dict[str, Path] = {}
+        for index, item in enumerate(self._episode.provenance.source_files):
+            field = f"provenance.source_files[{index}]"
+            path = self._declared_path(item.relative_path, field=f"{field}.relative_path")
+            try:
+                before = path.stat()
+                digest_builder = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest_builder.update(chunk)
+                after = path.stat()
+            except OSError as exc:
+                _fail(field, f"cannot verify source provenance: {exc}")
+            if (before.st_size, before.st_mtime_ns) != (
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                _fail(field, "source changed while verifying provenance")
+            if after.st_size != item.size_bytes:
+                _fail(f"{field}.size_bytes", "source size does not match provenance")
+            if digest_builder.hexdigest() != item.sha256:
+                _fail(f"{field}.sha256", "source hash does not match provenance")
+            verified[item.relative_path] = path
+        return MappingProxyType(verified)
+
     def video_path(self) -> Path:
         video = self._episode.main_video
         declared = [
@@ -108,29 +135,16 @@ class CanonicalQcBridge:
         ]
         if len(declared) != 1 or declared[0].relative_path != video.path:
             _fail("main_video.path", "must match the sole provenance main_video")
-        path = self._declared_path(video.path, field="main_video.path")
-        try:
-            before = path.stat()
-            digest_builder = hashlib.sha256()
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest_builder.update(chunk)
-            after = path.stat()
-        except OSError as exc:
-            _fail("main_video.path", f"cannot verify source provenance: {exc}")
-        if (before.st_size, before.st_mtime_ns) != (
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            _fail("main_video.path", "source file changed while verifying provenance")
-        digest = digest_builder.hexdigest()
-        if after.st_size != declared[0].size_bytes:
-            _fail("main_video.size_bytes", "source file size does not match provenance")
-        if digest != video.sha256 or digest != declared[0].sha256:
+        verified = self.verify_sources()
+        path = verified[video.path]
+        if video.sha256 != declared[0].sha256:
             _fail("main_video.sha256", "source file does not match canonical provenance")
         return path
 
     def semantic_payload(self) -> Mapping[str, Any]:
+        return self._semantic_payload()
+
+    def _semantic_payload(self) -> Mapping[str, Any]:
         semantics = self._episode.semantics
         subtasks = tuple(
             MappingProxyType(
@@ -171,7 +185,7 @@ class CanonicalQcBridge:
                 names[hand_index * 21 : (hand_index + 1) * 21]
             )
         }
-        payload = self.semantic_payload()
+        payload = self._semantic_payload()
         legacy_text_label = dict(payload)
         legacy_text_label.update(
             {
@@ -231,6 +245,7 @@ class CanonicalQcBridge:
         metadata: Mapping[str, Any] | None = None,
         supplemental_source_files: Mapping[str, Any] | None = None,
     ) -> AssetContext:
+        self.verify_sources()
         start, end = _range(source_range, self._episode.time_axis.frame_count)
         selected_range = None if source_range is None else (start, end)
         batch = Path(batch_root).resolve()

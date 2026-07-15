@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import json
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from qc_common.config import LoadedQcConfig
@@ -73,8 +74,9 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
 
         candidate_path = _source_path(context, "candidate_windows")
         assert candidate_path is not None
-        staging_root = context.batch_root / ".qc_pipeline" / context.asset_id / "sam3"
-        staging_root.mkdir(parents=True, exist_ok=True)
+        staging_parent = context.batch_root / ".qc_pipeline" / context.asset_id / "sam3"
+        staging_parent.mkdir(parents=True, exist_ok=True)
+        staging_root = Path(tempfile.mkdtemp(prefix="run-", dir=staging_parent))
         manifest_path = _source_path(context, "manifest", required=False)
         if bridge is not None:
             start, end = context.source_range or (
@@ -169,22 +171,30 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
 
             source_cache = CanonicalSourceCache()
 
-        summary = run_manifest_sam3_containment(
-            manifest=single_manifest,
-            candidate_windows=single_candidates,
-            supplier="canonical"
-            if bridge is not None
-            else str(context.metadata.get("supplier") or "jdt"),
-            output_dir=output_dir,
-            max_clips=1,
-            sam3_model=model,
-            overwrite=True,
-            segmenter=segmenter,
-            source_cache=source_cache,
-            config_path=config.path,
-            batch_root=staging_root,
-            profile=str(context.metadata.get("profile") or "acceptance"),
-        )
+        if bridge is not None:
+            bridge.verify_sources()
+        try:
+            summary = run_manifest_sam3_containment(
+                manifest=single_manifest,
+                candidate_windows=single_candidates,
+                supplier="canonical"
+                if bridge is not None
+                else str(context.metadata.get("supplier") or "jdt"),
+                output_dir=output_dir,
+                max_clips=1,
+                sam3_model=model,
+                overwrite=True,
+                segmenter=segmenter,
+                source_cache=source_cache,
+                config_path=config.path,
+                batch_root=staging_root,
+                profile=str(context.metadata.get("profile") or "acceptance"),
+            )
+        finally:
+            if source_cache is not None:
+                source_cache.close()
+        if bridge is not None:
+            bridge.verify_sources()
         if int(summary.get("failed_asset_count", 0)):
             raise RuntimeError(f"sam3_containment producer failed: {summary}")
         window_summaries = read_records(

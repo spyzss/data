@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from qc_common.config import LoadedQcConfig
@@ -20,7 +22,12 @@ from qc_reporting.projection import project_quality_archive
 from tools.run_qc_pipeline import run_batch
 from canonical_qc import StandardHdf5Adapter, StandardLeRobotAdapter
 from canonical_qc.bridge import CanonicalQcBridge
-from tests.fixtures import write_standard_hdf5_episode, write_standard_lerobot_dataset
+from tests.fixtures import (
+    solid_frame,
+    write_standard_hdf5_episode,
+    write_standard_lerobot_dataset,
+    write_test_video,
+)
 
 
 _CONFIG_HASH = "sha256:" + "1" * 64
@@ -461,3 +468,110 @@ def test_equivalent_standard_sources_have_same_machine_gate_and_revision(
         for state in left["execution"]["module_states"].values()
     )
     assert set(left["execution"]["module_states"]) == set(automatic_modules)
+
+
+def test_shared_lerobot_video_runs_logically_rebased_video_and_sam3_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_common.config import load_qc_acceptance_config
+    from tools import run_manifest_sam3_containment as sam3_producer
+
+    batch = tmp_path / "batch"
+    root = write_standard_lerobot_dataset(
+        batch / "dataset",
+        episodes=((3, "other-asset"), (7, "asset-001")),
+        frame_count=11,
+    )
+    data_paths = sorted((root / "data").rglob("*.parquet"))
+    pq.write_table(
+        pa.concat_tables([pq.read_table(path) for path in data_paths]),
+        data_paths[0],
+    )
+    data_paths[1].unlink()
+    episode_path = next((root / "meta" / "episodes").rglob("*.parquet"))
+    episode_rows = pq.read_table(episode_path).to_pylist()
+    episode_rows[1].update(
+        {
+            "data/file_index": 0,
+            "videos/observation.images.main/file_index": 0,
+            "dataset_from_index": 11,
+            "dataset_to_index": 22,
+            "videos/observation.images.main/from_index": 11,
+            "videos/observation.images.main/to_index": 22,
+        }
+    )
+    pq.write_table(pa.Table.from_pylist(episode_rows), episode_path)
+    videos = sorted((root / "videos").rglob("*.mp4"))
+    write_test_video(
+        videos[0],
+        [solid_frame(30 + index) for index in range(11)]
+        + [solid_frame(80) for _ in range(11)],
+        fps=10.0,
+    )
+    videos[1].unlink()
+
+    episode = StandardLeRobotAdapter().load(root, episode_index=7)
+    assert episode.main_video.source_frame_range == (11, 22)
+    candidates = batch / "candidate-windows.json"
+    candidates.write_text(
+        '[{"asset_id":"asset-001","start_frame":0,"end_frame":0,'
+        '"hand_side":"both"}]',
+        encoding="utf-8",
+    )
+    context = CanonicalQcBridge(episode, source_root=root).asset_context(
+        batch_root=batch,
+        report_path=batch / "quality_archive" / "asset-001.json",
+        supplemental_source_files={
+            "candidate_windows": {"path": candidates.name}
+        },
+    )
+    loaded = load_qc_acceptance_config()
+    raw = json.loads(json.dumps(loaded.raw))
+    raw["pipeline"]["modules"] = ["video_quality", "sam3_containment"]
+    config = LoadedQcConfig(path=loaded.path, raw=raw, sha256=loaded.sha256)
+    physical_reads: list[int] = []
+    original_read = sam3_producer.ManifestSourceCache.read_frame
+
+    def recording_read(cache, path, frame_idx):
+        physical_reads.append(int(frame_idx))
+        return original_read(cache, path, frame_idx)
+
+    monkeypatch.setattr(
+        sam3_producer.ManifestSourceCache,
+        "read_frame",
+        recording_read,
+    )
+
+    class Segmenter:
+        def segment_frame(self, frame, queries, detector_config):
+            return [
+                SimpleNamespace(
+                    mask=np.ones(frame.shape[:2], dtype=bool),
+                    category="hand",
+                )
+            ]
+
+    outcome = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=build_default_registry(
+            context,
+            config,
+            segmenter_factory=lambda: Segmenter(),
+        ),
+        now=lambda: "2026-07-15T00:00:00Z",
+    )
+
+    report = outcome.report
+    intervals = report["video_quality"]["metrics"]["freeze_metrics"][
+        "frozen_intervals"
+    ]
+    assert intervals
+    assert intervals[0]["start_frame"] == 0
+    assert intervals[0]["end_frame"] == 10
+    assert physical_reads == [11]
+    assert report["sam3_containment"]["flow"]["result_gate"]["verdict"] == "pass"
+    assert report["pipeline_state"]["status"] == "completed"
+    assert report["report_revision"] == 2

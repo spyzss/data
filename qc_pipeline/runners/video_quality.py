@@ -5,11 +5,51 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+import re
+from typing import Any
 
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import ModuleResult
 from qc_common.module_registry import ModulePrerequisiteError
 from qc_pipeline.context import AssetContext
+
+
+_RANGE_DECODE_ERROR = re.compile(r"range_decode_failed:(\d+)").fullmatch
+
+
+def _rebase_canonical_metrics(
+    metrics: Any,
+    *,
+    physical_origin: int,
+    logical_frame_count: int,
+) -> Any:
+    """Convert producer physical MP4 coordinates to Canonical frame numbers once."""
+    intervals = []
+    for interval in metrics.frozen_intervals:
+        start = interval.start_frame - physical_origin
+        end = interval.end_frame - physical_origin
+        if start < 0 or end < start or end >= logical_frame_count:
+            raise ValueError("video producer returned a frame outside canonical bounds")
+        intervals.append(
+            replace(
+                interval,
+                start_frame=start,
+                end_frame=end,
+                start_time_sec=start / metrics.fps if metrics.fps > 0 else 0.0,
+                end_time_sec=(end + 1) / metrics.fps if metrics.fps > 0 else 0.0,
+            )
+        )
+    errors: list[str] = []
+    for error in metrics.errors:
+        match = _RANGE_DECODE_ERROR(error)
+        if match is None:
+            errors.append(error)
+            continue
+        logical = int(match.group(1)) - physical_origin
+        if not 0 <= logical < logical_frame_count:
+            raise ValueError("video producer error frame is outside canonical bounds")
+        errors.append(f"range_decode_failed:{logical}")
+    return replace(metrics, frozen_intervals=tuple(intervals), errors=tuple(errors))
 
 
 def _source_path(
@@ -62,13 +102,15 @@ def run(context: AssetContext, config: LoadedQcConfig) -> ModuleResult:
             canonical_episode,
             source_root=Path(source_root),
         )
-        video = bridge.video_path()
+        video = None
         hdf5 = None
     else:
         video = _source_path(context, "video")
         hdf5 = _source_path(context, "hdf5", required=False)
-    assert video is not None
     detector_config = load_video_quality_config(config.path)
+    if canonical:
+        video = bridge.video_path()
+    assert video is not None
     physical_range = (
         bridge.physical_video_range(context.source_range)
         if canonical
@@ -130,6 +172,14 @@ def run(context: AssetContext, config: LoadedQcConfig) -> ModuleResult:
                 frame_count_match=None,
                 reason="logical range alignment validated by AssetContext bounds",
             )
+    if canonical:
+        physical_origin, _ = canonical_episode.main_video.source_frame_range
+        metrics = _rebase_canonical_metrics(
+            metrics,
+            physical_origin=physical_origin,
+            logical_frame_count=canonical_episode.time_axis.frame_count,
+        )
+        bridge.verify_sources()
     metrics = replace(metrics, asset_id=context.asset_id)
     evaluation = evaluate_video_quality(metrics, detector_config, alignment)
     return adapt_video_quality_result(

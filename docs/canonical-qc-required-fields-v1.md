@@ -80,7 +80,8 @@
 | `main_video.camera_role` | const `ego` | A | 首版固定为第一视角主视频。 |
 | `main_video.path` | relative path | R | 外置 MP4 路径。 |
 | `main_video.sha256` | SHA-256 | A | Adapter 对 MP4 实际字节计算。 |
-| `main_video.frame_count` | int64 | A | 从视频实际解码/探测；必须与 `T` 对齐。 |
+| `main_video.frame_count` | int64 | A | 选中逻辑 span 的帧数，必须等于 `T`；共享 MP4 的完整物理帧数可以大于 `T`，但必须完整包含 `source_frame_range`。 |
+| `main_video.source_frame_range` | int64 pair | A | MP4 中的物理半开区间 `[start,end)`；必须满足 `start>=0` 且 `end-start=T`。独立视频固定为 `[0,T)`，共享 LeRobot v3 视频必须保留 episode 的真实 offset。 |
 | `main_video.width_px` | int32 | A | 从视频探测。 |
 | `main_video.height_px` | int32 | A | 从视频探测。 |
 | `main_video.fps_num/fps_den` | int64 pair | A | 从容器和 PTS 探测，不信任仅由供应商声明的 FPS。 |
@@ -88,6 +89,12 @@
 | `main_video.pixel_format` | string | A | 实际像素格式。 |
 
 逐帧视频 PTS 由 Video QC 直接读取并与 `time_axis.timestamps_ns` 比较，不要求供应商重复提交一份视频时间戳数组。
+
+Canonical 内部及 QC JSON 始终使用逻辑帧号 `[0,T)`；`source_frame_range`
+只用于读取共享 MP4 的物理帧。Runner 必须在 producer 边界将物理坐标一次性
+转换回逻辑坐标，禁止把共享文件 offset 写入 QC metrics、issues 或 evidence。
+物理区间参与 source fingerprint 和当前 v1 semantic fingerprint，避免同一共享
+MP4 文件中不同 span 发生身份碰撞。
 
 ### 3.4 双手 21 点 Core
 
@@ -387,7 +394,26 @@ supplier.hand_quality.mapping_version
 6. 不截断不同长度的数组来伪造对齐。
 7. 不在 Adapter 内形成 QC Pass/Fail。
 8. 输出不可变 `CanonicalQcEpisode.v1` 或结构化失败诊断。
-9. 同一逻辑 episode 的 HDF5 与 LeRobot 输入，除 source provenance 外必须产生相同 Canonical 语义 fingerprint。
+9. 同一逻辑 episode 且视频物理 span 相同的 HDF5 与 LeRobot 输入，除 source provenance 外必须产生相同 Canonical 语义 fingerprint；不同 `source_frame_range` 在当前 v1 中视为不同视频身份。
+
+### 9.1 统一 QC CLI 的 Canonical manifest 合同
+
+`tools/run_qc_pipeline.py` 通过 manifest 行启用 Canonical 输入，固定字段如下：
+
+| 字段 | 必需 | 规则 |
+| --- | --- | --- |
+| `asset_id` | 是 | 必须与 Adapter 解析出的 episode `asset_id` 完全一致。 |
+| `canonical_format` | 是 | 仅允许 `hdf5` 或 `lerobot`。 |
+| `canonical_source_path` | 是 | 位于 `batch_root` 内的标准 HDF5 episode 路径或 LeRobot dataset 根目录。 |
+| `episode_index` | LeRobot 多 episode 时是 | 必须精确选择一个 episode；不允许默认取第一条。 |
+| `start_frame` / `end_frame` | 否 | manifest 边界仍为闭区间输入，入口仅转换一次为内部半开区间。必须成对出现。 |
+| `candidate_windows_path` | SAM3 时是 | supplemental source；必须位于 `batch_root` 内。 |
+| `sam3_model` / `sam3_model_path` | 无注入模型时是 | supplemental source；必须位于 `batch_root` 内。 |
+| `manifest` 及其他既有 runner 输入 | 按模块 | 作为 supplemental source 保留；Canonical 生成的 `video`、`hdf5/parquet` 和 provenance 保留键拥有最终优先级。 |
+
+入口会在 worker 前严格加载 Adapter、验证所有 provenance 文件，并把完整、纯 JSON
+的 Canonical provenance 写入 `AssetContext.source_files`。不得在 manifest 中放置
+Python 对象或覆盖 Canonical 保留键。
 
 ## 10. 错误与最终状态
 

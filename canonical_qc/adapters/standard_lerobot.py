@@ -718,7 +718,16 @@ class StandardLeRobotAdapter:
         )
         provenance = SourceProvenance(
             source_files=files,
-            source_fingerprint=source_fingerprint(files, source_schema_version=identity.source_schema_version, adapter_id=self.adapter_id, adapter_version=self.adapter_version),
+            source_fingerprint=source_fingerprint(
+                files,
+                source_schema_version=identity.source_schema_version,
+                adapter_id=self.adapter_id,
+                adapter_version=self.adapter_version,
+                main_video_source_frame_range=(
+                    inspection.video_frame_offset,
+                    inspection.video_frame_stop,
+                ),
+            ),
             adapter_id=self.adapter_id, adapter_version=self.adapter_version,
         )
         video_source = next(item for item in files if item.role == "main_video")

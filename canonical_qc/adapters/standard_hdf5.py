@@ -422,6 +422,7 @@ class StandardHdf5Adapter:
                 source_schema_version=identity.source_schema_version,
                 adapter_id=self.adapter_id,
                 adapter_version=self.adapter_version,
+                main_video_source_frame_range=(0, frame_count),
             ),
             adapter_id=self.adapter_id,
             adapter_version=self.adapter_version,
