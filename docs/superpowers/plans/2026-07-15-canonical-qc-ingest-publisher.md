@@ -196,6 +196,11 @@ def compare_supplier_and_machine(status, machine_status) -> SupplierAgreementRes
 - Create: `lerobot_v3_publisher/layout.py`
 - Create: `lerobot_v3_publisher/prerequisites.py`
 - Create: `tests/test_lerobot_v3_publish_prerequisites.py`
+- Modify: `schemas/asset_qc_report.v2.schema.json`
+- Modify: `qc_reporting/projection.py`
+- Modify: `tests/test_asset_qc_schema_v2.py`
+- Modify: `docs/asset-qc-json-format.md`
+- Modify: `docs/superpowers/specs/2026-07-15-canonical-qc-ingest-publisher-design.md`
 
 **Interfaces:**
 
@@ -204,11 +209,11 @@ def validate_publish_request(request: PublishRequest) -> PublishPlan: ...
 def release_id_for(request: PublishRequest) -> str: ...
 ```
 
-- [ ] Step 1: 写 pass/completed、人工完成或 not_required、source fingerprint、report revision、路径安全和 deterministic release ID 测试。
-- [ ] Step 2: 运行测试并确认 publisher package 缺失失败。
-- [ ] Step 3: 实现不可变请求/计划/结果/manifest 合同和前置校验，不修改 QC report。
-- [ ] Step 4: 增加 fail/null/error/stale/source drift 拒绝测试并通过。
-- [ ] Step 5: 提交 `feat(publisher): define gated LeRobot v3 release contract`。
+- [x] Step 1: 写 pass/completed、人工完成或 not_required、source fingerprint、report revision、路径安全和 deterministic release ID 测试。
+- [x] Step 2: 运行测试并确认 publisher package 缺失失败。
+- [x] Step 3: 实现不可变请求/计划/结果/manifest 合同和前置校验，不修改 QC report。
+- [x] Step 4: 增加 fail/null/error/stale/source drift 拒绝测试并通过。
+- [x] Step 5: 提交 `feat(publisher): define gated LeRobot v3 release contract`。
 
 ## Task 8: 写入 Curated LeRobot v3 staging
 

@@ -136,6 +136,8 @@ _REPORT_TOP_LEVEL_KEYS = frozenset(
         "manual_review",
         "metadata",
         "semantic_calibration",
+        "canonical_binding",
+        "canonical_qc_range",
     }
 )
 

@@ -154,6 +154,34 @@ def test_completed_v2_report_requires_quality_decision(decision: str) -> None:
         validate_asset_qc_report(report)
 
 
+def test_v2_schema_registers_canonical_publish_binding_and_full_range() -> None:
+    report = make_v2_report(status="completed", overall_decision="pass")
+    report["canonical_binding"] = {
+        "schema_version": "canonical_publish_binding.v1",
+        "canonical_revision": 3,
+        "semantic_fingerprint": "a" * 64,
+        "source_fingerprint": "b" * 64,
+        "qc_report_revision": report["report_revision"],
+    }
+    report["canonical_qc_range"] = {
+        "start_frame": 0,
+        "end_frame_exclusive": 10,
+        "interval_semantics": "half_open",
+    }
+
+    validate_asset_qc_report(report)
+
+    invalid = copy.deepcopy(report)
+    invalid["canonical_binding"]["semantic_fingerprint"] = "not-a-hash"
+    with pytest.raises(ValueError, match="canonical_binding.semantic_fingerprint"):
+        validate_asset_qc_report(invalid)
+
+    invalid = copy.deepcopy(report)
+    invalid["canonical_qc_range"]["start_frame"] = 1
+    with pytest.raises(ValueError, match="canonical_qc_range.start_frame"):
+        validate_asset_qc_report(invalid)
+
+
 def test_migrate_v1_preserves_video_unknown_fields_and_revision() -> None:
     old = make_v1_video_report()
     old["extension_from_colleague"] = {"keep": True}

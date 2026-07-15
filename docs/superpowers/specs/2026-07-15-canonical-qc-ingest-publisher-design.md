@@ -238,6 +238,7 @@ supplier `unknown/warning` 和 machine `unavailable/review/skipped` 不进入一
 class PublishRequest:
     episode: CanonicalQcEpisode
     canonical_revision: int
+    canonical_source_root: Path
     qc_report_path: Path
     expected_report_revision: int
     release_root: Path
@@ -248,9 +249,19 @@ Publisher 必须验证：
 - 报告为 `asset_qc_report.v2`；
 - `overall_decision=pass` 且 `pipeline_state.status=completed`；
 - 语义阶段完成，Warn 复核已完成或 `not_required`；
+- report 的 `canonical_binding.v1` 冻结 canonical revision、semantic fingerprint、
+  source fingerprint 和唯一 final QC report revision，并与请求及 episode 三方一致；
+- report 的 `canonical_qc_range` 必须是完整 `[0,T)` 半开区间；
 - report source fingerprint 与 episode 一致；
 - report revision 与请求一致；
-- 当前源文件 hash 未漂移。
+- `acceptance` profile、immutable QC config snapshot/hash、所有启用 module state、
+  issues、runtime errors、semantic consistency 和 manual review 状态组合一致；
+- 通过显式 `canonical_source_root` 重新读取当前源文件，拒绝相对路径、escape、
+  symlink 和 hash 漂移；不得从 `qc_report_path.parent` 猜源目录。
+
+`validate_publish_request` 只读报告和源文件，并在 `PublishPlan` 冻结 QC report
+SHA-256 与 source snapshot。Writer、独立验证器和 commit 前都必须调用 plan
+revalidation；同 revision 内容变化或当前源 hash 漂移必须拒绝。
 
 ### 9.2 输出布局
 
@@ -272,7 +283,11 @@ Publisher 必须验证：
 <release_root>/CURRENT.json
 ```
 
-`release_id` 由 asset、canonical revision、semantic fingerprint 和 publisher version 稳定派生。重复发布同一请求返回已有 release；同 ID 内容不同属于 `commit_conflict`。
+`release_id` 由 asset、canonical revision、semantic fingerprint 和 publisher version
+四元组稳定派生。canonical revision 不能由调用方任填：它必须绑定到报告中的
+唯一 final QC revision；同一 canonical revision 不允许换一个 final QC revision
+重新发布，如需重跑必须产生新的 canonical revision。重复发布同一请求返回已有
+release；同 ID 内容不同属于 `commit_conflict`。
 
 目录和基础 metadata 必须兼容官方 LeRobotDataset v3，而不仅是本仓库旧 reader。官方 v3 使用 file-based shards、`meta/episodes` 关系元数据、`meta/tasks.parquet`、`meta/stats.json`、`data/chunk-*/file-*.parquet` 和 `videos/<camera_key>/chunk-*/file-*.mp4`。`meta/episode_semantics.jsonl`、`meta/subtask.parquet` 和 `release_manifest.json` 是本项目在官方可扩展字段之外增加的审计/人工语义 sidecar；它们不得替代官方必需 metadata。
 

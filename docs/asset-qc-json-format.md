@@ -148,6 +148,8 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 | `overall_decision` | 只有流程停止或全部完成时才形成最终结论。 |
 | `issues` | 所有模块共享的 warn/fail 事实表。 |
 | `manual_review` | 人工路由输入、状态和结果。 |
+| `canonical_binding` | 发布绑定；冻结 canonical revision、semantic/source fingerprint 和唯一 final QC report revision。 |
+| `canonical_qc_range` | 本报告覆盖的 Canonical 半开区间；Publisher v1 只接受完整 `[0,T)`。 |
 | `<module_name>` | 模块自己的 gate、指标和证据。 |
 
 ### 3.1 `qc_config`
@@ -185,6 +187,31 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 `pending`、`running`、`awaiting_external` 不是质量等级，也不等于 warn。`warn` 是模块对具体问题的判定；
 流程未结束时只保存在 module verdict 和 `issues`，不提前写进
 `overall_decision`。
+
+### 3.3 Publisher 发布绑定
+
+最终人工语义和 Warn 复核完成时，报告必须写入：
+
+```json
+{
+  "canonical_binding": {
+    "schema_version": "canonical_publish_binding.v1",
+    "canonical_revision": 3,
+    "semantic_fingerprint": "<64 lowercase hex>",
+    "source_fingerprint": "<64 lowercase hex>",
+    "qc_report_revision": 19
+  },
+  "canonical_qc_range": {
+    "start_frame": 0,
+    "end_frame_exclusive": 1200,
+    "interval_semantics": "half_open"
+  }
+}
+```
+
+同一 canonical revision 只允许绑定一个最终 QC revision。Publisher 请求还必须显式
+提供 `canonical_source_root`，用 Canonical provenance 的相对路径重新校验所有当前
+源文件；不得从 QC JSON 路径推断源目录，也不得接受 escape 或 symlink。
 
 ## 4. Issue 结构
 

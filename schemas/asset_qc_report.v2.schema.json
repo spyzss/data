@@ -35,6 +35,8 @@
       "items": {"$ref": "#/$defs/runtimeError"}
     },
     "manual_review": {"$ref": "#/$defs/manualReview"},
+    "canonical_binding": {"$ref": "#/$defs/canonicalBinding"},
+    "canonical_qc_range": {"$ref": "#/$defs/canonicalQcRange"},
     "hdf5_text_info": {"type": "object"},
     "quality_hand": {"type": "object"},
     "keypoint_presence": {"type": "object"},
@@ -42,7 +44,8 @@
     "keypoint_temporal": {"type": "object"},
     "video_quality": {"type": "object"},
     "sam3_containment": {"type": "object"},
-    "semantic_consistency": {"type": "object"},
+    "semantic_consistency": {"$ref": "#/$defs/externalStage"},
+    "semantic_calibration": {"$ref": "#/$defs/semanticCalibration"},
     "duplicate_check": {"type": "object"},
     "content_validity": {"type": "object"},
     "effective_duration": {"type": "object"}
@@ -268,7 +271,79 @@
           "type": "array",
           "items": {"type": "string"},
           "uniqueItems": true
+        },
+        "issue_reviews": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["verdict"],
+            "properties": {
+              "verdict": {"enum": ["pass", "fail"]}
+            }
+          }
         }
+      }
+    },
+    "externalStage": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "state": {
+          "enum": [
+            "not_started",
+            "in_progress",
+            "completed",
+            "skipped_due_to_fail",
+            "error",
+            "awaiting_external"
+          ]
+        }
+      }
+    },
+    "semanticCalibration": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "state": {
+          "enum": [
+            "not_started",
+            "in_progress",
+            "finalizing",
+            "completed",
+            "skipped_due_to_fail",
+            "error"
+          ]
+        },
+        "canonical_revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "canonicalBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "canonical_revision",
+        "semantic_fingerprint",
+        "source_fingerprint",
+        "qc_report_revision"
+      ],
+      "properties": {
+        "schema_version": {"const": "canonical_publish_binding.v1"},
+        "canonical_revision": {"type": "integer", "minimum": 1},
+        "semantic_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "qc_report_revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "canonicalQcRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_frame", "end_frame_exclusive", "interval_semantics"],
+      "properties": {
+        "start_frame": {"const": 0},
+        "end_frame_exclusive": {"type": "integer", "minimum": 1},
+        "interval_semantics": {"const": "half_open"}
       }
     },
     "issue": {
