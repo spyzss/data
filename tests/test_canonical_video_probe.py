@@ -823,3 +823,31 @@ def test_validate_video_alignment_requires_half_open_interval_semantics(
         code="timebase_invalid",
         field="time_axis.interval_semantics",
     )
+
+
+class _IntervalString(str):
+    pass
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        np.str_("half_open"),
+        ["half_open"],
+        np.asarray("half_open"),
+        np.asarray(["half_open"]),
+        np.asarray(["half_open", "half_open"]),
+        _IntervalString("half_open"),
+    ],
+    ids=["numpy-scalar", "list", "0d-array", "1d-one", "1d-many", "str-subclass"],
+)
+def test_validate_video_alignment_rejects_non_exact_string_interval_semantics(
+    invalid: object,
+) -> None:
+    time_axis = replace(_time_axis(0), interval_semantics=invalid)
+
+    _assert_error(
+        lambda: validate_video_alignment(time_axis, _video(0), max_delta_ns=0),
+        code="timebase_invalid",
+        field="time_axis.interval_semantics",
+    )

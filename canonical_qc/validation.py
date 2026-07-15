@@ -624,6 +624,12 @@ def _validate_alignment_time_axis(time_axis: TimeAxis) -> tuple[int, ...]:
         "time_axis.frame_index_base",
         code="timebase_invalid",
     )
+    if type(time_axis.interval_semantics) is not str:
+        _fail(
+            "timebase_invalid",
+            "time_axis.interval_semantics",
+            "must be the exact string 'half_open'",
+        )
     _constant(
         time_axis.interval_semantics,
         "half_open",
