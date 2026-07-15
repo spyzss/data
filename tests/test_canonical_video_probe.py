@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
@@ -307,6 +308,150 @@ def test_probe_video_reports_invalid_ffprobe_json_as_tool_failure(
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("width", 640.0),
+        ("width", "640"),
+        ("height", 480.0),
+        ("height", "480"),
+    ],
+)
+def test_probe_video_rejects_coerced_json_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    invalid: object,
+) -> None:
+    payload = _ffprobe_payload()
+    streams = payload["streams"]
+    assert isinstance(streams, list)
+    streams[0][field] = invalid
+    monkeypatch.setattr(
+        "canonical_qc.video_probe.subprocess.run",
+        lambda *_args, **_kwargs: _completed_probe(payload),
+    )
+
+    _assert_error(
+        lambda: probe_video(tmp_path / "bad-dimension.mp4"),
+        code="source_integrity_error",
+        field=f"main_video.{field}_px",
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [True, 900_000.0, "900000.0", " 900000"],
+)
+def test_probe_video_rejects_invalid_present_best_effort_timestamp_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    payload = _ffprobe_payload()
+    frames = payload["frames"]
+    assert isinstance(frames, list)
+    frames[0]["best_effort_timestamp"] = invalid
+    assert frames[0]["best_effort_timestamp_time"] == "10.000000"
+    monkeypatch.setattr(
+        "canonical_qc.video_probe.subprocess.run",
+        lambda *_args, **_kwargs: _completed_probe(payload),
+    )
+
+    _assert_error(
+        lambda: probe_video(tmp_path / "bad-pts.mp4"),
+        code="timebase_invalid",
+        field="main_video.frames[0].best_effort_timestamp",
+    )
+
+
+def test_probe_video_accepts_exact_signed_decimal_integer_timestamp_strings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = _ffprobe_payload()
+    stream = payload["streams"]
+    frames = payload["frames"]
+    assert isinstance(stream, list)
+    assert isinstance(frames, list)
+    stream[0]["time_base"] = "1/3"
+    frames[:] = [
+        {"media_type": "video", "best_effort_timestamp": "-3"},
+        {"media_type": "video", "best_effort_timestamp": "+0"},
+    ]
+    monkeypatch.setattr(
+        "canonical_qc.video_probe.subprocess.run",
+        lambda *_args, **_kwargs: _completed_probe(payload),
+    )
+
+    video = probe_video(tmp_path / "signed-pts.mp4")
+
+    assert video.timestamps_ns == (0, 1_000_000_000)
+
+
+@pytest.mark.parametrize("missing", [None, "N/A"])
+def test_probe_video_uses_timestamp_time_only_when_integer_pts_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    missing: object,
+) -> None:
+    payload = _ffprobe_payload()
+    frames = payload["frames"]
+    assert isinstance(frames, list)
+    frames[0]["best_effort_timestamp"] = missing
+    frames[1]["best_effort_timestamp"] = missing
+    frames[2]["best_effort_timestamp"] = missing
+    monkeypatch.setattr(
+        "canonical_qc.video_probe.subprocess.run",
+        lambda *_args, **_kwargs: _completed_probe(payload),
+    )
+
+    video = probe_video(tmp_path / "fallback-pts.mp4")
+
+    assert video.timestamps_ns == (0, 33_367_000, 66_733_000)
+
+
+def test_probe_video_rejects_non_string_timestamp_time_without_coercion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = _ffprobe_payload()
+    frames = payload["frames"]
+    assert isinstance(frames, list)
+    frames[0]["best_effort_timestamp"] = None
+    frames[0]["best_effort_timestamp_time"] = 10.0
+    monkeypatch.setattr(
+        "canonical_qc.video_probe.subprocess.run",
+        lambda *_args, **_kwargs: _completed_probe(payload),
+    )
+
+    _assert_error(
+        lambda: probe_video(tmp_path / "bad-timestamp-time.mp4"),
+        code="timebase_invalid",
+        field="main_video.frames[0].best_effort_timestamp_time",
+    )
+
+
+def test_probe_video_rejects_invalid_present_stream_time_base(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = _ffprobe_payload()
+    streams = payload["streams"]
+    assert isinstance(streams, list)
+    streams[0]["time_base"] = "0/0"
+    monkeypatch.setattr(
+        "canonical_qc.video_probe.subprocess.run",
+        lambda *_args, **_kwargs: _completed_probe(payload),
+    )
+
+    _assert_error(
+        lambda: probe_video(tmp_path / "bad-time-base.mp4"),
+        code="timebase_invalid",
+        field="main_video.time_base",
+    )
+
+
 def test_validate_video_alignment_normalizes_both_authoritative_timelines() -> None:
     time_axis = _time_axis(5_000_000_000, 5_033_366_667, 5_066_733_333)
     video = _video(10_000_000_000, 10_033_366_667, 10_066_733_333)
@@ -315,14 +460,15 @@ def test_validate_video_alignment_normalizes_both_authoritative_timelines() -> N
 
 
 @pytest.mark.parametrize(
-    "video",
+    ("video", "field"),
     [
-        _video(0, 33_366_667, frame_count=3),
-        _video(0, 33_366_667, frame_count=2),
+        (_video(0, 33_366_667, frame_count=3), "main_video.timestamps_ns"),
+        (_video(0, 33_366_667, frame_count=2), "main_video.frame_count"),
     ],
 )
 def test_validate_video_alignment_rejects_insufficient_frame_pts(
     video: ProbedVideo,
+    field: str,
 ) -> None:
     error = _assert_error(
         lambda: validate_video_alignment(
@@ -331,7 +477,7 @@ def test_validate_video_alignment_rejects_insufficient_frame_pts(
             max_delta_ns=1_000,
         ),
         code="timebase_invalid",
-        field="main_video.timestamps_ns",
+        field=field,
     )
     assert "expected 3" in error.detail
 
@@ -448,6 +594,21 @@ def test_validate_video_alignment_rejects_canonical_timestamp_count_mismatch() -
     )
 
 
+def test_validate_video_alignment_rejects_scalar_canonical_timestamps_cleanly() -> None:
+    time_axis = TimeAxis(
+        frame_count=1,
+        timestamps_ns=np.asarray(0, dtype=np.int64),
+        fps_num=30000,
+        fps_den=1001,
+    )
+
+    _assert_error(
+        lambda: validate_video_alignment(time_axis, _video(0), max_delta_ns=0),
+        code="timebase_invalid",
+        field="time_axis.timestamps_ns",
+    )
+
+
 def test_validate_video_alignment_rejects_empty_canonical_time_axis_cleanly() -> None:
     time_axis = TimeAxis(
         frame_count=0,
@@ -459,6 +620,177 @@ def test_validate_video_alignment_rejects_empty_canonical_time_axis_cleanly() ->
 
     _assert_error(
         lambda: validate_video_alignment(time_axis, video, max_delta_ns=1_000),
-        code="invalid_integer",
+        code="timebase_invalid",
         field="time_axis.frame_count",
+    )
+
+
+@pytest.mark.parametrize(
+    ("time_axis", "video", "field"),
+    [
+        (object(), _video(0), "time_axis"),
+        (_time_axis(0), object(), "main_video"),
+    ],
+)
+def test_validate_video_alignment_checks_exact_contract_types_before_dereference(
+    time_axis: object,
+    video: object,
+    field: str,
+) -> None:
+    _assert_error(
+        lambda: validate_video_alignment(  # type: ignore[arg-type]
+            time_axis,
+            video,
+            max_delta_ns=0,
+        ),
+        code="invalid_contract_type",
+        field=field,
+    )
+
+
+@pytest.mark.parametrize("invalid", [True, 0, -1])
+def test_validate_video_alignment_rejects_invalid_probed_frame_count(
+    invalid: object,
+) -> None:
+    video = replace(_video(0, 33_366_667, 66_733_333), frame_count=invalid)
+
+    _assert_error(
+        lambda: validate_video_alignment(
+            _time_axis(0, 33_366_667, 66_733_333),
+            video,
+            max_delta_ns=0,
+        ),
+        code="timebase_invalid",
+        field="main_video.frame_count",
+    )
+
+
+@pytest.mark.parametrize("invalid", [True, -1])
+def test_validate_video_alignment_rejects_invalid_canonical_frame_count(
+    invalid: object,
+) -> None:
+    time_axis = replace(_time_axis(0), frame_count=invalid)
+
+    _assert_error(
+        lambda: validate_video_alignment(time_axis, _video(0), max_delta_ns=0),
+        code="timebase_invalid",
+        field="time_axis.frame_count",
+    )
+
+
+@pytest.mark.parametrize(
+    ("owner", "field", "invalid"),
+    [
+        ("time_axis", "fps_num", True),
+        ("time_axis", "fps_num", 0),
+        ("time_axis", "fps_den", -1),
+        ("main_video", "fps_num", True),
+        ("main_video", "fps_num", 0),
+        ("main_video", "fps_den", -1),
+    ],
+)
+def test_validate_video_alignment_rejects_invalid_rational_fps_components(
+    owner: str,
+    field: str,
+    invalid: object,
+) -> None:
+    time_axis = _time_axis(0, 33_366_667, 66_733_333)
+    video = _video(0, 33_366_667, 66_733_333)
+    if owner == "time_axis":
+        time_axis = replace(time_axis, **{field: invalid})
+    else:
+        video = replace(video, **{field: invalid})
+
+    _assert_error(
+        lambda: validate_video_alignment(time_axis, video, max_delta_ns=0),
+        code="timebase_invalid",
+        field=f"{owner}.{field}",
+    )
+
+
+def test_validate_video_alignment_rejects_rational_fps_mismatch() -> None:
+    video = replace(_video(0, 33_366_667, 66_733_333), fps_num=25, fps_den=1)
+
+    _assert_error(
+        lambda: validate_video_alignment(
+            _time_axis(0, 33_366_667, 66_733_333),
+            video,
+            max_delta_ns=0,
+        ),
+        code="timebase_invalid",
+        field="main_video.fps",
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("width_px", True),
+        ("width_px", 0),
+        ("width_px", -1),
+        ("width_px", 640.0),
+        ("height_px", 0),
+    ],
+)
+def test_validate_video_alignment_rejects_invalid_probed_dimensions(
+    field: str,
+    invalid: object,
+) -> None:
+    video = replace(_video(0, 33_366_667, 66_733_333), **{field: invalid})
+
+    _assert_error(
+        lambda: validate_video_alignment(
+            _time_axis(0, 33_366_667, 66_733_333),
+            video,
+            max_delta_ns=0,
+        ),
+        code="source_integrity_error",
+        field=f"main_video.{field}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("codec", ""),
+        ("codec", "   "),
+        ("pixel_format", ""),
+        ("pixel_format", None),
+    ],
+)
+def test_validate_video_alignment_rejects_invalid_probed_strings(
+    field: str,
+    invalid: object,
+) -> None:
+    video = replace(_video(0, 33_366_667, 66_733_333), **{field: invalid})
+
+    _assert_error(
+        lambda: validate_video_alignment(
+            _time_axis(0, 33_366_667, 66_733_333),
+            video,
+            max_delta_ns=0,
+        ),
+        code="source_integrity_error",
+        field=f"main_video.{field}",
+    )
+
+
+@pytest.mark.parametrize(
+    "timestamps_ns",
+    [
+        (0, 33_366_667, 33_366_667),
+        (0, 33_366_667, 20_000_000),
+    ],
+)
+def test_validate_video_alignment_rejects_non_increasing_canonical_timestamps(
+    timestamps_ns: tuple[int, ...],
+) -> None:
+    _assert_error(
+        lambda: validate_video_alignment(
+            _time_axis(*timestamps_ns),
+            _video(0, 33_366_667, 66_733_333),
+            max_delta_ns=100_000_000,
+        ),
+        code="timebase_invalid",
+        field="time_axis.timestamps_ns",
     )

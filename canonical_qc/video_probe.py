@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from fractions import Fraction
 import json
+from numbers import Integral
 from pathlib import Path
+import re
 import subprocess
 from typing import Any
 
@@ -13,6 +15,8 @@ from .errors import CanonicalInputError
 
 
 _FFPROBE_TIMEOUT_SECONDS = 30
+_SIGNED_INTEGER = re.compile(r"[+-]?\d+").fullmatch
+_DECIMAL_SECONDS = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)").fullmatch
 
 
 def _fail(code: str, field: str, detail: str) -> None:
@@ -32,15 +36,9 @@ def _fraction(value: object, *, field: str) -> Fraction:
 
 
 def _positive_int(value: object, *, field: str) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
         _fail("source_integrity_error", field, "must be a positive integer")
-    try:
-        result = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        _fail("source_integrity_error", field, "must be a positive integer")
-    if result <= 0:
-        _fail("source_integrity_error", field, "must be a positive integer")
-    return result
+    return int(value)
 
 
 def _nonempty_string(value: object, *, field: str) -> str:
@@ -50,24 +48,35 @@ def _nonempty_string(value: object, *, field: str) -> str:
 
 
 def _timestamp_seconds(
-    frame: dict[str, Any], time_base: Fraction | None
+    frame: dict[str, Any],
+    time_base: Fraction | None,
+    *,
+    frame_index: int,
 ) -> Fraction | None:
     raw_timestamp = frame.get("best_effort_timestamp")
-    if time_base is not None and raw_timestamp not in (None, "N/A"):
-        try:
+    if raw_timestamp not in (None, "N/A"):
+        field = f"main_video.frames[{frame_index}].best_effort_timestamp"
+        if isinstance(raw_timestamp, bool):
+            _fail("timebase_invalid", field, "must be an exact integer PTS")
+        if isinstance(raw_timestamp, Integral):
             timestamp = int(raw_timestamp)
-        except (TypeError, ValueError, OverflowError):
-            timestamp = None
-        if timestamp is not None:
+        elif isinstance(raw_timestamp, str) and _SIGNED_INTEGER(raw_timestamp):
+            timestamp = int(raw_timestamp)
+        else:
+            _fail("timebase_invalid", field, "must be an exact integer PTS")
+        if time_base is not None:
             return timestamp * time_base
 
     raw_seconds = frame.get("best_effort_timestamp_time")
     if raw_seconds in (None, "N/A"):
         return None
+    field = f"main_video.frames[{frame_index}].best_effort_timestamp_time"
+    if not isinstance(raw_seconds, str) or _DECIMAL_SECONDS(raw_seconds) is None:
+        _fail("timebase_invalid", field, "must be an exact decimal seconds string")
     try:
-        return Fraction(str(raw_seconds))
+        return Fraction(raw_seconds)
     except (ValueError, ZeroDivisionError):
-        return None
+        _fail("timebase_invalid", field, "must be an exact decimal seconds string")
 
 
 def _probe_payload(path: Path) -> dict[str, Any]:
@@ -174,13 +183,8 @@ def probe_video(path: Path) -> ProbedVideo:
     fps = _fraction(stream.get("avg_frame_rate"), field="main_video.fps")
     raw_time_base = stream.get("time_base")
     time_base: Fraction | None = None
-    if isinstance(raw_time_base, str):
-        try:
-            candidate = Fraction(raw_time_base)
-        except (ValueError, ZeroDivisionError):
-            candidate = Fraction(0, 1)
-        if candidate > 0:
-            time_base = candidate
+    if raw_time_base not in (None, "N/A"):
+        time_base = _fraction(raw_time_base, field="main_video.time_base")
 
     video_frames: list[dict[str, Any]] = []
     for frame in frames:
@@ -193,11 +197,15 @@ def probe_video(path: Path) -> ProbedVideo:
         if frame.get("media_type", "video") == "video":
             video_frames.append(frame)
 
-    absolute_timestamps = [
-        timestamp
-        for frame in video_frames
-        if (timestamp := _timestamp_seconds(frame, time_base)) is not None
-    ]
+    absolute_timestamps: list[Fraction] = []
+    for frame_index, frame in enumerate(video_frames):
+        timestamp = _timestamp_seconds(
+            frame,
+            time_base,
+            frame_index=frame_index,
+        )
+        if timestamp is not None:
+            absolute_timestamps.append(timestamp)
     if absolute_timestamps:
         first_timestamp = absolute_timestamps[0]
         timestamps_ns = tuple(

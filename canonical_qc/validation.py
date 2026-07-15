@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
 from numbers import Integral
 from pathlib import PurePosixPath
 import re
@@ -78,14 +79,24 @@ def _validate_contract_types(episode: CanonicalQcEpisode) -> None:
         )
 
 
-def _nonempty_string(value: object, field: str) -> None:
+def _nonempty_string(
+    value: object,
+    field: str,
+    *,
+    code: str = "invalid_string",
+) -> None:
     if not isinstance(value, str) or not value.strip():
-        _fail("invalid_string", field, "must be a non-empty string")
+        _fail(code, field, "must be a non-empty string")
 
 
-def _positive_int(value: object, field: str) -> None:
+def _positive_int(
+    value: object,
+    field: str,
+    *,
+    code: str = "invalid_integer",
+) -> None:
     if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
-        _fail("invalid_integer", field, "must be an integer greater than zero")
+        _fail(code, field, "must be an integer greater than zero")
 
 
 def _nonnegative_int(value: object, field: str) -> None:
@@ -133,6 +144,16 @@ def _array(
         _fail("invalid_shape", field, f"expected {shape}, got {value.shape}")
     if value.flags.writeable:
         _fail("mutable_array", field, "array must be read-only")
+
+
+def _strictly_increasing_timestamps(
+    values: tuple[int, ...],
+    *,
+    field: str,
+    code: str,
+) -> None:
+    if any(current <= previous for previous, current in zip(values, values[1:])):
+        _fail(code, field, "adjacent timestamps must increase")
 
 
 def _validate_identity(episode: CanonicalQcEpisode) -> None:
@@ -229,14 +250,11 @@ def _validate_time_axis(episode: CanonicalQcEpisode) -> None:
         dtype=np.int64,
         shape=(time_axis.frame_count,),
     )
-    if time_axis.frame_count > 1 and np.any(
-        time_axis.timestamps_ns[1:] <= time_axis.timestamps_ns[:-1]
-    ):
-        _fail(
-            "timestamps_not_strictly_increasing",
-            "time_axis.timestamps_ns",
-            "adjacent timestamps must increase",
-        )
+    _strictly_increasing_timestamps(
+        tuple(int(value) for value in time_axis.timestamps_ns),
+        field="time_axis.timestamps_ns",
+        code="timestamps_not_strictly_increasing",
+    )
 
 
 def _validate_observation(episode: CanonicalQcEpisode) -> None:
@@ -543,6 +561,80 @@ def validate_episode(episode: CanonicalQcEpisode) -> None:
     _validate_supplier_evidence(episode)
 
 
+def _validated_alignment_timestamps(
+    values: object,
+    *,
+    expected_count: int,
+    field: str,
+) -> tuple[int, ...]:
+    if not isinstance(values, (tuple, np.ndarray)):
+        _fail("timebase_invalid", field, "must be an integer timestamp sequence")
+    if isinstance(values, np.ndarray) and values.ndim != 1:
+        _fail("timebase_invalid", field, "must be a one-dimensional timestamp sequence")
+    if len(values) != expected_count:
+        _fail(
+            "timebase_invalid",
+            field,
+            f"expected {expected_count} timestamps, got {len(values)}",
+        )
+    timestamps: list[int] = []
+    for index, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            _fail(
+                "timebase_invalid",
+                f"{field}[{index}]",
+                "must be an exact integer nanosecond timestamp",
+            )
+        timestamps.append(int(value))
+    result = tuple(timestamps)
+    _strictly_increasing_timestamps(
+        result,
+        field=field,
+        code="timebase_invalid",
+    )
+    return result
+
+
+def _validate_alignment_time_axis(time_axis: TimeAxis) -> tuple[int, ...]:
+    for name in ("frame_count", "fps_num", "fps_den"):
+        _positive_int(
+            getattr(time_axis, name),
+            f"time_axis.{name}",
+            code="timebase_invalid",
+        )
+    return _validated_alignment_timestamps(
+        time_axis.timestamps_ns,
+        expected_count=time_axis.frame_count,
+        field="time_axis.timestamps_ns",
+    )
+
+
+def _validate_probed_video(video: ProbedVideo) -> tuple[int, ...]:
+    for name in ("frame_count", "fps_num", "fps_den"):
+        _positive_int(
+            getattr(video, name),
+            f"main_video.{name}",
+            code="timebase_invalid",
+        )
+    for name in ("width_px", "height_px"):
+        _positive_int(
+            getattr(video, name),
+            f"main_video.{name}",
+            code="source_integrity_error",
+        )
+    for name in ("codec", "pixel_format"):
+        _nonempty_string(
+            getattr(video, name),
+            f"main_video.{name}",
+            code="source_integrity_error",
+        )
+    return _validated_alignment_timestamps(
+        video.timestamps_ns,
+        expected_count=video.frame_count,
+        field="main_video.timestamps_ns",
+    )
+
+
 def validate_video_alignment(
     time_axis: TimeAxis,
     video: ProbedVideo,
@@ -551,56 +643,28 @@ def validate_video_alignment(
 ) -> None:
     """Compare authoritative Canonical timestamps with normalized video PTS."""
 
+    _contract_type(time_axis, TimeAxis, "time_axis")
+    _contract_type(video, ProbedVideo, "main_video")
     _nonnegative_int(max_delta_ns, "max_delta_ns")
-    expected_count = time_axis.frame_count
-    _positive_int(expected_count, "time_axis.frame_count")
-    if len(time_axis.timestamps_ns) != expected_count:
+    canonical_timestamps = _validate_alignment_time_axis(time_axis)
+    video_timestamps = _validate_probed_video(video)
+    if video.frame_count != time_axis.frame_count:
         _fail(
             "timebase_invalid",
-            "time_axis.timestamps_ns",
+            "main_video.frame_count",
             (
-                f"expected {expected_count} canonical timestamps, "
-                f"got {len(time_axis.timestamps_ns)}"
+                f"expected {time_axis.frame_count} frames, "
+                f"got {video.frame_count}"
             ),
         )
-    if video.frame_count != expected_count or len(video.timestamps_ns) != expected_count:
+    canonical_fps = Fraction(time_axis.fps_num, time_axis.fps_den)
+    video_fps = Fraction(video.fps_num, video.fps_den)
+    if video_fps != canonical_fps:
         _fail(
             "timebase_invalid",
-            "main_video.timestamps_ns",
-            (
-                f"expected {expected_count} frame PTS, got {len(video.timestamps_ns)} "
-                f"for {video.frame_count} probed frames"
-            ),
+            "main_video.fps",
+            f"expected {canonical_fps}, got {video_fps}",
         )
-
-    video_timestamps: list[int] = []
-    for index, value in enumerate(video.timestamps_ns):
-        if isinstance(value, bool) or not isinstance(value, Integral):
-            _fail(
-                "timebase_invalid",
-                f"main_video.timestamps_ns[{index}]",
-                "must be an exact integer nanosecond timestamp",
-            )
-        video_timestamps.append(int(value))
-    if any(
-        current <= previous
-        for previous, current in zip(video_timestamps, video_timestamps[1:])
-    ):
-        _fail(
-            "timebase_invalid",
-            "main_video.timestamps_ns",
-            "video PTS must be strictly increasing",
-        )
-
-    canonical_timestamps: list[int] = []
-    for index, value in enumerate(time_axis.timestamps_ns):
-        if isinstance(value, bool) or not isinstance(value, Integral):
-            _fail(
-                "timebase_invalid",
-                f"time_axis.timestamps_ns[{index}]",
-                "must be an exact integer nanosecond timestamp",
-            )
-        canonical_timestamps.append(int(value))
     canonical_zero = canonical_timestamps[0]
     video_zero = video_timestamps[0]
     for index, (canonical_timestamp, video_timestamp) in enumerate(
