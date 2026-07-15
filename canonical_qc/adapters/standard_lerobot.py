@@ -93,14 +93,21 @@ class _InfoContract:
     official_v3: bool
 
 
-def _fail(code: str, field: str, detail: str) -> None:
-    raise CanonicalInputError(code, field, detail)
+def _fail(
+    code: str, field: str, detail: str, *, retryable: bool = False
+) -> None:
+    raise CanonicalInputError(code, field, detail, retryable=retryable)
 
 
 def _mapped(error: CanonicalInputError) -> CanonicalInputError:
     if error.code in {"schema_missing", "field_mapping_error", "timebase_invalid", "source_integrity_error"}:
         return error
-    return CanonicalInputError("field_mapping_error", error.field, error.detail)
+    return CanonicalInputError(
+        "field_mapping_error",
+        error.field,
+        error.detail,
+        retryable=error.retryable,
+    )
 
 
 def _reject_symlink_chain(path: Path, *, field: str) -> None:
@@ -110,8 +117,15 @@ def _reject_symlink_chain(path: Path, *, field: str) -> None:
         current /= part
         try:
             metadata = current.lstat()
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             return
+        except OSError as exc:
+            _fail(
+                "source_integrity_error",
+                field,
+                f"cannot inspect path component {current}: {exc}",
+                retryable=True,
+            )
         if stat.S_ISLNK(metadata.st_mode):
             _fail("source_integrity_error", field, f"path component {current} must not be a symlink")
 
@@ -146,7 +160,12 @@ def _metadata(path: Path, root: Path, *, role: str) -> SourceFile:
     except CanonicalInputError:
         raise
     except OSError as exc:
-        _fail("source_integrity_error", relative, f"cannot stat/hash file: {exc}")
+        _fail(
+            "source_integrity_error",
+            relative,
+            f"cannot stat/hash file: {exc}",
+            retryable=True,
+        )
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         _fail("source_integrity_error", relative, "file changed while hashing")
     return SourceFile(relative, role, after.st_size, digest.hexdigest())
@@ -155,15 +174,29 @@ def _metadata(path: Path, root: Path, *, role: str) -> SourceFile:
 def _json_file(path: Path, *, field: str) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except OSError as exc:
+        _fail(
+            "source_integrity_error",
+            field,
+            f"cannot read JSON: {exc}",
+            retryable=True,
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
         _fail("field_mapping_error", field, f"must contain valid UTF-8 JSON: {exc}")
 
 
 def _jsonl(path: Path, *, field: str) -> list[dict[str, Any]]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
-        _fail("source_integrity_error", field, f"cannot read JSONL: {exc}")
+    except OSError as exc:
+        _fail(
+            "source_integrity_error",
+            field,
+            f"cannot read JSONL: {exc}",
+            retryable=True,
+        )
+    except UnicodeError as exc:
+        _fail("field_mapping_error", field, f"must contain valid UTF-8: {exc}")
     rows: list[dict[str, Any]] = []
     for index, line in enumerate(lines):
         try:
@@ -394,7 +427,14 @@ def _episode_rows(paths: tuple[Path, ...], layout: str) -> list[dict[str, Any]]:
         for path in paths:
             try:
                 rows.extend(pq.read_table(path).to_pylist())
-            except (OSError, pa.ArrowException) as exc:
+            except OSError as exc:
+                _fail(
+                    "source_integrity_error",
+                    "meta/episodes",
+                    f"cannot read Parquet: {exc}",
+                    retryable=True,
+                )
+            except pa.ArrowException as exc:
                 _fail("field_mapping_error", "meta/episodes", f"cannot read Parquet: {exc}")
         return rows
     return _jsonl(paths[0], field="meta/episodes.jsonl")
@@ -453,7 +493,14 @@ class StandardLeRobotAdapter:
             return self._inspect(source, episode_index=episode_index)
         except CanonicalInputError:
             raise
-        except (OSError, ValueError, TypeError, ZeroDivisionError, pa.ArrowException) as exc:
+        except OSError as exc:
+            _fail(
+                "source_integrity_error",
+                "source",
+                f"cannot inspect LeRobot dataset: {exc}",
+                retryable=True,
+            )
+        except (ValueError, TypeError, ZeroDivisionError, pa.ArrowException) as exc:
             _fail("source_integrity_error", "source", f"cannot inspect LeRobot dataset: {exc}")
 
     def _inspect(self, source: Path, *, episode_index: int | None = None) -> SourceInspection:
@@ -708,7 +755,14 @@ class StandardLeRobotAdapter:
             validate_episode(episode)
         except CanonicalInputError as exc:
             raise _mapped(exc) from exc
-        except (OSError, ValueError, TypeError, pa.ArrowException) as exc:
+        except OSError as exc:
+            _fail(
+                "source_integrity_error",
+                "source",
+                f"cannot decode LeRobot dataset: {exc}",
+                retryable=True,
+            )
+        except (ValueError, TypeError, pa.ArrowException) as exc:
             _fail("field_mapping_error", "source", f"cannot decode LeRobot dataset: {exc}")
         final_episode_paths = _revalidate_episode_paths(inspection)
         final_paths_roles = [(inspection.info_path, "dataset_info")]

@@ -266,6 +266,29 @@ def test_video_resolution_rejects_post_load_symlink_and_hash_drift(tmp_path: Pat
         CanonicalQcBridge(drift_episode, source_root=drift_root).video_path()
 
 
+def test_bridge_provenance_rehash_io_error_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "asset-001"
+    write_standard_hdf5_episode(source_root)
+    episode = StandardHdf5Adapter().load(source_root)
+    bridge = CanonicalQcBridge(episode, source_root=source_root)
+    original_open = Path.open
+
+    def fail_hdf5_open(path: Path, *args: object, **kwargs: object) -> object:
+        if path.suffix == ".h5" and args and args[0] == "rb":
+            raise OSError("temporary provenance read failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_hdf5_open)
+
+    with pytest.raises(CanonicalInputError) as caught:
+        bridge.verify_sources()
+
+    assert caught.value.code == "source_integrity_error"
+    assert caught.value.retryable is True
+
+
 def test_video_resolution_rejects_physical_span_beyond_mp4_frame_count(
     tmp_path: Path,
 ) -> None:

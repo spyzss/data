@@ -12,6 +12,36 @@ qc_acceptance_config_schema.v2 / qc_acceptance_v2.1.0
 Every asset has one master report. Batch statistics, the manual candidate queue,
 and compatibility ledgers are projections; sidecar 只作证据 and reconciliation.
 
+## Canonical ingest and Curated LeRobot v3
+
+新标准入口同时支持显式 HDF5 与 LeRobot source：
+
+```bash
+python tools/run_canonical_qc.py \
+  --source /data/batch/asset-001 \
+  --source-format hdf5 \
+  --source-root /data/batch/asset-001 \
+  --batch-root /data/batch \
+  --quality-archive /data/batch/quality_archive \
+  --profile acceptance
+```
+
+自动 QC 可以安全 resume，并在当前人工语义边界返回 `awaiting_external`。最终人工
+状态和 `canonical_binding` 完成后执行：
+
+```bash
+python tools/publish_lerobot_v3.py \
+  --source /data/batch/asset-001 \
+  --source-format hdf5 \
+  --canonical-source-root /data/batch/asset-001 \
+  --qc-report /data/batch/quality_archive/asset-001.json \
+  --release-root /training/curated-egodata
+```
+
+两条命令均支持 `--dry-run`，输出单行机器 JSON。正式发布只在所有门禁和官方
+reader 验证通过后原子更新 `CURRENT.json`。完整参数、退出码、训练读取和恢复步骤见
+`docs/canonical-qc-ingest-publish-runbook.md`。
+
 The workflows are:
 
 - `acceptance_pull`: validate a supplier manifest, sample IDs by scene/task,

@@ -13,6 +13,9 @@ import pandas as pd
 import pyarrow as pa
 
 
+TOOLCHAIN_SCHEMA_VERSION = "curated_lerobot_v3_toolchain.v1"
+
+
 @dataclass(frozen=True, slots=True)
 class WriterToolchain:
     schema_version: str
@@ -47,7 +50,7 @@ def current_toolchain() -> WriterToolchain:
     build_configuration = _command_signature(["ffmpeg", "-buildconf"])
     encoder = _command_signature(["ffmpeg", "-hide_banner", "-h", "encoder=libx264"])
     payload = {
-        "schema_version": "curated_lerobot_v3_toolchain.v1",
+        "schema_version": TOOLCHAIN_SCHEMA_VERSION,
         "python_version": platform.python_version(),
         "numpy_version": np.__version__,
         "pyarrow_version": pa.__version__,
@@ -68,4 +71,9 @@ def publisher_version_for(base: str) -> str:
     return f"{base}+toolchain.{current_toolchain().fingerprint[:16]}"
 
 
-__all__ = ["WriterToolchain", "current_toolchain", "publisher_version_for"]
+__all__ = [
+    "TOOLCHAIN_SCHEMA_VERSION",
+    "WriterToolchain",
+    "current_toolchain",
+    "publisher_version_for",
+]

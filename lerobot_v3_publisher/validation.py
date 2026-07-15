@@ -62,6 +62,7 @@ _OFFICIAL_READER_VERSIONS = {
     "video_backend": "pyav",
 }
 _OFFICIAL_READER_TIMEOUT_SECONDS = 180
+OFFICIAL_READER_VERSION = _OFFICIAL_READER_PACKAGES["lerobot"]
 
 
 def _reject(field: str | None, message: str, *, retryable: bool = False) -> NoReturn:

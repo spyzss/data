@@ -23,6 +23,7 @@ from .prerequisites import (
 from .writer import write_staging
 from .publisher import publish
 from .validation import validate_staged_release
+from .workflow import publish_from_paths
 
 __all__ = [
     "CanonicalDiagnostic",
@@ -43,5 +44,6 @@ __all__ = [
     "validate_publish_request",
     "write_staging",
     "publish",
+    "publish_from_paths",
     "validate_staged_release",
 ]

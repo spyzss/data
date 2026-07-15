@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from canonical_qc import CanonicalInputError, StandardHdf5Adapter
+from canonical_qc.adapters import _standard_hdf5_readers as hdf5_readers
 from tests.fixtures import solid_frame, write_standard_hdf5_episode, write_test_video
 
 
@@ -30,6 +31,25 @@ def _assert_error(
     assert raised.value.field == field
     assert str(raised.value).startswith(f"{code}: {field}:")
     return raised.value
+
+
+def test_semantics_scalar_io_error_is_retryable() -> None:
+    class FailingScalar:
+        shape = ()
+        dtype = h5py.string_dtype(encoding="utf-8")
+
+        def asstr(self) -> "FailingScalar":
+            return self
+
+        def __getitem__(self, _key: object) -> object:
+            raise OSError("temporary HDF5 dataset read failure")
+
+    with pytest.raises(CanonicalInputError) as caught:
+        hdf5_readers._json_string(FailingScalar())  # type: ignore[arg-type]
+
+    assert caught.value.code == "source_integrity_error"
+    assert caught.value.field == "/semantics/annotation_json"
+    assert caught.value.retryable is True
 
 
 @pytest.mark.parametrize("source_kind", ["directory", "hdf5"])

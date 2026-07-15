@@ -20,8 +20,10 @@ from .validation import validate_episode
 from .video_probe import probe_video
 
 
-def _fail(field: str, detail: str) -> None:
-    raise CanonicalInputError("source_integrity_error", field, detail)
+def _fail(field: str, detail: str, *, retryable: bool = False) -> None:
+    raise CanonicalInputError(
+        "source_integrity_error", field, detail, retryable=retryable
+    )
 
 
 def _readonly(values: np.ndarray) -> np.ndarray:
@@ -64,7 +66,11 @@ class CanonicalQcBridge:
         try:
             resolved = root.resolve(strict=True)
         except OSError as exc:
-            _fail("source_root", f"cannot resolve supplied source root: {exc}")
+            _fail(
+                "source_root",
+                f"cannot resolve supplied source root: {exc}",
+                retryable=True,
+            )
         if not resolved.is_dir():
             _fail("source_root", "must be an existing directory")
         if resolved != root.absolute():
@@ -92,7 +98,15 @@ class CanonicalQcBridge:
         try:
             resolved = lexical.resolve(strict=True)
             resolved.relative_to(self._source_root)
-        except (OSError, ValueError):
+        except (FileNotFoundError, NotADirectoryError):
+            _fail(field, "declared path does not resolve inside source_root")
+        except OSError as exc:
+            _fail(
+                field,
+                f"cannot resolve declared path: {exc}",
+                retryable=True,
+            )
+        except ValueError:
             _fail(field, "declared path does not resolve inside source_root")
         if resolved != lexical.absolute():
             _fail(field, "declared path must not traverse a filesystem symlink")
@@ -114,7 +128,11 @@ class CanonicalQcBridge:
                         digest_builder.update(chunk)
                 after = path.stat()
             except OSError as exc:
-                _fail(field, f"cannot verify source provenance: {exc}")
+                _fail(
+                    field,
+                    f"cannot verify source provenance: {exc}",
+                    retryable=True,
+                )
             if (before.st_size, before.st_mtime_ns) != (
                 after.st_size,
                 after.st_mtime_ns,

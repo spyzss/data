@@ -21,8 +21,10 @@ from ..errors import CanonicalInputError
 STATUS_NAMES = np.asarray(["unknown", "bad", "warning", "good"], dtype="<U7")
 
 
-def fail(code: str, field: str, detail: str) -> None:
-    raise CanonicalInputError(code, field, detail)
+def fail(
+    code: str, field: str, detail: str, *, retryable: bool = False
+) -> None:
+    raise CanonicalInputError(code, field, detail, retryable=retryable)
 
 
 def required_attr(container: Any, name: str, *, prefix: str = "/") -> object:
@@ -181,7 +183,14 @@ def _json_string(value: h5py.Dataset) -> str:
         fail("field_mapping_error", field, "must use an explicit UTF-8 string dtype")
     try:
         decoded = value.asstr()[()]
-    except (UnicodeDecodeError, OSError, TypeError) as exc:
+    except OSError as exc:
+        fail(
+            "source_integrity_error",
+            field,
+            f"cannot read UTF-8 scalar: {exc}",
+            retryable=True,
+        )
+    except (UnicodeDecodeError, TypeError) as exc:
         fail("field_mapping_error", field, f"cannot decode UTF-8 scalar: {exc}")
     if not isinstance(decoded, str):
         fail("field_mapping_error", field, "must decode to a string")

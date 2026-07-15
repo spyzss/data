@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 from numbers import Integral
 from pathlib import Path
@@ -47,12 +48,36 @@ _CANONICAL_ERROR_CODES = frozenset(
         "source_integrity_error",
     }
 )
+_TRANSIENT_IO_ERRNOS = frozenset(
+    {
+        errno.EAGAIN,
+        errno.EBUSY,
+        errno.EINTR,
+        errno.EIO,
+        errno.EMFILE,
+        errno.ENFILE,
+        errno.ENOSPC,
+        getattr(errno, "ESTALE", -1),
+        errno.ETIMEDOUT,
+    }
+)
+
+
+def _is_transient_hdf5_error(error: OSError) -> bool:
+    """Distinguish operational I/O from h5py's format-as-OSError failures."""
+
+    return error.errno in _TRANSIENT_IO_ERRNOS
 
 
 def _mapped_error(error: CanonicalInputError) -> CanonicalInputError:
     if error.code in _CANONICAL_ERROR_CODES:
         return error
-    return CanonicalInputError("field_mapping_error", error.field, error.detail)
+    return CanonicalInputError(
+        "field_mapping_error",
+        error.field,
+        error.detail,
+        retryable=error.retryable,
+    )
 
 
 def _file_metadata(path: Path, *, role: str, relative_path: str) -> SourceFile:
@@ -68,7 +93,12 @@ def _file_metadata(path: Path, *, role: str, relative_path: str) -> SourceFile:
     except CanonicalInputError:
         raise
     except OSError as exc:
-        _fail("source_integrity_error", relative_path, f"cannot stat/hash file: {exc}")
+        _fail(
+            "source_integrity_error",
+            relative_path,
+            f"cannot stat/hash file: {exc}",
+            retryable=True,
+        )
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         _fail("source_integrity_error", relative_path, "file changed while hashing")
     return SourceFile(
@@ -87,9 +117,16 @@ def _reject_symlink_chain(path: Path, *, field: str) -> None:
         current /= part
         try:
             metadata = current.lstat()
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             # Preserve the caller's existing missing/not-a-directory diagnostic.
             return
+        except OSError as exc:
+            _fail(
+                "source_integrity_error",
+                field,
+                f"cannot inspect path component {current}: {exc}",
+                retryable=True,
+            )
         if stat.S_ISLNK(metadata.st_mode):
             _fail(
                 "source_integrity_error",
@@ -174,7 +211,14 @@ class StandardHdf5Adapter:
                 _text(_required_attr(handle, "supplier_id"), field="/@supplier_id")
         except CanonicalInputError:
             raise
-        except (OSError, ValueError, TypeError) as exc:
+        except OSError as exc:
+            _fail(
+                "source_integrity_error",
+                "source",
+                f"cannot open HDF5 read-only: {exc}",
+                retryable=_is_transient_hdf5_error(exc),
+            )
+        except (ValueError, TypeError) as exc:
             _fail(
                 "source_integrity_error",
                 "source",
@@ -230,7 +274,14 @@ class StandardHdf5Adapter:
                 )
         except CanonicalInputError as exc:
             raise _mapped_error(exc) from exc
-        except (OSError, ValueError, TypeError) as exc:
+        except OSError as exc:
+            _fail(
+                "source_integrity_error",
+                "source",
+                f"cannot read HDF5: {exc}",
+                retryable=_is_transient_hdf5_error(exc),
+            )
+        except (ValueError, TypeError) as exc:
             _fail(
                 "source_integrity_error",
                 "source",

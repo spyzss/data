@@ -48,6 +48,24 @@ values are `pass`, `fail`, and `null` while incomplete.
 XLSX, Markdown, events and cache are derived evidence/reconciliation only
 （sidecar 只作证据）; they cannot replace or overwrite a report verdict.
 
+### 1.2 Canonical ingest and curated publish
+
+标准 HDF5 与 LeRobot 使用同一显式入口：
+
+```text
+SourceAdapter -> CanonicalQcEpisode -> CanonicalQcBridge
+-> automatic QC/resume -> external semantic calibration -> Warn review
+-> final asset_qc_report.v2 -> LeRobotV3Publisher -> immutable release/CURRENT
+```
+
+`configs/canonical_qc.yaml` 是 ingest/publish 顶层 active config，并绑定 immutable
+snapshot、QC config hash、Adapter/Publisher/toolchain/official-reader 版本。CLI 必须
+显式接收 source format、source root 和路径；不得猜格式或根目录。自动流程在
+`semantic_consistency` 返回 `awaiting_external`，不会伪造人工完成。训练从
+`CURRENT.json -> releases/<release_id>` 读取，不扫描 staging 或按 mtime 选数据。
+
+命令和故障恢复见 `docs/canonical-qc-ingest-publish-runbook.md`。
+
 ## 2. Module Ownership
 
 | Module | Owner Scope | Loads Heavy Models | Main Inputs | Main Outputs |

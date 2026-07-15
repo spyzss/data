@@ -19,8 +19,10 @@ _SIGNED_INTEGER = re.compile(r"[+-]?\d+").fullmatch
 _DECIMAL_SECONDS = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)").fullmatch
 
 
-def _fail(code: str, field: str, detail: str) -> None:
-    raise CanonicalInputError(code, field, detail)
+def _fail(
+    code: str, field: str, detail: str, *, retryable: bool = False
+) -> None:
+    raise CanonicalInputError(code, field, detail, retryable=retryable)
 
 
 def _fraction(value: object, *, field: str) -> Fraction:
@@ -113,6 +115,7 @@ def _probe_payload(path: Path, *, pass_fds: tuple[int, ...] = ()) -> dict[str, A
             "source_integrity_error",
             "main_video.path",
             f"ffprobe unavailable: {exc}",
+            retryable=True,
         )
     except subprocess.TimeoutExpired as exc:
         stderr = exc.stderr
@@ -129,12 +132,20 @@ def _probe_payload(path: Path, *, pass_fds: tuple[int, ...] = ()) -> dict[str, A
             "source_integrity_error",
             "main_video.path",
             detail,
+            retryable=True,
         )
-    except (OSError, UnicodeError) as exc:
+    except OSError as exc:
         _fail(
             "source_integrity_error",
             "main_video.path",
             f"ffprobe execution failed: {exc}",
+            retryable=True,
+        )
+    except UnicodeError as exc:
+        _fail(
+            "source_integrity_error",
+            "main_video.path",
+            f"ffprobe output is not valid text: {exc}",
         )
 
     if completed.returncode != 0:

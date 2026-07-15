@@ -306,11 +306,11 @@ python tools/run_canonical_qc.py --source ... --quality-archive ... --profile ac
 python tools/publish_lerobot_v3.py --source ... --qc-report ... --release-root ...
 ```
 
-- [ ] Step 1: 写 HDF5 与 LeRobot 两条 CLI E2E，覆盖 ingest、QC resume、人工完成 fixture、publish、独立回读。
-- [ ] Step 2: 写 JSON error 输出测试，区分输入 fail、runtime error、publish prerequisite 和 validation failure。
-- [ ] Step 3: 实现薄 CLI、配置加载和文档；业务逻辑只调用 package API。
-- [ ] Step 4: 运行 `.venv/bin/python -m pytest tests/test_canonical_qc_cli_e2e.py -q`，并执行两种输入的等价发布 smoke test。
-- [ ] Step 5: 提交 `feat: run canonical QC and publish curated LeRobot v3`。
+- [x] Step 1: 写 HDF5 与 LeRobot 两条 CLI E2E，覆盖 ingest、QC resume、人工完成 fixture、publish、独立回读。
+- [x] Step 2: 写 JSON error 输出测试，区分输入 fail、runtime error、publish prerequisite 和 validation failure。
+- [x] Step 3: 实现薄 CLI、配置加载和文档；业务逻辑只调用 package API。
+- [x] Step 4: 运行 `.venv/bin/python -m pytest tests/test_canonical_qc_cli_e2e.py -q`，并执行两种输入的等价发布 smoke test。
+- [x] Step 5: 提交 `feat: run canonical QC and publish curated LeRobot v3`。
 
 ## Task 11: Thorough 全量验证与设计对账
 
