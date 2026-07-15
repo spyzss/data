@@ -153,15 +153,28 @@ class CanonicalQcBridge:
 
 **Files:**
 - Create: `canonical_qc/hand_quality.py`
+- Create: `configs/qc_acceptance/qc_acceptance_v2.1.0.yaml`
 - Create: `tests/test_supplier_hand_quality_evidence.py`
+- Modify: `canonical_qc/bridge.py`
 - Modify: `qc_common/types.py`
 - Modify: `qc_pipeline/adapters/precheck.py`
+- Modify: `qc_pipeline/adapters/sam3_containment.py`
+- Modify: `qc_pipeline/runners/precheck.py`
+- Modify: `qc_pipeline/runners/sam3_containment.py`
 - Modify: `precheck/checks/quality_score.py`
 - Modify: `precheck/checks/keypoint_missing.py`
-- Modify: `precheck/checks/keypoint_temporal.py`
-- Modify: `precheck/checks/skeleton_quality_score.py`
-- Modify: `configs/qc_acceptance/qc_acceptance_v2.0.0.yaml`
 - Modify: `configs/qc_acceptance.yaml`
+- Modify: `ACCEPTANCE.md`
+- Modify: `WORKFLOW_INTERFACE.md`
+- Modify: `docs/PRD-qc-gated-json.md`
+- Modify: `docs/PRD-qc-unified-config.md`
+- Modify: `docs/asset-qc-json-format.md`
+- Modify: `docs/canonical-qc-required-fields-v1.md`
+- Modify: `docs/superpowers/specs/2026-07-15-canonical-qc-ingest-publisher-design.md`
+- Modify: `tests/test_acceptance_video_quality.py`
+- Modify: `tests/test_qc_config.py`
+- Modify: `tests/test_qc_config_v2.py`
+- Modify: `tests/test_qc_docs_contract.py`
 
 **Interfaces:**
 

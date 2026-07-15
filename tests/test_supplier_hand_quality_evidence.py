@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import copy
+import json
 
 import numpy as np
 import pytest
 import h5py
 
-from canonical_qc import StandardHdf5Adapter
+from canonical_qc import StandardHdf5Adapter, StandardLeRobotAdapter
 from canonical_qc.bridge import CanonicalQcBridge
 from canonical_qc.hand_quality import compare_supplier_and_machine
 from qc_common.config import LoadedQcConfig
@@ -15,7 +16,10 @@ from qc_common.report_mutation import apply_module_result
 from qc_pipeline.runners.precheck import runner_for
 from qc_pipeline.runners.sam3_containment import runner as sam3_runner
 from qc_pipeline.adapters.sam3_containment import adapt_sam3_containment
-from tests.fixtures import write_standard_hdf5_episode
+from tests.fixtures import (
+    write_standard_hdf5_episode,
+    write_standard_lerobot_dataset,
+)
 from tests.qc_report_fixtures import loaded_test_config
 
 
@@ -252,6 +256,88 @@ def test_sam3_adapter_missing_supplier_evidence_is_cleanly_not_provided(
 
     assert result.verdict == "pass"
     assert result.metrics["supplier_hand_quality"] == {"provided": False}
+
+
+def _load_explicitly_unprovided_episode(tmp_path, source_format: str):
+    if source_format == "hdf5":
+        source_root = tmp_path / source_format / "asset-001"
+        write_standard_hdf5_episode(source_root, hand_quality="false")
+        return source_root, StandardHdf5Adapter().load(source_root)
+
+    source_root = tmp_path / source_format
+    write_standard_lerobot_dataset(source_root)
+    semantics_path = source_root / "meta" / "episode_semantics.jsonl"
+    rows = [
+        json.loads(line)
+        for line in semantics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for row in rows:
+        row["supplier_hand_quality"] = {"provided": False}
+    semantics_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return source_root, StandardLeRobotAdapter().load(source_root)
+
+
+@pytest.mark.parametrize("source_format", ["hdf5", "lerobot"])
+def test_explicitly_unprovided_supplier_evidence_cleanly_skips_across_qc(
+    tmp_path,
+    source_format: str,
+) -> None:
+    source_root, episode = _load_explicitly_unprovided_episode(
+        tmp_path,
+        source_format,
+    )
+    bridge = CanonicalQcBridge(episode, source_root=source_root)
+    candidates = tmp_path / f"{source_format}-candidate-windows.json"
+    candidates.write_text(
+        json.dumps(
+            [
+                {
+                    "asset_id": episode.identity.asset_id,
+                    "start_frame": 0,
+                    "end_frame": 0,
+                    "hand_side": "both",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    context = bridge.asset_context(
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / f"{source_format}.json",
+        supplemental_source_files={
+            "candidate_windows": {"path": candidates.name}
+        },
+    )
+
+    clip = bridge.clip_inputs()
+    quality_result = runner_for("quality_hand")(context, loaded_test_config())
+
+    class Segmenter:
+        def segment_frame(self, frame, queries, config):
+            return [
+                SimpleNamespace(
+                    mask=np.ones(frame.shape[:2], dtype=bool),
+                    category="hand",
+                )
+            ]
+
+    sam3_result = sam3_runner(lambda: Segmenter())(
+        context,
+        loaded_test_config(),
+    )
+
+    assert episode.supplier_evidence.hand_quality is not None
+    assert episode.supplier_evidence.hand_quality.provided is False
+    assert clip.supplier_hand_quality_status is None
+    assert quality_result.verdict == "skipped"
+    assert quality_result.evaluation == {
+        "decision": "skipped",
+        "reason": "source_signal_not_provided",
+    }
+    assert sam3_result.metrics["supplier_hand_quality"] == {"provided": False}
 
 
 def test_sam3_supplier_alignment_rejects_both_as_a_frame_hand_side(tmp_path) -> None:

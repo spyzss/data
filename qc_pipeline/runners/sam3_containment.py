@@ -215,6 +215,7 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
                 None
                 if canonical_episode is None
                 or canonical_episode.supplier_evidence.hand_quality is None
+                or not canonical_episode.supplier_evidence.hand_quality.provided
                 else canonical_episode.supplier_evidence.hand_quality.status
             ),
         )

@@ -10,6 +10,7 @@ from qc_common.schema import validate_qc_config
 
 
 V1_SHA256 = "0ef58453f381651711ec84490975a1af5e274a179647f6ea2cc83e42404ea41d"
+V2_0_0_SHA256 = "747dc605a066eb992d89346611b1421f4225dbeeb37431d85e532e39fd94c37b"
 
 
 def _write_config(tmp_path: Path, raw: dict[str, object]) -> Path:
@@ -68,6 +69,10 @@ def test_active_config_matches_immutable_v2_snapshot() -> None:
     assert (
         hashlib.sha256(Path("configs/qc_acceptance/qc_acceptance_v1.1.0.yaml").read_bytes()).hexdigest()
         == V1_SHA256
+    )
+    assert (
+        hashlib.sha256(Path("configs/qc_acceptance/qc_acceptance_v2.0.0.yaml").read_bytes()).hexdigest()
+        == V2_0_0_SHA256
     )
 
 

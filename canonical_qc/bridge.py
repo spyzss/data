@@ -204,7 +204,11 @@ class CanonicalQcBridge:
         )
         quality = episode.supplier_evidence.hand_quality
         status = None
-        if quality is not None and quality.status is not None:
+        if (
+            quality is not None
+            and quality.provided
+            and quality.status is not None
+        ):
             status = _readonly(quality.status[start:end])
         clip = ClipInputs(
             episode_idx=0,
