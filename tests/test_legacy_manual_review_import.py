@@ -249,10 +249,12 @@ def test_changed_import_requires_current_expected_revision(tmp_path: Path) -> No
         )
 
 
-def test_review_id_is_a_supported_exact_legacy_issue_id_alias(tmp_path: Path) -> None:
+def test_generated_review_id_is_rejected_without_authoritative_issue_mapping(
+    tmp_path: Path,
+) -> None:
     report_path = _report(tmp_path, issue_ids=("warn-1",))
     row = _row("", "false_positive")
-    row["review_id"] = "warn-1"
+    row["review_id"] = "rq_001"
     result = import_legacy_manual_review(
         report_path,
         _csv(tmp_path, [row]),
@@ -262,7 +264,59 @@ def test_review_id_is_a_supported_exact_legacy_issue_id_alias(tmp_path: Path) ->
         dry_run=True,
     )
 
+    assert result.matched_count == 0
+    assert result.matched_issue_ids == ()
+    assert result.conflict_count == 1
+    assert result.problems[0].code == "review_id_requires_mapping"
+
+
+def test_authoritative_mapping_resolves_generated_review_id_exactly(tmp_path: Path) -> None:
+    report_path = _report(tmp_path, issue_ids=("warn-1",))
+    row = _row("", "false_positive")
+    row["review_id"] = "rq_001"
+    mapping_path = tmp_path / "review_issue_mapping.csv"
+    mapping_path.write_text(
+        "asset_id,review_id,issue_id\nasset-001,rq_001,warn-1\n",
+        encoding="utf-8",
+    )
+
+    result = import_legacy_manual_review(
+        report_path,
+        _csv(tmp_path, [row]),
+        None,
+        expected_revision=1,
+        reviewer="migration-bot",
+        dry_run=True,
+        issue_mapping_path=mapping_path,
+    )
+
     assert result.matched_issue_ids == ("warn-1",)
+    assert result.conflict_count == 0
+
+
+def test_matched_issue_ids_exclude_existing_review_conflicts(tmp_path: Path) -> None:
+    report_path = _report(tmp_path, issue_ids=("warn-1",))
+    report = load_asset_qc_report(report_path)
+    assert report is not None
+    report["manual_review"]["issue_reviews"] = {
+        "warn-1": {"verdict": "fail", "reviewer": "human", "reviewed_at": "earlier"}
+    }
+    report["report_revision"] = 2
+    write_asset_qc_report(report_path, report, expected_revision=1, profile="acceptance")
+
+    result = import_legacy_manual_review(
+        report_path,
+        _csv(tmp_path, [_row("warn-1", "false_positive")]),
+        None,
+        expected_revision=2,
+        reviewer="migration-bot",
+        dry_run=True,
+    )
+
+    assert result.matched_count == 0
+    assert result.matched_issue_ids == ()
+    assert result.conflict_count == 1
+    assert result.problems[0].code == "existing_review_differs"
 
 
 def test_import_cli_dry_run_prints_counts_and_does_not_write(
@@ -289,6 +343,132 @@ def test_import_cli_dry_run_prints_counts_and_does_not_write(
     assert output["totals"] == {"matched": 1, "unmatched": 0, "conflicts": 0}
     assert output["dry_run"] is True
     assert load_asset_qc_report(report_path)["report_revision"] == 1
+
+
+def test_batch_dry_run_counts_each_unknown_asset_source_row_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    archive = tmp_path / "quality_archive"
+    first = _report(tmp_path, issue_ids=("warn-1",))
+    second_report = load_asset_qc_report(first)
+    assert second_report is not None
+    second_report["asset_id"] = "asset-002"
+    second_path = archive / "asset-002.json"
+    write_asset_qc_report(second_path, second_report, expected_revision=0, profile="acceptance")
+    csv_path = _csv(
+        tmp_path,
+        [
+            _row("warn-1", "false_positive", asset_id="asset-001"),
+            _row("warn-1", "false_positive", asset_id="asset-002"),
+            _row("warn-1", "false_positive", asset_id="missing-asset"),
+            _row("warn-2", "true_positive", asset_id="missing-asset"),
+        ],
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "import_legacy_manual_review.py",
+            "--quality-archive",
+            str(archive),
+            "--csv",
+            str(csv_path),
+            "--reviewer",
+            "migration-bot",
+            "--dry-run",
+        ],
+    )
+
+    assert legacy_cli.main() == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["totals"] == {"matched": 2, "unmatched": 2, "conflicts": 0}
+
+
+def test_batch_write_preflights_all_scalar_expected_revisions_before_mutating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "quality_archive"
+    first = _report(tmp_path, issue_ids=("warn-1",))
+    second_report = load_asset_qc_report(first)
+    assert second_report is not None
+    second_report["asset_id"] = "asset-002"
+    second_path = archive / "asset-002.json"
+    write_asset_qc_report(second_path, second_report, expected_revision=0, profile="acceptance")
+    second_report = load_asset_qc_report(second_path)
+    assert second_report is not None
+    second_report["report_revision"] = 2
+    write_asset_qc_report(second_path, second_report, expected_revision=1, profile="acceptance")
+    csv_path = _csv(
+        tmp_path,
+        [
+            _row("warn-1", "false_positive", asset_id="asset-001"),
+            _row("warn-1", "false_positive", asset_id="asset-002"),
+        ],
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "import_legacy_manual_review.py",
+            "--quality-archive",
+            str(archive),
+            "--csv",
+            str(csv_path),
+            "--reviewer",
+            "migration-bot",
+            "--expected-revision",
+            "1",
+        ],
+    )
+
+    with pytest.raises(StaleReportRevisionError):
+        legacy_cli.main()
+
+    assert load_asset_qc_report(first)["report_revision"] == 1
+    assert load_asset_qc_report(second_path)["report_revision"] == 2
+
+
+def test_audit_hash_uses_same_csv_byte_snapshot_as_imported_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import human_qc.legacy_import as legacy_import_module
+
+    report_path = _report(tmp_path, issue_ids=("warn-1",))
+    csv_path = _csv(tmp_path, [_row("warn-1", "false_positive")])
+    progress_path = tmp_path / "progress.json"
+    progress_path.write_text('{"segmentsByReviewId": {}}', encoding="utf-8")
+    original_bytes = csv_path.read_bytes()
+    original_progress_bytes = progress_path.read_bytes()
+    original_reader = legacy_import_module._read_source_bytes
+
+    def mutate_after_snapshot(path: Path) -> bytes:
+        snapshot = original_reader(path)
+        if Path(path) == csv_path:
+            csv_path.write_text(
+                "asset_id,issue_id,manual_outcome\nasset-001,warn-1,true_positive\n",
+                encoding="utf-8",
+            )
+        if Path(path) == progress_path:
+            progress_path.write_text('{"segmentsByReviewId": "changed"}', encoding="utf-8")
+        return snapshot
+
+    monkeypatch.setattr(legacy_import_module, "_read_source_bytes", mutate_after_snapshot)
+    result = import_legacy_manual_review(
+        report_path,
+        csv_path,
+        progress_path,
+        expected_revision=1,
+        reviewer="migration-bot",
+    )
+
+    assert result.written is True
+    persisted = load_asset_qc_report(report_path)
+    review = persisted["manual_review"]["issue_reviews"]["warn-1"]
+    audit = persisted["manual_review"]["import_audit"][-1]
+    assert review["verdict"] == "pass"
+    assert audit["csv_sha256"] == "sha256:" + hashlib.sha256(original_bytes).hexdigest()
+    assert audit["progress_sha256"] == (
+        "sha256:" + hashlib.sha256(original_progress_bytes).hexdigest()
+    )
 
 
 def test_legacy_server_startup_logs_non_authoritative_deprecation(

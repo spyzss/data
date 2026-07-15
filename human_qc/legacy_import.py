@@ -1,16 +1,18 @@
 """One-time migration of legacy manual-review exports into asset QC reports.
 
 The importer deliberately recognizes only exact ``asset_id`` and ``issue_id``
-identities.  ``review_id`` is supported as the legacy spelling of
-``issue_id``; frame windows, row order, comments, and progress JSON are never
-used to infer an identity.  Once imported, the asset report is the only
-authoritative state read by the workbench.
+identities.  A generated legacy ``review_id`` is accepted only when an
+explicit asset/review/issue mapping is supplied; frame windows, row order,
+comments, and progress JSON are never used to infer an identity.  Once
+imported, the asset report is the only authoritative state read by the
+workbench.
 """
 
 from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -106,40 +108,86 @@ def _clean(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _sha256(path: Path | None) -> str | None:
-    if path is None:
-        return None
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return "sha256:" + digest.hexdigest()
+def _read_source_bytes(path: Path) -> bytes:
+    """Read one immutable source snapshot used for both parsing and hashing."""
+
+    return Path(path).read_bytes()
 
 
-def _read_rows(csv_path: Path) -> tuple[list[tuple[int, dict[str, str]]], list[str]]:
-    with Path(csv_path).open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fields = list(reader.fieldnames or [])
-        if "asset_id" not in fields:
-            raise ValueError("legacy CSV must contain asset_id")
-        if "issue_id" not in fields and "review_id" not in fields:
-            raise ValueError("legacy CSV must contain issue_id or review_id")
-        rows = [
-            (row_number, {str(key): value or "" for key, value in row.items() if key is not None})
-            for row_number, row in enumerate(reader, start=2)
-        ]
+def _sha256_bytes(value: bytes | None) -> str | None:
+    return None if value is None else "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _read_rows(csv_bytes: bytes) -> tuple[list[tuple[int, dict[str, str]]], list[str]]:
+    try:
+        text = csv_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"legacy CSV must be UTF-8: {exc}") from exc
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    fields = list(reader.fieldnames or [])
+    if "asset_id" not in fields:
+        raise ValueError("legacy CSV must contain asset_id")
+    if "issue_id" not in fields and "review_id" not in fields:
+        raise ValueError("legacy CSV must contain issue_id or review_id")
+    rows = [
+        (row_number, {str(key): value or "" for key, value in row.items() if key is not None})
+        for row_number, row in enumerate(reader, start=2)
+    ]
     return rows, fields
 
 
-def _row_issue_id(row: Mapping[str, str]) -> tuple[str | None, str | None]:
+def _read_issue_mapping(
+    mapping_bytes: bytes | None,
+) -> tuple[dict[tuple[str, str], str], set[tuple[str, str]]]:
+    if mapping_bytes is None:
+        return {}, set()
+    try:
+        text = mapping_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"issue mapping CSV must be UTF-8: {exc}") from exc
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    required = {"asset_id", "review_id", "issue_id"}
+    if not required.issubset(reader.fieldnames or []):
+        raise ValueError("issue mapping CSV must contain asset_id, review_id, issue_id")
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for row_number, row in enumerate(reader, start=2):
+        asset_id = _clean(row.get("asset_id"))
+        review_id = _clean(row.get("review_id"))
+        issue_id = _clean(row.get("issue_id"))
+        if not asset_id or not review_id or not issue_id:
+            raise ValueError(f"issue mapping row {row_number} has an empty identity")
+        grouped.setdefault((asset_id, review_id), []).append(issue_id)
+    ambiguous = {key for key, values in grouped.items() if len(values) != 1}
+    unique = {key: values[0] for key, values in grouped.items() if len(values) == 1}
+    return unique, ambiguous
+
+
+def _row_issue_id(
+    row: Mapping[str, str],
+    issue_mapping: Mapping[tuple[str, str], str],
+    ambiguous_mapping: set[tuple[str, str]],
+) -> tuple[str | None, str | None, str | None]:
     issue_id = _clean(row.get("issue_id"))
     review_id = _clean(row.get("review_id"))
-    if issue_id and review_id and issue_id != review_id:
-        return None, "issue_id and review_id disagree"
-    value = issue_id or review_id
-    if not value:
-        return None, "issue_id/review_id is empty"
-    return value, None
+    if issue_id:
+        return issue_id, None, None
+    if not review_id:
+        return None, "missing_issue_identity", "issue_id is empty"
+    key = (_clean(row.get("asset_id")), review_id)
+    if key in ambiguous_mapping:
+        return (
+            None,
+            "ambiguous_issue_mapping",
+            f"multiple mapping rows exist for asset_id={key[0]!r}, review_id={review_id!r}",
+        )
+    mapped = issue_mapping.get(key)
+    if mapped is None:
+        return (
+            None,
+            "review_id_requires_mapping",
+            f"generated review_id={review_id!r} requires an exact asset/review/issue mapping",
+        )
+    return mapped, None, None
 
 
 def _row_verdict(row: Mapping[str, str]) -> tuple[str | None, str | None]:
@@ -217,6 +265,11 @@ def import_legacy_manual_review(
     reviewer: str,
     *,
     dry_run: bool = False,
+    issue_mapping_path: Path | None = None,
+    asset_scope_only: bool = False,
+    _csv_bytes: bytes | None = None,
+    _progress_bytes: bytes | None = None,
+    _mapping_bytes: bytes | None = None,
 ) -> ImportResult:
     """Import exact legacy decisions into one report, or report a dry run.
 
@@ -228,15 +281,30 @@ def import_legacy_manual_review(
     path = Path(report_path)
     csv_file = Path(csv_path)
     progress_file = Path(progress_path) if progress_path is not None else None
+    mapping_file = Path(issue_mapping_path) if issue_mapping_path is not None else None
     if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
         raise TypeError("expected_revision must be an integer")
     reviewer = _clean(reviewer)
     if not reviewer:
         raise ValueError("reviewer must be a non-empty string")
-    if progress_file is not None:
+    csv_bytes = _read_source_bytes(csv_file) if _csv_bytes is None else _csv_bytes
+    progress_bytes = (
+        _read_source_bytes(progress_file)
+        if progress_file is not None and _progress_bytes is None
+        else _progress_bytes
+    )
+    mapping_bytes = (
+        _read_source_bytes(mapping_file)
+        if mapping_file is not None and _mapping_bytes is None
+        else _mapping_bytes
+    )
+    if progress_bytes is not None:
         # Parse only to reject corrupt migration input.  Its contents never
         # supply an identity or verdict.
-        value = json.loads(progress_file.read_text(encoding="utf-8"))
+        try:
+            value = json.loads(progress_bytes.decode("utf-8-sig"))
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"progress JSON must be UTF-8: {exc}") from exc
         if not isinstance(value, (dict, list)):
             raise ValueError("progress JSON must contain an object or array")
 
@@ -249,7 +317,8 @@ def import_legacy_manual_review(
     if not isinstance(asset_id, str) or not asset_id:
         raise ValueError("report asset_id must be a non-empty string")
     current_revision = int(report.get("report_revision", 0))
-    rows, _fields = _read_rows(csv_file)
+    rows, _fields = _read_rows(csv_bytes)
+    issue_mapping, ambiguous_mapping = _read_issue_mapping(mapping_bytes)
     issues, ambiguous_issues = _issue_index(report)
 
     manual = report.get("manual_review")
@@ -266,12 +335,15 @@ def import_legacy_manual_review(
         raise ValueError("manual_review.issue_reviews must be an object")
 
     resolved_ids: dict[int, str] = {}
-    identity_errors: dict[int, str] = {}
+    identity_errors: dict[int, tuple[str, str]] = {}
     keys: list[tuple[str, str]] = []
     for row_number, row in rows:
-        issue_id, identity_error = _row_issue_id(row)
-        if identity_error is not None:
-            identity_errors[row_number] = identity_error
+        issue_id, error_code, error_message = _row_issue_id(
+            row, issue_mapping, ambiguous_mapping
+        )
+        if error_code is not None:
+            assert error_message is not None
+            identity_errors[row_number] = (error_code, error_message)
             continue
         assert issue_id is not None
         resolved_ids[row_number] = issue_id
@@ -286,6 +358,8 @@ def import_legacy_manual_review(
         row_asset_id = _clean(row.get("asset_id"))
         issue_id = resolved_ids.get(row_number)
         if row_asset_id != asset_id:
+            if asset_scope_only:
+                continue
             unmatched_count += 1
             problems.append(
                 ImportProblem(
@@ -299,11 +373,12 @@ def import_legacy_manual_review(
             continue
         if issue_id is None:
             conflict_count += 1
+            error_code, error_message = identity_errors[row_number]
             problems.append(
                 ImportProblem(
                     row_number,
-                    "ambiguous_issue_identity",
-                    identity_errors[row_number],
+                    error_code,
+                    error_message,
                     asset_id,
                     None,
                 )
@@ -385,12 +460,14 @@ def import_legacy_manual_review(
     reviewed_at = datetime.now(timezone.utc).isoformat()
     to_write: list[tuple[_MatchedRow, dict[str, Any]]] = []
     idempotent_count = 0
+    idempotent_issue_ids: list[str] = []
     for row in matched:
         planned = _planned_review(row, issues[row.issue_id], reviewer, reviewed_at)
         existing = existing_reviews.get(row.issue_id)
         if isinstance(existing, Mapping):
             if _review_signature(existing) == _review_signature(planned):
                 idempotent_count += 1
+                idempotent_issue_ids.append(row.issue_id)
                 continue
             conflict_count += 1
             problems.append(
@@ -405,7 +482,12 @@ def import_legacy_manual_review(
             continue
         to_write.append((row, planned))
 
-    matched_issue_ids = tuple(row.issue_id for row in matched)
+    successful_issue_ids = {
+        row.issue_id for row, _review in to_write
+    } | set(idempotent_issue_ids)
+    matched_issue_ids = tuple(
+        row.issue_id for row in matched if row.issue_id in successful_issue_ids
+    )
     if dry_run or not to_write:
         return ImportResult(
             report_path=path,
@@ -421,8 +503,9 @@ def import_legacy_manual_review(
             dry_run=dry_run,
         )
 
-    csv_hash = _sha256(csv_file)
-    progress_hash = _sha256(progress_file)
+    csv_hash = _sha256_bytes(csv_bytes)
+    progress_hash = _sha256_bytes(progress_bytes)
+    mapping_hash = _sha256_bytes(mapping_bytes)
 
     def mutate(candidate: dict[str, Any]) -> None:
         block = candidate.get("manual_review")
@@ -452,6 +535,8 @@ def import_legacy_manual_review(
                 "csv_sha256": csv_hash,
                 "progress_path": str(progress_file) if progress_file is not None else None,
                 "progress_sha256": progress_hash,
+                "issue_mapping_path": str(mapping_file) if mapping_file is not None else None,
+                "issue_mapping_sha256": mapping_hash,
                 "issue_ids": [row.issue_id for row, _review in to_write],
                 "row_numbers": [row.row_number for row, _review in to_write],
             }
