@@ -274,7 +274,7 @@ test("task_type switches mutually exclusively between semantic, warn, and comple
   assert.match(stage.innerHTML, /已完成/);
 });
 
-test("warn tasks with no candidates or a terminal state advance directly to completed", () => {
+test("warn tasks advance only for explicitly empty candidates or a terminal state", () => {
   let warnConstructed = 0;
   const stage = { innerHTML: "" };
   const root = { querySelector: (selector) => selector === "[data-workbench-stage]" ? stage : null };
@@ -288,7 +288,12 @@ test("warn tasks with no candidates or a terminal state advance directly to comp
   });
   assert.equal(app.advanceStage({
     ...warnTask,
-    warn: { ...warnTask.warn, selected_issue_ids: [], selected_issues: {} },
+    warn: {
+      ...warnTask.warn,
+      candidate_issue_ids: [],
+      selected_issue_ids: [],
+      selected_issues: {},
+    },
   }), "completed");
   assert.equal(warnConstructed, 0);
   assert.match(stage.innerHTML, /已完成/);
@@ -297,6 +302,95 @@ test("warn tasks with no candidates or a terminal state advance directly to comp
     warn: { ...warnTask.warn, state: "completed" },
   }), "completed");
   assert.equal(warnConstructed, 0);
+});
+
+test("non-empty warn candidates do not auto-complete when selection is temporarily empty", () => {
+  let warnConstructed = 0;
+  const stage = { innerHTML: "" };
+  const root = { querySelector: (selector) => selector === "[data-workbench-stage]" ? stage : null };
+  const app = new WorkbenchApp({
+    documentRef: {},
+    root,
+    warnAdapterFactory: () => {
+      warnConstructed += 1;
+      return { render: () => {} };
+    },
+  });
+  assert.equal(app.advanceStage({
+    ...warnTask,
+    warn: {
+      ...warnTask.warn,
+      candidate_issue_ids: ["warn-1"],
+      selected_issue_ids: [],
+      selected_issues: {},
+    },
+  }), "warn_review");
+  assert.equal(warnConstructed, 1);
+});
+
+test("configured warn evidence video hides the opaque media placeholder", () => {
+  const video = {
+    src: "",
+    currentTime: -1,
+    dataset: {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const videoPlaceholder = { hidden: false };
+  const adapter = new WarnReviewAdapter({ video, videoPlaceholder });
+  adapter.task = warnTask;
+  adapter.configureVideo(buildWarnIssueModel(warnTask, "warn-1"));
+  assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
+  assert.equal(video.currentTime, 0);
+  assert.equal(videoPlaceholder.hidden, true);
+});
+
+test("rejected Pass or Fail saves are caught and shown in the warn error region", async () => {
+  const visibleError = { textContent: "" };
+  const adapter = new WarnReviewAdapter({ onVerdict: async () => { throw new Error("lease expired"); } });
+  adapter.task = warnTask;
+  adapter.selectedIssueId = "warn-1";
+  adapter.root = {
+    querySelector(selector) {
+      if (selector === "[data-review-reason]") return { value: "reviewed" };
+      if (selector === ".warn-error") return visibleError;
+      return null;
+    },
+  };
+  assert.equal(await adapter.submitCurrentVerdict("pass"), null);
+  assert.equal(visibleError.textContent, "lease expired");
+});
+
+test("overlay image load errors visibly degrade while preserving video evidence", () => {
+  let overlayErrorHandler = null;
+  const overlay = {
+    hidden: false,
+    addEventListener(type, handler) {
+      if (type === "error") overlayErrorHandler = handler;
+    },
+  };
+  const toggle = { checked: true, disabled: false, addEventListener() {} };
+  const degraded = { hidden: true, textContent: "" };
+  const root = {
+    innerHTML: "",
+    querySelectorAll: () => [],
+    querySelector(selector) {
+      if (selector === "[data-warn-overlay]") return overlay;
+      if (selector === '[data-action="toggle-overlay"]') return toggle;
+      if (selector === "[data-overlay-error]") return degraded;
+      return null;
+    },
+  };
+  const adapter = new WarnReviewAdapter();
+  adapter.render(warnTask, root);
+  assert.equal(typeof overlayErrorHandler, "function");
+  overlayErrorHandler();
+  assert.equal(overlay.hidden, true);
+  assert.equal(toggle.disabled, true);
+  assert.equal(toggle.checked, false);
+  assert.equal(degraded.hidden, false);
+  assert.match(degraded.textContent, /overlay.*加载失败/);
+  assert.match(root.innerHTML, /打开问题窗口视频/);
 });
 
 test("WorkbenchApp uses the issue-id verdict endpoint and server revision refresh", async () => {

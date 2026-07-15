@@ -133,9 +133,10 @@ export function renderWarnMarkup(task, issueId = null) {
   const overlay = model.overlayUrl
     ? `<label class="warn-overlay-toggle"><input type="checkbox" data-action="toggle-overlay">显示骨架 overlay</label><img class="warn-overlay" data-warn-overlay src="${escapeHtml(model.overlayUrl)}" alt="${escapeHtml(model.issueId)} 骨架 overlay" hidden>`
     : '<label class="warn-overlay-toggle"><input type="checkbox" data-action="toggle-overlay" disabled>没有可用 overlay</label>';
-  const degradation = model.generationError
-    ? `<div class="warn-evidence-degraded" role="status">overlay 生成失败，已保留原始视频：${escapeHtml(model.generationError)}</div>`
+  const degradationMessage = model.generationError
+    ? `overlay 生成失败，已保留原始视频：${model.generationError}`
     : "";
+  const degradation = `<div class="warn-evidence-degraded" data-overlay-error role="status"${degradationMessage ? "" : " hidden"}>${escapeHtml(degradationMessage)}</div>`;
   const clip = model.clipUrl
     ? `<a class="warn-clip-link" href="${escapeHtml(model.clipUrl)}" target="_blank" rel="noopener">打开问题窗口视频</a>`
     : '<span class="warn-clip-unavailable">问题窗口视频暂不可用</span>';
@@ -167,10 +168,11 @@ export function renderWarnMarkup(task, issueId = null) {
 }
 
 export class WarnReviewAdapter {
-  constructor({ onVerdict = null, onComplete = null, video = null } = {}) {
+  constructor({ onVerdict = null, onComplete = null, video = null, videoPlaceholder = null } = {}) {
     this.onVerdict = onVerdict;
     this.onComplete = onComplete;
     this.video = video;
+    this.videoPlaceholder = videoPlaceholder;
     this.task = null;
     this.root = null;
     this.selectedIssueId = null;
@@ -196,6 +198,7 @@ export class WarnReviewAdapter {
       const overlay = root.querySelector?.("[data-warn-overlay]");
       if (overlay) overlay.hidden = !event.currentTarget.checked;
     });
+    root.querySelector?.("[data-warn-overlay]")?.addEventListener("error", () => this.handleOverlayError());
     root.querySelector?.('[data-action="verdict-pass"]')?.addEventListener("click", () => this.submitCurrentVerdict("pass"));
     root.querySelector?.('[data-action="verdict-fail"]')?.addEventListener("click", () => this.submitCurrentVerdict("fail"));
     root.querySelector?.('[data-action="complete-warn"]')?.addEventListener("click", () => {
@@ -217,7 +220,12 @@ export class WarnReviewAdapter {
 
   async submitCurrentVerdict(verdict) {
     const reason = this.root?.querySelector?.("[data-review-reason]")?.value ?? "";
-    return this.submitVerdict(this.selectedIssueId, verdict, reason);
+    try {
+      return await this.submitVerdict(this.selectedIssueId, verdict, reason);
+    } catch (error) {
+      this.showError(error);
+      return null;
+    }
   }
 
   async submitVerdict(issueId, verdict, reason = "") {
@@ -245,6 +253,7 @@ export class WarnReviewAdapter {
     if (model.clipUrl) {
       video.src = model.clipUrl;
       video.currentTime = 0;
+      if (this.videoPlaceholder) this.videoPlaceholder.hidden = true;
     } else if (fps > 0 && Number.isInteger(startFrame)) {
       video.currentTime = startFrame / fps;
     }
@@ -259,6 +268,21 @@ export class WarnReviewAdapter {
       }
     };
     video.addEventListener?.("timeupdate", this.boundTimeUpdate);
+  }
+
+  handleOverlayError() {
+    const overlay = this.root?.querySelector?.("[data-warn-overlay]");
+    const toggle = this.root?.querySelector?.('[data-action="toggle-overlay"]');
+    const degraded = this.root?.querySelector?.("[data-overlay-error]");
+    if (overlay) overlay.hidden = true;
+    if (toggle) {
+      toggle.checked = false;
+      toggle.disabled = true;
+    }
+    if (degraded) {
+      degraded.hidden = false;
+      degraded.textContent = "overlay 图片加载失败，已保留原始视频证据。";
+    }
   }
 
   showError(error) {

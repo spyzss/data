@@ -82,6 +82,9 @@ def test_static_modules_expose_expected_boundary_and_lock_contracts() -> None:
     assert "data-machine-metrics" in warn_adapter
     assert "data-machine-threshold" in warn_adapter
     assert "data-evidence-window" in warn_adapter
+    assert "data-overlay-error" in warn_adapter
+    assert "videoPlaceholder" in warn_adapter
+    assert '[data-video-placeholder]' in app
     # Blocks are layout elements, never native draggable elements.  Handles
     # use pointer capture in the adapter instead.
     assert 'class="timeline-segment" draggable' not in adapter

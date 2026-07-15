@@ -19,10 +19,9 @@ export function stageTypeForTask(task) {
   const taskType = String(task?.task_type ?? "");
   if (taskType !== "warn_review") return taskType;
   const warn = task?.warn ?? {};
-  const selected = Array.isArray(warn.selected_issue_ids) ? warn.selected_issue_ids : [];
   const candidates = Array.isArray(warn.candidate_issue_ids) ? warn.candidate_issue_ids : null;
   if (["completed", "not_required", "skipped_due_to_fail"].includes(warn.state)) return "completed";
-  if (!selected.length || (candidates && !candidates.length)) return "completed";
+  if (candidates && !candidates.length) return "completed";
   return taskType;
 }
 
@@ -269,6 +268,7 @@ export class WorkbenchApp {
         onVerdict: (issueId, verdict, reason) => this.submitWarnVerdict(issueId, verdict, reason),
         onComplete: () => this.completeWarn(),
         video: this.root.querySelector?.("[data-video]") ?? null,
+        videoPlaceholder: this.root.querySelector?.("[data-video-placeholder]") ?? null,
       });
       this.adapter.render(task, stage);
     } else if (taskType === "completed") {
