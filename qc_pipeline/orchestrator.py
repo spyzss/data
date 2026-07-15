@@ -13,7 +13,11 @@ from qc_common.module_registry import (
     ModuleRegistry,
     ModuleUnavailableError,
 )
-from qc_common.report import StaleReportRevisionError, load_asset_qc_report
+from qc_common.report import (
+    StaleReportRevisionError,
+    load_asset_qc_report,
+    write_asset_qc_report,
+)
 from qc_common.report_mutation import (
     apply_module_result,
     initialize_v2_report,
@@ -264,10 +268,127 @@ def run_asset(
     return RunOutcome(report, tuple(executed), final_status, config)
 
 
+def resume_after_external(
+    context: AssetContext,
+    *,
+    config: LoadedQcConfig,
+    profile: str,
+    completed_module: str,
+    expected_revision: int,
+    registry: ModuleRegistry | None = None,
+    now: Callable[[], str] = utc_now,
+) -> RunOutcome:
+    """Advance a persisted external stage and optionally run its successors.
+
+    Human services own their domain payloads, while this helper owns only the
+    orchestrator cursor.  It is intentionally revision-aware and copy-on-write
+    so a stale browser cannot resume a different stage.  Supplying a registry
+    continues configured downstream modules immediately; without one the
+    function returns at the next persisted cursor for a caller that schedules
+    detector execution separately.
+    """
+
+    config.execution_profile(profile)
+    if completed_module not in config.pipeline_modules:
+        raise ValueError(f"unknown external module: {completed_module}")
+    module_config = config.module_config(completed_module)
+    if module_config.get("execution_kind") != "external":
+        raise ValueError(f"module is not external: {completed_module}")
+    report = load_asset_qc_report(context.report_path)
+    if report is None:
+        raise FileNotFoundError(context.report_path)
+    validate_report_identity(report, context=context, config=config, profile=profile)
+    current_revision = int(report.get("report_revision", 0))
+    if current_revision != expected_revision:
+        raise StaleReportRevisionError(
+            f"expected revision {expected_revision}, found {current_revision}: {context.report_path}"
+        )
+    pipeline = report.get("pipeline_state")
+    if not isinstance(pipeline, Mapping):
+        raise ValueError("pipeline_state must be an object")
+    if pipeline.get("status") != "awaiting_external" or pipeline.get("next_module") != completed_module:
+        raise ValueError(
+            "external completion requires pipeline status=awaiting_external "
+            f"and next_module={completed_module}"
+        )
+
+    timestamp = now()
+    candidate = copy.deepcopy(report)
+    block = candidate.get(completed_module)
+    if not isinstance(block, dict):
+        block = {}
+    block["state"] = "completed"
+    block["execution_kind"] = "external"
+    candidate[completed_module] = block
+    execution = candidate.get("execution")
+    if not isinstance(execution, dict):
+        raise ValueError("execution must be an object")
+    module_states = execution.setdefault("module_states", {})
+    if not isinstance(module_states, dict):
+        raise ValueError("execution.module_states must be an object")
+    module_states[completed_module] = {"state": "completed"}
+    execution["updated_at"] = timestamp
+
+    next_module = _successor(config.pipeline_modules, completed_module)
+    pipeline_state = dict(pipeline)
+    pipeline_state.update(
+        {
+            "status": "running" if next_module is not None else "completed",
+            "last_completed_module": completed_module,
+            "next_module": next_module,
+            "stop_reason": None,
+        }
+    )
+    candidate["pipeline_state"] = pipeline_state
+    if next_module is None:
+        manual = candidate.get("manual_review")
+        manual_state = manual.get("state") if isinstance(manual, Mapping) else None
+        reviews = manual.get("issue_reviews", {}) if isinstance(manual, Mapping) else {}
+        human_fail = isinstance(reviews, Mapping) and any(
+            isinstance(review, Mapping) and review.get("verdict") == "fail"
+            for review in reviews.values()
+        )
+        candidate["overall_decision"] = (
+            "fail" if _has_machine_fail(candidate, config.pipeline_modules) or human_fail else
+            ("pass" if manual_state in {None, "completed", "not_required"} else None)
+        )
+    else:
+        candidate["overall_decision"] = None
+    candidate["report_revision"] = expected_revision + 1
+    write_asset_qc_report(
+        context.report_path,
+        candidate,
+        expected_revision=expected_revision,
+        profile=profile,
+    )
+    transition = RunOutcome(
+        candidate,
+        (completed_module,),
+        str(candidate["pipeline_state"]["status"]),
+        config,
+    )
+    if registry is None or next_module is None:
+        return transition
+    resumed = run_asset(
+        context,
+        config=config,
+        profile=profile,
+        registry=registry,
+        now=now,
+    )
+    return RunOutcome(
+        resumed.report,
+        transition.executed_modules + resumed.executed_modules,
+        resumed.status,
+        config,
+    )
+
+
 __all__ = [
     "ModulePrerequisiteError",
     "RunOutcome",
     "build_default_registry",
+    "resume_after_external",
     "run_asset",
     "utc_now",
 ]

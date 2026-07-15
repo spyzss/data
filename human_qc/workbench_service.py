@@ -173,10 +173,20 @@ class WorkbenchService:
 
         if not isinstance(asset_id, str) or not asset_id.strip():
             raise ValueError("asset_id must be a non-empty string")
-        semantic = self._get_task(self.semantic_service, asset_id)
-        warn = self._get_task(self.warn_service, asset_id)
         context = self._context(asset_id)
         report = self._report(asset_id, context)
+        pipeline = report.get("pipeline_state") if isinstance(report, Mapping) else None
+        pipeline_status = pipeline.get("status") if isinstance(pipeline, Mapping) else None
+        pipeline_next = pipeline.get("next_module") if isinstance(pipeline, Mapping) else None
+        # Acceptance hard-fail and runtime-error assets are navigation records,
+        # not editable human tasks.  Avoid even constructing a semantic view
+        # for them, which also prevents accidental lease/task creation.
+        if pipeline_status in {"stopped", "error"}:
+            semantic = None
+            warn = None
+        else:
+            semantic = self._get_task(self.semantic_service, asset_id)
+            warn = self._get_task(self.warn_service, asset_id)
         if semantic is None and warn is None and report is None and context is None:
             raise KeyError(f"unknown asset: {asset_id}")
 
@@ -245,14 +255,19 @@ class WorkbenchService:
         elif warn is not None:
             task_type = "warn_review"
         elif report is not None:
-            task_type = "completed"
+            task_type = "error" if pipeline_status == "error" else "completed"
+
+        execution = report.get("execution") if isinstance(report, Mapping) else None
+        report_profile = execution.get("profile") if isinstance(execution, Mapping) else None
 
         return {
             "asset_id": asset_id,
             "revision": revision,
             "report_revision": revision,
-            "profile": self.profile,
+            "profile": report_profile if isinstance(report_profile, str) else self.profile,
             "task_type": task_type,
+            "pipeline_state": pipeline_status,
+            "next_module": pipeline_next,
             "semantic": semantic_data,
             "warn": warn_data,
             "evidence": self._evidence(asset_id, report, context),
@@ -266,9 +281,41 @@ class WorkbenchService:
         value = task.get("revision")
         return value if isinstance(value, int) else None
 
+    def list_actionable_assets(self, profile: str) -> tuple[str, ...]:
+        """Return assets paused at an editable human external stage."""
+
+        if not isinstance(profile, str) or not profile:
+            raise ValueError("profile must be a non-empty string")
+        asset_ids = set(self.asset_contexts)
+        for service in (self.semantic_service, self.warn_service):
+            reports = getattr(service, "_reports", None) if service is not None else None
+            if isinstance(reports, Mapping):
+                asset_ids.update(str(asset_id) for asset_id in reports)
+        actionable: list[str] = []
+        for asset_id in sorted(asset_ids):
+            context = self._context(asset_id)
+            report = self._report(asset_id, context)
+            if not isinstance(report, Mapping):
+                continue
+            execution = report.get("execution")
+            if isinstance(execution, Mapping) and execution.get("profile") not in {None, profile}:
+                continue
+            pipeline = report.get("pipeline_state")
+            if not isinstance(pipeline, Mapping):
+                continue
+            if pipeline.get("status") == "awaiting_external" and pipeline.get("next_module") in {
+                "semantic_consistency",
+                "manual_review",
+            }:
+                actionable.append(asset_id)
+        return tuple(actionable)
+
     def acquire_lease(
         self, asset_id: str, reviewer: str, ttl_seconds: int | None = None
     ) -> Lease:
+        task = self.get_asset_task(asset_id)
+        if task.get("task_type") in {"completed", "error"}:
+            raise KeyError(f"asset is not actionable: {asset_id}")
         lease = self.lease_store.acquire(
             asset_id,
             reviewer,
