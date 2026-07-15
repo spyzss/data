@@ -222,6 +222,107 @@ def test_empty_manual_review_stage_skips_and_runs_downstream(tmp_path: Path) -> 
     assert resumed.report["pipeline_state"]["next_module"] is None
 
 
+def test_machine_warn_with_empty_selection_skips_manual_and_runs_downstream(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    config = _config(
+        tmp_path,
+        ["auto", "semantic_consistency", "manual_review", "tail"],
+    )
+    calls: list[str] = []
+    registry = _registry(calls=calls, auto_issues=(_warn_issue(),))
+    first = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=registry,
+    )
+    assert first.report["manual_review"]["candidate_issue_ids"] == ["warn-1"]
+    assert first.report["manual_review"].get("selected_issue_ids", []) == []
+
+    resumed = resume_after_external(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        completed_module="semantic_consistency",
+        expected_revision=first.report["report_revision"],
+        registry=registry,
+    )
+
+    assert resumed.status == "completed"
+    assert calls == ["auto", "tail"]
+    assert resumed.report["manual_review"]["candidate_issue_ids"] == ["warn-1"]
+    assert resumed.report["manual_review"]["selected_issue_ids"] == []
+    assert resumed.report["manual_review"]["state"] == "not_required"
+
+
+def test_terminal_external_completion_replay_is_rejected_without_write(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    config = _config(tmp_path, ["auto", "semantic_consistency"])
+    first = run_asset(
+        context,
+        config=config,
+        profile="acceptance",
+        registry=_registry(),
+    )
+    completed = resume_after_external(
+        context,
+        config=config,
+        profile="acceptance",
+        completed_module="semantic_consistency",
+        expected_revision=first.report["report_revision"],
+    )
+    before = context.report_path.read_bytes()
+
+    with pytest.raises(ValueError, match="awaiting_external|completion"):
+        resume_after_external(
+            context,
+            config=config,
+            profile="acceptance",
+            completed_module="semantic_consistency",
+            expected_revision=completed.report["report_revision"],
+        )
+
+    assert context.report_path.read_bytes() == before
+
+
+def test_successor_pending_external_replay_is_rejected_without_write(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    config = _config(tmp_path, ["auto", "semantic_consistency", "tail"])
+    first = run_asset(
+        context,
+        config=config,
+        profile="acceptance",
+        registry=_registry(),
+    )
+    advanced = resume_after_external(
+        context,
+        config=config,
+        profile="acceptance",
+        completed_module="semantic_consistency",
+        expected_revision=first.report["report_revision"],
+    )
+    assert advanced.report["pipeline_state"]["status"] == "running"
+    assert advanced.report["pipeline_state"]["next_module"] == "tail"
+    before = context.report_path.read_bytes()
+
+    with pytest.raises(ValueError, match="awaiting_external|completion"):
+        resume_after_external(
+            context,
+            config=config,
+            profile="acceptance",
+            completed_module="semantic_consistency",
+            expected_revision=advanced.report["report_revision"],
+        )
+
+    assert context.report_path.read_bytes() == before
+
+
 def test_workbench_warn_completion_resumes_configured_downstream_once(
     tmp_path: Path,
 ) -> None:
@@ -238,6 +339,19 @@ def test_workbench_warn_completion_resumes_configured_downstream_once(
         profile="supplier_evaluation",
         registry=registry,
     )
+    selected_report = load_asset_qc_report(context.report_path)
+    assert selected_report is not None
+    selected_report["manual_review"].update(
+        {
+            "required": True,
+            "state": "queued",
+            "selected_issue_ids": ["warn-1"],
+            "selected_issue_id": "warn-1",
+            "issue_reviews": {},
+            "completed_at": None,
+        }
+    )
+    context.report_path.write_text(json.dumps(selected_report), encoding="utf-8")
     semantic_done = resume_after_external(
         context,
         config=config,
@@ -259,16 +373,6 @@ def test_workbench_warn_completion_resumes_configured_downstream_once(
         "pending_edit": None,
         "audit": [],
     }
-    report["manual_review"].update(
-        {
-            "required": True,
-            "state": "queued",
-            "selected_issue_ids": ["warn-1"],
-            "selected_issue_id": "warn-1",
-            "issue_reviews": {},
-            "completed_at": None,
-        }
-    )
     context.report_path.write_text(json.dumps(report), encoding="utf-8")
     warn = WarnReviewService(
         reports={context.asset_id: context.report_path},
@@ -457,6 +561,20 @@ class _StaleSemanticProjection:
         )
 
 
+class _StaleWarnProjection:
+    def __init__(self, report_path: Path, asset_id: str) -> None:
+        self._reports = {asset_id: report_path}
+
+    def get_task(self, asset_id: str) -> SimpleNamespace:
+        report = load_asset_qc_report(self._reports[asset_id])
+        assert report is not None
+        return SimpleNamespace(
+            report_revision=report["report_revision"],
+            state="queued",
+            selected_issue_ids=("warn-1",),
+        )
+
+
 @pytest.mark.parametrize("terminal_status", ["completed", "stopped", "error"])
 def test_terminal_status_blocks_stale_projection_acquire_and_renew(
     tmp_path: Path,
@@ -522,8 +640,49 @@ def test_empty_manual_projection_is_never_actionable(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    service = WorkbenchService(asset_contexts={context.asset_id: context})
+    service = WorkbenchService(
+        warn_service=_StaleWarnProjection(context.report_path, context.asset_id),
+        asset_contexts={context.asset_id: context},
+    )
 
+    assert service.get_asset_task(context.asset_id)["task_type"] == "completed"
+    assert service.list_actionable_assets("acceptance") == ()
+    with pytest.raises(KeyError, match="not actionable"):
+        service.acquire_lease(context.asset_id, "alice", 60)
+
+
+def test_unselected_manual_projection_is_never_actionable(tmp_path: Path) -> None:
+    context = _context(tmp_path, "unselected-manual")
+    context.report_path.parent.mkdir(parents=True, exist_ok=True)
+    context.report_path.write_text(
+        json.dumps(
+            {
+                "asset_id": context.asset_id,
+                "report_revision": 3,
+                "execution": {"profile": "acceptance"},
+                "pipeline_state": {
+                    "status": "awaiting_external",
+                    "last_completed_module": "semantic_consistency",
+                    "next_module": "manual_review",
+                    "stop_reason": None,
+                },
+                "semantic_calibration": {"state": "completed"},
+                "manual_review": {
+                    "state": "queued",
+                    "candidate_issue_ids": ["warn-1"],
+                    "selected_issue_ids": [],
+                },
+                "issues": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = WorkbenchService(
+        warn_service=_StaleWarnProjection(context.report_path, context.asset_id),
+        asset_contexts={context.asset_id: context},
+    )
+
+    assert service.get_asset_task(context.asset_id)["task_type"] == "completed"
     assert service.list_actionable_assets("acceptance") == ()
     with pytest.raises(KeyError, match="not actionable"):
         service.acquire_lease(context.asset_id, "alice", 60)

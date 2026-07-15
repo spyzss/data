@@ -62,15 +62,15 @@ def _disabled_overall_decision(report: Mapping[str, Any], completed: bool) -> st
     return "fail" if has_fail else "pass"
 
 
-def _manual_candidate_ids(report: Mapping[str, Any]) -> tuple[str, ...]:
+def _manual_selected_issue_ids(report: Mapping[str, Any]) -> tuple[str, ...]:
     manual = report.get("manual_review")
     if not isinstance(manual, Mapping):
         return ()
-    value = manual.get("candidate_issue_ids", [])
+    value = manual.get("selected_issue_ids", [])
     if not isinstance(value, list):
-        raise ValueError("manual_review.candidate_issue_ids must be an array")
+        raise ValueError("manual_review.selected_issue_ids must be an array")
     if any(not isinstance(item, str) or not item for item in value):
-        raise ValueError("manual_review.candidate_issue_ids must contain strings")
+        raise ValueError("manual_review.selected_issue_ids must contain strings")
     return tuple(value)
 
 
@@ -90,11 +90,14 @@ def _record_empty_manual_review(
     if not isinstance(manual, dict):
         manual = {}
         candidate["manual_review"] = manual
+    candidate_ids = manual.get("candidate_issue_ids", [])
+    if not isinstance(candidate_ids, list):
+        raise ValueError("manual_review.candidate_issue_ids must be an array")
     manual.update(
         {
             "required": False,
             "state": "not_required",
-            "candidate_issue_ids": [],
+            "candidate_issue_ids": candidate_ids,
             "selected_issue_ids": [],
             "selected_issue_id": None,
             "issue_reviews": {},
@@ -111,7 +114,7 @@ def _record_empty_manual_review(
         raise ValueError("execution.module_states must be an object")
     module_states["manual_review"] = {
         "state": "skipped",
-        "reason": "no_candidates",
+        "reason": "no_selected_issues",
     }
     execution["updated_at"] = now
 
@@ -261,7 +264,7 @@ def run_asset(
             )
             continue
         if module_config.get("execution_kind") == "external":
-            if module_name == "manual_review" and not _manual_candidate_ids(report):
+            if module_name == "manual_review" and not _manual_selected_issue_ids(report):
                 report = _record_empty_manual_review(
                     context,
                     config=config,
@@ -401,23 +404,14 @@ def resume_after_external(
     pipeline = report.get("pipeline_state")
     if not isinstance(pipeline, Mapping):
         raise ValueError("pipeline_state must be an object")
-    block = report.get(completed_module)
-    domain_states = {"completed"}
-    if completed_module == "manual_review":
-        domain_states.add("not_required")
-    domain_completed = (
-        isinstance(block, Mapping)
-        and block.get("state") in domain_states
-        and pipeline.get("last_completed_module") == completed_module
-    )
     awaiting_completion = (
         pipeline.get("status") == "awaiting_external"
         and pipeline.get("next_module") == completed_module
     )
-    if not awaiting_completion and not domain_completed:
+    if not awaiting_completion:
         raise ValueError(
             "external completion requires pipeline status=awaiting_external "
-            f"and next_module={completed_module}, or an already recorded domain completion"
+            f"and next_module={completed_module}"
         )
 
     timestamp = now()

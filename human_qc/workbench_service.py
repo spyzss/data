@@ -164,13 +164,13 @@ class WorkbenchService:
         if next_module != "manual_review":
             return False
         manual = report.get("manual_review")
-        candidates = (
-            manual.get("candidate_issue_ids", [])
+        selected = (
+            manual.get("selected_issue_ids", [])
             if isinstance(manual, Mapping)
             else []
         )
-        return isinstance(candidates, (list, tuple)) and any(
-            isinstance(item, str) and item for item in candidates
+        return isinstance(selected, (list, tuple)) and any(
+            isinstance(item, str) and item for item in selected
         )
 
     def _evidence(self, asset_id: str, report: Mapping[str, Any] | None, context: AssetContext | None) -> list[dict[str, Any]]:
@@ -212,10 +212,13 @@ class WorkbenchService:
         pipeline = report.get("pipeline_state") if isinstance(report, Mapping) else None
         pipeline_status = pipeline.get("status") if isinstance(pipeline, Mapping) else None
         pipeline_next = pipeline.get("next_module") if isinstance(pipeline, Mapping) else None
-        # Terminal assets are navigation records, not editable human tasks.
-        # Avoid even constructing a stale domain view for them, which also
-        # prevents accidental lease/task creation.
-        if pipeline_status in {"stopped", "completed", "error"}:
+        # A persisted report is authoritative over stale domain projections.
+        # Only a live external stage with editable selected work may expose a
+        # semantic/warn task; every other state is navigation-only.
+        report_is_noneditable = isinstance(report, Mapping) and not self._is_actionable_report(
+            report
+        )
+        if pipeline_status in {"stopped", "completed", "error"} or report_is_noneditable:
             semantic = None
             warn = None
         else:
