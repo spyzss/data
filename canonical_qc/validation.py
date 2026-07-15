@@ -99,14 +99,25 @@ def _positive_int(
         _fail(code, field, "must be an integer greater than zero")
 
 
-def _nonnegative_int(value: object, field: str) -> None:
+def _nonnegative_int(
+    value: object,
+    field: str,
+    *,
+    code: str = "invalid_integer",
+) -> None:
     if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-        _fail("invalid_integer", field, "must be a non-negative integer")
+        _fail(code, field, "must be a non-negative integer")
 
 
-def _constant(value: object, expected: object, field: str) -> None:
+def _constant(
+    value: object,
+    expected: object,
+    field: str,
+    *,
+    code: str = "invalid_constant",
+) -> None:
     if value != expected:
-        _fail("invalid_constant", field, f"must equal {expected!r}")
+        _fail(code, field, f"must equal {expected!r}")
 
 
 def _sha256(value: object, field: str) -> None:
@@ -602,6 +613,23 @@ def _validate_alignment_time_axis(time_axis: TimeAxis) -> tuple[int, ...]:
             f"time_axis.{name}",
             code="timebase_invalid",
         )
+    _nonnegative_int(
+        time_axis.frame_index_base,
+        "time_axis.frame_index_base",
+        code="timebase_invalid",
+    )
+    _constant(
+        time_axis.frame_index_base,
+        0,
+        "time_axis.frame_index_base",
+        code="timebase_invalid",
+    )
+    _constant(
+        time_axis.interval_semantics,
+        "half_open",
+        "time_axis.interval_semantics",
+        code="timebase_invalid",
+    )
     return _validated_alignment_timestamps(
         time_axis.timestamps_ns,
         expected_count=time_axis.frame_count,

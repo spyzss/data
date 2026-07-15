@@ -794,3 +794,32 @@ def test_validate_video_alignment_rejects_non_increasing_canonical_timestamps(
         code="timebase_invalid",
         field="time_axis.timestamps_ns",
     )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [1, -1, False, 0.0, np.float32(0.0)],
+)
+def test_validate_video_alignment_requires_exact_zero_frame_index_base(
+    invalid: object,
+) -> None:
+    time_axis = replace(_time_axis(0), frame_index_base=invalid)
+
+    _assert_error(
+        lambda: validate_video_alignment(time_axis, _video(0), max_delta_ns=0),
+        code="timebase_invalid",
+        field="time_axis.frame_index_base",
+    )
+
+
+@pytest.mark.parametrize("invalid", ["closed", "", False, None])
+def test_validate_video_alignment_requires_half_open_interval_semantics(
+    invalid: object,
+) -> None:
+    time_axis = replace(_time_axis(0), interval_semantics=invalid)
+
+    _assert_error(
+        lambda: validate_video_alignment(time_axis, _video(0), max_delta_ns=0),
+        code="timebase_invalid",
+        field="time_axis.interval_semantics",
+    )
