@@ -76,6 +76,21 @@ class TimeAxis:
 
 
 @dataclass(frozen=True, slots=True)
+class ProbedVideo:
+    frame_count: int
+    width_px: int
+    height_px: int
+    fps_num: int
+    fps_den: int
+    codec: str
+    pixel_format: str
+    timestamps_ns: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "timestamps_ns", tuple(self.timestamps_ns))
+
+
+@dataclass(frozen=True, slots=True)
 class VideoStream:
     path: str
     sha256: str

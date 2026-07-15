@@ -14,6 +14,7 @@ from .contracts import (
     EpisodeIdentity,
     EpisodeSemantics,
     HandObservation,
+    ProbedVideo,
     SourceFile,
     SourceProvenance,
     Subtask,
@@ -540,3 +541,77 @@ def validate_episode(episode: CanonicalQcEpisode) -> None:
     _validate_calibration(episode)
     _validate_semantics(episode)
     _validate_supplier_evidence(episode)
+
+
+def validate_video_alignment(
+    time_axis: TimeAxis,
+    video: ProbedVideo,
+    *,
+    max_delta_ns: int,
+) -> None:
+    """Compare authoritative Canonical timestamps with normalized video PTS."""
+
+    _nonnegative_int(max_delta_ns, "max_delta_ns")
+    expected_count = time_axis.frame_count
+    _positive_int(expected_count, "time_axis.frame_count")
+    if len(time_axis.timestamps_ns) != expected_count:
+        _fail(
+            "timebase_invalid",
+            "time_axis.timestamps_ns",
+            (
+                f"expected {expected_count} canonical timestamps, "
+                f"got {len(time_axis.timestamps_ns)}"
+            ),
+        )
+    if video.frame_count != expected_count or len(video.timestamps_ns) != expected_count:
+        _fail(
+            "timebase_invalid",
+            "main_video.timestamps_ns",
+            (
+                f"expected {expected_count} frame PTS, got {len(video.timestamps_ns)} "
+                f"for {video.frame_count} probed frames"
+            ),
+        )
+
+    video_timestamps: list[int] = []
+    for index, value in enumerate(video.timestamps_ns):
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            _fail(
+                "timebase_invalid",
+                f"main_video.timestamps_ns[{index}]",
+                "must be an exact integer nanosecond timestamp",
+            )
+        video_timestamps.append(int(value))
+    if any(
+        current <= previous
+        for previous, current in zip(video_timestamps, video_timestamps[1:])
+    ):
+        _fail(
+            "timebase_invalid",
+            "main_video.timestamps_ns",
+            "video PTS must be strictly increasing",
+        )
+
+    canonical_timestamps: list[int] = []
+    for index, value in enumerate(time_axis.timestamps_ns):
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            _fail(
+                "timebase_invalid",
+                f"time_axis.timestamps_ns[{index}]",
+                "must be an exact integer nanosecond timestamp",
+            )
+        canonical_timestamps.append(int(value))
+    canonical_zero = canonical_timestamps[0]
+    video_zero = video_timestamps[0]
+    for index, (canonical_timestamp, video_timestamp) in enumerate(
+        zip(canonical_timestamps, video_timestamps)
+    ):
+        delta_ns = abs(
+            (canonical_timestamp - canonical_zero) - (video_timestamp - video_zero)
+        )
+        if delta_ns > max_delta_ns:
+            _fail(
+                "timebase_invalid",
+                f"main_video.timestamps_ns[{index}]",
+                f"timestamp delta {delta_ns} ns exceeds tolerance {max_delta_ns} ns",
+            )

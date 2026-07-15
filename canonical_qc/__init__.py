@@ -6,6 +6,7 @@ from .contracts import (
     EpisodeIdentity,
     EpisodeSemantics,
     HandObservation,
+    ProbedVideo,
     SourceFile,
     SourceProvenance,
     Subtask,
@@ -16,7 +17,8 @@ from .contracts import (
 )
 from .errors import CanonicalInputError
 from .provenance import semantic_fingerprint, source_fingerprint
-from .validation import validate_episode
+from .validation import validate_episode, validate_video_alignment
+from .video_probe import probe_video
 
 __all__ = [
     "CameraCalibration",
@@ -25,6 +27,7 @@ __all__ = [
     "EpisodeIdentity",
     "EpisodeSemantics",
     "HandObservation",
+    "ProbedVideo",
     "SourceFile",
     "SourceProvenance",
     "Subtask",
@@ -33,6 +36,8 @@ __all__ = [
     "TimeAxis",
     "VideoStream",
     "semantic_fingerprint",
+    "probe_video",
     "source_fingerprint",
     "validate_episode",
+    "validate_video_alignment",
 ]
