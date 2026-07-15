@@ -1,11 +1,11 @@
 schema_version: canonical_qc_config_schema.v1
-config_version: canonical_qc_v1.1.0
+config_version: canonical_qc_v1.1.1
 config_name: canonical_qc_ingest_publish
 source:
   supported_formats: [hdf5, lerobot]
   require_explicit_format: true
   require_explicit_source_root: true
-  timestamp_tolerance_ns: 1000000
+  timestamp_tolerance_ns: 0
 source_gate:
   rule_registry_version: canonical_source_gate_rules.v1
   rules:

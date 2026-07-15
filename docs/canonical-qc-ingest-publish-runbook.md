@@ -2,10 +2,10 @@
 
 本手册覆盖标准 HDF5 / LeRobot 输入、可恢复自动 QC、人工阶段边界，以及 Curated
 LeRobot v3 原子发布。顶层 active 配置为 `configs/canonical_qc.yaml`，必须与
-`configs/canonical_qc/canonical_qc_v1.0.0.yaml` 逐字节一致；它绑定 QC config
+`configs/canonical_qc/canonical_qc_v1.1.0.yaml` 逐字节一致；它绑定 QC config
 版本/hash、Adapter 版本、时间戳 tolerance、Publisher/toolchain 和官方 reader 合同。
 `--config` 只接受仓库中已登记且逐字节匹配的不可变快照；例如
-`canonical_qc_v1.0.1.yaml` 是 timestamp tolerance 为 0 的严格诊断版本，不能用临时
+`canonical_qc_v1.1.1.yaml` 是 timestamp tolerance 为 0 的严格诊断版本，不能用临时
 YAML 绕过 active 合同。
 
 ## 1. 路径与输入原则
@@ -28,7 +28,10 @@ python tools/run_canonical_qc.py \
   --source-root /data/batch/asset-001 \
   --batch-root /data/batch \
   --quality-archive /data/batch/quality_archive \
-  --profile acceptance
+  --profile acceptance \
+  --asset-id asset-001 \
+  --batch-id batch-20260716 \
+  --supplier-id supplier-001
 ```
 
 LeRobot：
@@ -41,12 +44,23 @@ python tools/run_canonical_qc.py \
   --episode-index 7 \
   --batch-root /data/batch \
   --quality-archive /data/batch/quality_archive \
-  --profile supplier_evaluation
+  --profile supplier_evaluation \
+  --asset-id asset-007 \
+  --batch-id batch-20260716 \
+  --supplier-id supplier-001
 ```
 
 默认 `--resume`。报告已是 terminal 或 `awaiting_external` 时再次执行是字节幂等；
 `--no-resume` 只允许全新报告。`--dry-run` 只执行配置、路径、Adapter、Canonical
 合同和时间轴验证，不创建 report。
+
+`asset_id/batch_id/supplier_id` 必须来自批次 manifest 或编排调用方，禁止从路径或
+损坏的供应商内容猜测。Source Gate 在 Adapter 前先确定报告路径：成功时先原子写
+Gate Pass revision，再继续自动 QC；确定性合同失败写 `stopped/fail` 和 fail issue；
+临时 I/O 写 `error/null`。临时错误恢复后同一报告 CAS 前进，当前
+`runtime_errors` 清空，旧错误保留在 `execution.runtime_error_history`。
+`canonical_qc_v1.0.x` 快照缺少 Source Gate rule registry，只作为历史配置保留，
+不可执行；运行时必须使用 `v1.1.0` 或更高的已登记快照，不能为旧配置静默补规则。
 
 输出报告固定为：
 
@@ -59,12 +73,19 @@ python tools/run_canonical_qc.py \
 完成 mutation API；人工工作台 change 应通过 CAS 接口推进。CLI 不伪造人工完成，
 测试中的 completed report 只是明确 fixture。
 
+首版 Publisher 的路径入口只支持未发生语义修改的 Canonical source revision。
+如果 `timeline_edit_count` 或 `subtask_text_edit_count` 大于 0，而人工模块尚未提供
+format-neutral Canonical revision artifact，Publisher 以
+`canonical_revision_artifact_required` fail closed，绝不发布源文件中的旧文本。
+
 ## 3. 发布前置
 
 发布必须读取最终报告中的 `report_revision` 和
 `canonical_binding.canonical_revision`；CLI 不允许调用者覆盖它们。要求包括：
 
 - pipeline completed 且 `overall_decision=pass`；
+- 报告含 `source_gate` 时，Gate 必须为 completed/pass/continue；任何 fail 或
+  runtime_error 即使被篡改为顶层 pass 也拒绝发布；
 - 语义校准 completed；人工 Warn review 为 completed 或 not_required；
 - report、source、semantic/source fingerprint 与当前 Canonical episode 一致；
 - source 文件未漂移。
@@ -129,6 +150,8 @@ release ID 可以不同，但 normalized Canonical 语义和数组必须等价�
 - `source_integrity_error`：按 JSON 的 `retryable` 区分；临时 I/O 可重试，确定性的
   缺失、格式损坏、size/hash 漂移必须修复输入，禁止无限重试。
 - prerequisite：核对 final report、revision、binding 和 source hash。
+- `canonical_revision_artifact_required`：该资产有人工语义编辑；等待人工模块输出
+  format-neutral working revision artifact，不能回写或猜测源 HDF5/LeRobot。
 - validation：不要更新 CURRENT；检查冻结 validator 环境与 staged artifact。
 - commit conflict：保留现有 release，调查 release ID/不可变内容冲突，不覆盖目录。
 

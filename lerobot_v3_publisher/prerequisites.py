@@ -12,7 +12,8 @@ import re
 import stat
 from typing import Any, NoReturn
 
-from canonical_qc.contracts import SourceFile
+from canonical_qc.contracts import EpisodeIdentity, SourceFile
+from canonical_qc.config import load_canonical_qc_config
 from canonical_qc.provenance import semantic_fingerprint, source_fingerprint
 from canonical_qc.validation import validate_episode
 from qc_common.config import load_qc_acceptance_config
@@ -447,6 +448,130 @@ def _validate_module_states(report: Mapping[str, Any], config: Any) -> None:
         _validate_exit_gate(module, exit_gate, config.pipeline_modules)
 
 
+def _validate_source_gate_canonical_config(source_gate: Mapping[str, Any]) -> None:
+    runtime = _mapping(source_gate, "runtime", "source_gate.runtime")
+    reference = _mapping(
+        runtime,
+        "canonical_config",
+        "source_gate.runtime.canonical_config",
+    )
+    prefix = "source_gate.runtime.canonical_config"
+    if reference.get("schema_version") != "canonical_qc_config_schema.v1":
+        _reject(f"{prefix}.schema_version", "unsupported Canonical config schema")
+    version = reference.get("config_version")
+    match = (
+        re.fullmatch(r"canonical_qc_v(\d+)\.(\d+)\.(\d+)", version)
+        if isinstance(version, str)
+        else None
+    )
+    if match is None or tuple(int(item) for item in match.groups()) < (1, 1, 0):
+        _reject(
+            f"{prefix}.config_version",
+            "must name a registered Source Gate config at v1.1.0 or newer",
+        )
+    snapshot = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "canonical_qc"
+        / f"{version}.yaml"
+    )
+    try:
+        loaded = load_canonical_qc_config(snapshot)
+    except OSError as exc:
+        _reject(f"{prefix}.config_version", f"registered snapshot is missing: {exc}")
+    except (TypeError, ValueError) as exc:
+        _reject(prefix, f"immutable Canonical config verification failed: {exc}")
+    if loaded.config_version != version:
+        _reject(f"{prefix}.config_version", "does not match immutable snapshot content")
+    if reference.get("config_hash") != loaded.sha256:
+        _reject(f"{prefix}.config_hash", "does not match immutable snapshot content")
+    if reference.get("schema_version") != loaded.raw.get("schema_version"):
+        _reject(f"{prefix}.schema_version", "does not match immutable snapshot content")
+    if loaded.source_gate_rule_id != "canonical.source_gate.contract_failure":
+        _reject(prefix, "Source Gate rule registry does not match the runtime contract")
+
+
+def _validate_source_gate_for_publication(
+    report: Mapping[str, Any], execution: Mapping[str, Any], identity: EpisodeIdentity
+) -> None:
+    if "source_gate" not in report:
+        return
+    source_gate = _mapping(report, "source_gate")
+    evaluation = _mapping(
+        source_gate, "evaluation", "source_gate.evaluation"
+    )
+    if evaluation.get("status") != "pass":
+        _reject("source_gate.evaluation.status", "must be pass")
+    locator = _mapping(
+        evaluation,
+        "locator",
+        "source_gate.evaluation.locator",
+    )
+    source_format = locator.get("source_format")
+    episode_index = locator.get("episode_index")
+    valid_locator = (
+        source_format == "hdf5" and episode_index is None
+    ) or (
+        source_format == "lerobot"
+        and (
+            episode_index is None
+            or (type(episode_index) is int and episode_index >= 0)
+        )
+    )
+    if not valid_locator:
+        _reject(
+            "source_gate.evaluation.locator",
+            "passing Source Gate locator violates the format-specific contract",
+        )
+    declared = _mapping(
+        evaluation,
+        "declared_identity",
+        "source_gate.evaluation.declared_identity",
+    )
+    for field in ("asset_id", "batch_id", "supplier_id"):
+        expected = getattr(identity, field)
+        if declared.get(field) != expected or report.get(field) != expected:
+            _reject(
+                f"source_gate.evaluation.declared_identity.{field}",
+                "must match both the QC report and Canonical episode identity",
+            )
+    flow = _mapping(source_gate, "flow", "source_gate.flow")
+    result_gate = _mapping(
+        flow, "result_gate", "source_gate.flow.result_gate"
+    )
+    if (
+        result_gate.get("verdict") != "pass"
+        or result_gate.get("has_fail") is not False
+        or result_gate.get("has_warn") is not False
+    ):
+        _reject(
+            "source_gate.flow.result_gate",
+            "must be an unambiguous pass",
+        )
+    exit_gate = _mapping(flow, "exit_gate", "source_gate.flow.exit_gate")
+    if (
+        exit_gate.get("state") != "continue"
+        or exit_gate.get("continue_to_next_module") is not True
+    ):
+        _reject(
+            "source_gate.flow.exit_gate",
+            "must continue into the QC pipeline",
+        )
+    states = _mapping(execution, "module_states", "execution.module_states")
+    source_gate_state = states.get("source_gate")
+    if not isinstance(source_gate_state, Mapping):
+        _reject(
+            "execution.module_states.source_gate",
+            "final Source Gate state is missing",
+        )
+    if source_gate_state.get("state") != "completed":
+        _reject(
+            "execution.module_states.source_gate.state",
+            "must be completed",
+        )
+    _validate_source_gate_canonical_config(source_gate)
+
+
 def _validate_entry_gate(module: str, entry: Mapping[str, Any]) -> None:
     expected = {
         "state": "ready",
@@ -681,6 +806,8 @@ def _validated_report_binding(
         _reject("asset_id", "does not match the Canonical episode")
     if report.get("supplier_id") != identity.supplier_id:
         _reject("supplier_id", "does not match the Canonical episode")
+    if "source_gate" in report and report.get("batch_id") != identity.batch_id:
+        _reject("batch_id", "does not match the Canonical episode")
     revision = report.get("report_revision")
     if revision != request.expected_report_revision:
         _reject(
@@ -702,6 +829,7 @@ def _validated_report_binding(
         _reject("pipeline_state.stop_reason", "must be null after successful completion")
     if report.get("runtime_errors") != []:
         _reject("runtime_errors", "must be empty")
+    _validate_source_gate_for_publication(report, execution, identity)
 
     config = _verified_config(report)
     if pipeline.get("last_completed_module") != config.pipeline_modules[-1]:
@@ -716,6 +844,19 @@ def _validated_report_binding(
     semantic_calibration = _mapping(report, "semantic_calibration")
     if semantic_calibration.get("state") != "completed":
         _reject("semantic_calibration.state", "must be completed")
+    for edit_count_field in ("timeline_edit_count", "subtask_text_edit_count"):
+        edit_count = semantic_calibration.get(edit_count_field)
+        if type(edit_count) is not int or edit_count < 0:
+            _reject(
+                f"semantic_calibration.{edit_count_field}",
+                "must be a non-negative integer",
+            )
+        if edit_count > 0:
+            _reject(
+                f"semantic_calibration.{edit_count_field}",
+                "non-noop semantic edits require a format-neutral Canonical revision artifact",
+                code="canonical_revision_artifact_required",
+            )
     _validate_manual_review(report)
 
     if type(request.canonical_revision) is not int or request.canonical_revision < 1:

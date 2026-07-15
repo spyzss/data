@@ -319,12 +319,12 @@ python tools/publish_lerobot_v3.py --source ... --qc-report ... --release-root .
 - Modify: `docs/superpowers/plans/2026-07-15-canonical-qc-ingest-publisher.md`
 - Create: `docs/canonical-qc-verification-report.md`
 
-- [ ] Step 1: 运行 `.venv/bin/python -m pytest -q`，必须全量通过。
-- [ ] Step 2: 运行 `.venv/bin/python -m compileall canonical_qc lerobot_v3_publisher qc_pipeline tools`。
-- [ ] Step 3: 运行 `git diff --check`、schema/config 校验、HDF5/LeRobot semantic fingerprint 等价测试和 Publisher 故障注入测试。
-- [ ] Step 4: 对照字段合同逐项记录 implemented/tested/deferred；首版边界之外不得伪装支持。
-- [ ] Step 5: 由独立 reviewer 做跨任务 spec compliance 与代码质量审查；修复所有 Blocker/Important 后复跑全量测试。
-- [ ] Step 6: 更新计划 checkbox 和验证报告，提交 `test: complete canonical QC publisher verification`。
+- [x] Step 1: 运行 `.venv/bin/python -m pytest -q`，必须全量通过。
+- [x] Step 2: 运行 `.venv/bin/python -m compileall canonical_qc lerobot_v3_publisher qc_pipeline tools`。
+- [x] Step 3: 运行 `git diff --check`、schema/config 校验、HDF5/LeRobot semantic fingerprint 等价测试和 Publisher 故障注入测试。
+- [x] Step 4: 对照字段合同逐项记录 implemented/tested/deferred；首版边界之外不得伪装支持。
+- [x] Step 5: 由独立 reviewer 做跨任务 spec compliance 与代码质量审查；修复所有 Blocker/Important 后复跑全量测试。
+- [x] Step 6: 更新计划 checkbox 和验证报告，提交 `test: complete canonical QC publisher verification`。
 
 ## 最终验收命令
 

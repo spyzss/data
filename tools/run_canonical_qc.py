@@ -26,11 +26,14 @@ COMMAND = "run_canonical_qc"
 def build_parser() -> argparse.ArgumentParser:
     parser = JsonArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path)
-    parser.add_argument("--source-format", required=True, choices=("hdf5", "lerobot"))
+    parser.add_argument("--source-format", required=True)
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--batch-root", required=True, type=Path)
     parser.add_argument("--quality-archive", required=True, type=Path)
     parser.add_argument("--profile", required=True, choices=("acceptance", "supplier_evaluation"))
+    parser.add_argument("--asset-id", required=True)
+    parser.add_argument("--batch-id", required=True)
+    parser.add_argument("--supplier-id", required=True)
     parser.add_argument("--episode-index", type=int)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
@@ -74,6 +77,9 @@ def main(argv: list[str] | None = None) -> int:
             batch_root=args.batch_root,
             quality_archive=args.quality_archive,
             profile=args.profile,
+            expected_asset_id=args.asset_id,
+            expected_batch_id=args.batch_id,
+            expected_supplier_id=args.supplier_id,
             canonical_config_path=args.config,
             episode_index=args.episode_index,
             resume=args.resume,
@@ -94,9 +100,35 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     except CanonicalInputError as exc:
+        if exc.report_path is not None and exc.overall_decision == "fail":
+            emit(
+                {
+                    "ok": False,
+                    "command": COMMAND,
+                    "category": "quality_fail",
+                    "error": {
+                        "category": "input_contract",
+                        "code": exc.code,
+                        "stage": "source_ingest",
+                        "field": exc.field,
+                        "message": exc.detail,
+                        "retryable": False,
+                    },
+                    "result": {
+                        "asset_id": args.asset_id,
+                        "source": str(args.source.resolve()),
+                        "source_format": args.source_format,
+                        "state": "stopped",
+                        "status": "stopped",
+                        "overall_decision": "fail",
+                        "report_path": str(exc.report_path),
+                        "report_revision": exc.report_revision,
+                    },
+                }
+            )
+            return 2
         category = "qc_runtime" if exc.retryable else "input_contract"
-        emit(
-            error_payload(
+        payload = error_payload(
                 command=COMMAND,
                 category=category,
                 code=exc.code,
@@ -104,9 +136,11 @@ def main(argv: list[str] | None = None) -> int:
                 field=exc.field,
                 message=exc.detail,
                 retryable=exc.retryable,
-            ),
-            stream=sys.stderr,
-        )
+            )
+        if exc.report_path is not None:
+            payload["report_path"] = str(exc.report_path)
+            payload["report_revision"] = exc.report_revision
+        emit(payload, stream=sys.stderr)
         return 3 if exc.retryable else 2
     except ValueError as exc:
         emit(

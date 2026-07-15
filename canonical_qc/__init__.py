@@ -20,6 +20,7 @@ from .errors import CanonicalInputError
 from .bridge import CanonicalQcBridge
 from .config import LoadedCanonicalQcConfig, load_canonical_qc_config
 from .workflow import CanonicalQcRunResult, load_canonical_source, run_canonical_source_qc
+from .source_gate import DeclaredEpisodeIdentity, SourceGateLocator
 from .provenance import semantic_fingerprint, source_fingerprint
 from .validation import validate_episode, validate_video_alignment
 from .video_probe import probe_video
@@ -29,6 +30,7 @@ __all__ = [
     "CanonicalInputError",
     "CanonicalQcBridge",
     "CanonicalQcRunResult",
+    "DeclaredEpisodeIdentity",
     "LoadedCanonicalQcConfig",
     "CanonicalQcEpisode",
     "EpisodeIdentity",
@@ -36,6 +38,7 @@ __all__ = [
     "HandObservation",
     "ProbedVideo",
     "SourceFile",
+    "SourceGateLocator",
     "SourceAdapter",
     "SourceInspection",
     "SourceProvenance",

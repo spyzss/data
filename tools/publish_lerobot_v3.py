@@ -96,19 +96,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     except CanonicalInputError as exc:
+        category = "publish_runtime" if exc.retryable else "input_contract"
         emit(
             error_payload(
                 command=COMMAND,
-                category="input_contract",
+                category=category,
                 code=exc.code,
                 stage="source_ingest",
                 field=exc.field,
                 message=exc.detail,
-                retryable=False,
+                retryable=exc.retryable,
             ),
             stream=sys.stderr,
         )
-        return 2
+        return 3 if exc.retryable else 2
     except Exception as exc:
         classified = _publisher_error(exc)
         if classified is not None:

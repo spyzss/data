@@ -230,12 +230,22 @@ supplier `unknown/warning` 和 machine `unavailable/review/skipped` 不进入一
 
 ## 8. QC Gate 与人工阶段
 
-数据合同/Adapter 失败在 Source Gate 形成明确 fail issue；runtime I/O 错误形成 `overall_decision=null` 的可重试 error。进入现有自动 QC 后沿用两种 profile：
+编排调用方必须在 Adapter 前提供稳定 `asset_id/batch_id/supplier_id` 与 source
+locator。Source Gate 先通过现有 report CAS 原子建立该资产的
+`asset_qc_report.v2`：Pass revision 进入首个自动模块；数据合同/Adapter 失败形成
+`stopped/fail` issue；runtime I/O 形成 `overall_decision=null` 的可重试 error。恢复后
+同一报告 CAS 前进，旧 runtime 进入 `execution.runtime_error_history`。CLI 参数、unsafe
+path 或配置自身不可验证时尚无可信报告目标，只输出机器错误。进入现有自动 QC 后
+沿用两种 profile：
 
 - `acceptance`：自动 fail 立即停止，不做语义校准；自动全 pass 且无 warn 时完成语义校准后无需 Warn 人工质检；存在 warn 才进入人工 Pass/Fail。
 - `supplier_evaluation`：机器 fail 仍继续执行后续阶段，以便评估全流程，但最终结论保留 fail。
 
-人工语义时间轴使用共享半开边界；一次边界确认原子影响相邻两段并只计一次。Publisher 只读取人工阶段完成后的最新 Canonical working revision。
+人工语义时间轴使用共享半开边界；一次边界确认原子影响相邻两段并只计一次。目标
+合同由 format-neutral Canonical working revision artifact 连接只读 HDF5/LeRobot 与
+Publisher。该 artifact 接口由人工 change 后续实现；当前 path Publisher 在任一 edit
+count 非零时以 `canonical_revision_artifact_required` fail closed，禁止发布 raw source
+中的旧语义。
 
 ## 9. LeRobotV3Publisher
 
@@ -420,6 +430,7 @@ class CanonicalDiagnostic:
 | `field_mapping_error` | 输入合同 | Source Gate fail |
 | `timebase_invalid` | 输入合同 | Source Gate fail |
 | `source_integrity_error` | 数据/运行 | hash 漂移为 fail；临时 I/O 为 error |
+| `canonical_revision_artifact_required` | 发布前置 | 有人工编辑但无 format-neutral revision artifact，不发布 |
 | `publish_prerequisite_failed` | 发布前置 | 不发布 |
 | `staging_failed` | 发布运行 | 清理 staging，CURRENT 不变 |
 | `validation_failed` | 发布完整性 | 隔离 staging，CURRENT 不变 |
@@ -444,6 +455,10 @@ publisher:
   format_version: lerobot_v3_curated.v1
   chunk_size_episodes: 1000
 ```
+
+实现收尾新增 `canonical_qc_v1.1.0`，只扩展 pre-pipeline Source Gate 的版本化
+rule registry；旧 v1.0.x snapshot 保持不可变。Source Gate fail issue 的 `rule_id`
+必须从该 registry 读取，不能硬编码未登记规则。
 
 供应商 `quality_hand` 映射不写入全局阈值。若提供，输入必须已经同时给出明确 `status` 与 `mapping_version`；首版 Adapter 不猜 raw value 到 status 的映射。
 活动 QC 配置从 immutable `qc_acceptance_v2.1.0` 读取此 enum 合同和分歧 Warn

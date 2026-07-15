@@ -148,6 +148,8 @@ def _write_publish_fixture(
         "semantic_calibration": {
             "state": "completed",
             "canonical_revision": 3,
+            "timeline_edit_count": 0,
+            "subtask_text_edit_count": 0,
         },
         "manual_review": manual,
         "canonical_binding": {
@@ -185,6 +187,54 @@ def _rewrite_report(request: PublishRequest, report: dict[str, object]) -> None:
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _add_passing_source_gate(report: dict[str, object]) -> None:
+    config_path = Path(__file__).resolve().parents[1] / "configs/canonical_qc.yaml"
+    config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    report["batch_id"] = "batch-001"
+    report["execution"]["module_states"]["source_gate"] = {  # type: ignore[index]
+        "state": "completed"
+    }
+    report["source_gate"] = {
+        "flow": {
+            "entry_gate": {"state": "entered"},
+            "result_gate": {
+                "verdict": "pass",
+                "has_fail": False,
+                "has_warn": False,
+            },
+            "exit_gate": {
+                "state": "continue",
+                "continue_to_next_module": True,
+                "next_module": None,
+            },
+        },
+        "evaluation": {
+            "status": "pass",
+            "declared_identity": {
+                "asset_id": report["asset_id"],
+                "batch_id": report["batch_id"],
+                "supplier_id": report["supplier_id"],
+            },
+            "locator": {
+                "source_path": "asset-001",
+                "source_root": "asset-001",
+                "source_format": "hdf5",
+                "episode_index": None,
+            },
+        },
+        "metrics": {},
+        "evidence": [],
+        "runtime": {
+            "canonical_config": {
+                "schema_version": "canonical_qc_config_schema.v1",
+                "config_version": "canonical_qc_v1.1.0",
+                "config_path": str(config_path.resolve()),
+                "config_hash": f"sha256:{config_hash}",
+            }
+        },
+    }
 
 
 def _assert_rejected(
@@ -239,6 +289,120 @@ def test_valid_request_builds_immutable_deterministic_safe_plan_without_writes(
     } == before_sources
     with pytest.raises(FrozenInstanceError):
         first.release_id = "changed"  # type: ignore[misc]
+
+
+def test_source_gate_must_be_passing_and_completed_before_publication(
+    tmp_path: Path,
+) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    _add_passing_source_gate(report)
+    _rewrite_report(request, report)
+    validate_publish_request(request)
+
+    report["source_gate"]["evaluation"]["status"] = "fail"  # type: ignore[index]
+    report["source_gate"]["evaluation"]["diagnostic"] = {  # type: ignore[index]
+        "code": "source_contract_failure",
+        "field": "source",
+        "message": "failed",
+        "retryable": False,
+    }
+    report["source_gate"]["flow"]["result_gate"] = {  # type: ignore[index]
+        "verdict": "fail",
+        "has_fail": True,
+        "has_warn": False,
+    }
+    report["source_gate"]["flow"]["exit_gate"] = {  # type: ignore[index]
+        "state": "stop_qc",
+        "continue_to_next_module": False,
+        "next_module": None,
+    }
+    _rewrite_report(request, report)
+
+    _assert_rejected(request, field="source_gate.evaluation.status")
+
+
+@pytest.mark.parametrize("field", ["asset_id", "batch_id", "supplier_id"])
+def test_source_gate_declared_identity_must_match_report_and_canonical_episode(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    _add_passing_source_gate(report)
+    report["source_gate"]["evaluation"]["declared_identity"][field] = "drifted"
+    _rewrite_report(request, report)
+
+    _assert_rejected(
+        request,
+        field=f"source_gate.evaluation.declared_identity.{field}",
+    )
+
+
+def test_report_batch_identity_must_match_canonical_episode(tmp_path: Path) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    _add_passing_source_gate(report)
+    report["batch_id"] = "other-batch"
+    report["source_gate"]["evaluation"]["declared_identity"]["batch_id"] = (
+        "other-batch"
+    )
+    _rewrite_report(request, report)
+
+    _assert_rejected(request, field="batch_id")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("config_version", "canonical_qc_v1.0.0"),
+        ("config_hash", "sha256:" + "0" * 64),
+    ],
+)
+def test_source_gate_canonical_config_must_bind_registered_immutable_snapshot(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    _add_passing_source_gate(report)
+    report["source_gate"]["runtime"]["canonical_config"][field] = value
+    _rewrite_report(request, report)
+
+    _assert_rejected(
+        request,
+        field=f"source_gate.runtime.canonical_config.{field}",
+    )
+
+
+def test_source_gate_config_path_is_audit_only_and_registry_snapshot_is_authoritative(
+    tmp_path: Path,
+) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    _add_passing_source_gate(report)
+    report["source_gate"]["runtime"]["canonical_config"]["config_path"] = (
+        "/retired/active-alias/canonical_qc.yaml"
+    )
+    _rewrite_report(request, report)
+
+    validate_publish_request(request)
+
+
+@pytest.mark.parametrize(
+    ("source_format", "episode_index"),
+    [("bogus", None), ("hdf5", 0), ("lerobot", -1)],
+)
+def test_publisher_rejects_invalid_passing_source_gate_locator(
+    tmp_path: Path,
+    source_format: str,
+    episode_index: int | None,
+) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    _add_passing_source_gate(report)
+    report["source_gate"]["evaluation"]["locator"].update(
+        source_format=source_format,
+        episode_index=episode_index,
+    )
+    _rewrite_report(request, report)
+
+    _assert_rejected(request, field="source_gate.evaluation.locator")
 
 
 def test_manifest_contract_is_deeply_immutable_at_sequence_boundaries() -> None:
@@ -375,6 +539,32 @@ def test_report_gate_combinations_fail_closed(
     _rewrite_report(request, report)
 
     _assert_rejected(request, field=field)
+
+
+@pytest.mark.parametrize("field", ["timeline_edit_count", "subtask_text_edit_count"])
+def test_non_noop_semantic_edit_requires_format_neutral_revision_artifact(
+    tmp_path: Path, field: str
+) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    report["semantic_calibration"][field] = 1  # type: ignore[index]
+    _rewrite_report(request, report)
+
+    _assert_rejected(
+        request,
+        field=f"semantic_calibration.{field}",
+        code="canonical_revision_artifact_required",
+    )
+
+
+@pytest.mark.parametrize("field", ["timeline_edit_count", "subtask_text_edit_count"])
+def test_completed_semantic_calibration_requires_explicit_edit_counts(
+    tmp_path: Path, field: str
+) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    report["semantic_calibration"].pop(field)  # type: ignore[union-attr]
+    _rewrite_report(request, report)
+
+    _assert_rejected(request, field=f"semantic_calibration.{field}")
 
 
 def test_warn_candidates_require_completed_passing_human_reviews(tmp_path: Path) -> None:

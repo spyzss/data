@@ -29,6 +29,165 @@ def _runtime_error() -> dict[str, object]:
     }
 
 
+def _source_gate_report(status: str) -> dict[str, object]:
+    if status == "pass":
+        report = make_v2_report(status="running", overall_decision=None)
+        retryable = None
+        verdict = "pass"
+        exit_state = "continue"
+        module_state = "completed"
+    elif status == "fail":
+        report = make_v2_report(status="stopped", overall_decision="fail")
+        retryable = False
+        verdict = "fail"
+        exit_state = "stop_qc"
+        module_state = "completed"
+    else:
+        report = make_v2_report(status="error", overall_decision=None)
+        retryable = True
+        verdict = None
+        exit_state = "stop_incomplete"
+        module_state = "runtime_error"
+    report["batch_id"] = "batch-001"
+    report["execution"]["module_states"] = {
+        "source_gate": {"state": module_state}
+    }
+    flow: dict[str, object] = {
+        "entry_gate": {"state": "entered"},
+        "exit_gate": {
+            "state": exit_state,
+            "continue_to_next_module": status == "pass",
+            **({} if status == "pass" else {"next_module": None}),
+        },
+    }
+    if verdict is not None:
+        flow["result_gate"] = {
+            "verdict": verdict,
+            "has_fail": verdict == "fail",
+            "has_warn": False,
+        }
+    evaluation: dict[str, object] = {
+        "status": status,
+        "declared_identity": {
+            "asset_id": report["asset_id"],
+            "batch_id": "batch-001",
+            "supplier_id": "supplier-001",
+        },
+        "locator": {
+            "source_path": "asset-001",
+            "source_root": "asset-001",
+            "source_format": "hdf5",
+            "episode_index": None,
+        },
+    }
+    if retryable is not None:
+        evaluation["diagnostic"] = {
+            "code": "source_contract_failure",
+            "field": "source",
+            "message": "failed",
+            "retryable": retryable,
+        }
+    report["source_gate"] = {
+        "flow": flow,
+        "evaluation": evaluation,
+        "metrics": {},
+        "evidence": [],
+        "runtime": {
+            "canonical_config": {
+                "schema_version": "canonical_qc_config_schema.v1",
+                "config_version": "canonical_qc_v1.1.0",
+                "config_path": "/config.yaml",
+                "config_hash": "sha256:" + "0" * 64,
+            }
+        },
+    }
+    if status == "runtime_error":
+        report["runtime_errors"] = [{
+            "module": "source_gate",
+            "error_type": "source_contract_failure",
+            "message": "failed",
+            "occurred_at": "2026-07-16T00:00:00Z",
+            "retryable": True,
+        }]
+    return report
+
+
+@pytest.mark.parametrize("status", ["pass", "fail", "runtime_error"])
+def test_source_gate_schema_accepts_only_consistent_three_state_contract(
+    status: str,
+) -> None:
+    validate_asset_qc_report(_source_gate_report(status))
+
+
+@pytest.mark.parametrize(
+    ("status", "mutation"),
+    [
+        ("pass", "module_runtime"),
+        ("fail", "retryable_true"),
+        ("fail", "module_runtime"),
+        ("runtime_error", "retryable_false"),
+        ("runtime_error", "module_completed"),
+        ("runtime_error", "missing_runtime_error"),
+    ],
+)
+def test_source_gate_schema_rejects_reverse_three_state_mutations(
+    status: str,
+    mutation: str,
+) -> None:
+    report = _source_gate_report(status)
+    if mutation == "retryable_true":
+        report["source_gate"]["evaluation"]["diagnostic"]["retryable"] = True
+    elif mutation == "retryable_false":
+        report["source_gate"]["evaluation"]["diagnostic"]["retryable"] = False
+    elif mutation == "module_runtime":
+        report["execution"]["module_states"]["source_gate"] = {
+            "state": "runtime_error"
+        }
+    elif mutation == "module_completed":
+        report["execution"]["module_states"]["source_gate"] = {
+            "state": "completed"
+        }
+    else:
+        report["runtime_errors"] = []
+
+    with pytest.raises(ValueError):
+        validate_asset_qc_report(report)
+
+
+@pytest.mark.parametrize(
+    ("status", "source_format", "episode_index"),
+    [
+        ("pass", "bogus", None),
+        ("pass", "hdf5", 0),
+        ("runtime_error", "bogus", None),
+        ("runtime_error", "lerobot", -1),
+    ],
+)
+def test_nonfail_source_gate_requires_a_valid_format_specific_locator(
+    status: str,
+    source_format: str,
+    episode_index: int | None,
+) -> None:
+    report = _source_gate_report(status)
+    report["source_gate"]["evaluation"]["locator"].update(
+        source_format=source_format,
+        episode_index=episode_index,
+    )
+
+    with pytest.raises(ValueError, match="source_gate"):
+        validate_asset_qc_report(report)
+
+
+def test_deterministic_source_gate_fail_may_preserve_raw_invalid_locator() -> None:
+    report = _source_gate_report("fail")
+    report["source_gate"]["evaluation"]["locator"].update(
+        source_format="supplier-bogus",
+        episode_index=-9,
+    )
+
+    validate_asset_qc_report(report)
+
+
 @pytest.mark.parametrize("status", ["pending", "running", "awaiting_external", "error"])
 def test_unfinished_v2_report_requires_null_decision(status: str) -> None:
     report = make_v2_report(status=status, overall_decision=None)

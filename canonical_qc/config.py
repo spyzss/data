@@ -41,6 +41,13 @@ class LoadedCanonicalQcConfig:
     def exit_codes(self) -> dict[str, int]:
         return {key: int(value) for key, value in self.raw["cli"]["exit_codes"].items()}
 
+    @property
+    def source_gate_rule_id(self) -> str:
+        source_gate = self.raw.get("source_gate")
+        if not isinstance(source_gate, dict):
+            raise ValueError("Canonical QC config has no Source Gate rule registry")
+        return str(source_gate["rules"]["contract_failure"]["rule_id"])
+
 
 def _validate_schema(raw: dict[str, Any]) -> None:
     schema = json.loads(
@@ -67,6 +74,11 @@ def load_canonical_qc_config(path: Path | None = None) -> LoadedCanonicalQcConfi
     if not isinstance(raw, dict):
         raise ValueError("Canonical QC config must be an object")
     _validate_schema(raw)
+    if "source_gate" not in raw:
+        raise ValueError(
+            "Canonical QC configs before v1.1.0 are not executable: "
+            "the Source Gate rule registry is required"
+        )
     if path is None:
         snapshot = root / "configs/canonical_qc" / f"{raw['config_version']}.yaml"
         if not snapshot.is_file() or snapshot.read_bytes() != payload:

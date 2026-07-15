@@ -2,20 +2,28 @@
 
 文档版本：`canonical_qc_required_fields.v1`  
 适用数据 Profile：`human_ego_hand_pose.v1`  
-状态：设计确认稿  
+状态：实现验证稿（含明确 Deferred 边界）
 日期：2026-07-15
 
 ## 1. 目标
 
-首版只解决一件事：让 HDF5 和 LeRobot 两种供应商提交格式经过统一 Adapter 后，得到同一份 `CanonicalQcEpisode.v1`，完整执行自动 QC、人工语义校准和 Warn 人工复核，并由我方统一脚本发布为 Curated LeRobot v3。
+目标端态是让 HDF5 和 LeRobot 两种供应商提交格式经过统一 Adapter 后得到同一份
+`CanonicalQcEpisode.v1`，再串行完成自动 QC、人工语义校准、Warn 人工复核和
+Curated LeRobot v3 发布。本次已实现的首版切片是：Source Gate、Canonical 合同、
+已登记自动模块、外部人工阶段暂停点，以及“无语义编辑”资产的统一 Publisher。
+人工工作台、若干后置自动模块和非零编辑 revision artifact 明确为 Deferred。
 
 ```text
-标准 HDF5 ──────> StandardHdf5Adapter ───┐
+显式批次 identity ─> Source Gate ─────────┐
+标准 HDF5 ──────> StandardHdf5Adapter ────┤
                                           ├─> CanonicalQcEpisode.v1
 标准 LeRobot ───> StandardLeRobotAdapter ─┘
                                                     │
                                                     v
-自动 QC -> 语义校准 -> Warn 人工复核 -> LeRobotV3Publisher
+已登记自动 QC -> awaiting_external
+                         |
+                         +-> [Deferred: 语义校准 -> Warn 人工复核]
+                         +-> 无编辑 final report -> LeRobotV3Publisher
 ```
 
 本版不支持供应商自定义字段映射模板，也不执行供应商提供的转换脚本。供应商必须使用本标准规定的字段名、类型、shape、单位和语义。
@@ -29,8 +37,9 @@
 - 双手各 21 点的 3D/2D 骨骼与 validity。
 - 视频、时间轴、标定和任务/subtask 语义。
 - HDF5 与 LeRobot 两种输入格式。
-- 自动 QC Gate、人工语义校准、Warn 人工 Pass/Fail。
-- 通过 QC 后由我方统一发布 LeRobot v3。
+- 已登记且启用的自动 QC Gate；未实现模块以 Deferred/disabled 明示。
+- 人工语义校准与 Warn 人工 Pass/Fail 的 external stage 合同和暂停点；工作台实现 Deferred。
+- 无语义编辑且最终 QC Pass 后由我方统一发布 LeRobot v3；编辑 artifact 交接 Deferred。
 
 ### 2.2 不包含
 
@@ -167,7 +176,9 @@ size/SHA-256，用于发现误写和普通漂移；不会为每个 Runner 复制
 | `calibration.camera_axes` | const | R | 首版固定 `x_right_y_down_z_forward`。 |
 | `calibration.pixel_origin` | const | R | 首版固定 `top_left`。 |
 
-因为 `hand_keypoints_3d` 已统一到 `camera:main`，首版不要求静态或逐帧外参。Canonical Validator 使用内参、畸变模型、3D/2D 点执行重投影一致性检查。
+因为 `hand_keypoints_3d` 已统一到 `camera:main`，首版不要求静态或逐帧外参。
+当前 Canonical Validator 只验证标定的 dtype、shape、有限性、图像尺寸与登记模型；
+3D/2D 重投影阈值规则尚未实现，明确为 Deferred，不得把“字段已具备”解释为“已检查”。
 
 ### 3.6 任务与 Subtask 语义
 
@@ -424,26 +435,28 @@ sidecar 保存 dtype、`[T,2]` shape 与 utf8/base64 payload，由 Adapter 无�
 
 已是 LeRobot v3 的供应商数据也不能直接进入训练集。QC 通过后仍由我方 Publisher 重新生成 Curated LeRobot v3 的 meta、Parquet、索引、统计、checksum 和 ReleaseManifest。正式输出冻结为官方 `lerobot[dataset]==0.6.0` v3 合同；供应商旧方言只作为 Adapter 输入兼容，不原样透传。Publisher 保留 `fps_num/fps_den` 精确帧率，并把 Python、NumPy、PyArrow、Pandas、ffmpeg、libx264 工具链指纹绑定到 manifest 和 release ID。完整 `[0,T)` 且 frame count/PTS/hash 一致的 MP4 可独立复制；共享 span 必须裁剪，禁止 hardlink 源文件。
 
-## 8. 各 QC 阶段的字段依赖
+## 8. 各 QC 阶段的字段依赖与实现状态
 
-| 阶段 | 必需输入 |
-| --- | --- |
-| Source/Schema Gate | identity、source files/hash、全部 Core shape/dtype/unit。 |
-| Text/Metadata | task、description、subtask sequence。 |
-| Keypoint Presence | 3D/2D keypoints、3D/2D validity。 |
-| Keypoint Morphology | 3D keypoints、3D validity、joint topology、meter。 |
-| Keypoint Temporal | timestamps、3D keypoints、3D validity。 |
-| Video Quality | MP4、Canonical 时间轴、frame count。 |
-| SAM3 Containment | MP4、2D keypoints、2D validity；mask 由我方生成。 |
-| Reprojection Validation | 3D/2D keypoints、validity、intrinsics、distortion。 |
-| 人工语义校准 | MP4、subtask sequence、半开共享边界、双语描述。 |
-| Warn 人工质检 | QC JSON issues/evidence；不新增供应商 Core 字段。 |
-| Duplicate Check | MP4、asset ID、timestamps。 |
-| Content Validity | MP4、task/description/subtasks。 |
-| Effective Duration | timestamps 及前序 QC issue 区间。 |
-| LeRobot v3 Publisher | 完整 Canonical、最终语义 revision、最终 QC pass。 |
+| 阶段 | 必需输入 | 当前状态 |
+| --- | --- | --- |
+| Source/Schema Gate | manifest identity、source locator、全部 Core shape/dtype/unit。 | Implemented + tested；Pass/Fail/runtime 均写唯一 QC JSON。 |
+| Text/Metadata | task、description、subtask sequence。 | Implemented + tested。 |
+| Keypoint Presence | 3D/2D keypoints、3D/2D validity。 | Implemented + tested。 |
+| Keypoint Morphology | 3D keypoints、3D validity、joint topology、meter。 | Implemented + tested。 |
+| Keypoint Temporal | timestamps、3D keypoints、3D validity。 | Implemented + tested。 |
+| Video Quality | MP4、Canonical 时间轴、frame count。 | Implemented + tested。 |
+| SAM3 Containment | MP4、2D keypoints、2D validity；mask 由我方生成。 | 接口/结果桥接已实现；模型依赖按运行环境提供。 |
+| Reprojection Validation | 3D/2D keypoints、validity、intrinsics、distortion。 | **Deferred**；没有版本化阈值与判定实现。 |
+| 人工语义校准 | MP4、subtask sequence、半开共享边界、双语描述。 | **Deferred external change**；当前 runner 只停在 `awaiting_external`。 |
+| Warn 人工质检 | QC JSON issues/evidence；不新增供应商 Core 字段。 | **Deferred external change**。 |
+| Duplicate Check | MP4、asset ID、timestamps。 | **Deferred**；active config 为 disabled / `no_registered_implementation`。 |
+| Content Validity | MP4、task/description/subtasks。 | **Deferred**；active config 为 disabled / `no_registered_implementation`。 |
+| Effective Duration | timestamps 及前序 QC issue 区间。 | **Deferred**；active config 为 disabled / `no_registered_implementation`。 |
+| LeRobot v3 Publisher | 完整 Canonical、最终语义 revision、最终 QC pass。 | 未编辑 revision 已 implemented + tested；非零人工编辑 artifact 交接 Deferred 并 fail closed。 |
 
-因此本标准列出的 Core 已足够支撑完整 QC；无需把 `quality_hand`、供应商 mask、joint rotation、confidence 或多相机字段强制加入首版。
+因此本标准列出的 Core 已足够作为目标 QC 的输入合同；上表 Deferred 阶段不能宣称
+已有检测覆盖。无需为此把 `quality_hand`、供应商 mask、joint rotation、confidence
+或多相机字段强制加入首版。
 
 ## 9. Adapter 规则
 
@@ -461,11 +474,18 @@ sidecar 保存 dtype、`[T,2]` shape 与 utf8/base64 payload，由 Adapter 无�
 
 ### 9.1 统一 QC CLI 的 Canonical manifest 合同
 
+`tools/run_canonical_qc.py` 必须显式接收 `--asset-id`、`--batch-id`、
+`--supplier-id`。三者来自批次 manifest/调用方，不从路径或供应商内容猜测；Adapter
+成功后必须与源内 identity 精确相等。这样即使 Core 已损坏，仍能先确定
+`quality_archive/<asset_id>.json` 并原子写 Source Gate Fail。
+
 `tools/run_qc_pipeline.py` 通过 manifest 行启用 Canonical 输入，固定字段如下：
 
 | 字段 | 必需 | 规则 |
 | --- | --- | --- |
 | `asset_id` | 是 | 必须与 Adapter 解析出的 episode `asset_id` 完全一致。 |
+| `batch_id` | 是 | 调用方提供的稳定批次 ID；必须与 Adapter 结果一致。 |
+| `supplier_id` | 是 | 调用方提供的稳定供应商 ID；必须与 Adapter 结果一致。 |
 | `canonical_format` | 是 | 仅允许 `hdf5` 或 `lerobot`。 |
 | `canonical_source_path` | 是 | 位于 `batch_root` 内的标准 HDF5 episode 路径或 LeRobot dataset 根目录。 |
 | `episode_index` | LeRobot 多 episode 时是 | 必须精确选择一个 episode；不允许默认取第一条。 |
@@ -490,7 +510,7 @@ Python 对象或覆盖 Canonical 保留键。
 | shape/dtype/单位错误 | 数据合同缺陷 | fail，不进入依赖该字段的 QC。 |
 | 时间戳不递增 | 数据合同缺陷 | fail。 |
 | 视频与 `T` 不对齐 | 数据合同缺陷 | fail。 |
-| 3D/2D 重投影严重不一致 | 数据质量问题 | 按统一 QC Config 生成 warn/fail。 |
+| 3D/2D 重投影严重不一致 | Deferred | 当前只校验标定合同；重投影质量规则尚未实现，不生成结论。 |
 | Subtask 不连续或越界 | 数据合同缺陷 | fail；不得由 UI 自动猜测修复。 |
 | `quality_hand` 未提供 | 正常可选缺失 | 不 fail，status 视为 unknown。 |
 | `quality_hand` 与机器结果冲突 | 供应商 Evidence 分歧 | 生成 Warn/统计，不直接覆盖机器结论。 |
@@ -498,30 +518,38 @@ Python 对象或覆盖 Canonical 保留键。
 | QC report revision 冲突 | CAS Error | 拒绝旧写入，重新读取。 |
 | Publisher 验证失败 | Publish Error | 不暴露新 release，原 QC JSON 不变。 |
 
+上述 Source Gate 持久化保证从“显式 identity、路径和配置均验证通过”后开始；CLI
+参数缺失、unsafe path 或配置本身不可验证时没有可信报告目标，只输出单行 CLI 错误。
+
 ## 11. 人工语义修订与发布
 
 为同时支持 HDF5 和 LeRobot 输入，人工语义修订不依赖某一种源格式：
 
 1. 人工确认一次时间边界或文本修改。
-2. Canonical working revision 原子更新。
+2. 目标合同要求 format-neutral Canonical working revision artifact 通过 CAS 原子更新。
 3. QC JSON 记录 `timeline_edit_count`、`subtask_text_edit_count` 及 before/after 审计。
 4. 源 HDF5/LeRobot 保持只读。
-5. 最终 LeRobotV3Publisher 只读取最新 Canonical revision，将修订后的文本和时间轴写入 Curated LeRobot v3。
+5. 最终 LeRobotV3Publisher 应读取最新 artifact，将修订后的文本和时间轴写入 Curated LeRobot v3。
+
+第 2、5 步的 artifact 接口属于 `add-human-semantic-warn-review` 后续 change，当前尚未
+实现。现有 path Publisher 只允许两个 edit count 都为 0；任一非零时返回
+`canonical_revision_artifact_required`，禁止把 raw source 的旧语义发布出去。
 
 只有 `overall_decision=pass`、语义阶段完成、Warn 复核完成且 source fingerprint 未变化的资产可以发布。
 
 ## 12. 验收清单
 
-- [ ] 供应商提交格式只能是标准 HDF5 或受支持的标准 LeRobot。
-- [ ] 所有 Core 字段存在且符合固定名称、shape、dtype、单位和坐标系。
-- [ ] 主视频可解码且与 `T`、FPS、时间轴一致。
-- [ ] 3D/2D 骨骼与 validity 对齐。
-- [ ] joint topology 严格等于 `egodata_hand21.v1`。
-- [ ] 3D 点位于 `camera:main`，2D 点使用 pixel。
-- [ ] 标定可用于重投影验证。
-- [ ] Subtask 使用半开共享边界并完整覆盖 `[0,T)`。
-- [ ] `quality_hand` 缺失不会触发 fail。
-- [ ] `quality_hand` 原值、标准化状态和我方 Mask 结果互不覆盖。
-- [ ] HDF5 与 LeRobot 的 Canonical 等价性测试通过。
-- [ ] QC 通过后只使用我方 LeRobotV3Publisher 生成训练数据。
-- [ ] Publisher 未完成验证前，训练 release 不可见。
+- [x] 供应商提交格式只能是标准 HDF5 或受支持的标准 LeRobot。
+- [x] 所有 Core 字段存在且符合固定名称、shape、dtype、单位和坐标系。
+- [x] 主视频可解码且与 `T`、FPS、时间轴一致。
+- [x] 3D/2D 骨骼与 validity 对齐。
+- [x] joint topology 严格等于 `egodata_hand21.v1`。
+- [x] 3D 点位于 `camera:main`，2D 点使用 pixel。
+- [ ] 重投影质量规则（Deferred；当前只验证标定合同）。
+- [x] Subtask 使用半开共享边界并完整覆盖 `[0,T)`。
+- [x] `quality_hand` 缺失不会触发 fail。
+- [x] `quality_hand` 原值、标准化状态和我方 Mask 结果互不覆盖。
+- [x] HDF5 与 LeRobot 的 Canonical 等价性测试通过。
+- [x] QC 通过后只使用我方 LeRobotV3Publisher 生成训练数据。
+- [x] Publisher 未完成验证前，训练 release 不可见。
+- [ ] 非零人工语义编辑的 format-neutral revision artifact（Deferred；当前 fail closed）。

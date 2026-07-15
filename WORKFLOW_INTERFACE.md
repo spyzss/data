@@ -60,9 +60,15 @@ SourceAdapter -> CanonicalQcEpisode -> CanonicalQcBridge
 
 `configs/canonical_qc.yaml` 是 ingest/publish 顶层 active config，并绑定 immutable
 snapshot、QC config hash、Adapter/Publisher/toolchain/official-reader 版本。CLI 必须
-显式接收 source format、source root 和路径；不得猜格式或根目录。自动流程在
+显式接收 source format、source root、路径及 manifest 提供的
+`asset_id/batch_id/supplier_id`；不得猜格式、根目录或失败资产 identity。Source Gate
+在 Adapter 前建立资产报告，确定性合同失败仍进入唯一 QC JSON；可重试错误恢复后
+以 CAS revision 继续并保留历史。自动流程在
 `semantic_consistency` 返回 `awaiting_external`，不会伪造人工完成。训练从
 `CURRENT.json -> releases/<release_id>` 读取，不扫描 staging 或按 mtime 选数据。
+
+当前 path Publisher 对非零语义编辑 fail closed；format-neutral Canonical working
+revision artifact 及其 CAS 交接属于人工模块 change，未完成前不得发布源文件旧语义。
 
 命令和故障恢复见 `docs/canonical-qc-ingest-publish-runbook.md`。
 

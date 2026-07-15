@@ -19,6 +19,30 @@
         "timestamp_tolerance_ns": {"type": "integer", "minimum": 0}
       }
     },
+    "source_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_registry_version", "rules"],
+      "properties": {
+        "rule_registry_version": {"const": "canonical_source_gate_rules.v1"},
+        "rules": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contract_failure"],
+          "properties": {
+            "contract_failure": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["rule_id", "severity"],
+              "properties": {
+                "rule_id": {"const": "canonical.source_gate.contract_failure"},
+                "severity": {"const": "fail"}
+              }
+            }
+          }
+        }
+      }
+    },
     "qc": {
       "type": "object",
       "additionalProperties": false,

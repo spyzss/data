@@ -18,6 +18,12 @@ from .bridge import CanonicalQcBridge
 from .config import LoadedCanonicalQcConfig, load_canonical_qc_config
 from .contracts import CanonicalQcEpisode
 from .errors import CanonicalInputError
+from .source_gate import (
+    DeclaredEpisodeIdentity,
+    SourceGateLocator,
+    record_source_gate_failure,
+    record_source_gate_pass,
+)
 
 
 SourceFormat = Literal["hdf5", "lerobot"]
@@ -106,6 +112,12 @@ def load_canonical_source(
         raise CanonicalInputError(
             "format_unsupported", "source_format", f"unsupported format {source_format!r}"
         )
+    if episode_index is not None and episode_index < 0:
+        raise CanonicalInputError(
+            "field_mapping_error",
+            "episode_index",
+            "must be a non-negative integer",
+        )
     resolved_source = _resolved_inside(source, source_root, field="source")
     tolerance = loaded.timestamp_tolerance_ns
     if source_format == "hdf5":
@@ -131,6 +143,9 @@ def run_canonical_source_qc(
     batch_root: Path,
     quality_archive: Path,
     profile: str,
+    expected_asset_id: str,
+    expected_batch_id: str,
+    expected_supplier_id: str,
     canonical_config_path: Path | None = None,
     episode_index: int | None = None,
     resume: bool = True,
@@ -170,14 +185,18 @@ def run_canonical_source_qc(
             "quality_archive",
             "must not contain supplier source_root",
         )
-    episode = load_canonical_source(
-        source=resolved_source,
-        source_format=source_format,
-        source_root=resolved_source_root,
-        episode_index=episode_index,
-        config=canonical_config,
+    declared_identity = DeclaredEpisodeIdentity(
+        asset_id=expected_asset_id,
+        batch_id=expected_batch_id,
+        supplier_id=expected_supplier_id,
     )
-    report_path = resolved_archive / f"{episode.identity.asset_id}.json"
+    locator = SourceGateLocator(
+        source_path=resolved_source.relative_to(resolved_batch).as_posix(),
+        source_root=resolved_source_root.relative_to(resolved_batch).as_posix(),
+        source_format=source_format,
+        episode_index=episode_index,
+    )
+    report_path = resolved_archive / f"{declared_identity.asset_id}.json"
     existed = report_path.exists()
     if existed and not resume:
         raise CanonicalInputError(
@@ -185,6 +204,79 @@ def run_canonical_source_qc(
             "quality_archive",
             f"--no-resume requires a fresh report path: {report_path}",
         )
+    qc_config = load_qc_acceptance_config(canonical_config.qc_config_path)
+    try:
+        episode = load_canonical_source(
+            source=resolved_source,
+            source_format=source_format,
+            source_root=resolved_source_root,
+            episode_index=episode_index,
+            config=canonical_config,
+        )
+        for field, expected in (
+            ("asset_id", declared_identity.asset_id),
+            ("batch_id", declared_identity.batch_id),
+            ("supplier_id", declared_identity.supplier_id),
+        ):
+            observed = getattr(episode.identity, field)
+            if observed != expected:
+                raise CanonicalInputError(
+                    "identity_mismatch",
+                    field,
+                    f"declared {expected!r}, source contains {observed!r}",
+                )
+        context = CanonicalQcBridge(
+            episode, source_root=resolved_source_root
+        ).asset_context(
+            batch_root=resolved_batch,
+            report_path=report_path,
+        )
+    except CanonicalInputError as exc:
+        if dry_run:
+            raise
+        report = record_source_gate_failure(
+            report_path,
+            identity=declared_identity,
+            locator=locator,
+            batch_root=resolved_batch,
+            diagnostic=exc,
+            canonical_config=canonical_config,
+            qc_config=qc_config,
+            profile=profile,
+        )
+        raise exc.attach_report(
+            report_path,
+            revision=int(report["report_revision"]),
+            overall_decision=(
+                report.get("overall_decision")
+                if isinstance(report.get("overall_decision"), str)
+                else None
+            ),
+        )
+    except OSError as exc:
+        diagnostic = CanonicalInputError(
+            "source_integrity_error",
+            "source",
+            str(exc),
+            retryable=True,
+        )
+        if dry_run:
+            raise diagnostic from exc
+        report = record_source_gate_failure(
+            report_path,
+            identity=declared_identity,
+            locator=locator,
+            batch_root=resolved_batch,
+            diagnostic=diagnostic,
+            canonical_config=canonical_config,
+            qc_config=qc_config,
+            profile=profile,
+        )
+        raise diagnostic.attach_report(
+            report_path,
+            revision=int(report["report_revision"]),
+            overall_decision=None,
+        ) from exc
     if dry_run:
         return CanonicalQcRunResult(
             episode=episode,
@@ -206,12 +298,14 @@ def run_canonical_source_qc(
             runtime_error=None,
         )
 
-    qc_config = load_qc_acceptance_config(canonical_config.qc_config_path)
-    context = CanonicalQcBridge(
-        episode, source_root=resolved_source_root
-    ).asset_context(
-        batch_root=resolved_batch,
-        report_path=report_path,
+    record_source_gate_pass(
+        report_path,
+        context=context,
+        identity=declared_identity,
+        locator=locator,
+        canonical_config=canonical_config,
+        qc_config=qc_config,
+        profile=profile,
     )
     registry = (
         registry_factory(context, qc_config)

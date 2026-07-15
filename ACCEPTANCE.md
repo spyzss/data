@@ -23,11 +23,18 @@ python tools/run_canonical_qc.py \
   --source-root /data/batch/asset-001 \
   --batch-root /data/batch \
   --quality-archive /data/batch/quality_archive \
-  --profile acceptance
+  --profile acceptance \
+  --asset-id asset-001 \
+  --batch-id batch-20260716 \
+  --supplier-id supplier-001
 ```
 
 自动 QC 可以安全 resume，并在当前人工语义边界返回 `awaiting_external`。最终人工
 状态和 `canonical_binding` 完成后执行：
+
+显式 identity 来自批次 manifest；Source Gate 的确定性失败也会原子写入该资产的
+QC JSON，保证后续批次统计不依赖 CLI 日志。存在非零语义编辑时，首版 Publisher
+在 format-neutral revision artifact 落地前 fail closed，不会发布旧语义。
 
 ```bash
 python tools/publish_lerobot_v3.py \

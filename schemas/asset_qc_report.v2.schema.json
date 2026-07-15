@@ -19,6 +19,7 @@
   "properties": {
     "schema_version": {"const": "asset_qc_report.v2"},
     "asset_id": {"type": "string", "minLength": 1},
+    "batch_id": {"type": "string", "minLength": 1},
     "supplier_id": {"type": "string", "minLength": 1},
     "report_revision": {"type": "integer", "minimum": 1},
     "qc_config": {"$ref": "#/$defs/qcConfig"},
@@ -37,6 +38,7 @@
     "manual_review": {"$ref": "#/$defs/manualReview"},
     "canonical_binding": {"$ref": "#/$defs/canonicalBinding"},
     "canonical_qc_range": {"$ref": "#/$defs/canonicalQcRange"},
+    "source_gate": {"$ref": "#/$defs/sourceGate"},
     "hdf5_text_info": {"type": "object"},
     "quality_hand": {"type": "object"},
     "keypoint_presence": {"type": "object"},
@@ -129,6 +131,144 @@
             "properties": {
               "status": {"const": "error"}
             }
+          },
+          "overall_decision": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"required": ["source_gate"]},
+      "then": {"required": ["batch_id"]}
+    },
+    {
+      "if": {
+        "required": ["source_gate"],
+        "properties": {
+          "source_gate": {
+            "required": ["evaluation"],
+            "properties": {
+              "evaluation": {
+                "required": ["status"],
+                "properties": {"status": {"enum": ["pass", "fail"]}}
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "execution": {
+            "required": ["module_states"],
+            "properties": {
+              "module_states": {
+                "required": ["source_gate"],
+                "properties": {
+                  "source_gate": {
+                    "required": ["state"],
+                    "properties": {"state": {"const": "completed"}}
+                  }
+                }
+              }
+            }
+          },
+          "runtime_errors": {
+            "not": {
+              "contains": {
+                "required": ["module"],
+                "properties": {"module": {"const": "source_gate"}}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["source_gate"],
+        "properties": {
+          "source_gate": {
+            "required": ["evaluation"],
+            "properties": {
+              "evaluation": {
+                "required": ["status"],
+                "properties": {"status": {"const": "runtime_error"}}
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "execution": {
+            "required": ["module_states"],
+            "properties": {
+              "module_states": {
+                "required": ["source_gate"],
+                "properties": {
+                  "source_gate": {
+                    "required": ["state"],
+                    "properties": {"state": {"const": "runtime_error"}}
+                  }
+                }
+              }
+            }
+          },
+          "runtime_errors": {
+            "minItems": 1,
+            "contains": {
+              "required": ["module", "retryable"],
+              "properties": {
+                "module": {"const": "source_gate"},
+                "retryable": {"const": true}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["source_gate"],
+        "properties": {
+          "source_gate": {
+            "properties": {
+              "evaluation": {
+                "properties": {"status": {"const": "fail"}},
+                "required": ["status"]
+              }
+            },
+            "required": ["evaluation"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "pipeline_state": {
+            "properties": {"status": {"const": "stopped"}}
+          },
+          "overall_decision": {"const": "fail"}
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["source_gate"],
+        "properties": {
+          "source_gate": {
+            "properties": {
+              "evaluation": {
+                "properties": {"status": {"const": "runtime_error"}},
+                "required": ["status"]
+              }
+            },
+            "required": ["evaluation"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "pipeline_state": {
+            "properties": {"status": {"const": "error"}}
           },
           "overall_decision": {"type": "null"}
         }
@@ -330,6 +470,262 @@
         }
       }
     },
+    "sourceGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["flow", "evaluation", "metrics", "evidence", "runtime"],
+      "properties": {
+        "flow": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["entry_gate", "exit_gate"],
+          "properties": {
+            "entry_gate": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["state"],
+              "properties": {"state": {"const": "entered"}}
+            },
+            "result_gate": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["verdict", "has_fail", "has_warn"],
+              "properties": {
+                "verdict": {"enum": ["pass", "fail"]},
+                "has_fail": {"type": "boolean"},
+                "has_warn": {"const": false}
+              }
+            },
+            "exit_gate": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["state", "continue_to_next_module"],
+              "properties": {
+                "state": {"enum": ["continue", "stop_qc", "stop_incomplete"]},
+                "continue_to_next_module": {"type": "boolean"},
+                "next_module": {"type": "null"}
+              }
+            }
+          }
+        },
+        "evaluation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "declared_identity", "locator"],
+          "properties": {
+            "status": {"enum": ["pass", "fail", "runtime_error"]},
+            "declared_identity": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["asset_id", "batch_id", "supplier_id"],
+              "properties": {
+                "asset_id": {"type": "string", "minLength": 1},
+                "batch_id": {"type": "string", "minLength": 1},
+                "supplier_id": {"type": "string", "minLength": 1}
+              }
+            },
+            "locator": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source_path", "source_root", "source_format", "episode_index"],
+              "properties": {
+                "source_path": {"type": "string", "minLength": 1},
+                "source_root": {"type": "string", "minLength": 1},
+                "source_format": {"type": "string", "minLength": 1},
+                "episode_index": {"type": ["integer", "null"]}
+              }
+            },
+            "diagnostic": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["code", "field", "message", "retryable"],
+              "properties": {
+                "code": {"type": "string", "minLength": 1},
+                "field": {"type": "string", "minLength": 1},
+                "message": {"type": "string", "minLength": 1},
+                "retryable": {"type": "boolean"}
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {"status": {"enum": ["fail", "runtime_error"]}},
+                "required": ["status"]
+              },
+              "then": {"required": ["diagnostic"]}
+            }
+          ]
+        },
+        "metrics": {"type": "object", "maxProperties": 0},
+        "evidence": {"type": "array", "maxItems": 0},
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["canonical_config"],
+          "properties": {
+            "canonical_config": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["schema_version", "config_version", "config_path", "config_hash"],
+              "properties": {
+                "schema_version": {"const": "canonical_qc_config_schema.v1"},
+                "config_version": {"pattern": "^canonical_qc_v[0-9]+\\.[0-9]+\\.[0-9]+$"},
+                "config_path": {"type": "string", "minLength": 1},
+                "config_hash": {"pattern": "^sha256:[0-9a-f]{64}$"}
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "evaluation": {
+                "properties": {"status": {"const": "pass"}},
+                "required": ["status"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "flow": {
+                "required": ["result_gate"],
+                "properties": {
+                  "result_gate": {
+                    "properties": {
+                      "verdict": {"const": "pass"},
+                      "has_fail": {"const": false},
+                      "has_warn": {"const": false}
+                    }
+                  },
+                  "exit_gate": {
+                    "properties": {
+                      "state": {"const": "continue"},
+                      "continue_to_next_module": {"const": true}
+                    }
+                  }
+                }
+              },
+              "evaluation": {"not": {"required": ["diagnostic"]}}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "evaluation": {
+                "properties": {"status": {"const": "fail"}},
+                "required": ["status"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "flow": {
+                "required": ["result_gate"],
+                "properties": {
+                  "result_gate": {
+                    "properties": {
+                      "verdict": {"const": "fail"},
+                      "has_fail": {"const": true},
+                      "has_warn": {"const": false}
+                    }
+                  },
+                  "exit_gate": {
+                    "properties": {
+                      "state": {"const": "stop_qc"},
+                      "continue_to_next_module": {"const": false}
+                    }
+                  }
+                }
+              },
+              "evaluation": {
+                "required": ["diagnostic"],
+                "properties": {
+                  "diagnostic": {
+                    "properties": {"retryable": {"const": false}}
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "evaluation": {
+                "properties": {"status": {"const": "runtime_error"}},
+                "required": ["status"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "flow": {
+                "not": {"required": ["result_gate"]},
+                "properties": {
+                  "exit_gate": {
+                    "properties": {
+                      "state": {"const": "stop_incomplete"},
+                      "continue_to_next_module": {"const": false}
+                    }
+                  }
+                }
+              },
+              "evaluation": {
+                "required": ["diagnostic"],
+                "properties": {
+                  "diagnostic": {
+                    "properties": {"retryable": {"const": true}}
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "evaluation": {
+                "required": ["status"],
+                "properties": {
+                  "status": {"enum": ["pass", "runtime_error"]}
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "evaluation": {
+                "properties": {
+                  "locator": {
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "source_format": {"const": "hdf5"},
+                          "episode_index": {"type": "null"}
+                        }
+                      },
+                      {
+                        "properties": {
+                          "source_format": {"const": "lerobot"},
+                          "episode_index": {
+                            "type": ["integer", "null"],
+                            "minimum": 0
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
     "semanticCalibration": {
       "type": "object",
       "additionalProperties": true,
@@ -344,8 +740,25 @@
             "error"
           ]
         },
-        "canonical_revision": {"type": "integer", "minimum": 1}
-      }
+        "canonical_revision": {"type": "integer", "minimum": 1},
+        "timeline_edit_count": {"type": "integer", "minimum": 0},
+        "subtask_text_edit_count": {"type": "integer", "minimum": 0}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"state": {"const": "completed"}},
+            "required": ["state"]
+          },
+          "then": {
+            "required": [
+              "canonical_revision",
+              "timeline_edit_count",
+              "subtask_text_edit_count"
+            ]
+          }
+        }
+      ]
     },
     "canonicalBinding": {
       "type": "object",
