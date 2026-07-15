@@ -15,8 +15,12 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from qc_common.config import LoadedQcConfig
+from qc_common.module_registry import ModuleRegistry
 from qc_common.report import load_asset_qc_report
 from qc_pipeline.context import AssetContext
+from qc_pipeline.default_registry import build_default_registry
+from qc_pipeline.orchestrator import resume_after_external
 
 from .evidence import EvidenceService
 from .lease import Lease, LeaseStore
@@ -85,6 +89,10 @@ class WorkbenchService:
         context_provider: Callable[[str], AssetContext | None] | None = None,
         lease_ttl_seconds: int = 900,
         profile: str | None = None,
+        config: LoadedQcConfig | None = None,
+        registry_factory: Callable[
+            [AssetContext, LoadedQcConfig], ModuleRegistry
+        ] | None = None,
     ) -> None:
         self.semantic_service = semantic_service
         self.warn_service = warn_service
@@ -98,6 +106,8 @@ class WorkbenchService:
             raise ValueError("lease_ttl_seconds must be positive")
         self.lease_ttl_seconds = lease_ttl_seconds
         self.profile = profile
+        self.config = config
+        self.registry_factory = registry_factory or build_default_registry
 
     def _context(self, asset_id: str) -> AssetContext | None:
         context = self.asset_contexts.get(asset_id)
@@ -139,6 +149,30 @@ class WorkbenchService:
             raise ValueError("asset report identity does not match requested asset")
         return report
 
+    @staticmethod
+    def _is_actionable_report(report: Mapping[str, Any] | None) -> bool:
+        if not isinstance(report, Mapping):
+            return False
+        pipeline = report.get("pipeline_state")
+        if not isinstance(pipeline, Mapping):
+            return False
+        if pipeline.get("status") != "awaiting_external":
+            return False
+        next_module = pipeline.get("next_module")
+        if next_module == "semantic_consistency":
+            return True
+        if next_module != "manual_review":
+            return False
+        manual = report.get("manual_review")
+        candidates = (
+            manual.get("candidate_issue_ids", [])
+            if isinstance(manual, Mapping)
+            else []
+        )
+        return isinstance(candidates, (list, tuple)) and any(
+            isinstance(item, str) and item for item in candidates
+        )
+
     def _evidence(self, asset_id: str, report: Mapping[str, Any] | None, context: AssetContext | None) -> list[dict[str, Any]]:
         service = self.evidence_service
         if service is None or report is None or context is None:
@@ -178,10 +212,10 @@ class WorkbenchService:
         pipeline = report.get("pipeline_state") if isinstance(report, Mapping) else None
         pipeline_status = pipeline.get("status") if isinstance(pipeline, Mapping) else None
         pipeline_next = pipeline.get("next_module") if isinstance(pipeline, Mapping) else None
-        # Acceptance hard-fail and runtime-error assets are navigation records,
-        # not editable human tasks.  Avoid even constructing a semantic view
-        # for them, which also prevents accidental lease/task creation.
-        if pipeline_status in {"stopped", "error"}:
+        # Terminal assets are navigation records, not editable human tasks.
+        # Avoid even constructing a stale domain view for them, which also
+        # prevents accidental lease/task creation.
+        if pipeline_status in {"stopped", "completed", "error"}:
             semantic = None
             warn = None
         else:
@@ -303,16 +337,17 @@ class WorkbenchService:
             pipeline = report.get("pipeline_state")
             if not isinstance(pipeline, Mapping):
                 continue
-            if pipeline.get("status") == "awaiting_external" and pipeline.get("next_module") in {
-                "semantic_consistency",
-                "manual_review",
-            }:
+            if self._is_actionable_report(report):
                 actionable.append(asset_id)
         return tuple(actionable)
 
     def acquire_lease(
         self, asset_id: str, reviewer: str, ttl_seconds: int | None = None
     ) -> Lease:
+        context = self._context(asset_id)
+        report = self._report(asset_id, context)
+        if not self._is_actionable_report(report):
+            raise KeyError(f"asset is not actionable: {asset_id}")
         task = self.get_asset_task(asset_id)
         if task.get("task_type") in {"completed", "error"}:
             raise KeyError(f"asset is not actionable: {asset_id}")
@@ -327,6 +362,10 @@ class WorkbenchService:
     def renew_lease(
         self, asset_id: str, token: str, ttl_seconds: int | None = None
     ) -> Lease:
+        context = self._context(asset_id)
+        report = self._report(asset_id, context)
+        if not self._is_actionable_report(report):
+            raise KeyError(f"asset is not actionable: {asset_id}")
         lease = self.lease_store.renew(
             asset_id,
             token,
@@ -358,6 +397,36 @@ class WorkbenchService:
 
     def _latest(self, asset_id: str) -> dict[str, Any]:
         return self.get_asset_task(asset_id)
+
+    def _resume_external(self, asset_id: str, completed_module: str) -> None:
+        """Continue the configured pipeline after a domain completion write."""
+
+        if self.config is None:
+            return
+        context = self._context(asset_id)
+        if context is None:
+            raise KeyError(f"asset context is not configured for {asset_id}")
+        report = self._report(asset_id, context)
+        if not isinstance(report, Mapping):
+            raise FileNotFoundError(context.report_path)
+        execution = report.get("execution")
+        report_profile = (
+            execution.get("profile") if isinstance(execution, Mapping) else None
+        )
+        profile = (
+            report_profile
+            if isinstance(report_profile, str)
+            else self.profile or self.config.default_profile
+        )
+        registry = self.registry_factory(context, self.config)
+        resume_after_external(
+            context,
+            config=self.config,
+            profile=profile,
+            completed_module=completed_module,
+            expected_revision=int(report.get("report_revision", 0)),
+            registry=registry,
+        )
 
     def semantic_boundary_pending(
         self,
@@ -437,7 +506,16 @@ class WorkbenchService:
         self._prepare_mutation(asset_id, lease_token)
         if self.semantic_service is None:
             raise KeyError(f"semantic service is not configured for {asset_id}")
-        self.semantic_service.complete(asset_id, expected_revision, lease_token)
+        if self.config is None:
+            self.semantic_service.complete(asset_id, expected_revision, lease_token)
+        else:
+            self.semantic_service.complete(
+                asset_id,
+                expected_revision,
+                lease_token,
+                advance_pipeline=False,
+            )
+            self._resume_external(asset_id, "semantic_consistency")
         return self._latest(asset_id)
 
     def warn_verdict(
@@ -469,7 +547,16 @@ class WorkbenchService:
         self._prepare_mutation(asset_id, lease_token)
         if self.warn_service is None:
             raise KeyError(f"warn service is not configured for {asset_id}")
-        self.warn_service.complete(asset_id, expected_revision, lease_token)
+        if self.config is None:
+            self.warn_service.complete(asset_id, expected_revision, lease_token)
+        else:
+            self.warn_service.complete(
+                asset_id,
+                expected_revision,
+                lease_token,
+                advance_pipeline=False,
+            )
+            self._resume_external(asset_id, "manual_review")
         return self._latest(asset_id)
 
 

@@ -19,6 +19,7 @@ from human_qc.lease import LeaseStore  # noqa: E402
 from human_qc.semantic_service import SemanticCalibrationService  # noqa: E402
 from human_qc.warn_service import WarnReviewService  # noqa: E402
 from human_qc.workbench_service import WorkbenchService  # noqa: E402
+from qc_common.config import load_qc_acceptance_config  # noqa: E402
 from qc_pipeline.context import AssetContext  # noqa: E402
 
 
@@ -153,6 +154,7 @@ def build_workbench_service(
     semantic = SemanticCalibrationService(assets=assets, reports=reports)
     warn = WarnReviewService(reports=reports)
     evidence = EvidenceService(batch_root / ".human_qc_evidence")
+    config = load_qc_acceptance_config()
     service = WorkbenchService(
         semantic,
         warn,
@@ -161,6 +163,7 @@ def build_workbench_service(
         asset_contexts={context.asset_id: context for context in contexts},
         lease_ttl_seconds=lease_ttl_seconds,
         profile=profile,
+        config=config,
     )
     # Force report/HDF5 loading at process start so a durable ``finalizing``
     # semantic transaction is recovered before the first browser request.

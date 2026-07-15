@@ -19,6 +19,7 @@ from qc_common.report import (
     write_asset_qc_report,
 )
 from qc_common.report_mutation import (
+    _has_machine_fail,
     apply_module_result,
     initialize_v2_report,
     record_awaiting_external,
@@ -59,6 +60,90 @@ def _disabled_overall_decision(report: Mapping[str, Any], completed: bool) -> st
         for issue in issues
     )
     return "fail" if has_fail else "pass"
+
+
+def _manual_candidate_ids(report: Mapping[str, Any]) -> tuple[str, ...]:
+    manual = report.get("manual_review")
+    if not isinstance(manual, Mapping):
+        return ()
+    value = manual.get("candidate_issue_ids", [])
+    if not isinstance(value, list):
+        raise ValueError("manual_review.candidate_issue_ids must be an array")
+    if any(not isinstance(item, str) or not item for item in value):
+        raise ValueError("manual_review.candidate_issue_ids must contain strings")
+    return tuple(value)
+
+
+def _record_empty_manual_review(
+    context: AssetContext,
+    *,
+    config: LoadedQcConfig,
+    profile: str,
+    report: Mapping[str, Any],
+    expected_revision: int,
+    now: str,
+) -> dict[str, Any]:
+    """Skip a candidate-free manual stage without exposing a human task."""
+
+    candidate = copy.deepcopy(dict(report))
+    manual = candidate.get("manual_review")
+    if not isinstance(manual, dict):
+        manual = {}
+        candidate["manual_review"] = manual
+    manual.update(
+        {
+            "required": False,
+            "state": "not_required",
+            "candidate_issue_ids": [],
+            "selected_issue_ids": [],
+            "selected_issue_id": None,
+            "issue_reviews": {},
+            "completed_at": None,
+        }
+    )
+    manual.setdefault("failures_for_batch_stats_issue_ids", [])
+
+    execution = candidate.get("execution")
+    if not isinstance(execution, dict):
+        raise ValueError("execution must be an object")
+    module_states = execution.setdefault("module_states", {})
+    if not isinstance(module_states, dict):
+        raise ValueError("execution.module_states must be an object")
+    module_states["manual_review"] = {
+        "state": "skipped",
+        "reason": "no_candidates",
+    }
+    execution["updated_at"] = now
+
+    next_module = _successor(config.pipeline_modules, "manual_review")
+    pipeline = candidate.get("pipeline_state")
+    if not isinstance(pipeline, dict):
+        raise ValueError("pipeline_state must be an object")
+    pipeline.update(
+        {
+            "status": "running" if next_module is not None else "completed",
+            "last_completed_module": "manual_review",
+            "next_module": next_module,
+            "stop_reason": None,
+        }
+    )
+    candidate["overall_decision"] = (
+        None
+        if next_module is not None
+        else (
+            "fail"
+            if _has_machine_fail(candidate, config.pipeline_modules)
+            else "pass"
+        )
+    )
+    candidate["report_revision"] = expected_revision + 1
+    write_asset_qc_report(
+        context.report_path,
+        candidate,
+        expected_revision=expected_revision,
+        profile=profile,
+    )
+    return candidate
 
 
 def _record_stale_revision_if_current(
@@ -176,6 +261,16 @@ def run_asset(
             )
             continue
         if module_config.get("execution_kind") == "external":
+            if module_name == "manual_review" and not _manual_candidate_ids(report):
+                report = _record_empty_manual_review(
+                    context,
+                    config=config,
+                    profile=profile,
+                    report=report,
+                    expected_revision=expected_revision,
+                    now=timestamp,
+                )
+                continue
             report = record_awaiting_external(
                 context.report_path,
                 context=context,
@@ -306,10 +401,23 @@ def resume_after_external(
     pipeline = report.get("pipeline_state")
     if not isinstance(pipeline, Mapping):
         raise ValueError("pipeline_state must be an object")
-    if pipeline.get("status") != "awaiting_external" or pipeline.get("next_module") != completed_module:
+    block = report.get(completed_module)
+    domain_states = {"completed"}
+    if completed_module == "manual_review":
+        domain_states.add("not_required")
+    domain_completed = (
+        isinstance(block, Mapping)
+        and block.get("state") in domain_states
+        and pipeline.get("last_completed_module") == completed_module
+    )
+    awaiting_completion = (
+        pipeline.get("status") == "awaiting_external"
+        and pipeline.get("next_module") == completed_module
+    )
+    if not awaiting_completion and not domain_completed:
         raise ValueError(
             "external completion requires pipeline status=awaiting_external "
-            f"and next_module={completed_module}"
+            f"and next_module={completed_module}, or an already recorded domain completion"
         )
 
     timestamp = now()
@@ -350,7 +458,12 @@ def resume_after_external(
         )
         candidate["overall_decision"] = (
             "fail" if _has_machine_fail(candidate, config.pipeline_modules) or human_fail else
-            ("pass" if manual_state in {None, "completed", "not_required"} else None)
+            (
+                "pass"
+                if completed_module != "manual_review"
+                or manual_state in {None, "completed", "not_required"}
+                else None
+            )
         )
     else:
         candidate["overall_decision"] = None

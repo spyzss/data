@@ -357,7 +357,12 @@ class WarnReviewService:
         return self._view(asset_id, updated)
 
     def complete(
-        self, asset_id: str, expected_revision: int, lease_token: str
+        self,
+        asset_id: str,
+        expected_revision: int,
+        lease_token: str,
+        *,
+        advance_pipeline: bool = True,
     ) -> WarnTaskView:
         asset_id = _non_empty(asset_id, "asset_id")
         report = self._load(asset_id)
@@ -410,15 +415,18 @@ class WarnReviewService:
                 block["required"] = False
                 block["selected_issue_id"] = None
                 block["completed_at"] = None
-            pipeline_now = candidate.get("pipeline_state")
-            if not isinstance(pipeline_now, dict):
-                raise WarnStateError("pipeline_state block is missing")
-            pipeline_now["status"] = "completed"
-            pipeline_now["last_completed_module"] = "manual_review"
-            pipeline_now["next_module"] = None
-            pipeline_now["stop_reason"] = None
-            candidate["pipeline_state"] = pipeline_now
-            candidate["overall_decision"] = reduce_overall_decision(candidate) or "pass"
+            if advance_pipeline:
+                pipeline_now = candidate.get("pipeline_state")
+                if not isinstance(pipeline_now, dict):
+                    raise WarnStateError("pipeline_state block is missing")
+                pipeline_now["status"] = "completed"
+                pipeline_now["last_completed_module"] = "manual_review"
+                pipeline_now["next_module"] = None
+                pipeline_now["stop_reason"] = None
+                candidate["pipeline_state"] = pipeline_now
+                candidate["overall_decision"] = (
+                    reduce_overall_decision(candidate) or "pass"
+                )
 
         updated = update_human_state(self.report_path(asset_id), expected_revision, mutate)
         return self._view(asset_id, updated)

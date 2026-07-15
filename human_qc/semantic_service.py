@@ -1115,7 +1115,14 @@ class SemanticCalibrationService:
         self._active_pending_asset = None
         return self._view(state)
 
-    def complete(self, asset_id: str, expected_revision: int, lease_token: str) -> SemanticTaskView:
+    def complete(
+        self,
+        asset_id: str,
+        expected_revision: int,
+        lease_token: str,
+        *,
+        advance_pipeline: bool = True,
+    ) -> SemanticTaskView:
         self._assert_navigation(asset_id)
         state = self._load_state(asset_id)
         self._check_lease(state, lease_token)
@@ -1176,6 +1183,7 @@ class SemanticCalibrationService:
             block["staged_identity"] = list(record.staged_identity or ())
             block["finalizing_record"] = finalizing_payload
             block["working_timeline"] = _timeline_dict(state.timeline)
+            block["orchestrator_resume_required"] = not advance_pipeline
 
         try:
             self._mutate_report(state, expected_revision, mark_finalizing)
@@ -1203,7 +1211,8 @@ class SemanticCalibrationService:
             module["state"] = "completed"
             module["execution_kind"] = "external"
             candidate["semantic_consistency"] = module
-            _advance_pipeline_after_semantic(candidate)
+            if advance_pipeline:
+                _advance_pipeline_after_semantic(candidate)
 
         self._mutate_report(state, state.revision, mark_completed)
         state.pending_edit = None
@@ -1380,7 +1389,8 @@ class SemanticCalibrationService:
             if not isinstance(pipeline, dict):
                 pipeline = {}
                 candidate["pipeline_state"] = pipeline
-            _advance_pipeline_after_semantic(candidate)
+            if not semantic.get("orchestrator_resume_required", False):
+                _advance_pipeline_after_semantic(candidate)
 
         update_human_state(report_path, revision, mutate)
 
