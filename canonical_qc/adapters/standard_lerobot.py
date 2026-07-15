@@ -68,7 +68,6 @@ _RAW_PRIMITIVE_CONTRACTS: tuple[tuple[pa.DataType, str, Any], ...] = (
     (pa.float64(), "float64", np.float64),
     (pa.bool_(), "bool", np.bool_),
     (pa.string(), "string", str),
-    (pa.binary(), "binary", bytes),
 )
 
 

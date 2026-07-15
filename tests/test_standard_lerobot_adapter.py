@@ -433,7 +433,6 @@ def test_supplier_raw_float_contract_names_preserve_exact_dtype_and_values(
         ("int32", pa.int32(), np.int32, [[-2, 3], [4, -5], [6, 7]]),
         ("bool", pa.bool_(), np.bool_, [[True, False], [False, True], [True, True]]),
         ("string", pa.string(), str, [["a", "bb"], ["ccc", "d"], ["e", "ff"]]),
-        ("binary", pa.binary(), bytes, [[b"a", b"bb"], [b"c", b"dd"], [b"e", b"ff"]]),
     ],
 )
 def test_supplier_raw_explicit_primitive_mappings_preserve_values(
@@ -467,6 +466,37 @@ def test_supplier_raw_explicit_primitive_mappings_preserve_values(
     np.testing.assert_array_equal(
         quality.raw_value,
         np.asarray(values, dtype=numpy_dtype),
+    )
+
+
+def test_supplier_raw_binary_is_rejected_without_lossy_numpy_conversion(
+    tmp_path: Path,
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "binary")
+    _add_quality_column(
+        root,
+        "supplier.hand_quality.status",
+        pa.array([["unknown", "bad"], ["warning", "good"], ["good", "unknown"]], type=pa.list_(pa.string(), 2)),
+    )
+    _add_quality_column(
+        root,
+        "supplier.hand_quality.raw_value",
+        pa.array(
+            [[b"a\x00", b"a"], [b"b\x00\x00", b"b"], [b"c\x00", b"c"]],
+            type=pa.list_(pa.binary(), 2),
+        ),
+    )
+    _declare_feature(root, "supplier.hand_quality.status", {"dtype": "string", "shape": [2]})
+    _declare_feature(root, "supplier.hand_quality.raw_value", {"dtype": "binary", "shape": [2]})
+    _rewrite_semantic(
+        root,
+        lambda rows: [dict(row, supplier_hand_quality={"provided": True, "mapping_version": "supplier.binary.v1"}) for row in rows],
+    )
+
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="field_mapping_error",
+        field="supplier.hand_quality.raw_value",
     )
 
 
