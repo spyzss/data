@@ -114,12 +114,12 @@ class StandardLeRobotAdapter:
     def load(self, source: Path, *, episode_index: int | None = None) -> CanonicalQcEpisode: ...
 ```
 
-- [ ] Step 1: 写固定 LeRobot fixture 和目标失败测试，要求 `meta/episodes`、data Parquet、`episode_semantics.jsonl`、外置 main MP4 与精确 `timestamp_ns`。
-- [ ] Step 2: 运行新增测试，确认 Adapter 缺失失败。
-- [ ] Step 3: 实现受支持布局识别、唯一 episode 选择、固定 feature 解码和共享 Validator。
-- [ ] Step 4: 写同一逻辑 episode 的 HDF5/LeRobot 对照，断言除 provenance/source_format 外字段相同且 semantic fingerprint 相同。
-- [ ] Step 5: 增加缺 `timestamp_ns`、float timestamp 漂移、episode selector 歧义和目录逃逸测试；运行 annotation reader 回归。
-- [ ] Step 6: 提交 `feat(canonical): normalize standard LeRobot inputs`。
+- [x] Step 1: 写固定 LeRobot fixture 和目标失败测试，要求 `meta/episodes`、data Parquet、`episode_semantics.jsonl`、外置 main MP4 与精确 `timestamp_ns`。
+- [x] Step 2: 运行新增测试，确认 Adapter 缺失失败。
+- [x] Step 3: 实现受支持布局识别、唯一 episode 选择、固定 feature 解码和共享 Validator。
+- [x] Step 4: 写同一逻辑 episode 的 HDF5/LeRobot 对照，断言除 provenance/source_format 外字段相同且 semantic fingerprint 相同。
+- [x] Step 5: 增加缺 `timestamp_ns`、float timestamp 漂移、episode selector 歧义和目录逃逸测试；运行 annotation reader 回归。
+- [x] Step 6: 提交 `feat(canonical): normalize standard LeRobot inputs`。
 
 ## Task 5: 实现 CanonicalQcBridge 并接入现有 runner
 
