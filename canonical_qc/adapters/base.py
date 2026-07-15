@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
-from ..contracts import CanonicalQcEpisode
+from ..contracts import CanonicalQcEpisode, SourceFile
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +28,11 @@ class SourceInspection:
     data_row_offset: int = 0
     video_frame_offset: int = 0
     layout_version: Literal["v3", "v2.1"] | None = None
+    inspection_source_files: tuple[SourceFile, ...] = ()
+    data_row_stop: int = 0
+    video_frame_stop: int = 0
+    video_width_px: int | None = None
+    video_height_px: int | None = None
 
 
 class SourceAdapter(Protocol):

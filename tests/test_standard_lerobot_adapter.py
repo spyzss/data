@@ -168,6 +168,7 @@ def test_v3_shared_shards_use_metadata_row_and_video_offsets(tmp_path: Path) -> 
         "dataset_from_index": 3,
         "dataset_to_index": 6,
         "videos/observation.images.main/from_index": 3,
+        "videos/observation.images.main/to_index": 6,
     })
     pq.write_table(pa.Table.from_pylist(rows), episode_path)
     videos = sorted((root / "videos").rglob("*.mp4"))
@@ -244,7 +245,7 @@ def test_provided_supplier_quality_requires_declared_features_and_preserves_stat
 
     _assert_error(
         lambda: StandardLeRobotAdapter().load(root),
-        code="schema_missing", field="info.features.supplier.hand_quality.raw_value",
+        code="schema_missing", field="info.features.supplier.hand_quality.status",
     )
 
     info_path = root / "meta" / "info.json"
@@ -299,4 +300,260 @@ def test_selector_rejects_zero_and_duplicate_episode_metadata_rows(tmp_path: Pat
     _assert_error(
         lambda: StandardLeRobotAdapter().load(root, episode_index=0),
         code="field_mapping_error", field="episode_index",
+    )
+
+
+def _rewrite_semantic(root: Path, transform: object) -> None:
+    assert callable(transform)
+    path = root / "meta" / "episode_semantics.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    transformed = transform(rows)
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in transformed),
+        encoding="utf-8",
+    )
+
+
+def _add_quality_column(root: Path, name: str, values: pa.Array) -> None:
+    path = next((root / "data").rglob("*.parquet"))
+    pq.write_table(pq.read_table(path).append_column(name, values), path)
+
+
+def _declare_feature(root: Path, name: str, declaration: dict[str, object]) -> None:
+    path = root / "meta" / "info.json"
+    info = json.loads(path.read_text(encoding="utf-8"))
+    info["features"][name] = declaration
+    path.write_text(json.dumps(info), encoding="utf-8")
+
+
+def test_provided_quality_allows_independently_optional_raw_and_score(tmp_path: Path) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "status-only")
+    _add_quality_column(
+        root,
+        "supplier.hand_quality.status",
+        pa.array([["unknown", "bad"], ["warning", "good"], ["good", "unknown"]], type=pa.list_(pa.string(), 2)),
+    )
+    _declare_feature(root, "supplier.hand_quality.status", {"dtype": "string", "shape": [2]})
+    _rewrite_semantic(
+        root,
+        lambda rows: [dict(row, supplier_hand_quality={"provided": True, "mapping_version": "supplier.status.v1"}) for row in rows],
+    )
+
+    status_only = StandardLeRobotAdapter().load(root).supplier_evidence.hand_quality
+    assert status_only is not None and status_only.provided
+    assert status_only.raw_value is None
+    assert status_only.normalized_score is None
+
+    root = write_standard_lerobot_dataset(tmp_path / "uint32-raw")
+    _add_quality_column(
+        root,
+        "supplier.hand_quality.status",
+        pa.array([["unknown", "bad"], ["warning", "good"], ["good", "unknown"]], type=pa.list_(pa.string(), 2)),
+    )
+    _add_quality_column(
+        root,
+        "supplier.hand_quality.raw_value",
+        pa.array([[1, 2], [3, 4], [5, 6]], type=pa.list_(pa.uint32(), 2)),
+    )
+    _declare_feature(root, "supplier.hand_quality.status", {"dtype": "string", "shape": [2]})
+    _declare_feature(root, "supplier.hand_quality.raw_value", {"dtype": "uint32", "shape": [2]})
+    _rewrite_semantic(
+        root,
+        lambda rows: [dict(row, supplier_hand_quality={"provided": True, "mapping_version": "supplier.raw.v1"}) for row in rows],
+    )
+
+    raw = StandardLeRobotAdapter().load(root).supplier_evidence.hand_quality
+    assert raw is not None and raw.raw_value is not None
+    assert raw.raw_value.dtype == np.uint32
+
+
+def test_quality_status_is_validated_before_fixed_width_conversion(tmp_path: Path) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "dataset")
+    _add_quality_column(
+        root,
+        "supplier.hand_quality.status",
+        pa.array([["unknown", "bad"], ["warning-extra", "good"], ["good", "unknown"]], type=pa.list_(pa.string(), 2)),
+    )
+    _declare_feature(root, "supplier.hand_quality.status", {"dtype": "string", "shape": [2]})
+    _rewrite_semantic(
+        root,
+        lambda rows: [dict(row, supplier_hand_quality={"provided": True, "mapping_version": "supplier.status.v1"}) for row in rows],
+    )
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="field_mapping_error", field="supplier.hand_quality.status",
+    )
+
+
+def test_video_feature_shape_is_dynamic_and_matches_calibration_and_probe(tmp_path: Path) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "dataset")
+    video = next((root / "videos").rglob("*.mp4"))
+    write_test_video(
+        video,
+        [solid_frame(20 + index * 10, width=64, height=48) for index in range(3)],
+        fps=10.0,
+    )
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["features"]["observation.images.main"]["shape"] = [48, 64, 3]
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    _rewrite_semantic(
+        root,
+        lambda rows: [
+            dict(row, calibration=dict(row["calibration"], image_width_px=64, image_height_px=48))
+            for row in rows
+        ],
+    )
+
+    loaded = StandardLeRobotAdapter().load(root)
+    assert (loaded.main_video.width_px, loaded.main_video.height_px) == (64, 48)
+
+    info["features"]["observation.images.main"]["shape"] = [48, 32, 3]
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="field_mapping_error", field="info.features.observation.images.main.shape",
+    )
+
+
+def test_mutation_during_inspect_is_rejected_and_not_rebased_into_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "dataset")
+    info_path = root / "meta" / "info.json"
+    original = Path.read_text
+    mutated = False
+
+    def mutating_read(path: Path, *args: object, **kwargs: object) -> str:
+        nonlocal mutated
+        value = original(path, *args, **kwargs)
+        if path == info_path and not mutated:
+            mutated = True
+            info_path.write_text(value + " ", encoding="utf-8")
+        return value
+
+    monkeypatch.setattr(Path, "read_text", mutating_read)
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="source_integrity_error", field="source",
+    )
+
+
+def test_episode_metadata_mutation_during_selection_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "dataset")
+    episode_path = next((root / "meta" / "episodes").rglob("*.parquet"))
+    original = pq.read_table
+    mutated = False
+
+    def mutating_read(*args: object, **kwargs: object) -> pa.Table:
+        nonlocal mutated
+        table = original(*args, **kwargs)
+        if Path(args[0]) == episode_path and not mutated:
+            mutated = True
+            episode_path.write_bytes(episode_path.read_bytes() + b"mutation")
+        return table
+
+    monkeypatch.setattr(pq, "read_table", mutating_read)
+    _assert_error(
+        lambda: StandardLeRobotAdapter().inspect(root),
+        code="source_integrity_error", field="source",
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "field"),
+    [
+        ("dataset_from_index", -1, "episode.dataset_from_index"),
+        ("dataset_to_index", None, "episode.dataset_to_index"),
+        ("videos/observation.images.main/from_index", -1, "episode.video_from_index"),
+        ("videos/observation.images.main/to_index", None, "episode.video_to_index"),
+    ],
+)
+def test_v3_requires_explicit_nonnegative_exact_data_and_video_offsets(
+    tmp_path: Path, key: str, value: int | None, field: str
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / key.replace("/", "_"))
+    path = next((root / "meta" / "episodes").rglob("*.parquet"))
+    rows = pq.read_table(path).to_pylist()
+    if value is None:
+        del rows[0][key]
+    else:
+        rows[0][key] = value
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="schema_missing" if value is None else "field_mapping_error",
+        field=field,
+    )
+
+
+def test_v21_episode_files_must_not_hide_shared_rows_or_frames(tmp_path: Path) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "rows", layout="v2.1")
+    data_path = next((root / "data").rglob("*.parquet"))
+    table = pq.read_table(data_path)
+    pq.write_table(pa.concat_tables([table, table.slice(0, 1)]), data_path)
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="field_mapping_error", field="episode.length",
+    )
+
+    root = write_standard_lerobot_dataset(tmp_path / "frames", layout="v2.1")
+    video_path = next((root / "videos").rglob("*.mp4"))
+    write_test_video(
+        video_path,
+        [solid_frame(20 + index * 10) for index in range(4)],
+        fps=10.0,
+    )
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="timebase_invalid", field="main_video.frame_count",
+    )
+
+
+def test_semantics_keys_are_globally_unique_typed_and_subtask_ids_are_sequential(tmp_path: Path) -> None:
+    root = write_standard_lerobot_dataset(
+        tmp_path / "duplicate", episodes=((0, "asset-zero"), (1, "asset-one"))
+    )
+    _rewrite_semantic(root, lambda rows: rows + [dict(rows[1])])
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root, episode_index=0),
+        code="field_mapping_error", field="episode_semantics",
+    )
+
+    root = write_standard_lerobot_dataset(tmp_path / "bool-index")
+    _rewrite_semantic(root, lambda rows: [dict(rows[0], episode_index=True)])
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="field_mapping_error", field="episode_semantics[0].episode_index",
+    )
+
+    root = write_standard_lerobot_dataset(tmp_path / "subtask")
+    data_path = next((root / "data").rglob("*.parquet"))
+    table = pq.read_table(data_path)
+    index = table.schema.get_field_index("subtask_index")
+    pq.write_table(table.set_column(index, "subtask_index", pa.array([4, 4, 4], type=pa.int64())), data_path)
+    _rewrite_semantic(
+        root,
+        lambda rows: [dict(rows[0], subtask_sequence=[dict(rows[0]["subtask_sequence"][0], subtask_index=4)])],
+    )
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="field_mapping_error", field="semantics.subtask_sequence[0].subtask_index",
+    )
+
+
+@pytest.mark.parametrize(("name", "value"), [("fps_num", 0), ("fps_den", -1), ("fps_num", True)])
+def test_public_inspect_rejects_invalid_fps_with_structured_error(
+    tmp_path: Path, name: str, value: object
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / f"{name}-{value}")
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info[name] = value
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    _assert_error(
+        lambda: StandardLeRobotAdapter().inspect(root),
+        code="field_mapping_error", field=f"info.{name}",
     )

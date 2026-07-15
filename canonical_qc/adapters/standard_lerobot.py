@@ -51,7 +51,6 @@ _CORE_FEATURES: dict[str, tuple[str, list[int]]] = {
     "observation.hand_joint_valid_3d": ("bool", [2, 21]),
     "observation.hand_keypoints_2d": ("float32", [2, 21, 2]),
     "observation.hand_joint_valid_2d": ("bool", [2, 21]),
-    _VIDEO_KEY: ("video", [24, 32, 3]),
     "task_index": ("int64", []),
     "subtask_index": ("int64", []),
 }
@@ -146,6 +145,20 @@ def _integer(value: object, *, field: str) -> int:
     return int(value)
 
 
+def _positive_integer(value: object, *, field: str) -> int:
+    result = _integer(value, field=field)
+    if result <= 0:
+        _fail("field_mapping_error", field, "must be greater than zero")
+    return result
+
+
+def _nonnegative_integer(value: object, *, field: str) -> int:
+    result = _integer(value, field=field)
+    if result < 0:
+        _fail("field_mapping_error", field, "must be non-negative")
+    return result
+
+
 def _text(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         _fail("field_mapping_error", field, "must be a non-empty string")
@@ -165,7 +178,7 @@ def _feature_type(dtype: str, shape: list[int]) -> pa.DataType:
     return result
 
 
-def _validate_info(info: Any) -> tuple[str, str, str]:
+def _validate_info(info: Any) -> tuple[str, str, str, int, int]:
     if not isinstance(info, dict):
         _fail("field_mapping_error", "info", "JSON root must be an object")
     schema = _text(_required(info, "schema_version", prefix="info"), field="info.schema_version")
@@ -184,8 +197,8 @@ def _validate_info(info: Any) -> tuple[str, str, str]:
         _fail("source_integrity_error", "info.data_path", f"expected registered template {data_expected!r}")
     if video_template != video_expected:
         _fail("source_integrity_error", "info.video_path", f"expected registered template {video_expected!r}")
-    fps_num = _integer(_required(info, "fps_num", prefix="info"), field="info.fps_num")
-    fps_den = _integer(_required(info, "fps_den", prefix="info"), field="info.fps_den")
+    fps_num = _positive_integer(_required(info, "fps_num", prefix="info"), field="info.fps_num")
+    fps_den = _positive_integer(_required(info, "fps_den", prefix="info"), field="info.fps_den")
     fps = _required(info, "fps", prefix="info")
     if isinstance(fps, bool) or not isinstance(fps, (int, float)) or Fraction(str(fps)) != Fraction(fps_num, fps_den):
         _fail("field_mapping_error", "info.fps", "must exactly match fps_num/fps_den")
@@ -196,6 +209,21 @@ def _validate_info(info: Any) -> tuple[str, str, str]:
         feature = _required(features, name, prefix="info.features")
         if not isinstance(feature, dict) or feature.get("dtype") != dtype or feature.get("shape") != shape:
             _fail("field_mapping_error", f"info.features.{name}", f"must declare dtype={dtype!r}, shape={shape!r}")
+    video_feature = _required(features, _VIDEO_KEY, prefix="info.features")
+    if not isinstance(video_feature, dict) or video_feature.get("dtype") != "video":
+        _fail("field_mapping_error", f"info.features.{_VIDEO_KEY}", "must declare dtype='video'")
+    video_shape = video_feature.get("shape")
+    if (
+        not isinstance(video_shape, list)
+        or len(video_shape) != 3
+        or any(isinstance(value, bool) or not isinstance(value, Integral) or value <= 0 for value in video_shape)
+        or video_shape[2] != 3
+    ):
+        _fail(
+            "field_mapping_error",
+            f"info.features.{_VIDEO_KEY}.shape",
+            "must be [positive_height, positive_width, 3]",
+        )
     constants = {
         "observation.hand_keypoints_3d": {"hand_order": ["left", "right"], "joint_topology": "egodata_hand21.v1", "coordinate_frame": "camera:main", "unit": "meter"},
         "observation.hand_keypoints_2d": {"hand_order": ["left", "right"], "joint_topology": "egodata_hand21.v1", "coordinate_space": "pixel", "unit": "pixel"},
@@ -208,24 +236,31 @@ def _validate_info(info: Any) -> tuple[str, str, str]:
         for key, expected in declared.items():
             if feature.get(key) != expected:
                 _fail("field_mapping_error", f"info.features.{name}.{key}", f"expected {expected!r}")
-    return layout, data_template, video_template
+    return layout, data_template, video_template, int(video_shape[1]), int(video_shape[0])
 
 
-def _episode_rows(root: Path, layout: str) -> tuple[list[dict[str, Any]], tuple[Path, ...]]:
+def _episode_paths(root: Path, layout: str) -> tuple[Path, ...]:
     if layout == "v3":
         paths = tuple(sorted((root / "meta" / "episodes").glob("chunk-*/file-*.parquet")))
         if not paths:
             _fail("schema_missing", "meta/episodes", "no episode metadata parquet found")
-        rows: list[dict[str, Any]] = []
         for path in paths:
             _reject_symlink_chain(path, field="meta/episodes")
+        return paths
+    path = _safe_file(root, "meta/episodes.jsonl", field="meta/episodes.jsonl")
+    return (path,)
+
+
+def _episode_rows(paths: tuple[Path, ...], layout: str) -> list[dict[str, Any]]:
+    if layout == "v3":
+        rows: list[dict[str, Any]] = []
+        for path in paths:
             try:
                 rows.extend(pq.read_table(path).to_pylist())
             except (OSError, pa.ArrowException) as exc:
                 _fail("field_mapping_error", "meta/episodes", f"cannot read Parquet: {exc}")
-        return rows, paths
-    path = _safe_file(root, "meta/episodes.jsonl", field="meta/episodes.jsonl")
-    return _jsonl(path, field="meta/episodes.jsonl"), (path,)
+        return rows
+    return _jsonl(paths[0], field="meta/episodes.jsonl")
 
 
 def _select(rows: list[dict[str, Any]], episode_index: int | None) -> dict[str, Any]:
@@ -257,6 +292,14 @@ class StandardLeRobotAdapter:
         self.max_timestamp_delta_ns = int(max_timestamp_delta_ns)
 
     def inspect(self, source: Path, *, episode_index: int | None = None) -> SourceInspection:
+        try:
+            return self._inspect(source, episode_index=episode_index)
+        except CanonicalInputError:
+            raise
+        except (OSError, ValueError, TypeError, ZeroDivisionError, pa.ArrowException) as exc:
+            _fail("source_integrity_error", "source", f"cannot inspect LeRobot dataset: {exc}")
+
+    def _inspect(self, source: Path, *, episode_index: int | None = None) -> SourceInspection:
         source_path = Path(source).expanduser()
         if not source_path.is_absolute():
             source_path = Path.cwd() / source_path
@@ -265,32 +308,46 @@ class StandardLeRobotAdapter:
         if not root.is_dir():
             _fail("source_integrity_error", "source", "must be a dataset directory")
         info_path = _safe_file(root, "meta/info.json", field="meta/info.json")
+        info_source = _metadata(info_path, root, role="dataset_info")
         info = _json_file(info_path, field="meta/info.json")
-        layout, data_template, video_template = _validate_info(info)
-        rows, episode_paths = _episode_rows(root, layout)
+        (
+            layout,
+            data_template,
+            video_template,
+            video_width_px,
+            video_height_px,
+        ) = _validate_info(info)
+        episode_paths = _episode_paths(root, layout)
+        episode_sources = tuple(
+            _metadata(path, root, role="episode_index") for path in episode_paths
+        )
+        inspection_sources = (info_source, *episode_sources)
+        rows = _episode_rows(episode_paths, layout)
         row = _select(rows, episode_index)
         selected_index = _integer(row["episode_index"], field="episode.episode_index")
         asset_id = _text(_required(row, "asset_id", prefix="episode"), field="episode.asset_id")
-        frame_count = _integer(_required(row, "length", prefix="episode"), field="episode.length")
+        frame_count = _positive_integer(
+            _required(row, "length", prefix="episode"), field="episode.length"
+        )
         if layout == "v3":
-            data_chunk = _integer(
+            data_chunk = _nonnegative_integer(
                 _required(row, "data/chunk_index", prefix="episode"),
                 field="episode.data/chunk_index",
             )
-            data_file = _integer(
+            data_file = _nonnegative_integer(
                 _required(row, "data/file_index", prefix="episode"),
                 field="episode.data/file_index",
             )
-            video_chunk = _integer(
+            video_chunk = _nonnegative_integer(
                 _required(row, f"videos/{_VIDEO_KEY}/chunk_index", prefix="episode"),
                 field=f"episode.videos/{_VIDEO_KEY}/chunk_index",
             )
-            video_file = _integer(
+            video_file = _nonnegative_integer(
                 _required(row, f"videos/{_VIDEO_KEY}/file_index", prefix="episode"),
                 field=f"episode.videos/{_VIDEO_KEY}/file_index",
             )
         else:
-            data_chunk = video_chunk = _integer(
+            data_chunk = video_chunk = _nonnegative_integer(
                 _required(row, "episode_chunk", prefix="episode"),
                 field="episode.episode_chunk",
             )
@@ -315,35 +372,112 @@ class StandardLeRobotAdapter:
         data_path = _safe_file(root, data_relative, field="episode.data_path")
         video_path = _safe_file(root, video_relative, field="main_video.path")
         semantics_path = _safe_file(root, "meta/episode_semantics.jsonl", field="meta/episode_semantics.jsonl")
-        start = _integer(row.get("dataset_from_index", 0), field="episode.dataset_from_index")
-        stop = _integer(row.get("dataset_to_index", frame_count), field="episode.dataset_to_index")
-        if stop - start != frame_count or start < 0:
-            _fail("field_mapping_error", "episode.dataset_from_index", "row offsets must define exactly length rows")
-        video_offset = _integer(row.get(f"videos/{_VIDEO_KEY}/from_index", start), field="episode.video_from_index")
+        if layout == "v3":
+            start = _nonnegative_integer(
+                _required(row, "dataset_from_index", prefix="episode"),
+                field="episode.dataset_from_index",
+            )
+            stop = _nonnegative_integer(
+                _required(row, "dataset_to_index", prefix="episode"),
+                field="episode.dataset_to_index",
+            )
+            video_from_key = f"videos/{_VIDEO_KEY}/from_index"
+            video_to_key = f"videos/{_VIDEO_KEY}/to_index"
+            if video_from_key not in row:
+                _fail("schema_missing", "episode.video_from_index", "required field is missing")
+            if video_to_key not in row:
+                _fail("schema_missing", "episode.video_to_index", "required field is missing")
+            video_offset = _nonnegative_integer(
+                row[video_from_key], field="episode.video_from_index"
+            )
+            video_stop = _nonnegative_integer(
+                row[video_to_key], field="episode.video_to_index"
+            )
+        else:
+            start, stop = 0, frame_count
+            video_offset, video_stop = 0, frame_count
+        if stop - start != frame_count:
+            _fail(
+                "field_mapping_error",
+                "episode.dataset_to_index",
+                "[from, to) must contain exactly length rows",
+            )
+        if video_stop - video_offset != frame_count:
+            _fail(
+                "field_mapping_error",
+                "episode.video_to_index",
+                "[from, to) must contain exactly length frames",
+            )
+        current_episode_paths = _episode_paths(root, layout)
+        final_inspection_sources = (
+            _metadata(info_path, root, role="dataset_info"),
+            *(
+                _metadata(path, root, role="episode_index")
+                for path in current_episode_paths
+            ),
+        )
+        if current_episode_paths != episode_paths or final_inspection_sources != inspection_sources:
+            _fail(
+                "source_integrity_error",
+                "source",
+                "info or episode metadata changed while inspecting",
+            )
         return SourceInspection(
             adapter_id=self.adapter_id, adapter_version=self.adapter_version,
             source_format="lerobot", source_schema_version=_SCHEMA_VERSION,
             asset_id=asset_id, source_root=root, main_video_path=video_path,
             info_path=info_path, episode_metadata_paths=episode_paths, data_path=data_path,
             semantics_path=semantics_path, episode_index=selected_index,
-            frame_count=frame_count, data_row_offset=start, video_frame_offset=video_offset,
-            layout_version=layout,
+            frame_count=frame_count, data_row_offset=start, data_row_stop=stop,
+            video_frame_offset=video_offset, video_frame_stop=video_stop,
+            layout_version=layout, inspection_source_files=inspection_sources,
+            video_width_px=video_width_px, video_height_px=video_height_px,
         )
 
     def load(self, source: Path, *, episode_index: int | None = None) -> CanonicalQcEpisode:
         inspection = self.inspect(source, episode_index=episode_index)
-        assert inspection.info_path and inspection.data_path and inspection.semantics_path
-        paths_roles = [(inspection.info_path, "dataset_info")]
-        paths_roles.extend((path, "episode_index") for path in inspection.episode_metadata_paths)
-        paths_roles.extend([(inspection.data_path, "episode_data"), (inspection.semantics_path, "episode_semantics"), (inspection.main_video_path, "main_video")])
-        initial = tuple(_metadata(path, inspection.source_root, role=role) for path, role in paths_roles)
+        if not inspection.info_path or not inspection.data_path or not inspection.semantics_path:
+            _fail("source_integrity_error", "source", "inspection did not resolve required files")
+        load_paths_roles = [
+            (inspection.data_path, "episode_data"),
+            (inspection.semantics_path, "episode_semantics"),
+            (inspection.main_video_path, "main_video"),
+        ]
+        current_inspection = (
+            _metadata(inspection.info_path, inspection.source_root, role="dataset_info"),
+            *(
+                _metadata(path, inspection.source_root, role="episode_index")
+                for path in inspection.episode_metadata_paths
+            ),
+        )
+        if current_inspection != inspection.inspection_source_files:
+            _fail(
+                "source_integrity_error",
+                "source",
+                "info or episode metadata changed after inspection",
+            )
+        initial = inspection.inspection_source_files + tuple(
+            _metadata(path, inspection.source_root, role=role)
+            for path, role in load_paths_roles
+        )
         try:
             episode = self._read_episode(inspection, initial)
             full_video = probe_video(inspection.main_video_path)
             start = inspection.video_frame_offset
-            stop = start + episode.time_axis.frame_count
+            stop = inspection.video_frame_stop
             if stop > full_video.frame_count:
                 _fail("timebase_invalid", "main_video.frame_count", "video slice exceeds shared video")
+            if inspection.layout_version == "v2.1" and full_video.frame_count != episode.time_axis.frame_count:
+                _fail("timebase_invalid", "main_video.frame_count", "v2.1 episode video must contain exactly length frames")
+            if (
+                full_video.width_px != inspection.video_width_px
+                or full_video.height_px != inspection.video_height_px
+            ):
+                _fail(
+                    "field_mapping_error",
+                    f"info.features.{_VIDEO_KEY}.shape",
+                    "declared video dimensions disagree with ffprobe",
+                )
             absolute = full_video.timestamps_ns[start:stop]
             relative = tuple(value - absolute[0] for value in absolute) if absolute else ()
             sliced = ProbedVideo(
@@ -371,14 +505,38 @@ class StandardLeRobotAdapter:
             raise _mapped(exc) from exc
         except (OSError, ValueError, TypeError, pa.ArrowException) as exc:
             _fail("field_mapping_error", "source", f"cannot decode LeRobot dataset: {exc}")
-        final = tuple(_metadata(path, inspection.source_root, role=role) for path, role in paths_roles)
+        final_paths_roles = [(inspection.info_path, "dataset_info")]
+        final_paths_roles.extend(
+            (path, "episode_index") for path in inspection.episode_metadata_paths
+        )
+        final_paths_roles.extend(load_paths_roles)
+        final = tuple(
+            _metadata(path, inspection.source_root, role=role)
+            for path, role in final_paths_roles
+        )
         if tuple(item.sha256 for item in initial) != tuple(item.sha256 for item in final):
             _fail("source_integrity_error", "source", "source files changed while loading")
         return episode
 
     def _read_episode(self, inspection: SourceInspection, files: tuple[SourceFile, ...]) -> CanonicalQcEpisode:
-        assert inspection.data_path and inspection.semantics_path and inspection.frame_count is not None and inspection.episode_index is not None
+        if (
+            not inspection.data_path
+            or not inspection.semantics_path
+            or inspection.frame_count is None
+            or inspection.episode_index is None
+        ):
+            _fail(
+                "source_integrity_error",
+                "source",
+                "inspection is missing required episode fields",
+            )
         table = pq.read_table(inspection.data_path)
+        if inspection.layout_version == "v2.1" and table.num_rows != inspection.frame_count:
+            _fail(
+                "field_mapping_error",
+                "episode.length",
+                "v2.1 episode parquet must contain exactly length rows",
+            )
         required = [name for name in _CORE_FEATURES if name != _VIDEO_KEY]
         for name in required:
             if name not in table.column_names:
@@ -386,7 +544,7 @@ class StandardLeRobotAdapter:
             dtype, shape = _CORE_FEATURES[name]
             if table.schema.field(name).type != _feature_type(dtype, shape):
                 _fail("field_mapping_error", name, f"expected Arrow type {_feature_type(dtype, shape)}, got {table.schema.field(name).type}")
-        start, stop = inspection.data_row_offset, inspection.data_row_offset + inspection.frame_count
+        start, stop = inspection.data_row_offset, inspection.data_row_stop
         if stop > table.num_rows:
             _fail("field_mapping_error", "episode.dataset_from_index", "row slice exceeds data shard")
         selected = table.slice(start, inspection.frame_count)
@@ -404,7 +562,35 @@ class StandardLeRobotAdapter:
         if bad.size:
             _fail("timebase_invalid", f"timestamp[{int(bad[0])}]", "float timestamp disagrees with authoritative timestamp_ns")
         semantics_rows = _jsonl(inspection.semantics_path, field="meta/episode_semantics.jsonl")
-        matches = [row for row in semantics_rows if row.get("episode_index") == inspection.episode_index and row.get("asset_id") == inspection.asset_id]
+        semantic_keys: set[tuple[int, str]] = set()
+        normalized_semantics: list[tuple[int, str, dict[str, Any]]] = []
+        for row_index, row in enumerate(semantics_rows):
+            prefix = f"episode_semantics[{row_index}]"
+            semantic_episode_index = _integer(
+                _required(row, "episode_index", prefix=prefix),
+                field=f"{prefix}.episode_index",
+            )
+            semantic_asset_id = _text(
+                _required(row, "asset_id", prefix=prefix),
+                field=f"{prefix}.asset_id",
+            )
+            key = (semantic_episode_index, semantic_asset_id)
+            if key in semantic_keys:
+                _fail(
+                    "field_mapping_error",
+                    "episode_semantics",
+                    f"duplicate episode_index + asset_id key {key!r}",
+                )
+            semantic_keys.add(key)
+            normalized_semantics.append(
+                (semantic_episode_index, semantic_asset_id, row)
+            )
+        matches = [
+            row
+            for semantic_episode_index, semantic_asset_id, row in normalized_semantics
+            if semantic_episode_index == inspection.episode_index
+            and semantic_asset_id == inspection.asset_id
+        ]
         if len(matches) != 1:
             _fail("field_mapping_error", "episode_semantics", f"expected one episode_index + asset_id match, found {len(matches)}")
         semantic = matches[0]
@@ -417,13 +603,19 @@ class StandardLeRobotAdapter:
         if not isinstance(raw_subtasks, list):
             _fail("field_mapping_error", "semantics.subtask_sequence", "must be an array")
         subtasks: list[Subtask] = []
-        expected_subtask = np.empty(inspection.frame_count, dtype=np.int64)
+        expected_subtask = np.full(inspection.frame_count, -1, dtype=np.int64)
         for index, raw in enumerate(raw_subtasks):
             if not isinstance(raw, dict):
                 _fail("field_mapping_error", f"semantics.subtask_sequence[{index}]", "must be an object")
             begin = _integer(_required(raw, "start_frame", prefix="subtask"), field=f"subtask[{index}].start_frame")
             end = _integer(_required(raw, "end_frame_exclusive", prefix="subtask"), field=f"subtask[{index}].end_frame_exclusive")
             sub_index = _integer(_required(raw, "subtask_index", prefix="subtask"), field=f"subtask[{index}].subtask_index")
+            if sub_index != index:
+                _fail(
+                    "field_mapping_error",
+                    f"semantics.subtask_sequence[{index}].subtask_index",
+                    f"must equal sequential index {index}",
+                )
             if begin < 0 or end > inspection.frame_count or begin >= end:
                 _fail("field_mapping_error", "semantics.subtask_sequence", "invalid half-open boundary")
             expected_subtask[begin:end] = sub_index
@@ -451,6 +643,15 @@ class StandardLeRobotAdapter:
             camera_axes=_text(_required(calibration_raw, "camera_axes", prefix="calibration"), field="calibration.camera_axes"),
             pixel_origin=_text(_required(calibration_raw, "pixel_origin", prefix="calibration"), field="calibration.pixel_origin"),
         )
+        if (
+            calibration.image_width_px != inspection.video_width_px
+            or calibration.image_height_px != inspection.video_height_px
+        ):
+            _fail(
+                "field_mapping_error",
+                f"info.features.{_VIDEO_KEY}.shape",
+                "declared video dimensions disagree with calibration",
+            )
         def array(name: str, dtype: Any) -> np.ndarray:
             return np.asarray(selected[name].to_pylist(), dtype=dtype)
         observation = HandObservation(
@@ -460,6 +661,9 @@ class StandardLeRobotAdapter:
             hand_joint_valid_2d=array("observation.hand_joint_valid_2d", np.bool_),
         )
         info = _json_file(inspection.info_path, field="meta/info.json")
+        _validate_info(info)
+        fps_num = _positive_integer(info["fps_num"], field="info.fps_num")
+        fps_den = _positive_integer(info["fps_den"], field="info.fps_den")
         quality = self._quality(selected, semantic, inspection.frame_count, info)
         identity = EpisodeIdentity(
             asset_id=inspection.asset_id,
@@ -476,8 +680,8 @@ class StandardLeRobotAdapter:
         return CanonicalQcEpisode(
             schema_version="canonical_qc_episode.v1", profile="human_ego_hand_pose.v1",
             identity=identity, provenance=provenance,
-            time_axis=TimeAxis(frame_count=inspection.frame_count, timestamps_ns=timestamps, fps_num=int(info["fps_num"]), fps_den=int(info["fps_den"])),
-            main_video=VideoStream(path=video_source.relative_path, sha256=video_source.sha256, frame_count=inspection.frame_count, width_px=calibration.image_width_px, height_px=calibration.image_height_px, fps_num=int(info["fps_num"]), fps_den=int(info["fps_den"]), codec="pending_probe", pixel_format="pending_probe"),
+            time_axis=TimeAxis(frame_count=inspection.frame_count, timestamps_ns=timestamps, fps_num=fps_num, fps_den=fps_den),
+            main_video=VideoStream(path=video_source.relative_path, sha256=video_source.sha256, frame_count=inspection.frame_count, width_px=calibration.image_width_px, height_px=calibration.image_height_px, fps_num=fps_num, fps_den=fps_den, codec="pending_probe", pixel_format="pending_probe"),
             observation=observation, calibration=calibration,
             semantics=EpisodeSemantics(
                 scene_id=_text(_required(semantic, "scene_id", prefix="semantics"), field="semantics.scene_id"),
@@ -511,25 +715,114 @@ class StandardLeRobotAdapter:
             if present or "mapping_version" in state:
                 _fail("field_mapping_error", "supplier.hand_quality", "provided=false forbids payload and mapping_version")
             return SupplierEvidence(hand_quality=SupplierHandQuality(provided=False, status=np.full((frame_count, 2), "unknown", dtype="<U7")))
-        if present != names or not isinstance(state.get("mapping_version"), str) or not state["mapping_version"].strip():
-            _fail("field_mapping_error", "supplier.hand_quality", "provided=true requires all payload fields and mapping_version")
+        status_name = "supplier.hand_quality.status"
+        raw_name = "supplier.hand_quality.raw_value"
+        score_name = "supplier.hand_quality.normalized_score"
+        if status_name not in present:
+            _fail(
+                "schema_missing",
+                status_name,
+                "provided=true requires canonical status",
+            )
+        if not isinstance(state.get("mapping_version"), str) or not state["mapping_version"].strip():
+            _fail(
+                "field_mapping_error",
+                "supplier_hand_quality.mapping_version",
+                "provided=true requires a non-empty mapping_version",
+            )
         features = info["features"]
-        declarations = {
-            "supplier.hand_quality.raw_value": ("int16", [2], pa.list_(pa.int16(), 2)),
-            "supplier.hand_quality.normalized_score": ("float32", [2], pa.list_(pa.float32(), 2)),
-            "supplier.hand_quality.status": ("string", [2], pa.list_(pa.string(), 2)),
-        }
-        for name, (dtype, shape, arrow_type) in declarations.items():
+
+        def declared(name: str, dtype: str, arrow_type: pa.DataType) -> None:
             if name not in features:
                 _fail("schema_missing", f"info.features.{name}", "provided quality feature declaration is missing")
             declaration = features[name]
-            if not isinstance(declaration, dict) or declaration.get("dtype") != dtype or declaration.get("shape") != shape:
-                _fail("field_mapping_error", f"info.features.{name}", f"must declare dtype={dtype!r}, shape={shape!r}")
+            if not isinstance(declaration, dict) or declaration.get("dtype") != dtype or declaration.get("shape") != [2]:
+                _fail("field_mapping_error", f"info.features.{name}", f"must declare dtype={dtype!r}, shape=[2]")
             if table.schema.field(name).type != arrow_type:
                 _fail("field_mapping_error", name, f"expected Arrow type {arrow_type}, got {table.schema.field(name).type}")
-        raw = np.asarray(table["supplier.hand_quality.raw_value"].to_pylist(), dtype=np.int16)
-        score = np.asarray(table["supplier.hand_quality.normalized_score"].to_pylist(), dtype=np.float32)
-        status = np.asarray(table["supplier.hand_quality.status"].to_pylist(), dtype="<U7")
-        if raw.shape != (frame_count, 2) or score.shape != (frame_count, 2) or status.shape != (frame_count, 2):
-            _fail("field_mapping_error", "supplier.hand_quality", "payload must have shape (T, 2)")
+
+        declared(status_name, "string", pa.list_(pa.string(), 2))
+        status_values = table[status_name].to_pylist()
+        if len(status_values) != frame_count or any(
+            not isinstance(row, list) or len(row) != 2 for row in status_values
+        ):
+            _fail("field_mapping_error", status_name, "must have shape (T, 2)")
+        allowed_status = {"unknown", "bad", "warning", "good"}
+        invalid_status = sorted(
+            {
+                value
+                for row in status_values
+                for value in row
+                if not isinstance(value, str) or value not in allowed_status
+            },
+            key=repr,
+        )
+        if invalid_status:
+            _fail(
+                "field_mapping_error",
+                status_name,
+                f"unknown canonical status values {invalid_status!r}",
+            )
+        status = np.asarray(status_values, dtype="<U7")
+
+        raw: np.ndarray | None = None
+        if raw_name in present:
+            declaration = features.get(raw_name)
+            if not isinstance(declaration, dict):
+                _fail("schema_missing", f"info.features.{raw_name}", "provided raw feature declaration is missing")
+            raw_dtype = declaration.get("dtype")
+            raw_arrow_type = table.schema.field(raw_name).type
+            if not pa.types.is_fixed_size_list(raw_arrow_type) or raw_arrow_type.list_size != 2:
+                _fail(
+                    "field_mapping_error",
+                    raw_name,
+                    "must use a fixed-size list of two stable Arrow primitive values",
+                )
+            arrow_leaf = raw_arrow_type.value_type
+            if pa.types.is_string(arrow_leaf):
+                expected_dtype, numpy_dtype = "string", str
+            elif pa.types.is_binary(arrow_leaf):
+                expected_dtype, numpy_dtype = "binary", bytes
+            elif (
+                pa.types.is_boolean(arrow_leaf)
+                or pa.types.is_integer(arrow_leaf)
+                or pa.types.is_floating(arrow_leaf)
+            ):
+                expected_dtype = str(arrow_leaf)
+                numpy_dtype = arrow_leaf.to_pandas_dtype()
+            else:
+                _fail(
+                    "field_mapping_error",
+                    raw_name,
+                    f"unsupported supplier raw Arrow primitive {arrow_leaf}",
+                )
+            if raw_dtype != expected_dtype:
+                _fail(
+                    "field_mapping_error",
+                    f"info.features.{raw_name}.dtype",
+                    f"expected {expected_dtype!r} for Arrow type {arrow_leaf}",
+                )
+            declared(raw_name, expected_dtype, raw_arrow_type)
+            raw_values = table[raw_name].to_pylist()
+            if len(raw_values) != frame_count or any(
+                not isinstance(row, list)
+                or len(row) != 2
+                or any(value is None for value in row)
+                for row in raw_values
+            ):
+                _fail("field_mapping_error", raw_name, "must have shape (T, 2) without nulls")
+            raw = np.asarray(raw_values, dtype=numpy_dtype)
+
+        score: np.ndarray | None = None
+        if score_name in present:
+            declared(score_name, "float32", pa.list_(pa.float32(), 2))
+            score_values = table[score_name].to_pylist()
+            if len(score_values) != frame_count or any(
+                not isinstance(row, list)
+                or len(row) != 2
+                or any(value is None for value in row)
+                for row in score_values
+            ):
+                _fail("field_mapping_error", score_name, "must have shape (T, 2) without nulls")
+            score = np.asarray(score_values, dtype=np.float32)
         return SupplierEvidence(hand_quality=SupplierHandQuality(provided=True, raw_value=raw, normalized_score=score, status=status, mapping_version=state["mapping_version"]))

@@ -257,6 +257,8 @@ def write_standard_lerobot_dataset(
                 "data/file_index": np.int64(file_index),
                 "videos/observation.images.main/chunk_index": np.int64(0),
                 "videos/observation.images.main/file_index": np.int64(file_index),
+                "videos/observation.images.main/from_index": np.int64(0),
+                "videos/observation.images.main/to_index": np.int64(frame_count),
             })
         else:
             episode_row["episode_chunk"] = np.int64(0)
