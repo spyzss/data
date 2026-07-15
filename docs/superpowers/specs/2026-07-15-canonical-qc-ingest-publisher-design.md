@@ -255,12 +255,20 @@ Publisher 必须验证：
 - report source fingerprint 与 episode 一致；
 - report revision 与请求一致；
 - `acceptance` profile、immutable QC config snapshot/hash、所有启用 module state、
-  issues、runtime errors、semantic consistency 和 manual review 状态组合一致；
+  issues、runtime errors、semantic consistency 和 manual review 状态组合一致；每个
+  enabled automatic module 都必须有顶层 result block 和完整 flow，result Gate 不得
+  fail，且必须与 module state 一致；最终 cursor 必须指向配置末模块；
+- Warn 人工复核只消费正式 `manual_review.reviews[]` 合同；每条记录包含
+  `review_id/issue_id/reviewer/reviewed_at/verdict/asset_action/comment/evidence_paths`，
+  候选必须恰好覆盖一次，且只有最终 `asset_action=accept/accept_with_risk` 可发布；
 - 通过显式 `canonical_source_root` 重新读取当前源文件，拒绝相对路径、escape、
-  symlink 和 hash 漂移；不得从 `qc_report_path.parent` 猜源目录。
+  symlink 和 hash 漂移；`release_root` 不得与 source root 重叠或与 report/source
+  别名；不得从 `qc_report_path.parent` 猜源目录。
 
 `validate_publish_request` 只读报告和源文件，并在 `PublishPlan` 冻结 QC report
-SHA-256 与 source snapshot。Writer、独立验证器和 commit 前都必须调用 plan
+SHA-256 与 strictly typed frozen source snapshot。报告和源文件都使用同一个
+`O_NOFOLLOW` file descriptor 做 pre/post `fstat` 与 hash，hash 期间发生原地修改或
+路径替换必须拒绝。Writer、独立验证器和 commit 前都必须调用 plan
 revalidation；同 revision 内容变化或当前源 hash 漂移必须拒绝。
 
 ### 9.2 输出布局

@@ -215,6 +215,11 @@ def release_id_for(request: PublishRequest) -> str: ...
 - [x] Step 4: 增加 fail/null/error/stale/source drift 拒绝测试并通过。
 - [x] Step 5: 提交 `feat(publisher): define gated LeRobot v3 release contract`。
 
+复审收口：逐 enabled automatic module 校验顶层 result/flow、末模块 cursor；人工
+结果统一为正式 `manual_review.reviews[]`；release/source/report 路径禁止重叠或
+别名；report/source snapshot 使用同一 nofollow fd 的 pre/post fstat+hash；Plan 和
+Manifest 的嵌套序列仅接受 frozen typed dataclass。
+
 ## Task 8: 写入 Curated LeRobot v3 staging
 
 **Files:**

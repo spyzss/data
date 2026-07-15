@@ -213,6 +213,11 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 提供 `canonical_source_root`，用 Canonical provenance 的相对路径重新校验所有当前
 源文件；不得从 QC JSON 路径推断源目录，也不得接受 escape 或 symlink。
 
+发布 Gate 只读取本 PRD 第 8.3 节的正式 `manual_review.reviews[]`；不得另造
+`issue_reviews` 的 pass/fail 字典。每个 candidate issue 必须恰好有一条 review，且
+最终 `asset_action` 只能是 `accept` 或 `accept_with_risk`。`reject` 和
+`return_for_rework` 均不可发布。
+
 ## 4. Issue 结构
 
 每个触发的指标单独生成一个 issue 对象。一个视频有多个 warn 时，`issues`

@@ -272,16 +272,45 @@
           "items": {"type": "string"},
           "uniqueItems": true
         },
-        "issue_reviews": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": true,
-            "required": ["verdict"],
-            "properties": {
-              "verdict": {"enum": ["pass", "fail"]}
-            }
-          }
+        "selected_issue_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "reviews": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/manualReviewRecord"}
+        }
+      }
+    },
+    "manualReviewRecord": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "review_id",
+        "issue_id",
+        "reviewer",
+        "reviewed_at",
+        "verdict",
+        "asset_action",
+        "comment",
+        "evidence_paths"
+      ],
+      "properties": {
+        "review_id": {"type": "string", "minLength": 1},
+        "issue_id": {"type": "string", "minLength": 1},
+        "reviewer": {"type": "string", "minLength": 1},
+        "reviewed_at": {"type": "string", "minLength": 1},
+        "verdict": {
+          "enum": ["accept_issue", "reject_issue", "unable_to_determine"]
+        },
+        "asset_action": {
+          "enum": ["accept", "accept_with_risk", "reject", "return_for_rework"]
+        },
+        "comment": {"type": "string"},
+        "evidence_paths": {
+          "type": "array",
+          "items": {"type": "string"}
         }
       }
     },

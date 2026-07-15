@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from lerobot_v3_publisher import (
     validate_publish_request,
 )
 from lerobot_v3_publisher.layout import derive_release_id
+import lerobot_v3_publisher.prerequisites as publisher_prerequisites
 from qc_common.config import load_qc_acceptance_config
 from tests.fixtures import write_standard_hdf5_episode
 
@@ -51,14 +53,47 @@ def _write_publish_fixture(
         for module in config.pipeline_modules
     }
     issue_id = "video_quality:warn:fixture" if manual_state == "completed" else None
+    reviews = (
+        []
+        if issue_id is None
+        else [
+            {
+                "review_id": "review-000001",
+                "issue_id": issue_id,
+                "reviewer": "reviewer-001",
+                "reviewed_at": "2026-07-15T00:00:30Z",
+                "verdict": "accept_issue",
+                "asset_action": "accept_with_risk",
+                "comment": "accepted after checking evidence",
+                "evidence_paths": [],
+            }
+        ]
+    )
     manual = {
         "required": manual_state == "completed",
         "state": manual_state,
         "candidate_issue_ids": [] if issue_id is None else [issue_id],
+        "selected_issue_ids": [] if issue_id is None else [issue_id],
         "failures_for_batch_stats_issue_ids": [],
-        "issue_reviews": (
-            {} if issue_id is None else {issue_id: {"verdict": "pass"}}
-        ),
+        "reviews": reviews,
+    }
+    module_blocks = {
+        module: {
+            "flow": {
+                "entry_gate": {"state": "ready"},
+                "result_gate": {
+                    "verdict": "pass",
+                    "has_fail": False,
+                    "has_warn": False,
+                },
+                "exit_gate": {"state": "continue"},
+            },
+            "evaluation": {"decision": "pass"},
+            "metrics": {},
+        }
+        for module in config.pipeline_modules
+        if config.module_config(module)["enabled"]
+        and config.module_config(module).get("execution_kind") != "external"
     }
     report: dict[str, object] = {
         "schema_version": "asset_qc_report.v2",
@@ -74,7 +109,7 @@ def _write_publish_fixture(
         },
         "pipeline_state": {
             "status": "completed",
-            "last_completed_module": "manual_review",
+            "last_completed_module": config.pipeline_modules[-1],
             "next_module": None,
             "stop_reason": None,
         },
@@ -110,6 +145,7 @@ def _write_publish_fixture(
             "end_frame_exclusive": episode.time_axis.frame_count,
             "interval_semantics": "half_open",
         },
+        **module_blocks,
     }
     report_path.parent.mkdir(parents=True)
     report_path.write_text(
@@ -209,6 +245,27 @@ def test_manifest_contract_is_deeply_immutable_at_sequence_boundaries() -> None:
     assert len(manifest.files) == 1
     with pytest.raises(FrozenInstanceError):
         manifest.asset_id = "changed"  # type: ignore[misc]
+    with pytest.raises(TypeError, match="ManifestFile"):
+        ReleaseManifest(
+            schema_version="curated_lerobot_v3_release_manifest.v1",
+            release_id="lerobot-v3-" + "a" * 32,
+            publisher_version=PUBLISHER_VERSION,
+            asset_id="asset-001",
+            canonical_revision=3,
+            semantic_fingerprint="b" * 64,
+            source_fingerprint="c" * 64,
+            qc_report_revision=9,
+            qc_report_sha256="d" * 64,
+            files=({"relative_path": "mutable"},),  # type: ignore[arg-type]
+        )
+
+
+def test_publish_plan_rejects_mutable_source_snapshot_entries(tmp_path: Path) -> None:
+    request, _report = _write_publish_fixture(tmp_path)
+    plan = validate_publish_request(request)
+
+    with pytest.raises(TypeError, match="SourceSnapshot"):
+        replace(plan, source_snapshot=({},))  # type: ignore[arg-type]
 
 
 def test_release_id_four_tuple_is_deterministic_and_domain_separated() -> None:
@@ -315,14 +372,66 @@ def test_warn_candidates_require_completed_passing_human_reviews(tmp_path: Path)
     ]
     report["manual_review"].update(  # type: ignore[union-attr]
         candidate_issue_ids=[issue_id],
-        issue_reviews={issue_id: {"verdict": "pass"}},
+        selected_issue_ids=[issue_id],
+        reviews=[
+            {
+                "review_id": "review-000002",
+                "issue_id": issue_id,
+                "reviewer": "reviewer-001",
+                "reviewed_at": "2026-07-15T00:00:30Z",
+                "verdict": "reject_issue",
+                "asset_action": "accept",
+                "comment": "machine warning rejected",
+                "evidence_paths": [],
+            }
+        ],
     )
     _rewrite_report(request, report)
     assert validate_publish_request(request).release_id
 
-    report["manual_review"]["issue_reviews"] = {}  # type: ignore[index]
+    report["manual_review"]["reviews"] = []  # type: ignore[index]
     _rewrite_report(request, report)
-    _assert_rejected(request, field="manual_review.issue_reviews")
+    _assert_rejected(request, field="manual_review.reviews")
+
+
+@pytest.mark.parametrize("asset_action", ["reject", "return_for_rework"])
+def test_final_manual_asset_action_controls_publishability(
+    tmp_path: Path,
+    asset_action: str,
+) -> None:
+    request, report = _write_publish_fixture(tmp_path, manual_state="completed")
+    report["manual_review"]["reviews"][0]["asset_action"] = asset_action  # type: ignore[index]
+    _rewrite_report(request, report)
+
+    _assert_rejected(request, field="manual_review.reviews[0].asset_action")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "field"),
+    [
+        ("missing_block", "video_quality"),
+        ("fail_gate", "video_quality.flow.result_gate.verdict"),
+        ("state_mismatch", "execution.module_states.video_quality"),
+        ("cursor", "pipeline_state.last_completed_module"),
+    ],
+)
+def test_automatic_module_results_and_final_cursor_are_required(
+    tmp_path: Path,
+    mutation: str,
+    field: str,
+) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    if mutation == "missing_block":
+        report.pop("video_quality")
+    elif mutation == "fail_gate":
+        report["video_quality"]["flow"]["result_gate"]["verdict"] = "fail"  # type: ignore[index]
+    elif mutation == "state_mismatch":
+        report["execution"]["module_states"]["video_quality"]["state"] = "skipped"  # type: ignore[index]
+    else:
+        report["pipeline_state"]["last_completed_module"] = "manual_review"  # type: ignore[index]
+    _rewrite_report(request, report)
+
+    _assert_rejected(request, field=field)
 
 
 def test_fail_issue_is_rejected_even_if_top_level_claims_pass(tmp_path: Path) -> None:
@@ -464,6 +573,74 @@ def test_source_root_and_report_paths_reject_relative_symlink_and_escape(
         release_root=Path("relative-release"),
     )
     _assert_rejected(unsafe_release, field="release_root")
+
+
+@pytest.mark.parametrize("relation", ["equal", "inside", "contains"])
+def test_release_root_must_not_overlap_canonical_source_root(
+    tmp_path: Path,
+    relation: str,
+) -> None:
+    request, _report = _write_publish_fixture(tmp_path)
+    release_root = {
+        "equal": request.canonical_source_root,
+        "inside": request.canonical_source_root / "curated",
+        "contains": request.canonical_source_root.parent,
+    }[relation]
+    unsafe = replace(request, release_root=release_root)
+
+    _assert_rejected(unsafe, field="release_root")
+
+
+def test_qc_report_must_not_alias_a_canonical_source_file(tmp_path: Path) -> None:
+    request, _report = _write_publish_fixture(tmp_path)
+    source = (
+        request.canonical_source_root
+        / request.episode.provenance.source_files[0].relative_path
+    )
+    request.qc_report_path.unlink()
+    os.link(source, request.qc_report_path)
+
+    _assert_rejected(request, field="qc_report_path")
+
+
+@pytest.mark.parametrize("target", ["report", "source"])
+def test_snapshot_detects_in_place_drift_during_hash(
+    tmp_path: Path,
+    monkeypatch,
+    target: str,
+) -> None:
+    request, _report = _write_publish_fixture(tmp_path)
+    path = (
+        request.qc_report_path
+        if target == "report"
+        else request.canonical_source_root
+        / request.episode.provenance.source_files[0].relative_path
+    )
+    target_inode = path.stat().st_ino
+    original_read = publisher_prerequisites.os.read
+    mutated = False
+
+    def drifting_read(fd: int, size: int) -> bytes:
+        nonlocal mutated
+        data = original_read(fd, size)
+        if data and not mutated and os.fstat(fd).st_ino == target_inode:
+            mutated = True
+            with path.open("ab") as stream:
+                stream.write(b"drift-during-hash")
+        return data
+
+    monkeypatch.setattr(publisher_prerequisites.os, "read", drifting_read)
+
+    error = _assert_rejected(
+        request,
+        field="qc_report_path" if target == "report" else "provenance.source_files[0]",
+        code=(
+            "publish_prerequisite_failed"
+            if target == "report"
+            else "source_integrity_error"
+        ),
+    )
+    assert error.diagnostic.retryable is True
 
 
 def test_malformed_issue_is_rejected_before_release(tmp_path: Path) -> None:

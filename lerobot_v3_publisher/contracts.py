@@ -68,9 +68,14 @@ class PublishPlan:
     source_snapshot: tuple[SourceSnapshot, ...]
 
     def __post_init__(self) -> None:
+        if type(self.request) is not PublishRequest:
+            raise TypeError("request must be an exact PublishRequest")
+        source_snapshot = tuple(self.source_snapshot)
+        if any(type(item) is not SourceSnapshot for item in source_snapshot):
+            raise TypeError("source_snapshot entries must be exact SourceSnapshot values")
         object.__setattr__(self, "release_path", Path(self.release_path))
         object.__setattr__(self, "current_path", Path(self.current_path))
-        object.__setattr__(self, "source_snapshot", tuple(self.source_snapshot))
+        object.__setattr__(self, "source_snapshot", source_snapshot)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +99,10 @@ class ReleaseManifest:
     files: tuple[ManifestFile, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "files", tuple(self.files))
+        files = tuple(self.files)
+        if any(type(item) is not ManifestFile for item in files):
+            raise TypeError("files entries must be exact ManifestFile values")
+        object.__setattr__(self, "files", files)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +110,12 @@ class PublishResult:
     state: Literal["published", "already_published"]
     plan: PublishPlan
     manifest: ReleaseManifest
+
+    def __post_init__(self) -> None:
+        if type(self.plan) is not PublishPlan:
+            raise TypeError("plan must be an exact PublishPlan")
+        if type(self.manifest) is not ReleaseManifest:
+            raise TypeError("manifest must be an exact ReleaseManifest")
 
 
 __all__ = [

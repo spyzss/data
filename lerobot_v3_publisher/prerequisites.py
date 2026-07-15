@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 from typing import Any, NoReturn
 
 from canonical_qc.contracts import SourceFile
@@ -45,20 +48,82 @@ def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
+@dataclass(frozen=True, slots=True)
+class _FileSnapshot:
+    payload: bytes
+    size_bytes: int
+    sha256: str
+    device: int
+    inode: int
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _snapshot_file(
+    path: Path,
+    *,
+    field: str,
+    code: str,
+    retryable_io: bool,
+) -> _FileSnapshot:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
+        descriptor = os.open(path, flags)
     except OSError as exc:
         _reject(
-            "canonical_source_root",
-            f"cannot read source file {path}: {exc}",
-            code="source_integrity_error",
-            retryable=True,
+            field,
+            f"cannot open file without following symlinks: {exc}",
+            code=code,
+            retryable=retryable_io,
         )
-    return digest.hexdigest()
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            _reject(field, "must be a regular file", code=code)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        try:
+            current_path = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            _reject(
+                field,
+                f"file path changed while hashing: {exc}",
+                code=code,
+                retryable=True,
+            )
+        if (
+            _stat_identity(before) != _stat_identity(after)
+            or _stat_identity(before) != _stat_identity(current_path)
+        ):
+            _reject(
+                field,
+                "file changed while hashing",
+                code=code,
+                retryable=True,
+            )
+        payload = b"".join(chunks)
+        return _FileSnapshot(
+            payload=payload,
+            size_bytes=before.st_size,
+            sha256=_sha256_bytes(payload),
+            device=before.st_dev,
+            inode=before.st_ino,
+        )
+    finally:
+        os.close(descriptor)
 
 
 def _has_symlink_component(path: Path) -> bool:
@@ -140,16 +205,37 @@ def _source_snapshot(request: PublishRequest) -> tuple[SourceSnapshot, ...]:
                 "source path is not a regular file",
                 code="source_integrity_error",
             )
-        size = resolved.stat().st_size
-        digest = _sha256_file(resolved)
-        if size != source.size_bytes or digest != source.sha256:
+        file_snapshot = _snapshot_file(
+            resolved,
+            field=field,
+            code="source_integrity_error",
+            retryable_io=True,
+        )
+        if (
+            file_snapshot.size_bytes != source.size_bytes
+            or file_snapshot.sha256 != source.sha256
+        ):
             _reject(
                 field,
                 "current source size/hash differs from the Canonical provenance",
                 code="source_integrity_error",
             )
-        observed.append(SourceFile(source.relative_path, source.role, size, digest))
-        snapshot.append(SourceSnapshot(source.relative_path, source.role, size, digest))
+        observed.append(
+            SourceFile(
+                source.relative_path,
+                source.role,
+                file_snapshot.size_bytes,
+                file_snapshot.sha256,
+            )
+        )
+        snapshot.append(
+            SourceSnapshot(
+                source.relative_path,
+                source.role,
+                file_snapshot.size_bytes,
+                file_snapshot.sha256,
+            )
+        )
 
     current_fingerprint = source_fingerprint(
         observed,
@@ -174,14 +260,75 @@ def _read_report(request: PublishRequest) -> tuple[dict[str, Any], bytes]:
         kind="file",
         must_exist=True,
     )
+    file_snapshot = _snapshot_file(
+        path,
+        field="qc_report_path",
+        code="publish_prerequisite_failed",
+        retryable_io=True,
+    )
     try:
-        payload = path.read_bytes()
+        payload = file_snapshot.payload
         loaded = json.loads(payload)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         _reject("qc_report_path", f"cannot read valid QC JSON: {exc}", retryable=True)
     if not isinstance(loaded, dict):
         _reject("qc_report_path", "QC report root must be an object")
     return loaded, payload
+
+
+def _assert_non_overlapping_roots(request: PublishRequest) -> None:
+    source_root = _safe_absolute_path(
+        request.canonical_source_root,
+        "canonical_source_root",
+        kind="directory",
+        must_exist=True,
+    ).resolve(strict=True)
+    release_root = _safe_absolute_path(
+        request.release_root,
+        "release_root",
+        kind="directory",
+        must_exist=False,
+    ).absolute()
+    report_path = _safe_absolute_path(
+        request.qc_report_path,
+        "qc_report_path",
+        kind="file",
+        must_exist=True,
+    ).resolve(strict=True)
+
+    def contains(parent: Path, child: Path) -> bool:
+        try:
+            child.relative_to(parent)
+        except ValueError:
+            return False
+        return True
+
+    if contains(source_root, release_root) or contains(release_root, source_root):
+        _reject(
+            "release_root",
+            "must not equal, contain, or be inside canonical_source_root",
+        )
+    if contains(release_root, report_path):
+        _reject("release_root", "must not contain the QC report")
+
+    report_stat = os.stat(report_path, follow_symlinks=False)
+    for index, source in enumerate(request.episode.provenance.source_files):
+        relative = _safe_relative_source_path(source.relative_path, index)
+        source_path = source_root.joinpath(*relative.parts)
+        try:
+            source_stat = os.stat(source_path, follow_symlinks=False)
+        except OSError as exc:
+            _reject(
+                f"provenance.source_files[{index}]",
+                f"cannot stat source path: {exc}",
+                code="source_integrity_error",
+                retryable=True,
+            )
+        if (report_stat.st_dev, report_stat.st_ino) == (
+            source_stat.st_dev,
+            source_stat.st_ino,
+        ):
+            _reject("qc_report_path", "must not alias a Canonical source file")
 
 
 def _mapping(
@@ -236,6 +383,37 @@ def _validate_module_states(report: Mapping[str, Any], config: Any) -> None:
                 f"execution.module_states.{module}",
                 f"final state must be one of {sorted(allowed)}, got {state!r}",
             )
+        module_config = config.module_config(module)
+        if not enabled or module_config.get("execution_kind") == "external":
+            continue
+        block = report.get(module)
+        if not isinstance(block, Mapping):
+            _reject(module, "enabled automatic module result block is missing")
+        flow = _mapping(block, "flow", f"{module}.flow")
+        _mapping(flow, "entry_gate", f"{module}.flow.entry_gate")
+        result_gate = _mapping(
+            flow,
+            "result_gate",
+            f"{module}.flow.result_gate",
+        )
+        _mapping(flow, "exit_gate", f"{module}.flow.exit_gate")
+        verdict = result_gate.get("verdict")
+        if verdict == "fail" or result_gate.get("has_fail") is True:
+            _reject(
+                f"{module}.flow.result_gate.verdict",
+                "final pass release cannot contain an automatic fail Gate",
+            )
+        if verdict not in {"pass", "warn", "skipped"}:
+            _reject(
+                f"{module}.flow.result_gate.verdict",
+                "must be pass, warn, or skipped",
+            )
+        expected_state = "skipped" if verdict == "skipped" else "completed"
+        if state != expected_state:
+            _reject(
+                f"execution.module_states.{module}",
+                f"state {state!r} conflicts with result Gate {verdict!r}",
+            )
 
 
 def _validate_manual_review(report: Mapping[str, Any]) -> None:
@@ -248,6 +426,13 @@ def _validate_manual_review(report: Mapping[str, Any]) -> None:
         _reject("manual_review.candidate_issue_ids", "must be a string array")
     if len(candidates) != len(set(candidates)):
         _reject("manual_review.candidate_issue_ids", "must not contain duplicates")
+    selected = manual.get("selected_issue_ids")
+    if not isinstance(selected, list) or any(
+        not isinstance(item, str) for item in selected
+    ):
+        _reject("manual_review.selected_issue_ids", "must be a string array")
+    if len(selected) != len(set(selected)):
+        _reject("manual_review.selected_issue_ids", "must not contain duplicates")
     issues = report.get("issues")
     if not isinstance(issues, list):
         _reject("issues", "must be an array")
@@ -289,7 +474,8 @@ def _validate_manual_review(report: Mapping[str, Any]) -> None:
         if (
             manual.get("required") is not False
             or candidates
-            or manual.get("issue_reviews") not in ({}, None)
+            or selected
+            or manual.get("reviews") != []
         ):
             _reject("manual_review.state", "not_required requires no candidates")
         return
@@ -298,14 +484,57 @@ def _validate_manual_review(report: Mapping[str, Any]) -> None:
             "manual_review.state",
             "must be completed for warn candidates or not_required when empty",
         )
-    reviews = manual.get("issue_reviews")
-    if not isinstance(reviews, Mapping) or set(reviews) != set(candidates):
-        _reject("manual_review.issue_reviews", "must cover every candidate exactly once")
-    if any(
-        not isinstance(review, Mapping) or review.get("verdict") != "pass"
-        for review in reviews.values()
-    ):
-        _reject("manual_review.issue_reviews", "all human warn reviews must pass")
+    if set(selected) != set(candidates):
+        _reject(
+            "manual_review.selected_issue_ids",
+            "final review must cover every candidate issue",
+        )
+    reviews = manual.get("reviews")
+    if not isinstance(reviews, list):
+        _reject("manual_review.reviews", "must be an array")
+    reviewed_issue_ids: list[str] = []
+    review_ids: list[str] = []
+    for index, review in enumerate(reviews):
+        prefix = f"manual_review.reviews[{index}]"
+        if not isinstance(review, Mapping):
+            _reject(prefix, "must be an object")
+        for field in ("review_id", "issue_id", "reviewer", "reviewed_at"):
+            if not isinstance(review.get(field), str) or not review.get(field):
+                _reject(f"{prefix}.{field}", "must be a non-empty string")
+        if review.get("verdict") not in {
+            "accept_issue",
+            "reject_issue",
+            "unable_to_determine",
+        }:
+            _reject(f"{prefix}.verdict", "unsupported manual issue verdict")
+        action = review.get("asset_action")
+        if action not in {
+            "accept",
+            "accept_with_risk",
+            "reject",
+            "return_for_rework",
+        }:
+            _reject(f"{prefix}.asset_action", "unsupported final asset action")
+        if action not in {"accept", "accept_with_risk"}:
+            _reject(
+                f"{prefix}.asset_action",
+                "final asset action does not permit publication",
+            )
+        if not isinstance(review.get("comment"), str):
+            _reject(f"{prefix}.comment", "must be a string")
+        evidence_paths = review.get("evidence_paths")
+        if not isinstance(evidence_paths, list) or any(
+            not isinstance(item, str) for item in evidence_paths
+        ):
+            _reject(f"{prefix}.evidence_paths", "must be a string array")
+        reviewed_issue_ids.append(review["issue_id"])
+        review_ids.append(review["review_id"])
+    if len(review_ids) != len(set(review_ids)):
+        _reject("manual_review.reviews", "review IDs must be unique")
+    if len(reviewed_issue_ids) != len(set(reviewed_issue_ids)):
+        _reject("manual_review.reviews", "each candidate may be reviewed only once")
+    if set(reviewed_issue_ids) != set(candidates):
+        _reject("manual_review.reviews", "must cover every candidate exactly once")
 
 
 def _validated_report_binding(
@@ -342,6 +571,11 @@ def _validated_report_binding(
         _reject("runtime_errors", "must be empty")
 
     config = _verified_config(report)
+    if pipeline.get("last_completed_module") != config.pipeline_modules[-1]:
+        _reject(
+            "pipeline_state.last_completed_module",
+            "must equal the final configured pipeline module",
+        )
     _validate_module_states(report, config)
     semantic_stage = _mapping(report, "semantic_consistency")
     if semantic_stage.get("state") != "completed":
@@ -414,6 +648,7 @@ def _validated_report_binding(
 
 
 def _build_plan(request: PublishRequest) -> PublishPlan:
+    _assert_non_overlapping_roots(request)
     report, report_payload = _read_report(request)
     semantic_hash = _validated_report_binding(request, report)
     snapshot = _source_snapshot(request)
@@ -422,12 +657,6 @@ def _build_plan(request: PublishRequest) -> PublishPlan:
         canonical_revision=request.canonical_revision,
         semantic_fingerprint=semantic_hash,
         publisher_version=PUBLISHER_VERSION,
-    )
-    _safe_absolute_path(
-        request.release_root,
-        "release_root",
-        kind="directory",
-        must_exist=False,
     )
     layout = layout_for(request.release_root, release_id)
     return PublishPlan(

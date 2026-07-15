@@ -182,6 +182,34 @@ def test_v2_schema_registers_canonical_publish_binding_and_full_range() -> None:
         validate_asset_qc_report(invalid)
 
 
+def test_v2_schema_registers_formal_manual_review_records() -> None:
+    report = make_v2_report()
+    report["manual_review"].update(
+        {
+            "selected_issue_ids": ["issue-1"],
+            "reviews": [
+                {
+                    "review_id": "review-1",
+                    "issue_id": "issue-1",
+                    "reviewer": "reviewer-1",
+                    "reviewed_at": "2026-07-16T00:00:00Z",
+                    "verdict": "reject_issue",
+                    "asset_action": "accept",
+                    "comment": "false positive",
+                    "evidence_paths": [],
+                }
+            ],
+        }
+    )
+
+    validate_asset_qc_report(report)
+
+    invalid = copy.deepcopy(report)
+    invalid["manual_review"]["reviews"][0]["verdict"] = "pass"
+    with pytest.raises(ValueError, match="manual_review.reviews.0.verdict"):
+        validate_asset_qc_report(invalid)
+
+
 def test_migrate_v1_preserves_video_unknown_fields_and_revision() -> None:
     old = make_v1_video_report()
     old["extension_from_colleague"] = {"keep": True}
