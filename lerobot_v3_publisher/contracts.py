@@ -8,8 +8,10 @@ from typing import Literal
 
 from canonical_qc.contracts import CanonicalQcEpisode
 
+from .toolchain import WriterToolchain, publisher_version_for
 
-PUBLISHER_VERSION = "lerobot_v3_curated.v1"
+
+PUBLISHER_VERSION = publisher_version_for("lerobot_v3_curated.v1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +88,19 @@ class ManifestFile:
 
 
 @dataclass(frozen=True, slots=True)
+class VideoMaterialization:
+    relative_path: str
+    source_relative_path: str
+    source_frame_range: tuple[int, int]
+    source_sha256: str
+    target_sha256: str
+    method: Literal["verified_copy", "transcoded_frame_range"]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_frame_range", tuple(self.source_frame_range))
+
+
+@dataclass(frozen=True, slots=True)
 class ReleaseManifest:
     schema_version: Literal["curated_lerobot_v3_release_manifest.v1"]
     release_id: str
@@ -97,12 +112,40 @@ class ReleaseManifest:
     qc_report_revision: int
     qc_report_sha256: str
     files: tuple[ManifestFile, ...] = ()
+    video_materialization: VideoMaterialization | None = None
+    toolchain: WriterToolchain | None = None
 
     def __post_init__(self) -> None:
         files = tuple(self.files)
         if any(type(item) is not ManifestFile for item in files):
             raise TypeError("files entries must be exact ManifestFile values")
+        if (
+            self.video_materialization is not None
+            and type(self.video_materialization) is not VideoMaterialization
+        ):
+            raise TypeError(
+                "video_materialization must be an exact VideoMaterialization value"
+            )
+        if self.toolchain is not None and type(self.toolchain) is not WriterToolchain:
+            raise TypeError("toolchain must be an exact WriterToolchain value")
         object.__setattr__(self, "files", files)
+
+
+@dataclass(frozen=True, slots=True)
+class StagedRelease:
+    plan: PublishPlan
+    root: Path
+    transaction_id: str
+    manifest: ReleaseManifest
+    manifest_sha256: str
+    checksums_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.plan) is not PublishPlan:
+            raise TypeError("plan must be an exact PublishPlan")
+        if type(self.manifest) is not ReleaseManifest:
+            raise TypeError("manifest must be an exact ReleaseManifest")
+        object.__setattr__(self, "root", Path(self.root))
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,4 +171,7 @@ __all__ = [
     "PublishResult",
     "ReleaseManifest",
     "SourceSnapshot",
+    "StagedRelease",
+    "VideoMaterialization",
+    "WriterToolchain",
 ]

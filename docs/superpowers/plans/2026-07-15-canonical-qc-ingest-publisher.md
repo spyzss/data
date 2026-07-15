@@ -237,11 +237,16 @@ entry/result/exit Gate、evaluation、module state、next module 与最终 curso
 def write_staging(plan: PublishPlan, staging_root: Path) -> StagedRelease: ...
 ```
 
-- [ ] Step 1: 写目标目录结构、逐帧 Parquet、episode metadata、semantics、video、manifest 和 checksums 的失败测试。
-- [ ] Step 2: 实现固定 schema writer；float timestamp 只能从 `timestamps_ns` 派生，subtask index 只能从半开边界展开。
-- [ ] Step 3: 证明输入为 LeRobot v3 时仍重写 meta/Parquet，只有 hash 一致的 MP4 可复用。
-- [ ] Step 4: 证明 source 文件 hash 全部不变、staging 不含绝对路径或未登记文件。
-- [ ] Step 5: 提交 `feat(publisher): write curated LeRobot v3 staging release`。
+- [x] Step 1: 写目标目录结构、逐帧 Parquet、episode metadata、semantics、video、manifest 和 checksums 的失败测试。
+- [x] Step 2: 实现固定 schema writer；float timestamp 只能从 `timestamps_ns` 派生，subtask index 只能从半开边界展开。
+- [x] Step 3: 证明输入为 LeRobot v3 时仍重写 meta/Parquet，只有 hash 一致的 MP4 可复用。
+- [x] Step 4: 证明 source 文件 hash 全部不变、staging 不含绝对路径或未登记文件。
+- [x] Step 5: 提交 `feat(publisher): write curated LeRobot v3 staging release`。
+
+实施收口采用官方 `lerobot==0.6.0` v3 合同而非旧方言 hybrid：输出全局 `index`、
+官方 path placeholder、episode video timestamp span 和 pandas-indexed tasks Parquet；
+StandardLeRobotAdapter 仍兼容供应商旧方言。禁止 MP4 hardlink，非零共享 span 必须
+裁剪并归一 PTS。staging、manifest/checksum、确定性和失败清理合同按设计 9.3 执行。
 
 ## Task 9: 独立回读验证与原子发布
 

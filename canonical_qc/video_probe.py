@@ -79,7 +79,7 @@ def _timestamp_seconds(
         _fail("timebase_invalid", field, "must be an exact decimal seconds string")
 
 
-def _probe_payload(path: Path) -> dict[str, Any]:
+def _probe_payload(path: Path, *, pass_fds: tuple[int, ...] = ()) -> dict[str, Any]:
     argv = [
         "ffprobe",
         "-v",
@@ -106,6 +106,7 @@ def _probe_payload(path: Path) -> dict[str, Any]:
             text=True,
             timeout=_FFPROBE_TIMEOUT_SECONDS,
             check=False,
+            pass_fds=pass_fds,
         )
     except FileNotFoundError as exc:
         _fail(
@@ -160,10 +161,16 @@ def _probe_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
-def probe_video(path: Path) -> ProbedVideo:
+def probe_video(path: Path, *, file_descriptor: int | None = None) -> ProbedVideo:
     """Probe one video without hashing it or fabricating missing frame timestamps."""
 
-    payload = _probe_payload(path)
+    if file_descriptor is None:
+        probe_path = Path(path)
+        pass_fds: tuple[int, ...] = ()
+    else:
+        probe_path = Path(f"/dev/fd/{file_descriptor}")
+        pass_fds = (file_descriptor,)
+    payload = _probe_payload(probe_path, pass_fds=pass_fds)
     streams = payload.get("streams")
     frames = payload.get("frames")
     if not isinstance(streams, list) or not streams or not isinstance(streams[0], dict):

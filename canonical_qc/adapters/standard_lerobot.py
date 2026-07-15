@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from fractions import Fraction
 import hashlib
 import json
@@ -37,9 +38,12 @@ from .base import SourceInspection
 
 
 _SCHEMA_VERSION = "egodata_lerobot_qc_input.v1"
+_OFFICIAL_SCHEMA_VERSION = "lerobot_v3.0"
 _VIDEO_KEY = "observation.images.main"
 _V3_DATA = "data/chunk-{episode_chunk:03d}/file-{episode_file:03d}.parquet"
 _V3_VIDEO = "videos/{video_key}/chunk-{episode_chunk:03d}/file-{episode_file:03d}.mp4"
+_OFFICIAL_V3_DATA = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+_OFFICIAL_V3_VIDEO = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
 _V21_DATA = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
 _V21_VIDEO = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
 _CORE_FEATURES: dict[str, tuple[str, list[int]]] = {
@@ -69,6 +73,19 @@ _RAW_PRIMITIVE_CONTRACTS: tuple[tuple[pa.DataType, str, Any], ...] = (
     (pa.bool_(), "bool", np.bool_),
     (pa.string(), "string", str),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _InfoContract:
+    layout: str
+    data_template: str
+    video_template: str
+    video_width_px: int
+    video_height_px: int
+    source_schema_version: str
+    fps_num: int
+    fps_den: int
+    official_v3: bool
 
 
 def _fail(code: str, field: str, detail: str) -> None:
@@ -174,6 +191,28 @@ def _nonnegative_integer(value: object, *, field: str) -> int:
     return result
 
 
+def _timestamp_frame_boundary(
+    value: object,
+    *,
+    fps_num: int,
+    fps_den: int,
+    field: str,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _fail("field_mapping_error", field, "must be numeric")
+    timestamp = Fraction(str(value))
+    frames = timestamp * Fraction(fps_num, fps_den)
+    nearest = round(frames)
+    error_seconds = abs(frames - nearest) * Fraction(fps_den, fps_num)
+    if error_seconds > Fraction(1, 1_000_000_000):
+        _fail(
+            "timebase_invalid",
+            field,
+            "timestamp span must resolve to a frame boundary within 1 ns",
+        )
+    return int(nearest)
+
+
 def _text(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         _fail("field_mapping_error", field, "must be a non-empty string")
@@ -200,17 +239,31 @@ def _raw_primitive_contract(dtype: pa.DataType) -> tuple[str, Any] | None:
     return None
 
 
-def _validate_info(info: Any) -> tuple[str, str, str, int, int]:
+def _validate_info(info: Any) -> _InfoContract:
     if not isinstance(info, dict):
         _fail("field_mapping_error", "info", "JSON root must be an object")
-    schema = _text(_required(info, "schema_version", prefix="info"), field="info.schema_version")
-    if schema != _SCHEMA_VERSION:
-        _fail("field_mapping_error", "info.schema_version", f"expected {_SCHEMA_VERSION!r}")
     version = _text(_required(info, "codebase_version", prefix="info"), field="info.codebase_version")
-    if version.startswith("v3"):
+    official_v3 = "schema_version" not in info and version.startswith("v3")
+    if not official_v3:
+        schema = _text(
+            _required(info, "schema_version", prefix="info"),
+            field="info.schema_version",
+        )
+        if schema != _SCHEMA_VERSION:
+            _fail("field_mapping_error", "info.schema_version", f"expected {_SCHEMA_VERSION!r}")
+    if official_v3:
+        layout, data_expected, video_expected = (
+            "v3",
+            _OFFICIAL_V3_DATA,
+            _OFFICIAL_V3_VIDEO,
+        )
+        source_schema_version = _OFFICIAL_SCHEMA_VERSION
+    elif version.startswith("v3"):
         layout, data_expected, video_expected = "v3", _V3_DATA, _V3_VIDEO
+        source_schema_version = _SCHEMA_VERSION
     elif version == "v2.1":
         layout, data_expected, video_expected = "v2.1", _V21_DATA, _V21_VIDEO
+        source_schema_version = _SCHEMA_VERSION
     else:
         _fail("field_mapping_error", "info.codebase_version", "only registered v3 and v2.1 are supported")
     data_template = _text(_required(info, "data_path", prefix="info"), field="info.data_path")
@@ -219,15 +272,61 @@ def _validate_info(info: Any) -> tuple[str, str, str, int, int]:
         _fail("source_integrity_error", "info.data_path", f"expected registered template {data_expected!r}")
     if video_template != video_expected:
         _fail("source_integrity_error", "info.video_path", f"expected registered template {video_expected!r}")
-    fps_num = _positive_integer(_required(info, "fps_num", prefix="info"), field="info.fps_num")
-    fps_den = _positive_integer(_required(info, "fps_den", prefix="info"), field="info.fps_den")
     fps = _required(info, "fps", prefix="info")
-    if isinstance(fps, bool) or not isinstance(fps, (int, float)) or Fraction(str(fps)) != Fraction(fps_num, fps_den):
-        _fail("field_mapping_error", "info.fps", "must exactly match fps_num/fps_den")
+    if isinstance(fps, bool) or not isinstance(fps, (int, float)):
+        _fail("field_mapping_error", "info.fps", "must be a positive number")
+    fps_fraction = Fraction(str(fps))
+    if fps_fraction <= 0:
+        _fail("field_mapping_error", "info.fps", "must be a positive number")
+    if official_v3:
+        if ("fps_num" in info) != ("fps_den" in info):
+            _fail(
+                "schema_missing",
+                "info.fps_num",
+                "official project extension requires fps_num and fps_den together",
+            )
+        if "fps_num" in info:
+            fps_num = _positive_integer(info["fps_num"], field="info.fps_num")
+            fps_den = _positive_integer(info["fps_den"], field="info.fps_den")
+            if abs(float(fps_fraction) - fps_num / fps_den) > 1e-12:
+                _fail(
+                    "field_mapping_error",
+                    "info.fps",
+                    "display fps must agree with exact fps_num/fps_den",
+                )
+        else:
+            fps_num, fps_den = fps_fraction.numerator, fps_fraction.denominator
+        for name in (
+            "total_episodes",
+            "total_frames",
+            "total_tasks",
+            "chunks_size",
+            "data_files_size_in_mb",
+            "video_files_size_in_mb",
+        ):
+            _nonnegative_integer(_required(info, name, prefix="info"), field=f"info.{name}")
+    else:
+        fps_num = _positive_integer(_required(info, "fps_num", prefix="info"), field="info.fps_num")
+        fps_den = _positive_integer(_required(info, "fps_den", prefix="info"), field="info.fps_den")
+        if fps_fraction != Fraction(fps_num, fps_den):
+            _fail("field_mapping_error", "info.fps", "must exactly match fps_num/fps_den")
     features = _required(info, "features", prefix="info")
     if not isinstance(features, dict):
         _fail("field_mapping_error", "info.features", "must be an object")
-    for name, (dtype, shape) in _CORE_FEATURES.items():
+    declared_core = dict(_CORE_FEATURES)
+    if official_v3:
+        declared_core.update(
+            {
+                "index": ("int64", [1]),
+                "episode_index": ("int64", [1]),
+                "frame_index": ("int64", [1]),
+                "timestamp": ("float64", [1]),
+                "timestamp_ns": ("int64", [1]),
+                "task_index": ("int64", [1]),
+                "subtask_index": ("int64", [1]),
+            }
+        )
+    for name, (dtype, shape) in declared_core.items():
         feature = _required(features, name, prefix="info.features")
         if not isinstance(feature, dict) or feature.get("dtype") != dtype or feature.get("shape") != shape:
             _fail("field_mapping_error", f"info.features.{name}", f"must declare dtype={dtype!r}, shape={shape!r}")
@@ -250,15 +349,26 @@ def _validate_info(info: Any) -> tuple[str, str, str, int, int]:
         "observation.hand_keypoints_3d": {"hand_order": ["left", "right"], "joint_topology": "egodata_hand21.v1", "coordinate_frame": "camera:main", "unit": "meter"},
         "observation.hand_keypoints_2d": {"hand_order": ["left", "right"], "joint_topology": "egodata_hand21.v1", "coordinate_space": "pixel", "unit": "pixel"},
         _VIDEO_KEY: {"camera_id": "main", "camera_role": "ego"},
-        "timestamp": {"unit": "second"},
         "timestamp_ns": {"unit": "nanosecond"},
     }
+    if not official_v3:
+        constants["timestamp"] = {"unit": "second"}
     for name, declared in constants.items():
         feature = features[name]
         for key, expected in declared.items():
             if feature.get(key) != expected:
                 _fail("field_mapping_error", f"info.features.{name}.{key}", f"expected {expected!r}")
-    return layout, data_template, video_template, int(video_shape[1]), int(video_shape[0])
+    return _InfoContract(
+        layout,
+        data_template,
+        video_template,
+        int(video_shape[1]),
+        int(video_shape[0]),
+        source_schema_version,
+        fps_num,
+        fps_den,
+        official_v3,
+    )
 
 
 def _episode_paths(root: Path, layout: str) -> tuple[Path, ...]:
@@ -326,7 +436,7 @@ def _revalidate_episode_paths(inspection: SourceInspection) -> tuple[Path, ...]:
 
 class StandardLeRobotAdapter:
     adapter_id = "standard_lerobot"
-    adapter_version = "1.0.0"
+    adapter_version = "1.1.0"
 
     def __init__(self, *, max_timestamp_delta_ns: int = 1_000_000) -> None:
         if isinstance(max_timestamp_delta_ns, bool) or not isinstance(max_timestamp_delta_ns, Integral) or max_timestamp_delta_ns < 0:
@@ -352,13 +462,12 @@ class StandardLeRobotAdapter:
         info_path = _safe_file(root, "meta/info.json", field="meta/info.json")
         info_source = _metadata(info_path, root, role="dataset_info")
         info = _json_file(info_path, field="meta/info.json")
-        (
-            layout,
-            data_template,
-            video_template,
-            video_width_px,
-            video_height_px,
-        ) = _validate_info(info)
+        info_contract = _validate_info(info)
+        layout = info_contract.layout
+        data_template = info_contract.data_template
+        video_template = info_contract.video_template
+        video_width_px = info_contract.video_width_px
+        video_height_px = info_contract.video_height_px
         episode_paths = _episode_paths(root, layout)
         episode_sources = tuple(
             _metadata(path, root, role="episode_index") for path in episode_paths
@@ -367,7 +476,33 @@ class StandardLeRobotAdapter:
         rows = _episode_rows(episode_paths, layout)
         row = _select(rows, episode_index)
         selected_index = _integer(row["episode_index"], field="episode.episode_index")
-        asset_id = _text(_required(row, "asset_id", prefix="episode"), field="episode.asset_id")
+        semantics_path = _safe_file(
+            root,
+            "meta/episode_semantics.jsonl",
+            field="meta/episode_semantics.jsonl",
+        )
+        if "asset_id" in row:
+            asset_id = _text(row["asset_id"], field="episode.asset_id")
+        elif info_contract.official_v3:
+            semantic_matches = [
+                value
+                for value in _jsonl(
+                    semantics_path, field="meta/episode_semantics.jsonl"
+                )
+                if value.get("episode_index") == selected_index
+            ]
+            if len(semantic_matches) != 1:
+                _fail(
+                    "field_mapping_error",
+                    "episode.asset_id",
+                    "official v3 requires one matching project semantics sidecar row",
+                )
+            asset_id = _text(
+                _required(semantic_matches[0], "asset_id", prefix="semantics"),
+                field="semantics.asset_id",
+            )
+        else:
+            _fail("schema_missing", "episode.asset_id", "required field is missing")
         frame_count = _positive_integer(
             _required(row, "length", prefix="episode"), field="episode.length"
         )
@@ -397,12 +532,16 @@ class StandardLeRobotAdapter:
         data_values = {
             "episode_chunk": data_chunk,
             "episode_file": data_file,
+            "chunk_index": data_chunk,
+            "file_index": data_file,
             "episode_index": selected_index,
             "video_key": _VIDEO_KEY,
         }
         video_values = {
             "episode_chunk": video_chunk,
             "episode_file": video_file,
+            "chunk_index": video_chunk,
+            "file_index": video_file,
             "episode_index": selected_index,
             "video_key": _VIDEO_KEY,
         }
@@ -413,7 +552,6 @@ class StandardLeRobotAdapter:
             _fail("field_mapping_error", "info", f"cannot expand registered path template: {exc}")
         data_path = _safe_file(root, data_relative, field="episode.data_path")
         video_path = _safe_file(root, video_relative, field="main_video.path")
-        semantics_path = _safe_file(root, "meta/episode_semantics.jsonl", field="meta/episode_semantics.jsonl")
         if layout == "v3":
             start = _nonnegative_integer(
                 _required(row, "dataset_from_index", prefix="episode"),
@@ -423,18 +561,36 @@ class StandardLeRobotAdapter:
                 _required(row, "dataset_to_index", prefix="episode"),
                 field="episode.dataset_to_index",
             )
-            video_from_key = f"videos/{_VIDEO_KEY}/from_index"
-            video_to_key = f"videos/{_VIDEO_KEY}/to_index"
-            if video_from_key not in row:
-                _fail("schema_missing", "episode.video_from_index", "required field is missing")
-            if video_to_key not in row:
-                _fail("schema_missing", "episode.video_to_index", "required field is missing")
-            video_offset = _nonnegative_integer(
-                row[video_from_key], field="episode.video_from_index"
-            )
-            video_stop = _nonnegative_integer(
-                row[video_to_key], field="episode.video_to_index"
-            )
+            if info_contract.official_v3:
+                video_from_key = f"videos/{_VIDEO_KEY}/from_timestamp"
+                video_to_key = f"videos/{_VIDEO_KEY}/to_timestamp"
+                from_timestamp = _required(row, video_from_key, prefix="episode")
+                to_timestamp = _required(row, video_to_key, prefix="episode")
+                video_offset = _timestamp_frame_boundary(
+                    from_timestamp,
+                    fps_num=info_contract.fps_num,
+                    fps_den=info_contract.fps_den,
+                    field="episode.video_from_timestamp",
+                )
+                video_stop = _timestamp_frame_boundary(
+                    to_timestamp,
+                    fps_num=info_contract.fps_num,
+                    fps_den=info_contract.fps_den,
+                    field="episode.video_to_timestamp",
+                )
+            else:
+                video_from_key = f"videos/{_VIDEO_KEY}/from_index"
+                video_to_key = f"videos/{_VIDEO_KEY}/to_index"
+                if video_from_key not in row:
+                    _fail("schema_missing", "episode.video_from_index", "required field is missing")
+                if video_to_key not in row:
+                    _fail("schema_missing", "episode.video_to_index", "required field is missing")
+                video_offset = _nonnegative_integer(
+                    row[video_from_key], field="episode.video_from_index"
+                )
+                video_stop = _nonnegative_integer(
+                    row[video_to_key], field="episode.video_to_index"
+                )
         else:
             start, stop = 0, frame_count
             video_offset, video_stop = 0, frame_count
@@ -466,7 +622,7 @@ class StandardLeRobotAdapter:
             )
         return SourceInspection(
             adapter_id=self.adapter_id, adapter_version=self.adapter_version,
-            source_format="lerobot", source_schema_version=_SCHEMA_VERSION,
+            source_format="lerobot", source_schema_version=info_contract.source_schema_version,
             asset_id=asset_id, source_root=root, main_video_path=video_path,
             info_path=info_path, episode_metadata_paths=episode_paths, data_path=data_path,
             semantics_path=semantics_path, episode_index=selected_index,
@@ -590,9 +746,28 @@ class StandardLeRobotAdapter:
             if table.schema.field(name).type != _feature_type(dtype, shape):
                 _fail("field_mapping_error", name, f"expected Arrow type {_feature_type(dtype, shape)}, got {table.schema.field(name).type}")
         start, stop = inspection.data_row_offset, inspection.data_row_stop
-        if stop > table.num_rows:
-            _fail("field_mapping_error", "episode.dataset_from_index", "row slice exceeds data shard")
-        selected = table.slice(start, inspection.frame_count)
+        official_v3 = inspection.source_schema_version == _OFFICIAL_SCHEMA_VERSION
+        if official_v3:
+            if "index" not in table.column_names:
+                _fail("schema_missing", "index", "official v3 requires global frame index")
+            if table.schema.field("index").type != pa.int64():
+                _fail("field_mapping_error", "index", "must use Arrow int64")
+            global_indices = np.asarray(table["index"].to_numpy(), dtype=np.int64)
+            mask = (global_indices >= start) & (global_indices < stop)
+            selected = table.filter(pa.array(mask))
+            if selected.num_rows != inspection.frame_count:
+                _fail(
+                    "field_mapping_error",
+                    "episode.dataset_from_index",
+                    "global index span must select exactly length rows",
+                )
+            selected_indices = np.asarray(selected["index"].to_numpy(), dtype=np.int64)
+            if not np.array_equal(selected_indices, np.arange(start, stop, dtype=np.int64)):
+                _fail("field_mapping_error", "index", "must be contiguous over episode span")
+        else:
+            if stop > table.num_rows:
+                _fail("field_mapping_error", "episode.dataset_from_index", "row slice exceeds data shard")
+            selected = table.slice(start, inspection.frame_count)
         episode_values = np.asarray(selected["episode_index"].to_numpy(), dtype=np.int64)
         frame_values = np.asarray(selected["frame_index"].to_numpy(), dtype=np.int64)
         if not np.all(episode_values == inspection.episode_index):
@@ -706,9 +881,9 @@ class StandardLeRobotAdapter:
             hand_joint_valid_2d=array("observation.hand_joint_valid_2d", np.bool_),
         )
         info = _json_file(inspection.info_path, field="meta/info.json")
-        _validate_info(info)
-        fps_num = _positive_integer(info["fps_num"], field="info.fps_num")
-        fps_den = _positive_integer(info["fps_den"], field="info.fps_den")
+        info_contract = _validate_info(info)
+        fps_num = info_contract.fps_num
+        fps_den = info_contract.fps_den
         quality = self._quality(selected, semantic, inspection.frame_count, info)
         identity = EpisodeIdentity(
             asset_id=inspection.asset_id,

@@ -413,7 +413,7 @@ supplier.hand_quality.status
 supplier.hand_quality.mapping_version
 ```
 
-已是 LeRobot v3 的供应商数据也不能直接进入训练集。QC 通过后仍由我方 Publisher 重新生成或重打包 Curated LeRobot v3 的 meta、Parquet、索引、统计、checksum 和 ReleaseManifest；合规 MP4 可以按 hash 复用。
+已是 LeRobot v3 的供应商数据也不能直接进入训练集。QC 通过后仍由我方 Publisher 重新生成 Curated LeRobot v3 的 meta、Parquet、索引、统计、checksum 和 ReleaseManifest。正式输出冻结为官方 `lerobot[dataset]==0.6.0` v3 合同；供应商旧方言只作为 Adapter 输入兼容，不原样透传。Publisher 保留 `fps_num/fps_den` 精确帧率，并把 Python、NumPy、PyArrow、Pandas、ffmpeg、libx264 工具链指纹绑定到 manifest 和 release ID。完整 `[0,T)` 且 frame count/PTS/hash 一致的 MP4 可独立复制；共享 span 必须裁剪，禁止 hardlink 源文件。
 
 ## 8. 各 QC 阶段的字段依赖
 

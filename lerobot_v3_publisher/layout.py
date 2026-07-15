@@ -39,6 +39,7 @@ class ReleaseLayout:
     release_id: str
     release_path: Path
     current_path: Path
+    staging_path: Path
 
 
 def layout_for(release_root: Path, release_id: str) -> ReleaseLayout:
@@ -50,6 +51,7 @@ def layout_for(release_root: Path, release_id: str) -> ReleaseLayout:
         release_id=release_id,
         release_path=root / "releases" / release_id,
         current_path=root / "CURRENT.json",
+        staging_path=root / ".staging",
     )
 
 

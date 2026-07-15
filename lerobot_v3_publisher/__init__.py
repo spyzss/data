@@ -10,6 +10,8 @@ from .contracts import (
     PublishResult,
     ReleaseManifest,
     SourceSnapshot,
+    StagedRelease,
+    VideoMaterialization,
 )
 from .layout import ReleaseLayout
 from .prerequisites import (
@@ -17,6 +19,7 @@ from .prerequisites import (
     revalidate_publish_plan,
     validate_publish_request,
 )
+from .writer import write_staging
 
 __all__ = [
     "CanonicalDiagnostic",
@@ -29,7 +32,10 @@ __all__ = [
     "ReleaseLayout",
     "ReleaseManifest",
     "SourceSnapshot",
+    "StagedRelease",
+    "VideoMaterialization",
     "release_id_for",
     "revalidate_publish_plan",
     "validate_publish_request",
+    "write_staging",
 ]

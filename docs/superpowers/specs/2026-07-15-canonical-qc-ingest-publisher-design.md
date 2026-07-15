@@ -153,6 +153,14 @@ standard_lerobot -> StandardLeRobotAdapter
 
 Adapter 可处理已登记的 v2.1/v3 布局差异，但 feature 名、shape 和语义固定。输入中 `timestamp` 只用于交叉检查；Canonical 权威值必须来自精确 `timestamp_ns`。缺少 `timestamp_ns` 直接拒绝，不能从 float 秒恢复纳秒时间轴。
 
+Reader 同时保留供应商已登记的 `egodata_lerobot_qc_input.v1` 旧方言兼容，并读取
+Publisher 生成的官方 v3.0 布局。Publisher 不输出二者的 hybrid：正式输出以官方
+`lerobot==0.6.0`（tag `v0.6.0`，commit
+`30da8e687a6dfc617fcd94afc367ac7071c376ce`）合同为准，使用
+`{chunk_index}/{file_index}` path placeholder、逐帧全局 `index`、episode video
+`from_timestamp/to_timestamp` 和带 `task` index 的 `meta/tasks.parquet`。项目扩展
+`timestamp_ns/subtask_index` 仍登记在 features 并保持严格类型。
+
 ## 6. 时间戳与视频对齐
 
 ### 6.1 权威来源
@@ -303,19 +311,48 @@ revalidation；同 revision 内容变化或当前源 hash 漂移必须拒绝。
 重新发布，如需重跑必须产生新的 canonical revision。重复发布同一请求返回已有
 release；同 ID 内容不同属于 `commit_conflict`。
 
+`publisher_version` 必须包含会影响产物字节的工具链指纹。首版指纹至少覆盖
+Python、NumPy、PyArrow、Pandas 版本，完整 `ffmpeg -version/-buildconf` 输出摘要和
+libx264 encoder signature；完整工具链身份写入 manifest。不同工具链不得复用同一个
+release ID。
+
 目录和基础 metadata 必须兼容官方 LeRobotDataset v3，而不仅是本仓库旧 reader。官方 v3 使用 file-based shards、`meta/episodes` 关系元数据、`meta/tasks.parquet`、`meta/stats.json`、`data/chunk-*/file-*.parquet` 和 `videos/<camera_key>/chunk-*/file-*.mp4`。`meta/episode_semantics.jsonl`、`meta/subtask.parquet` 和 `release_manifest.json` 是本项目在官方可扩展字段之外增加的审计/人工语义 sidecar；它们不得替代官方必需 metadata。
+
+逐帧 Parquet 的 `timestamp` 固定为 float64，且只能由
+`(timestamps_ns[i]-timestamps_ns[0])/1e9` 派生；这项项目精度合同高于官方默认
+float32 feature，避免长 episode 静默丢失 1 ns 对齐精度。官方 v3 reader 支持该
+登记 dtype；`meta/info.json` 额外登记精确的 `fps_num/fps_den`，禁止只从浮点 FPS
+反推 NTSC 等有理数帧率。Task 9 仍必须用冻结版本 reader 做最终门禁。
+
+`meta/stats.json` 覆盖逐帧表中的 index、时间、骨骼、validity、task/subtask index
+以及实际发布的数值型供应商 hand quality Evidence。骨骼 min/max/mean/std 必须按
+对应 validity 排除无效点；bool 另写 true_count。timestamp/timestamp_ns 只登记
+count/range，不作为归一化统计。首版不计算视频像素统计，也不得伪造视频统计。
 
 ### 9.3 写入策略
 
 1. 在 `<release_root>/.staging/<transaction_id>` 创建全新目录；
 2. 从 Canonical 写逐帧 Parquet、episode metadata、semantics 和 manifest；
-3. 合规 MP4 可硬链接或复制到 staging，但 manifest 必须记录源/目标 hash；
+3. 禁止 hardlink 源 MP4；完整 `[0,T)`、物理文件恰好 T 帧且 PTS 对齐时，才可从
+   `O_NOFOLLOW` fd 独立复制。共享/偏移 span 必须裁成恰好 T 帧并把 PTS 归零；
+   manifest 必须记录源相对路径、源半开帧区间、source/target hash 和
+   `verified_copy` 或 `transcoded_frame_range`；
 4. 生成全文件 checksum；
 5. 使用独立 reader 从 staging 重新打开全部产物；
 6. 验证 schema、行数、frame index、timestamp、数组值、subtask、视频 PTS 和 hash；
 7. fsync 文件及目录；
 8. 原子 rename staging 为不可变 release；
 9. 最后以临时文件 + `os.replace` 原子更新 `CURRENT.json`。
+
+Task 8 只写 `<release_root>/.staging/<unique_tx>` 的全新同文件系统直属子目录，不碰
+`releases/` 或 `CURRENT.json`。manifest 登记全部 payload；`checksums.sha256` 覆盖
+payload 加 manifest，仅排除自身。失败只清理本 transaction，不得删除其他 staging。
+任何产物不得嵌入 wall-clock、绝对 staging path 或 transaction ID；同一 Plan 的两次
+staging 必须逐文件字节一致。
+
+staging 根、transaction 目录和其父目录必须通过持有的 directory fd 与
+`openat`/`O_NOFOLLOW` 操作；文件以 `O_EXCL` 创建。祖先路径或目标文件被替换为
+symlink 时必须失败，且不得写入外部路径。ffmpeg timeout 按片段时长扩展并设硬上限。
 
 任何第 1–8 步失败都不能修改 `CURRENT.json`。已有 release 不覆盖、不原地修改。训练程序读取 `CURRENT.json` 或明确 release ID，不依赖固定 HDF5 路径。
 
