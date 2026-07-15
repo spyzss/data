@@ -8,10 +8,22 @@
  */
 
 import { SemanticCalibrationAdapter } from "./semantic_adapter.js";
+import { WarnReviewAdapter } from "./warn_adapter.js";
 
 export function mutationControlsDisabled(task) {
   const semantic = task?.semantic ?? task;
   return Boolean(semantic?.pending_edit ?? task?.pending_edit);
+}
+
+export function stageTypeForTask(task) {
+  const taskType = String(task?.task_type ?? "");
+  if (taskType !== "warn_review") return taskType;
+  const warn = task?.warn ?? {};
+  const selected = Array.isArray(warn.selected_issue_ids) ? warn.selected_issue_ids : [];
+  const candidates = Array.isArray(warn.candidate_issue_ids) ? warn.candidate_issue_ids : null;
+  if (["completed", "not_required", "skipped_due_to_fail"].includes(warn.state)) return "completed";
+  if (!selected.length || (candidates && !candidates.length)) return "completed";
+  return taskType;
 }
 
 function responseError(response, body) {
@@ -30,7 +42,9 @@ export class WorkbenchApp {
     documentRef = globalThis.document,
     root = null,
     reviewer = "",
-    adapterFactory = (options) => new SemanticCalibrationAdapter(options),
+    adapterFactory = null,
+    semanticAdapterFactory = null,
+    warnAdapterFactory = null,
     leaseRenewIntervalMs = 240000,
     onNavigate = null,
   } = {}) {
@@ -39,13 +53,17 @@ export class WorkbenchApp {
     this.document = documentRef;
     this.root = root;
     this.reviewer = reviewer;
-    this.adapterFactory = adapterFactory;
+    this.semanticAdapterFactory = semanticAdapterFactory
+      ?? adapterFactory
+      ?? ((options) => new SemanticCalibrationAdapter(options));
+    this.warnAdapterFactory = warnAdapterFactory ?? ((options) => new WarnReviewAdapter(options));
     this.leaseRenewIntervalMs = Number(leaseRenewIntervalMs) || 0;
     this.onNavigate = onNavigate;
     this.task = null;
     this.assetId = null;
     this.lease = null;
     this.adapter = null;
+    this.adapterType = null;
     this.lastError = null;
     this.loading = false;
     this.onTask = null;
@@ -124,9 +142,23 @@ export class WorkbenchApp {
     this.task = task;
     this.assetId = task.asset_id ?? this.assetId;
     if (task.lease_token && !this.lease) this.lease = { token: task.lease_token };
-    this.render();
+    this.advanceStage(task);
     this.onTask?.(task);
     return task;
+  }
+
+  advanceStage(serverTask = this.task) {
+    if (!serverTask || typeof serverTask !== "object") throw new Error("server task must be an object");
+    this.task = serverTask;
+    this.assetId = serverTask.asset_id ?? this.assetId;
+    const nextType = stageTypeForTask(serverTask);
+    if (nextType !== this.adapterType) {
+      this.adapter?.destroy?.();
+      this.adapter = null;
+      this.adapterType = nextType;
+    }
+    this.render();
+    return nextType;
   }
 
   async acquireLease(reviewer = this.reviewer) {
@@ -197,6 +229,17 @@ export class WorkbenchApp {
     return this.mutate(`/api/assets/${encodeURIComponent(this.assetId)}/semantic/complete`);
   }
 
+  async submitWarnVerdict(issueId, verdict, reason = "") {
+    return this.mutate(
+      `/api/assets/${encodeURIComponent(this.assetId)}/warn/${encodeURIComponent(issueId)}/verdict`,
+      { verdict, reason },
+    );
+  }
+
+  async completeWarn() {
+    return this.mutate(`/api/assets/${encodeURIComponent(this.assetId)}/warn/complete`);
+  }
+
   mount(root = this.root ?? this.document?.querySelector?.("#app")) {
     this.root = root;
     if (!root) return this;
@@ -208,11 +251,11 @@ export class WorkbenchApp {
   render() {
     if (!this.root || !this.document) return;
     const task = this.task;
-    const semantic = task?.semantic;
     const stage = this.root.querySelector?.("[data-workbench-stage]");
     if (!stage) return;
-    if (semantic) {
-      this.adapter ??= this.adapterFactory({
+    const taskType = this.adapterType ?? stageTypeForTask(task);
+    if (taskType === "semantic_calibration") {
+      this.adapter ??= this.semanticAdapterFactory({
         postPending: (payload) => this.submitBoundary(payload),
         onTextPending: (payload) => this.submitText(payload),
         onConfirm: () => this.confirmPending(),
@@ -221,8 +264,19 @@ export class WorkbenchApp {
         onLockChange: (locked) => this.setMutationLock(locked),
       });
       this.adapter.render(task, stage);
+    } else if (taskType === "warn_review") {
+      this.adapter ??= this.warnAdapterFactory({
+        onVerdict: (issueId, verdict, reason) => this.submitWarnVerdict(issueId, verdict, reason),
+        onComplete: () => this.completeWarn(),
+        video: this.root.querySelector?.("[data-video]") ?? null,
+      });
+      this.adapter.render(task, stage);
+    } else if (taskType === "completed") {
+      stage.innerHTML = '<div class="empty-stage" data-task-completed>当前资产的人工复核已完成，可以进入下一条。</div>';
+    } else if (taskType === "error") {
+      stage.innerHTML = '<div class="empty-stage" data-task-error>当前资产处理失败，请查看服务端错误后刷新。</div>';
     } else {
-      stage.innerHTML = `<div class="empty-stage">当前任务没有可用的语义校准数据。</div>`;
+      stage.innerHTML = '<div class="empty-stage">当前任务没有可用的复核阶段。</div>';
     }
     this.renderStatus();
   }
@@ -243,7 +297,23 @@ export class WorkbenchApp {
     set("[data-text-count]", Number.isInteger(textCount) ? `${textCount} 次` : "—");
     const progress = this.root.querySelector?.("[data-progress]");
     if (progress && this.task) progress.textContent = this.task.task_type || "—";
-    set("[data-task-kind]", this.task?.task_type || "Semantic");
+    const currentTaskType = this.task ? stageTypeForTask(this.task) : "";
+    const taskLabels = {
+      semantic_calibration: "Semantic",
+      warn_review: "Warn Review",
+      completed: "Completed",
+      error: "Error",
+    };
+    set("[data-task-kind]", taskLabels[currentTaskType] || "—");
+    set("[data-stage-title]", {
+      semantic_calibration: "语义时间轴校准",
+      warn_review: "Warn 问题人工复核",
+      completed: "人工复核已完成",
+      error: "任务处理失败",
+    }[currentTaskType] || "人工复核");
+    set("[data-inspector-note]", currentTaskType === "warn_review"
+      ? "机器原因、指标、阈值和证据均为只读；人工只提交 Pass/Fail 与原因。"
+      : "只允许拖动相邻任务之间的共享边界。每次修改先进入待确认状态。");
     const error = this.root.querySelector?.("[data-save-error]");
     if (error) {
       error.textContent = this.lastError?.message || "";

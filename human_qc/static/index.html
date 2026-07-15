@@ -3,16 +3,17 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>人工复核工作台 · 语义校准</title>
+    <title>人工复核工作台</title>
     <link rel="stylesheet" href="./workbench.css">
     <link rel="modulepreload" href="./semantic_adapter.js">
+    <link rel="modulepreload" href="./warn_adapter.js">
   </head>
   <body>
     <main id="app" data-reviewer="">
       <header class="topbar">
         <div class="brand-lockup">
           <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-          <div><span class="eyebrow">人工复核工作台</span><h1>语义校准</h1></div>
+          <div><span class="eyebrow">人工复核工作台</span><h1>语义与 Warn 复核</h1></div>
         </div>
         <div class="topbar-actions">
           <span class="status-dot" aria-hidden="true"></span><span data-reviewer>reviewer —</span>
@@ -55,12 +56,12 @@
             <div><dt>时间轴修改</dt><dd data-timeline-count>0 次</dd></div>
             <div><dt>文字修改</dt><dd data-text-count>0 次</dd></div>
           </dl>
-          <div class="inspector-note">只允许拖动相邻任务之间的共享边界。每次修改先进入待确认状态。</div>
+          <div class="inspector-note" data-inspector-note>只允许拖动相邻任务之间的共享边界。每次修改先进入待确认状态。</div>
         </aside>
       </section>
 
       <section class="task-panel" aria-label="任务区域">
-        <div class="task-panel-heading"><div><span class="eyebrow">当前步骤</span><h2>语义时间轴校准</h2></div><span class="task-progress" data-progress>—</span></div>
+        <div class="task-panel-heading"><div><span class="eyebrow">当前步骤</span><h2 data-stage-title>人工复核</h2></div><span class="task-progress" data-progress>—</span></div>
         <div data-workbench-stage class="workbench-stage">
           <div class="empty-stage">输入资产编号后开始复核。</div>
         </div>

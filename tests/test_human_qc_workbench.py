@@ -56,6 +56,7 @@ def test_static_workbench_is_served_with_boundary_only_contract() -> None:
         assert status == 200
         text = body.decode("utf-8")
         assert "semantic_adapter.js" in text
+        assert "warn_adapter.js" in text
         assert "workbench.css" in text
         assert "data-workbench-stage" in text
     finally:
@@ -70,10 +71,17 @@ def test_static_modules_expose_expected_boundary_and_lock_contracts() -> None:
     root = Path(__file__).parents[1] / "human_qc" / "static"
     adapter = (root / "semantic_adapter.js").read_text(encoding="utf-8")
     app = (root / "app.js").read_text(encoding="utf-8")
+    warn_adapter = (root / "warn_adapter.js").read_text(encoding="utf-8")
     assert "beginBoundaryDrag" in adapter
     assert "pending_edit" in adapter
     assert "pointercapture" in adapter.lower()
     assert "mutationControlsDisabled" in app
+    assert "advanceStage" in app
+    assert "/warn/${encodeURIComponent(issueId)}/verdict" in app
+    assert "data-machine-reason" in warn_adapter
+    assert "data-machine-metrics" in warn_adapter
+    assert "data-machine-threshold" in warn_adapter
+    assert "data-evidence-window" in warn_adapter
     # Blocks are layout elements, never native draggable elements.  Handles
     # use pointer capture in the adapter instead.
     assert 'class="timeline-segment" draggable' not in adapter

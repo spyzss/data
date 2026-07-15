@@ -9,6 +9,12 @@ import {
   pendingPresentation,
   renderTimelineMarkup,
 } from "./semantic_adapter.js";
+import {
+  WarnReviewAdapter,
+  allSelectedIssuesReviewed,
+  buildWarnIssueModel,
+  renderWarnMarkup,
+} from "./warn_adapter.js";
 import { WorkbenchApp, mutationControlsDisabled } from "./app.js";
 
 const segments = [
@@ -20,6 +26,7 @@ const segments = [
 const task = {
   asset_id: "asset-1",
   revision: 4,
+  task_type: "semantic_calibration",
   semantic: {
     report_revision: 4,
     report_state: "in_progress",
@@ -149,4 +156,165 @@ test("loading a different asset clears the prior asset lease", async () => {
     return { asset_id: assetId };
   };
   await app.loadAsset("asset-2");
+});
+
+const warnTask = {
+  asset_id: "asset-1",
+  revision: 7,
+  task_type: "warn_review",
+  semantic: { state: "completed" },
+  warn: {
+    state: "in_progress",
+    selected_issue_ids: ["warn-1", "warn-2"],
+    selected_issue_id: "warn-1",
+    selected_issues: {
+      "warn-1": {
+        issue_id: "warn-1",
+        code: "motion_spike",
+        reason: "关节速度超过阈值",
+        metric: "joint_velocity_max",
+        observed_value: 1.4,
+        operator: ">",
+        boundary_value: 1.0,
+        context: { start_frame: 30, end_frame: 42 },
+      },
+      "warn-2": {
+        issue_id: "warn-2",
+        code: "blur_warning",
+        reason: "画面清晰度偏低",
+        metrics: { blur_score: 0.2 },
+        threshold: { operator: "<", value: 0.5 },
+      },
+    },
+    issue_reviews: {
+      "warn-1": { verdict: "pass", reason: "动作本身正常" },
+    },
+  },
+  evidence: [
+    {
+      issue_id: "warn-1",
+      start_frame: 30,
+      end_frame_exclusive: 43,
+      clip_url: "/evidence/asset-1/warn-1.mp4",
+      overlay_url: "/evidence/asset-1/warn-1.png",
+      generation_error: null,
+    },
+  ],
+};
+
+test("warn model keeps machine reason metrics threshold and half-open evidence read-only", () => {
+  const model = buildWarnIssueModel(warnTask, "warn-1");
+  assert.equal(model.issueId, "warn-1");
+  assert.equal(model.reason, "关节速度超过阈值");
+  assert.deepEqual(model.metrics, { joint_velocity_max: 1.4 });
+  assert.deepEqual(model.threshold, { operator: ">", value: 1.0 });
+  assert.deepEqual(model.window, { startFrame: 30, endFrameExclusive: 43 });
+  assert.equal(model.overlayUrl, "/evidence/asset-1/warn-1.png");
+
+  const markup = renderWarnMarkup(warnTask, "warn-1");
+  assert.match(markup, /关节速度超过阈值/);
+  assert.match(markup, /joint_velocity_max/);
+  assert.match(markup, /30–42/);
+  assert.match(markup, /data-action="toggle-overlay"/);
+  assert.match(markup, /data-action="verdict-pass"/);
+  assert.match(markup, /data-action="verdict-fail"/);
+  assert.doesNotMatch(markup, /timeline-track|semantic-text-slot|boundary-handle/);
+});
+
+test("warn completion stays disabled until every selected issue has a verdict", () => {
+  assert.equal(allSelectedIssuesReviewed(warnTask), false);
+  assert.match(renderWarnMarkup(warnTask, "warn-1"), /data-action="complete-warn"[^>]*disabled/);
+  const complete = structuredClone(warnTask);
+  complete.warn.issue_reviews["warn-2"] = { verdict: "fail", reason: "confirmed" };
+  assert.equal(allSelectedIssuesReviewed(complete), true);
+  assert.doesNotMatch(renderWarnMarkup(complete, "warn-1"), /data-action="complete-warn"[^>]*disabled/);
+});
+
+test("warn adapter submits verdict for the explicitly selected issue", async () => {
+  const submissions = [];
+  const adapter = new WarnReviewAdapter({
+    onVerdict: async (...args) => submissions.push(args),
+  });
+  adapter.render(warnTask);
+  adapter.selectIssue("warn-2");
+  await adapter.submitVerdict("warn-2", "fail", "confirmed");
+  assert.deepEqual(submissions, [["warn-2", "fail", "confirmed"]]);
+  await assert.rejects(() => adapter.submitVerdict("not-selected", "pass", ""), /selected/);
+});
+
+test("task_type switches mutually exclusively between semantic, warn, and completed", () => {
+  let semanticConstructed = 0;
+  let warnConstructed = 0;
+  const renders = [];
+  const stage = { innerHTML: "", querySelector: () => null };
+  const root = {
+    querySelector(selector) {
+      return selector === "[data-workbench-stage]" ? stage : null;
+    },
+  };
+  const app = new WorkbenchApp({
+    documentRef: {},
+    root,
+    semanticAdapterFactory: () => {
+      semanticConstructed += 1;
+      return { render: () => renders.push("semantic") };
+    },
+    warnAdapterFactory: () => {
+      warnConstructed += 1;
+      return { render: () => renders.push("warn") };
+    },
+  });
+
+  app.advanceStage(task);
+  assert.deepEqual([semanticConstructed, warnConstructed, renders.at(-1)], [1, 0, "semantic"]);
+  app.advanceStage(warnTask);
+  assert.deepEqual([semanticConstructed, warnConstructed, renders.at(-1)], [1, 1, "warn"]);
+  app.advanceStage({ ...warnTask, task_type: "completed", warn: { state: "completed", selected_issue_ids: [] } });
+  assert.equal(app.adapter, null);
+  assert.match(stage.innerHTML, /已完成/);
+});
+
+test("warn tasks with no candidates or a terminal state advance directly to completed", () => {
+  let warnConstructed = 0;
+  const stage = { innerHTML: "" };
+  const root = { querySelector: (selector) => selector === "[data-workbench-stage]" ? stage : null };
+  const app = new WorkbenchApp({
+    documentRef: {},
+    root,
+    warnAdapterFactory: () => {
+      warnConstructed += 1;
+      return { render: () => {} };
+    },
+  });
+  assert.equal(app.advanceStage({
+    ...warnTask,
+    warn: { ...warnTask.warn, selected_issue_ids: [], selected_issues: {} },
+  }), "completed");
+  assert.equal(warnConstructed, 0);
+  assert.match(stage.innerHTML, /已完成/);
+  assert.equal(app.advanceStage({
+    ...warnTask,
+    warn: { ...warnTask.warn, state: "completed" },
+  }), "completed");
+  assert.equal(warnConstructed, 0);
+});
+
+test("WorkbenchApp uses the issue-id verdict endpoint and server revision refresh", async () => {
+  let request = null;
+  const app = new WorkbenchApp({ fetcher: async (path, options) => {
+    request = { path, options };
+    return { ok: true, status: 200, json: async () => ({ task: { ...warnTask, revision: 8 } }) };
+  } });
+  app.task = warnTask;
+  app.assetId = "asset-1";
+  app.lease = { token: "lease-1" };
+  await app.submitWarnVerdict("warn-1", "pass", "normal motion");
+  assert.equal(request.path, "/api/assets/asset-1/warn/warn-1/verdict");
+  assert.deepEqual(JSON.parse(request.options.body), {
+    verdict: "pass",
+    reason: "normal motion",
+    expected_revision: 7,
+    lease_token: "lease-1",
+  });
+  assert.equal(app.revision(), 8);
 });
