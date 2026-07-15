@@ -54,6 +54,22 @@ _CORE_FEATURES: dict[str, tuple[str, list[int]]] = {
     "task_index": ("int64", []),
     "subtask_index": ("int64", []),
 }
+_RAW_PRIMITIVE_CONTRACTS: tuple[tuple[pa.DataType, str, Any], ...] = (
+    (pa.int8(), "int8", np.int8),
+    (pa.int16(), "int16", np.int16),
+    (pa.int32(), "int32", np.int32),
+    (pa.int64(), "int64", np.int64),
+    (pa.uint8(), "uint8", np.uint8),
+    (pa.uint16(), "uint16", np.uint16),
+    (pa.uint32(), "uint32", np.uint32),
+    (pa.uint64(), "uint64", np.uint64),
+    (pa.float16(), "float16", np.float16),
+    (pa.float32(), "float32", np.float32),
+    (pa.float64(), "float64", np.float64),
+    (pa.bool_(), "bool", np.bool_),
+    (pa.string(), "string", str),
+    (pa.binary(), "binary", bytes),
+)
 
 
 def _fail(code: str, field: str, detail: str) -> None:
@@ -178,6 +194,13 @@ def _feature_type(dtype: str, shape: list[int]) -> pa.DataType:
     return result
 
 
+def _raw_primitive_contract(dtype: pa.DataType) -> tuple[str, Any] | None:
+    for arrow_type, contract_name, numpy_dtype in _RAW_PRIMITIVE_CONTRACTS:
+        if dtype == arrow_type:
+            return contract_name, numpy_dtype
+    return None
+
+
 def _validate_info(info: Any) -> tuple[str, str, str, int, int]:
     if not isinstance(info, dict):
         _fail("field_mapping_error", "info", "JSON root must be an object")
@@ -280,6 +303,26 @@ def _select(rows: list[dict[str, Any]], episode_index: int | None) -> dict[str, 
     if len(matches) != 1:
         _fail("field_mapping_error", "episode_index", f"selector matched {len(matches)} episodes")
     return matches[0]
+
+
+def _revalidate_episode_paths(inspection: SourceInspection) -> tuple[Path, ...]:
+    if inspection.layout_version not in ("v3", "v2.1"):
+        _fail("source_integrity_error", "source", "inspection has no registered layout")
+    try:
+        current = _episode_paths(inspection.source_root, inspection.layout_version)
+    except CanonicalInputError as exc:
+        _fail(
+            "source_integrity_error",
+            "source",
+            f"cannot revalidate episode metadata shard set: {exc.detail}",
+        )
+    if current != inspection.episode_metadata_paths:
+        _fail(
+            "source_integrity_error",
+            "source",
+            "episode metadata shard set changed after inspection",
+        )
+    return current
 
 
 class StandardLeRobotAdapter:
@@ -443,11 +486,12 @@ class StandardLeRobotAdapter:
             (inspection.semantics_path, "episode_semantics"),
             (inspection.main_video_path, "main_video"),
         ]
+        current_episode_paths = _revalidate_episode_paths(inspection)
         current_inspection = (
             _metadata(inspection.info_path, inspection.source_root, role="dataset_info"),
             *(
                 _metadata(path, inspection.source_root, role="episode_index")
-                for path in inspection.episode_metadata_paths
+                for path in current_episode_paths
             ),
         )
         if current_inspection != inspection.inspection_source_files:
@@ -505,9 +549,10 @@ class StandardLeRobotAdapter:
             raise _mapped(exc) from exc
         except (OSError, ValueError, TypeError, pa.ArrowException) as exc:
             _fail("field_mapping_error", "source", f"cannot decode LeRobot dataset: {exc}")
+        final_episode_paths = _revalidate_episode_paths(inspection)
         final_paths_roles = [(inspection.info_path, "dataset_info")]
         final_paths_roles.extend(
-            (path, "episode_index") for path in inspection.episode_metadata_paths
+            (path, "episode_index") for path in final_episode_paths
         )
         final_paths_roles.extend(load_paths_roles)
         final = tuple(
@@ -779,23 +824,14 @@ class StandardLeRobotAdapter:
                     "must use a fixed-size list of two stable Arrow primitive values",
                 )
             arrow_leaf = raw_arrow_type.value_type
-            if pa.types.is_string(arrow_leaf):
-                expected_dtype, numpy_dtype = "string", str
-            elif pa.types.is_binary(arrow_leaf):
-                expected_dtype, numpy_dtype = "binary", bytes
-            elif (
-                pa.types.is_boolean(arrow_leaf)
-                or pa.types.is_integer(arrow_leaf)
-                or pa.types.is_floating(arrow_leaf)
-            ):
-                expected_dtype = str(arrow_leaf)
-                numpy_dtype = arrow_leaf.to_pandas_dtype()
-            else:
+            primitive_contract = _raw_primitive_contract(arrow_leaf)
+            if primitive_contract is None:
                 _fail(
                     "field_mapping_error",
                     raw_name,
                     f"unsupported supplier raw Arrow primitive {arrow_leaf}",
                 )
+            expected_dtype, numpy_dtype = primitive_contract
             if raw_dtype != expected_dtype:
                 _fail(
                     "field_mapping_error",

@@ -385,6 +385,91 @@ def test_quality_status_is_validated_before_fixed_width_conversion(tmp_path: Pat
     )
 
 
+@pytest.mark.parametrize(
+    ("declared_dtype", "arrow_type", "numpy_dtype", "values"),
+    [
+        ("float32", pa.float32(), np.float32, [[0.125, 0.25], [0.375, 0.5], [0.625, 0.75]]),
+        ("float64", pa.float64(), np.float64, [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]),
+    ],
+)
+def test_supplier_raw_float_contract_names_preserve_exact_dtype_and_values(
+    tmp_path: Path,
+    declared_dtype: str,
+    arrow_type: pa.DataType,
+    numpy_dtype: object,
+    values: list[list[float]],
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / declared_dtype)
+    _add_quality_column(
+        root,
+        "supplier.hand_quality.status",
+        pa.array([["unknown", "bad"], ["warning", "good"], ["good", "unknown"]], type=pa.list_(pa.string(), 2)),
+    )
+    _add_quality_column(
+        root,
+        "supplier.hand_quality.raw_value",
+        pa.array(values, type=pa.list_(arrow_type, 2)),
+    )
+    _declare_feature(root, "supplier.hand_quality.status", {"dtype": "string", "shape": [2]})
+    _declare_feature(root, "supplier.hand_quality.raw_value", {"dtype": declared_dtype, "shape": [2]})
+    _rewrite_semantic(
+        root,
+        lambda rows: [dict(row, supplier_hand_quality={"provided": True, "mapping_version": "supplier.float.v1"}) for row in rows],
+    )
+
+    quality = StandardLeRobotAdapter().load(root).supplier_evidence.hand_quality
+
+    assert quality is not None and quality.raw_value is not None
+    assert quality.raw_value.dtype == np.dtype(numpy_dtype)
+    np.testing.assert_array_equal(
+        quality.raw_value,
+        np.asarray(values, dtype=numpy_dtype),
+    )
+
+
+@pytest.mark.parametrize(
+    ("declared_dtype", "arrow_type", "numpy_dtype", "values"),
+    [
+        ("int32", pa.int32(), np.int32, [[-2, 3], [4, -5], [6, 7]]),
+        ("bool", pa.bool_(), np.bool_, [[True, False], [False, True], [True, True]]),
+        ("string", pa.string(), str, [["a", "bb"], ["ccc", "d"], ["e", "ff"]]),
+        ("binary", pa.binary(), bytes, [[b"a", b"bb"], [b"c", b"dd"], [b"e", b"ff"]]),
+    ],
+)
+def test_supplier_raw_explicit_primitive_mappings_preserve_values(
+    tmp_path: Path,
+    declared_dtype: str,
+    arrow_type: pa.DataType,
+    numpy_dtype: object,
+    values: list[list[object]],
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / declared_dtype)
+    _add_quality_column(
+        root,
+        "supplier.hand_quality.status",
+        pa.array([["unknown", "bad"], ["warning", "good"], ["good", "unknown"]], type=pa.list_(pa.string(), 2)),
+    )
+    _add_quality_column(
+        root,
+        "supplier.hand_quality.raw_value",
+        pa.array(values, type=pa.list_(arrow_type, 2)),
+    )
+    _declare_feature(root, "supplier.hand_quality.status", {"dtype": "string", "shape": [2]})
+    _declare_feature(root, "supplier.hand_quality.raw_value", {"dtype": declared_dtype, "shape": [2]})
+    _rewrite_semantic(
+        root,
+        lambda rows: [dict(row, supplier_hand_quality={"provided": True, "mapping_version": "supplier.primitive.v1"}) for row in rows],
+    )
+
+    quality = StandardLeRobotAdapter().load(root).supplier_evidence.hand_quality
+
+    assert quality is not None and quality.raw_value is not None
+    np.testing.assert_array_equal(
+        quality.raw_value,
+        np.asarray(values, dtype=numpy_dtype),
+    )
+
+
 def test_video_feature_shape_is_dynamic_and_matches_calibration_and_probe(tmp_path: Path) -> None:
     root = write_standard_lerobot_dataset(tmp_path / "dataset")
     video = next((root / "videos").rglob("*.mp4"))
@@ -458,6 +543,54 @@ def test_episode_metadata_mutation_during_selection_is_rejected(
     monkeypatch.setattr(pq, "read_table", mutating_read)
     _assert_error(
         lambda: StandardLeRobotAdapter().inspect(root),
+        code="source_integrity_error", field="source",
+    )
+
+
+def test_load_rejects_episode_shard_added_after_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "dataset")
+    existing = next((root / "meta" / "episodes").rglob("*.parquet"))
+    added = root / "meta" / "episodes" / "chunk-001" / "file-001.parquet"
+    adapter = StandardLeRobotAdapter()
+    original_inspect = adapter.inspect
+
+    def inspect_then_add(*args: object, **kwargs: object) -> object:
+        inspection = original_inspect(*args, **kwargs)
+        added.parent.mkdir(parents=True, exist_ok=True)
+        added.write_bytes(existing.read_bytes())
+        return inspection
+
+    monkeypatch.setattr(adapter, "inspect", inspect_then_add)
+    _assert_error(
+        lambda: adapter.load(root),
+        code="source_integrity_error", field="source",
+    )
+
+
+def test_load_rejects_episode_shard_added_during_decode_before_final_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "dataset")
+    existing = next((root / "meta" / "episodes").rglob("*.parquet"))
+    data_path = next((root / "data").rglob("*.parquet"))
+    added = root / "meta" / "episodes" / "chunk-001" / "file-001.parquet"
+    original = pq.read_table
+    mutated = False
+
+    def read_then_add(*args: object, **kwargs: object) -> pa.Table:
+        nonlocal mutated
+        table = original(*args, **kwargs)
+        if Path(args[0]) == data_path and not mutated:
+            mutated = True
+            added.parent.mkdir(parents=True, exist_ok=True)
+            added.write_bytes(existing.read_bytes())
+        return table
+
+    monkeypatch.setattr(pq, "read_table", read_then_add)
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
         code="source_integrity_error", field="source",
     )
 
