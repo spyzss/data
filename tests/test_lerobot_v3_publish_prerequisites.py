@@ -77,24 +77,41 @@ def _write_publish_fixture(
         "failures_for_batch_stats_issue_ids": [],
         "reviews": reviews,
     }
-    module_blocks = {
-        module: {
+    module_blocks = {}
+    for module in config.pipeline_modules:
+        module_config = config.module_config(module)
+        if not module_config["enabled"] or module_config.get("execution_kind") == "external":
+            continue
+        module_index = config.pipeline_modules.index(module)
+        next_module = (
+            config.pipeline_modules[module_index + 1]
+            if module_index + 1 < len(config.pipeline_modules)
+            else None
+        )
+        module_blocks[module] = {
             "flow": {
-                "entry_gate": {"state": "ready"},
+                "entry_gate": {
+                    "state": "ready",
+                    "eligible": True,
+                    "blocked_by_module": None,
+                    "required_inputs": [],
+                    "missing_inputs": [],
+                    "upstream_continue": True,
+                },
                 "result_gate": {
                     "verdict": "pass",
                     "has_fail": False,
                     "has_warn": False,
                 },
-                "exit_gate": {"state": "continue"},
+                "exit_gate": {
+                    "state": "continue" if next_module is not None else "complete_qc",
+                    "continue_to_next_module": next_module is not None,
+                    "next_module": next_module,
+                },
             },
             "evaluation": {"decision": "pass"},
             "metrics": {},
         }
-        for module in config.pipeline_modules
-        if config.module_config(module)["enabled"]
-        and config.module_config(module).get("execution_kind") != "external"
-    }
     report: dict[str, object] = {
         "schema_version": "asset_qc_report.v2",
         "asset_id": episode.identity.asset_id,
@@ -434,6 +451,64 @@ def test_automatic_module_results_and_final_cursor_are_required(
     _assert_rejected(request, field=field)
 
 
+def test_sam3_zero_candidate_clean_skip_is_publishable(tmp_path: Path) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    report["execution"]["module_states"]["sam3_containment"]["state"] = "skipped"  # type: ignore[index]
+    block = report["sam3_containment"]
+    block["flow"]["result_gate"] = {  # type: ignore[index]
+        "verdict": "skipped",
+        "has_fail": False,
+        "has_warn": False,
+    }
+    block["evaluation"] = {"decision": "skipped", "window_count": 0}  # type: ignore[index]
+    block["metrics"] = {"window_count": 0}  # type: ignore[index]
+    _rewrite_report(request, report)
+
+    assert validate_publish_request(request).release_id
+
+
+@pytest.mark.parametrize(
+    ("mutation", "field"),
+    [
+        ("missing_entry_field", "video_quality.flow.entry_gate.eligible"),
+        ("wrong_result_boolean", "video_quality.flow.result_gate.has_warn"),
+        ("evaluation_mismatch", "video_quality.evaluation.decision"),
+        ("evaluation_fail", "video_quality.evaluation.decision"),
+        ("stop_qc", "video_quality.flow.exit_gate.state"),
+        ("wrong_continue", "video_quality.flow.exit_gate.continue_to_next_module"),
+        ("wrong_next", "video_quality.flow.exit_gate.next_module"),
+    ],
+)
+def test_automatic_module_flow_is_deeply_consistent(
+    tmp_path: Path,
+    mutation: str,
+    field: str,
+) -> None:
+    request, report = _write_publish_fixture(tmp_path)
+    block = report["video_quality"]
+    if mutation == "missing_entry_field":
+        block["flow"]["entry_gate"].pop("eligible")  # type: ignore[index]
+    elif mutation == "wrong_result_boolean":
+        block["flow"]["result_gate"]["has_warn"] = True  # type: ignore[index]
+    elif mutation == "evaluation_mismatch":
+        block["evaluation"]["decision"] = "warn"  # type: ignore[index]
+    elif mutation == "evaluation_fail":
+        block["evaluation"]["decision"] = "fail"  # type: ignore[index]
+    elif mutation == "stop_qc":
+        block["flow"]["exit_gate"].update(  # type: ignore[index]
+            state="stop_qc",
+            continue_to_next_module=False,
+            next_module=None,
+        )
+    elif mutation == "wrong_continue":
+        block["flow"]["exit_gate"]["continue_to_next_module"] = False  # type: ignore[index]
+    else:
+        block["flow"]["exit_gate"]["next_module"] = "manual_review"  # type: ignore[index]
+    _rewrite_report(request, report)
+
+    _assert_rejected(request, field=field)
+
+
 def test_fail_issue_is_rejected_even_if_top_level_claims_pass(tmp_path: Path) -> None:
     request, report = _write_publish_fixture(tmp_path)
     report["issues"] = [{"issue_id": "x", "severity": "fail"}]
@@ -641,6 +716,36 @@ def test_snapshot_detects_in_place_drift_during_hash(
         ),
     )
     assert error.diagnostic.retryable is True
+
+
+def test_large_source_snapshot_streams_hash_without_capturing_payload(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "large-source.bin"
+    payload = b"0123456789abcdef" * (1024 * 256)
+    path.write_bytes(payload)
+
+    snapshot = publisher_prerequisites._snapshot_file(
+        path,
+        field="source",
+        code="source_integrity_error",
+        retryable_io=True,
+        capture_payload=False,
+    )
+
+    assert snapshot.payload is None
+    assert snapshot.size_bytes == len(payload)
+    assert snapshot.sha256 == hashlib.sha256(payload).hexdigest()
+
+
+def test_qc_report_snapshot_rejects_oversized_payload(tmp_path: Path) -> None:
+    request, _report = _write_publish_fixture(tmp_path)
+    request.qc_report_path.write_bytes(
+        b"{" + b" " * publisher_prerequisites.MAX_QC_REPORT_BYTES + b"}"
+    )
+
+    error = _assert_rejected(request, field="qc_report_path")
+    assert "maximum" in error.diagnostic.message
 
 
 def test_malformed_issue_is_rejected_before_release(tmp_path: Path) -> None:

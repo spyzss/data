@@ -257,7 +257,12 @@ Publisher 必须验证：
 - `acceptance` profile、immutable QC config snapshot/hash、所有启用 module state、
   issues、runtime errors、semantic consistency 和 manual review 状态组合一致；每个
   enabled automatic module 都必须有顶层 result block 和完整 flow，result Gate 不得
-  fail，且必须与 module state 一致；最终 cursor 必须指向配置末模块；
+  fail，且 entry/result/exit Gate、`evaluation.decision`、module state、配置中的下一
+  模块和最终 cursor 必须逐项一致；`stop_qc`、缺字段或 evaluation/result 分歧均
+  fail closed；
+- clean skip 使用显式模块合同：`quality_hand` 只允许未提供 optional Evidence，
+  `sam3_containment` 只允许零候选窗口；其他 skipped、`skipped_due_to_fail` 和
+  runtime error 均不可发布；
 - Warn 人工复核只消费正式 `manual_review.reviews[]` 合同；每条记录包含
   `review_id/issue_id/reviewer/reviewed_at/verdict/asset_action/comment/evidence_paths`，
   候选必须恰好覆盖一次，且只有最终 `asset_action=accept/accept_with_risk` 可发布；
@@ -268,7 +273,8 @@ Publisher 必须验证：
 `validate_publish_request` 只读报告和源文件，并在 `PublishPlan` 冻结 QC report
 SHA-256 与 strictly typed frozen source snapshot。报告和源文件都使用同一个
 `O_NOFOLLOW` file descriptor 做 pre/post `fstat` 与 hash，hash 期间发生原地修改或
-路径替换必须拒绝。Writer、独立验证器和 commit 前都必须调用 plan
+路径替换必须拒绝。源文件只流式更新 SHA-256，不缓存文件 payload；只有 QC report
+允许捕获内容，且上限为 16 MiB。Writer、独立验证器和 commit 前都必须调用 plan
 revalidation；同 revision 内容变化或当前源 hash 漂移必须拒绝。
 
 ### 9.2 输出布局

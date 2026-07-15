@@ -220,6 +220,10 @@ def release_id_for(request: PublishRequest) -> str: ...
 别名；report/source snapshot 使用同一 nofollow fd 的 pre/post fstat+hash；Plan 和
 Manifest 的嵌套序列仅接受 frozen typed dataclass。
 
+二审收口：源文件使用不缓存 payload 的流式 SHA-256，QC report 捕获上限 16 MiB；
+clean skip 仅按显式模块合同放行 optional `quality_hand` 和 SAM3 零候选；自动模块
+entry/result/exit Gate、evaluation、module state、next module 与最终 cursor 深度一致。
+
 ## Task 8: 写入 Curated LeRobot v3 staging
 
 **Files:**

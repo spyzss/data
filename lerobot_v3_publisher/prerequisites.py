@@ -30,6 +30,8 @@ from .layout import derive_release_id, layout_for
 
 
 _STAGE = "publish_prerequisite"
+MAX_QC_REPORT_BYTES = 16 * 1024 * 1024
+_CLEAN_SKIP_MODULES = frozenset({"quality_hand", "sam3_containment"})
 
 
 def _reject(
@@ -50,7 +52,7 @@ def _sha256_bytes(payload: bytes) -> str:
 
 @dataclass(frozen=True, slots=True)
 class _FileSnapshot:
-    payload: bytes
+    payload: bytes | None
     size_bytes: int
     sha256: str
     device: int
@@ -73,6 +75,8 @@ def _snapshot_file(
     field: str,
     code: str,
     retryable_io: bool,
+    capture_payload: bool,
+    max_capture_bytes: int | None = None,
 ) -> _FileSnapshot:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -88,12 +92,23 @@ def _snapshot_file(
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             _reject(field, "must be a regular file", code=code)
-        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        captured = bytearray() if capture_payload else None
+        total_bytes = 0
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
                 break
-            chunks.append(chunk)
+            total_bytes += len(chunk)
+            digest.update(chunk)
+            if captured is not None:
+                if max_capture_bytes is not None and total_bytes > max_capture_bytes:
+                    _reject(
+                        field,
+                        f"file exceeds maximum captured size of {max_capture_bytes} bytes",
+                        code=code,
+                    )
+                captured.extend(chunk)
         after = os.fstat(descriptor)
         try:
             current_path = os.stat(path, follow_symlinks=False)
@@ -114,11 +129,10 @@ def _snapshot_file(
                 code=code,
                 retryable=True,
             )
-        payload = b"".join(chunks)
         return _FileSnapshot(
-            payload=payload,
+            payload=None if captured is None else bytes(captured),
             size_bytes=before.st_size,
-            sha256=_sha256_bytes(payload),
+            sha256=digest.hexdigest(),
             device=before.st_dev,
             inode=before.st_ino,
         )
@@ -210,6 +224,7 @@ def _source_snapshot(request: PublishRequest) -> tuple[SourceSnapshot, ...]:
             field=field,
             code="source_integrity_error",
             retryable_io=True,
+            capture_payload=False,
         )
         if (
             file_snapshot.size_bytes != source.size_bytes
@@ -265,7 +280,11 @@ def _read_report(request: PublishRequest) -> tuple[dict[str, Any], bytes]:
         field="qc_report_path",
         code="publish_prerequisite_failed",
         retryable_io=True,
+        capture_payload=True,
+        max_capture_bytes=MAX_QC_REPORT_BYTES,
     )
+    if file_snapshot.payload is None:
+        _reject("qc_report_path", "QC report payload was not captured")
     try:
         payload = file_snapshot.payload
         loaded = json.loads(payload)
@@ -374,7 +393,7 @@ def _validate_module_states(report: Mapping[str, Any], config: Any) -> None:
         state = state_row.get("state")
         enabled = bool(config.module_config(module)["enabled"])
         allowed = {"completed"}
-        if module == "quality_hand":
+        if module in _CLEAN_SKIP_MODULES:
             allowed.add("skipped")
         if not enabled:
             allowed = {"disabled"}
@@ -390,13 +409,12 @@ def _validate_module_states(report: Mapping[str, Any], config: Any) -> None:
         if not isinstance(block, Mapping):
             _reject(module, "enabled automatic module result block is missing")
         flow = _mapping(block, "flow", f"{module}.flow")
-        _mapping(flow, "entry_gate", f"{module}.flow.entry_gate")
         result_gate = _mapping(
             flow,
             "result_gate",
             f"{module}.flow.result_gate",
         )
-        _mapping(flow, "exit_gate", f"{module}.flow.exit_gate")
+        entry_gate = _mapping(flow, "entry_gate", f"{module}.flow.entry_gate")
         verdict = result_gate.get("verdict")
         if verdict == "fail" or result_gate.get("has_fail") is True:
             _reject(
@@ -414,6 +432,121 @@ def _validate_module_states(report: Mapping[str, Any], config: Any) -> None:
                 f"execution.module_states.{module}",
                 f"state {state!r} conflicts with result Gate {verdict!r}",
             )
+        _validate_entry_gate(module, entry_gate)
+        _validate_result_gate(module, result_gate, verdict)
+        evaluation = _mapping(block, "evaluation", f"{module}.evaluation")
+        if evaluation.get("decision") != verdict:
+            _reject(
+                f"{module}.evaluation.decision",
+                "must exactly match result_gate.verdict",
+            )
+        metrics = _mapping(block, "metrics", f"{module}.metrics")
+        if verdict == "skipped":
+            _validate_clean_skip(module, evaluation, metrics)
+        exit_gate = _mapping(flow, "exit_gate", f"{module}.flow.exit_gate")
+        _validate_exit_gate(module, exit_gate, config.pipeline_modules)
+
+
+def _validate_entry_gate(module: str, entry: Mapping[str, Any]) -> None:
+    expected = {
+        "state": "ready",
+        "eligible": True,
+        "blocked_by_module": None,
+        "upstream_continue": True,
+    }
+    for field, value in expected.items():
+        if entry.get(field) != value or (
+            isinstance(value, bool) and type(entry.get(field)) is not bool
+        ):
+            _reject(
+                f"{module}.flow.entry_gate.{field}",
+                f"must be {value!r}",
+            )
+    for field in ("required_inputs", "missing_inputs"):
+        value = entry.get(field)
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) for item in value
+        ):
+            _reject(
+                f"{module}.flow.entry_gate.{field}",
+                "must be a string array",
+            )
+    if entry.get("missing_inputs"):
+        _reject(
+            f"{module}.flow.entry_gate.missing_inputs",
+            "must be empty after an eligible automatic run",
+        )
+
+
+def _validate_result_gate(
+    module: str,
+    result: Mapping[str, Any],
+    verdict: Any,
+) -> None:
+    expected = {
+        "has_fail": verdict == "fail",
+        "has_warn": verdict == "warn",
+    }
+    for field, value in expected.items():
+        if type(result.get(field)) is not bool or result.get(field) is not value:
+            _reject(
+                f"{module}.flow.result_gate.{field}",
+                f"must be {value!r} for verdict {verdict!r}",
+            )
+
+
+def _validate_clean_skip(
+    module: str,
+    evaluation: Mapping[str, Any],
+    metrics: Mapping[str, Any],
+) -> None:
+    if module == "quality_hand":
+        if evaluation.get("reason") != "source_signal_not_provided":
+            _reject(
+                f"{module}.evaluation.reason",
+                "only absent optional supplier Evidence is a clean skip",
+            )
+        return
+    if module == "sam3_containment":
+        if evaluation.get("window_count") != 0 or metrics.get("window_count") != 0:
+            _reject(
+                f"{module}.evaluation.window_count",
+                "only zero candidate windows is a clean skip",
+            )
+        return
+    _reject(
+        f"execution.module_states.{module}",
+        "module contract does not permit a clean skip",
+    )
+
+
+def _validate_exit_gate(
+    module: str,
+    exit_gate: Mapping[str, Any],
+    modules: tuple[str, ...],
+) -> None:
+    index = modules.index(module)
+    next_module = modules[index + 1] if index + 1 < len(modules) else None
+    expected_state = "continue" if next_module is not None else "complete_qc"
+    if exit_gate.get("state") != expected_state:
+        _reject(
+            f"{module}.flow.exit_gate.state",
+            f"must be {expected_state!r}",
+        )
+    expected_continue = next_module is not None
+    if (
+        type(exit_gate.get("continue_to_next_module")) is not bool
+        or exit_gate.get("continue_to_next_module") is not expected_continue
+    ):
+        _reject(
+            f"{module}.flow.exit_gate.continue_to_next_module",
+            f"must be {expected_continue!r}",
+        )
+    if exit_gate.get("next_module") != next_module:
+        _reject(
+            f"{module}.flow.exit_gate.next_module",
+            f"must be {next_module!r}",
+        )
 
 
 def _validate_manual_review(report: Mapping[str, Any]) -> None:

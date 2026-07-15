@@ -218,6 +218,11 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 最终 `asset_action` 只能是 `accept` 或 `accept_with_risk`。`reject` 和
 `return_for_rework` 均不可发布。
 
+Publisher 还会逐 enabled automatic module 核对 `flow.entry_gate/result_gate/exit_gate`
+和 `evaluation.decision`。clean skip 不是通用放行状态：首版只允许未提供 optional
+`quality_hand` Evidence，以及 `sam3_containment` 零候选窗口；任何 runtime、
+`skipped_due_to_fail`、伪造 `stop_qc` 或 result/evaluation 分歧都拒绝发布。
+
 ## 4. Issue 结构
 
 每个触发的指标单独生成一个 issue 对象。一个视频有多个 warn 时，`issues`
