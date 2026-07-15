@@ -90,11 +90,11 @@ class StandardHdf5Adapter:
     def load(self, source: Path) -> CanonicalQcEpisode: ...
 ```
 
-- [ ] Step 1: 新建标准 HDF5 fixture，覆盖所有固定 paths、语义 JSON、可选/缺失 hand quality、外置 MP4 和源 hash 不变测试。
-- [ ] Step 2: 运行测试，确认 Adapter 缺失失败。
-- [ ] Step 3: 严格读取固定字段；禁止别名、默认 FPS、静默 shape 修正或 validity→quality。
-- [ ] Step 4: 增加缺 dataset、错误 dtype/shape、非法 status code、视频不匹配的诊断测试并通过。
-- [ ] Step 5: 运行 legacy HDF5 adapter 回归，提交 `feat(canonical): add standard HDF5 source adapter`。
+- [x] Step 1: 新建标准 HDF5 fixture，覆盖所有固定 paths、语义 JSON、可选/缺失 hand quality、外置 MP4 和源 hash 不变测试。
+- [x] Step 2: 运行测试，确认 Adapter 缺失失败。
+- [x] Step 3: 严格读取固定字段；禁止别名、默认 FPS、静默 shape 修正或 validity→quality。
+- [x] Step 4: 增加缺 dataset、错误 dtype/shape、非法 status code、视频不匹配的诊断测试并通过。
+- [x] Step 5: 运行 legacy HDF5 adapter 回归，提交 `feat(canonical): add standard HDF5 source adapter`。
 
 ## Task 4: 实现 StandardLeRobotAdapter 与跨格式等价性
 
