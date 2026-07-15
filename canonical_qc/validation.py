@@ -35,7 +35,7 @@ def _fail(code: str, field: str, detail: str) -> None:
 
 
 def _contract_type(value: object, expected: type[object], field: str) -> None:
-    if not isinstance(value, expected):
+    if type(value) is not expected:
         _fail(
             "invalid_contract_type",
             field,
@@ -530,8 +530,7 @@ def _validate_supplier_evidence(episode: CanonicalQcEpisode) -> None:
 def validate_episode(episode: CanonicalQcEpisode) -> None:
     """Validate without coercing, truncating, regenerating, or repairing data."""
 
-    if not isinstance(episode, CanonicalQcEpisode):
-        _fail("invalid_episode_type", "episode", "must be CanonicalQcEpisode")
+    _contract_type(episode, CanonicalQcEpisode, "episode")
     _validate_contract_types(episode)
     _validate_identity(episode)
     _validate_provenance(episode)

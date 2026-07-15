@@ -167,8 +167,21 @@ def _duck(value: object) -> SimpleNamespace:
     )
 
 
+def _subclass_copy(value: object) -> object:
+    subclass = type(
+        f"{type(value).__name__}Subclass",
+        (type(value),),
+        {},
+    )
+    return subclass(
+        **{item.name: getattr(value, item.name) for item in fields(value)}
+    )
+
+
 def _episode_with_duck(field: str) -> CanonicalQcEpisode:
     episode = make_episode()
+    if field == "episode":
+        return _duck(episode)
     if field == "identity":
         return replace(episode, identity=_duck(episode.identity))
     if field == "provenance":
@@ -219,6 +232,74 @@ def _episode_with_duck(field: str) -> CanonicalQcEpisode:
     raise AssertionError(f"unknown test field: {field}")
 
 
+def _episode_with_contract_subclass(field: str) -> CanonicalQcEpisode:
+    episode = make_episode()
+    if field == "episode":
+        return _subclass_copy(episode)
+    if field == "identity":
+        return replace(episode, identity=_subclass_copy(episode.identity))
+    if field == "provenance":
+        return replace(
+            episode,
+            provenance=_subclass_copy(episode.provenance),
+        )
+    if field == "provenance.source_files[0]":
+        source_files = (
+            _subclass_copy(episode.provenance.source_files[0]),
+            episode.provenance.source_files[1],
+        )
+        return replace(
+            episode,
+            provenance=replace(episode.provenance, source_files=source_files),
+        )
+    if field == "time_axis":
+        return replace(episode, time_axis=_subclass_copy(episode.time_axis))
+    if field == "main_video":
+        return replace(episode, main_video=_subclass_copy(episode.main_video))
+    if field == "observation":
+        return replace(
+            episode,
+            observation=_subclass_copy(episode.observation),
+        )
+    if field == "calibration":
+        return replace(
+            episode,
+            calibration=_subclass_copy(episode.calibration),
+        )
+    if field == "semantics":
+        return replace(
+            episode,
+            semantics=_subclass_copy(episode.semantics),
+        )
+    if field == "semantics.subtask_sequence[0]":
+        subtasks = (
+            _subclass_copy(episode.semantics.subtask_sequence[0]),
+            episode.semantics.subtask_sequence[1],
+        )
+        return replace(
+            episode,
+            semantics=replace(episode.semantics, subtask_sequence=subtasks),
+        )
+    if field == "supplier_evidence":
+        return replace(
+            episode,
+            supplier_evidence=_subclass_copy(episode.supplier_evidence),
+        )
+    if field == "supplier_evidence.hand_quality":
+        quality = SupplierHandQuality(
+            provided=True,
+            status=np.full((3, 2), "unknown"),
+            mapping_version="supplier-001.hand-quality.v1",
+        )
+        return replace(
+            episode,
+            supplier_evidence=SupplierEvidence(
+                hand_quality=_subclass_copy(quality)
+            ),
+        )
+    raise AssertionError(f"unknown test field: {field}")
+
+
 def test_minimal_episode_is_valid_and_keeps_authoritative_timestamps() -> None:
     episode = make_episode()
 
@@ -233,6 +314,7 @@ def test_minimal_episode_is_valid_and_keeps_authoritative_timestamps() -> None:
 @pytest.mark.parametrize(
     "field",
     [
+        "episode",
         "identity",
         "provenance",
         "provenance.source_files[0]",
@@ -248,6 +330,33 @@ def test_minimal_episode_is_valid_and_keeps_authoritative_timestamps() -> None:
 )
 def test_validator_rejects_every_nested_duck_typed_contract(field: str) -> None:
     episode = _episode_with_duck(field)
+
+    _assert_error(
+        episode,
+        code="invalid_contract_type",
+        field=field,
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "episode",
+        "identity",
+        "provenance",
+        "provenance.source_files[0]",
+        "time_axis",
+        "main_video",
+        "observation",
+        "calibration",
+        "semantics",
+        "semantics.subtask_sequence[0]",
+        "supplier_evidence",
+        "supplier_evidence.hand_quality",
+    ],
+)
+def test_validator_rejects_contract_subclasses(field: str) -> None:
+    episode = _episode_with_contract_subclass(field)
 
     _assert_error(
         episode,
