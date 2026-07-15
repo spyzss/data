@@ -70,6 +70,14 @@ def _slice_clip(clip: Any, source_range: tuple[int, int]) -> Any:
         text_label_raw=clip.text_label_raw,
         text_label_parse_error=clip.text_label_parse_error,
         intrinsics=clip.intrinsics,
+        supplier_hand_quality_status=sliced(
+            clip.supplier_hand_quality_status
+        ),
+        hand_keypoints_3d=sliced(clip.hand_keypoints_3d),
+        hand_joint_valid_3d=sliced(clip.hand_joint_valid_3d),
+        timestamps_ns=sliced(clip.timestamps_ns),
+        hand_keypoints_2d=sliced(clip.hand_keypoints_2d),
+        hand_joint_valid_2d=sliced(clip.hand_joint_valid_2d),
         fps=clip.fps,
     )
     for name in (

@@ -8,7 +8,7 @@ from qc_common.config import load_qc_acceptance_config
 def test_default_qc_config_loads_and_hashes() -> None:
     loaded = load_qc_acceptance_config()
 
-    assert loaded.config_version == "qc_acceptance_v2.0.0"
+    assert loaded.config_version == "qc_acceptance_v2.1.0"
     assert loaded.module_rules("video_quality")["fps_below_min"]["verdict"] == "fail"
     assert loaded.json_reference()["config_hash"].startswith("sha256:")
 
@@ -26,3 +26,12 @@ def test_historical_v1_config_still_loads() -> None:
 
     assert loaded.schema_version == "qc_acceptance_config_schema.v1"
     assert loaded.config_version == "qc_acceptance_v1.1.0"
+
+
+def test_historical_v2_config_still_loads() -> None:
+    loaded = load_qc_acceptance_config(
+        Path("configs/qc_acceptance/qc_acceptance_v2.0.0.yaml")
+    )
+
+    assert loaded.schema_version == "qc_acceptance_config_schema.v2"
+    assert loaded.config_version == "qc_acceptance_v2.0.0"

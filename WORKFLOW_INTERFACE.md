@@ -22,7 +22,7 @@ supplier data / raw video
 The acceptance workflow that produces formal quality decisions is separate from
 the legacy annotation outputs above. It is driven by
 `configs/qc_acceptance.yaml` (`qc_acceptance_config_schema.v2`,
-`qc_acceptance_v2.0.0`) and writes one
+`qc_acceptance_v2.1.0`) and writes one
 `<batch>/quality_archive/<asset_id>.json` per asset with
 `schema_version=asset_qc_report.v2`.
 

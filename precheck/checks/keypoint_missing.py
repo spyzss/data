@@ -28,6 +28,9 @@ class KeypointMissingCheck(BaseCheck):
         self.repair_records: list[dict] = []
 
     def run(self, clip: ClipInputs) -> list[CheckResult]:
+        if clip.hand_joint_valid_3d is not None or clip.hand_keypoints_3d is not None:
+            return self._run_canonical(clip)
+
         quality_hand = clip.quality_hand
         if quality_hand is None:
             return []
@@ -98,6 +101,84 @@ class KeypointMissingCheck(BaseCheck):
                     },
                     flag=flag,
                     reason=json.dumps(reason, sort_keys=True),
+                )
+            )
+        return results
+
+    def _run_canonical(self, clip: ClipInputs) -> list[CheckResult]:
+        valid = np.asarray(clip.hand_joint_valid_3d)
+        points = np.asarray(clip.hand_keypoints_3d)
+        if valid.dtype != np.bool_ or valid.ndim != 3 or valid.shape[1:] != (2, 21):
+            raise ValueError("canonical hand_joint_valid_3d must be bool [T,2,21]")
+        if points.dtype != np.float32 or points.ndim != 4 or points.shape[1:] != (2, 21, 3):
+            raise ValueError("canonical hand_keypoints_3d must be float32 [T,2,21,3]")
+        if points.shape[0] != valid.shape[0]:
+            raise ValueError("canonical keypoint and validity frame counts must match")
+        num_frames = min(clip.num_frames, valid.shape[0])
+        finite = np.isfinite(points[:num_frames]).all(axis=-1)
+        effective_valid = valid[:num_frames] & finite
+        valid_counts = np.sum(effective_valid, axis=-1)
+        missing_frame = valid_counts < 21
+        fps = float(self.config_fps or clip.fps or 30.0)
+        window_frames = max(1, int(round(fps * self.window_seconds)))
+        allowed_missing_frames = max(
+            0,
+            int(round(fps * self.allowed_missing_seconds)),
+        )
+        self.repair_records = [
+            {
+                "episode_idx": clip.episode_idx,
+                "frame_idx": clip.frame_idx_at(frame_offset),
+                "hand": hand,
+            }
+            for frame_offset in range(num_frames)
+            for hand_index, hand in enumerate(("left", "right"))
+            if missing_frame[frame_offset, hand_index]
+        ]
+        results: list[CheckResult] = []
+        for frame_offset in range(num_frames):
+            start = max(0, frame_offset - window_frames + 1)
+            window = missing_frame[start : frame_offset + 1]
+            missing_left = int(np.sum(window[:, 0]))
+            missing_right = int(np.sum(window[:, 1]))
+            results.append(
+                CheckResult(
+                    check=self.name,
+                    episode_idx=clip.episode_idx,
+                    frame_idx=clip.frame_idx_at(frame_offset),
+                    metrics={
+                        "valid_keypoint_count_left": float(
+                            valid_counts[frame_offset, 0]
+                        ),
+                        "valid_keypoint_count_right": float(
+                            valid_counts[frame_offset, 1]
+                        ),
+                        "missing_keypoint_count_left": float(
+                            21 - valid_counts[frame_offset, 0]
+                        ),
+                        "missing_keypoint_count_right": float(
+                            21 - valid_counts[frame_offset, 1]
+                        ),
+                        "missing_fraction_in_10s_window_left": float(
+                            missing_left / len(window)
+                        ),
+                        "missing_fraction_in_10s_window_right": float(
+                            missing_right / len(window)
+                        ),
+                        "window_frames": float(window_frames),
+                        "allowed_missing_frames": float(allowed_missing_frames),
+                    },
+                    flag=(
+                        missing_left > allowed_missing_frames
+                        or missing_right > allowed_missing_frames
+                    ),
+                    reason=json.dumps(
+                        {
+                            "rule": "Canonical validity and finite 3D coordinates",
+                            "coordinate_system": "canonical_logical",
+                        },
+                        sort_keys=True,
+                    ),
                 )
             )
         return results

@@ -218,6 +218,7 @@ class CanonicalQcBridge:
             intrinsics=_readonly(episode.calibration.intrinsic_matrix),
             fps=episode.time_axis.fps_num / episode.time_axis.fps_den,
             supplier_hand_quality_status=status,
+            hand_keypoints_3d=_readonly(points),
             hand_joint_valid_3d=_readonly(
                 episode.observation.hand_joint_valid_3d[start:end]
             ),

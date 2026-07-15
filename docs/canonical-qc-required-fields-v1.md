@@ -274,6 +274,25 @@ SAM3/Mask 模块由我方生成并输出：
 
 最终 Pass/Fail 以我方 Keypoint、SAM3、视频 QC 和人工结果为准。供应商 `quality_hand` 只用于一致率、误报率、漏报率、人工抽查优先级和供应商评估。
 
+首版在单资产 QC JSON 的 `sam3_containment.metrics.supplier_hand_quality`
+持久化以下统计。输入必须来自 SAM3 逐帧结果，并按逻辑
+`(frame_idx, hand_side, camera_id="main")` 对齐；重叠窗口的相同 key 去重，
+冲突结果 fail closed，`both` 不能作为逐帧 hand side：
+
+- `good/pass` 为 TN，`good/fail` 为 supplier FN 并生成
+  `supplier_mask_disagreement` Warn；
+- `bad/pass` 为 supplier FP，仅记录统计；`bad/fail` 为 TP；
+- 分母只包含 supplier `{good,bad}` 与 machine `{pass,fail}`；supplier
+  `unknown/warning` 以及 machine `unavailable/review/skipped` 分别记录排除计数；
+- `agreement_rate`、`supplier_false_positive_rate`、
+  `supplier_false_negative_rate` 在分母为 0 时必须为 `null`，并始终保留对应
+  numerator/denominator；
+- 字段使用 `supplier_false_positive_*` / `supplier_false_negative_*`，避免与
+  我方算法或人工判定的同名概念混淆。
+
+本 Task 只冻结 per-asset QC JSON 合同。批次 projection 与 `by_supplier` rollup
+将在统一聚合任务中从这些资产 JSON 计算，不在 SAM3 runner 内维护第二份账本。
+
 ## 6. 固定 HDF5 输入合同
 
 HDF5 必须使用固定路径；`StandardHdf5Adapter` 不搜索别名，也不按供应商猜测路径。

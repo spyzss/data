@@ -15,7 +15,7 @@ def test_reviewer_docs_name_v2_profiles_and_single_source() -> None:
     combined = "\n".join(path.read_text(encoding="utf-8") for path in DOCS)
     for token in (
         "asset_qc_report.v2",
-        "qc_acceptance_v2.0.0",
+        "qc_acceptance_v2.1.0",
         "acceptance",
         "supplier_evaluation",
         "quality_archive/*.json",

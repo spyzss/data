@@ -169,11 +169,11 @@ class CanonicalQcBridge:
 def compare_supplier_and_machine(status, machine_status) -> SupplierAgreementResult: ...
 ```
 
-- [ ] Step 1: 写 `unknown` 不 fail、不计一致率；good+machine fail 生成 `supplier_mask_disagreement` warn；bad+machine pass 记 false positive 的测试。
-- [ ] Step 2: 运行测试并确认旧裸数值逻辑不符合预期。
-- [ ] Step 3: 删除 Canonical 路径中的 `==0`/`<0.5` 推断，保留 legacy 行为所需兼容适配；统一消费 enum status。
-- [ ] Step 4: 配置不再把 `[0,1]` 声明成全局供应商语义；已有 Config 快照若不可变，则发布新的 config minor 版本并更新活跃入口，绝不修改历史快照。
-- [ ] Step 5: 运行所有 precheck/QC config/report 测试，提交 `feat(qc): treat supplier hand quality as optional evidence`。
+- [x] Step 1: 写 `unknown` 不 fail、不计一致率；good+machine fail 生成 `supplier_mask_disagreement` warn；bad+machine pass 记 false positive 的测试。
+- [x] Step 2: 运行测试并确认旧裸数值逻辑不符合预期。
+- [x] Step 3: 删除 Canonical 路径中的 `==0`/`<0.5` 推断，保留 legacy 行为所需兼容适配；统一消费 enum status。
+- [x] Step 4: 配置不再把 `[0,1]` 声明成全局供应商语义；保留 `v2.0.0` 不变，发布 `qc_acceptance_v2.1.0` immutable snapshot 并让 active 与新快照逐字节一致。
+- [x] Step 5: 运行所有 precheck/QC config/report 测试，提交 `feat(qc): treat supplier hand quality as optional evidence`。
 
 ## Task 7: 实现 Publisher 合同、布局和前置条件
 

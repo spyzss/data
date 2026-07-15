@@ -207,6 +207,19 @@ Bridge 是半开区间和旧闭区间之间唯一转换层。Canonical 内部永
 
 供应商 hand quality 在 legacy `ClipInputs.quality_hand` 中不再作为机器 validity。首版 Bridge 只通过新 `supplier_hand_quality_status` 只读属性暴露，机器 Keypoint/SAM3 Gate 不消费其裸数值。
 
+Canonical `quality_hand` 模块只验证并记录 enum Evidence，不根据 raw/score 推断，
+也不形成质量 Gate。Canonical Keypoint Presence 独立消费
+`hand_joint_valid_3d` 与 finite `hand_keypoints_3d`；legacy numeric
+`quality_hand` 路径保持兼容。
+
+供应商/机器一致性属于后置 SAM3 block。Runner 必须读取逐帧 containment rows，
+按逻辑 `(frame_idx, hand_side, camera_id="main")` 对齐并对重叠窗口去重；
+`hand_side=both` 或同 key 冲突必须 fail closed。`good/fail` 生成
+`supplier_mask_disagreement` Warn，`bad/pass` 只累计 supplier false positive。
+supplier `unknown/warning` 和 machine `unavailable/review/skipped` 不进入一致率。
+每资产统计写入 QC JSON；批次 `by_supplier` 汇总从资产 JSON 派生，不由 Runner
+维护第二份状态。
+
 ## 8. QC Gate 与人工阶段
 
 数据合同/Adapter 失败在 Source Gate 形成明确 fail issue；runtime I/O 错误形成 `overall_decision=null` 的可重试 error。进入现有自动 QC 后沿用两种 profile：
@@ -340,6 +353,9 @@ publisher:
 ```
 
 供应商 `quality_hand` 映射不写入全局阈值。若提供，输入必须已经同时给出明确 `status` 与 `mapping_version`；首版 Adapter 不猜 raw value 到 status 的映射。
+活动 QC 配置从 immutable `qc_acceptance_v2.1.0` 读取此 enum 合同和分歧 Warn
+rule；`v2.0.0` 历史快照保持字节不变，numeric `0/1` 规则只保留在明确命名的
+legacy compatibility block。
 
 ## 12. 验收标准
 

@@ -11,6 +11,12 @@ from numbers import Integral
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
+
+from canonical_qc.hand_quality import (
+    SupplierAgreementResult,
+    compare_supplier_and_machine,
+)
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import (
     EvidenceRef,
@@ -60,6 +66,9 @@ _CONTEXT_FIELDS = (
     "source_priority",
     "source_window_source",
 )
+
+_FRAME_PASS = frozenset({"pass", "acceptable", "likely_visible_ok"})
+_FRAME_FAIL = frozenset({"strong_containment_mismatch", "containment_fail"})
 
 
 def _utc_now() -> str:
@@ -199,6 +208,76 @@ def _normalized_summaries(
     return [normalized[key] for key in sorted(normalized, key=repr)]
 
 
+def _frame_machine_status(row: Mapping[str, Any]) -> str:
+    value = row.get("containment_verdict")
+    if value is None:
+        return "unavailable"
+    if not isinstance(value, str) or not value:
+        raise ValueError("frame containment_verdict must be a non-empty string")
+    if value in _FRAME_PASS:
+        return "pass"
+    if value in _FRAME_FAIL:
+        return "fail"
+    if value in _LEGACY_VERDICT or value in SAM3_VERDICT:
+        return "review"
+    raise ValueError(f"unsupported frame containment verdict: {value!r}")
+
+
+def _supplier_machine_observations(
+    *,
+    asset_id: str,
+    frame_rows: Sequence[Mapping[str, Any]],
+    supplier_status: np.ndarray,
+) -> tuple[SupplierAgreementResult, tuple[tuple[int, str, str], ...]]:
+    status = np.asarray(supplier_status)
+    if status.ndim != 2 or status.shape[1] != 2:
+        raise ValueError("supplier hand quality status must have shape [T,2]")
+    machine_by_key: dict[tuple[int, str, str], str] = {}
+    for row in frame_rows:
+        if row.get("asset_id") != asset_id:
+            continue
+        frame_idx = _integer(row.get("frame_idx"), "frame_idx")
+        raw_side = row.get("hand_side")
+        if not isinstance(raw_side, str) or raw_side not in {"left", "right"}:
+            raise ValueError("frame hand_side must be exactly left or right")
+        camera_id = row.get("camera_id")
+        if camera_id != "main":
+            raise ValueError("frame camera_id must be main")
+        if frame_idx >= status.shape[0]:
+            raise ValueError(
+                "SAM3 logical frame_idx is outside supplier hand quality status"
+            )
+        key = (frame_idx, raw_side, "main")
+        machine = _frame_machine_status(row)
+        previous = machine_by_key.get(key)
+        if previous is not None and previous != machine:
+            raise ValueError(
+                f"conflicting SAM3 frame observations for logical alignment key {key}"
+            )
+        machine_by_key[key] = machine
+
+    keys = tuple(sorted(machine_by_key))
+    supplier_values = np.asarray(
+        [status[frame, 0 if side == "left" else 1] for frame, side, _camera in keys]
+    )
+    machine_values = np.asarray([machine_by_key[key] for key in keys])
+    agreement = compare_supplier_and_machine(
+        supplier_values,
+        machine_values,
+    )
+    false_negative_keys = tuple(
+        key
+        for key, supplier, machine in zip(
+            keys,
+            supplier_values.tolist(),
+            machine_values.tolist(),
+            strict=True,
+        )
+        if supplier == "good" and machine == "fail"
+    )
+    return agreement, false_negative_keys
+
+
 def _matching_evidence_ids(
     *,
     start_frame: int | None,
@@ -290,6 +369,70 @@ def _issue(
     )
 
 
+def _supplier_disagreement_issue(
+    *,
+    asset_id: str,
+    keys: tuple[tuple[int, str, str], ...],
+    agreement: SupplierAgreementResult,
+    config: LoadedQcConfig,
+) -> Issue:
+    rule_id = "sam3_containment.supplier_mask_disagreement"
+    configured = config.module_rules(_MODULE).get("supplier_mask_disagreement")
+    if (
+        not isinstance(configured, Mapping)
+        or configured.get("rule_id") != rule_id
+        or configured.get("verdict") != "warn"
+    ):
+        raise ValueError(f"missing configured warn rule: {rule_id}")
+    frames = [frame for frame, _side, _camera in keys]
+    sides = {side for _frame, side, _camera in keys}
+    issue_side = next(iter(sides)) if len(sides) == 1 else None
+    start_frame = min(frames)
+    end_frame = max(frames)
+    return Issue(
+        issue_id=build_issue_id(
+            asset_id=asset_id,
+            module=_MODULE,
+            rule_id=rule_id,
+            source_relative_path="frame_keypoint_containment.json",
+            coordinate_system="canonical_logical",
+            start_frame=start_frame,
+            end_frame=end_frame,
+            hand_side=issue_side,
+            evidence_kind="supplier_machine_agreement",
+        ),
+        code="supplier_mask_disagreement",
+        severity="warn",
+        module=_MODULE,
+        issue_type="supplier_mask_disagreement",
+        metric="supplier_hand_quality.status",
+        observed_value={
+            "supplier_status": "good",
+            "machine_status": "fail",
+            "count": agreement.supplier_false_negative_count,
+        },
+        operator="disagrees_with",
+        boundary_value="machine_pass",
+        rule_id=rule_id,
+        needs_manual_review=True,
+        context={
+            "coordinate_system": "canonical_logical",
+            "camera_id": "main",
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "hand_side": issue_side,
+            "alignment_keys": [
+                {
+                    "frame_idx": frame,
+                    "hand_side": side,
+                    "camera_id": camera,
+                }
+                for frame, side, camera in keys
+            ],
+        },
+    )
+
+
 def adapt_sam3_containment(
     *,
     asset_id: str,
@@ -297,6 +440,8 @@ def adapt_sam3_containment(
     window_summaries: Sequence[Mapping[str, Any]],
     evidence_rows: Sequence[Mapping[str, Any]],
     config: LoadedQcConfig,
+    frame_rows: Sequence[Mapping[str, Any]] = (),
+    supplier_hand_quality_status: np.ndarray | None = None,
 ) -> ModuleResult:
     """Translate one asset's structured SAM3 sidecars without rerunning QC."""
     batch_root = Path(batch_root)
@@ -336,6 +481,26 @@ def adapt_sam3_containment(
             issue_ids.add(issue.issue_id)
             issues.append(issue)
 
+    supplier_metrics: dict[str, Any] = {"provided": False}
+    if supplier_hand_quality_status is not None:
+        agreement, false_negative_keys = _supplier_machine_observations(
+            asset_id=asset_id,
+            frame_rows=frame_rows,
+            supplier_status=supplier_hand_quality_status,
+        )
+        supplier_metrics = agreement.to_metrics()
+        if false_negative_keys:
+            issue = _supplier_disagreement_issue(
+                asset_id=asset_id,
+                keys=false_negative_keys,
+                agreement=agreement,
+                config=config,
+            )
+            if issue.issue_id not in issue_ids:
+                issue_ids.add(issue.issue_id)
+                issues.append(issue)
+            verdicts.append("warn")
+
     verdict: Verdict = (
         max(verdicts, key=_VERDICT_ORDER.__getitem__) if verdicts else "skipped"
     )
@@ -351,6 +516,7 @@ def adapt_sam3_containment(
             "window_count": len(summaries),
             "window_verdict_counts": dict(sorted(verdict_counts.items())),
             "evidence_count": len(evidence),
+            "supplier_hand_quality": supplier_metrics,
         },
         issues=tuple(issues),
         evidence=evidence,

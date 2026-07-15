@@ -5,10 +5,10 @@
 | 项目 | 当前值 |
 |---|---|
 | 配置 schema | `qc_acceptance_config_schema.v2` |
-| 当前配置版本 | `qc_acceptance_v2.0.0` |
+| 当前配置版本 | `qc_acceptance_v2.1.0` |
 | 当前模块版本 | `video_prefilter_v0.3.2` |
 | 活动配置 | `configs/qc_acceptance.yaml` |
-| 不可变归档 | `configs/qc_acceptance/qc_acceptance_v2.0.0.yaml` |
+| 不可变归档 | `configs/qc_acceptance/qc_acceptance_v2.1.0.yaml` |
 | 配置 schema 文件 | `schemas/qc_acceptance_config.v2.schema.json` |
 | 已接入代码 | 自动 adapters、双 profile orchestrator、projection |
 | 外部阶段 | `semantic_consistency`、`manual_review` |
@@ -58,7 +58,7 @@ python run_acceptance_video_quality.py \
 
 ```yaml
 schema_version: qc_acceptance_config_schema.v2
-config_version: qc_acceptance_v2.0.0
+config_version: qc_acceptance_v2.1.0
 config_name: acceptance_gate
 execution_profiles:
   acceptance:
@@ -217,7 +217,7 @@ hand_roi
 {
   "qc_config": {
     "schema_version": "qc_acceptance_config_schema.v2",
-    "config_version": "qc_acceptance_v2.0.0",
+    "config_version": "qc_acceptance_v2.1.0",
     "config_name": "acceptance_gate",
     "config_path": "configs/qc_acceptance.yaml",
     "config_hash": "sha256:<actual loaded file bytes>"
@@ -328,9 +328,9 @@ issue.config_version
 
 ```text
 config schema: qc_acceptance_config_schema.v2
-config version: qc_acceptance_v2.0.0
+config version: qc_acceptance_v2.1.0
 active: configs/qc_acceptance.yaml
-immutable: configs/qc_acceptance/qc_acceptance_v2.0.0.yaml
+immutable: configs/qc_acceptance/qc_acceptance_v2.1.0.yaml
 report: asset_qc_report.v2
 report root: <batch>/quality_archive/*.json
 ```

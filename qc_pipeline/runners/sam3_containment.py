@@ -200,6 +200,9 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
         window_summaries = read_records(
             output_dir / "window_keypoint_containment_summary.json"
         )
+        frame_rows = read_records(output_dir / "frame_keypoint_containment.json")
+        if bridge is not None:
+            frame_rows = [{**row, "camera_id": "main"} for row in frame_rows]
         evidence_rows = read_records(output_dir / "review_evidence_manifest.csv")
         return adapt_sam3_containment(
             asset_id=context.asset_id,
@@ -207,6 +210,13 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
             window_summaries=window_summaries,
             evidence_rows=evidence_rows,
             config=config,
+            frame_rows=frame_rows,
+            supplier_hand_quality_status=(
+                None
+                if canonical_episode is None
+                or canonical_episode.supplier_evidence.hand_quality is None
+                else canonical_episode.supplier_evidence.hand_quality.status
+            ),
         )
 
     return run

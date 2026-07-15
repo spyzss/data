@@ -6,7 +6,7 @@
 |---|---|
 | 单资产 JSON 与 gate 合同 | `asset_qc_report.v2` 已实现 |
 | 统一配置 loader/schema | `qc_acceptance_config_schema.v2` 已实现 |
-| 配置版本 | `qc_acceptance_v2.0.0` |
+| 配置版本 | `qc_acceptance_v2.1.0` |
 | 自动模块适配与双 profile orchestrator | 已实现 |
 | 人工/语义阶段接口 | `execution_kind: external`，由外部工作台接续 |
 | 批次投影、缓存与 ledger 入口 | 已切换为 `quality_archive/*.json` |
@@ -106,7 +106,7 @@ flowchart TD
 ```
 
 模块顺序、profile 行为和 external 边界以该资产顶层 `qc_config` 指向的
-`qc_acceptance_v2.0.0` 版本化配置为准。`supplier_evaluation` 的 fail 分支会
+`qc_acceptance_v2.1.0` 版本化配置为准。`supplier_evaluation` 的 fail 分支会
 汇入同一条“记录 fail 后继续”路径；图中的 acceptance hard fail 才会进入停止节点。
 
 ## 5. 单资产 JSON 顶层合同
@@ -116,7 +116,7 @@ flowchart TD
   "schema_version": "asset_qc_report.v2",
   "qc_config": {
     "schema_version": "qc_acceptance_config_schema.v2",
-    "config_version": "qc_acceptance_v2.0.0",
+    "config_version": "qc_acceptance_v2.1.0",
     "config_name": "acceptance_gate",
     "config_path": "configs/qc_acceptance.yaml",
     "config_hash": "sha256:..."
@@ -592,7 +592,7 @@ ledger event 是“模块开始、结束、重试、写回”等事件日志，�
 本次可合并内容：
 
 - 统一 config loader 和 schema；
-- `qc_acceptance_v2.0.0` 活动/归档配置；
+- `qc_acceptance_v2.1.0` 活动/归档配置；
 - `asset_qc_report.v2` schema、迁移器和 CAS writer；
 - 新 `video_quality` gate、issue、config 和 JSON 输出；
 - 本 PRD、统一 config PRD 和视频使用文档。
@@ -613,9 +613,9 @@ ledger event 是“模块开始、结束、重试、写回”等事件日志，�
 ```text
 schema_version: asset_qc_report.v2
 config schema: qc_acceptance_config_schema.v2
-config version: qc_acceptance_v2.0.0
+config version: qc_acceptance_v2.1.0
 active config: configs/qc_acceptance.yaml
-immutable snapshot: configs/qc_acceptance/qc_acceptance_v2.0.0.yaml
+immutable snapshot: configs/qc_acceptance/qc_acceptance_v2.1.0.yaml
 archive: <batch>/quality_archive/<asset_id>.json
 ```
 

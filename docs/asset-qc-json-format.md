@@ -35,7 +35,7 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
   "schema_version": "asset_qc_report.v2",
   "qc_config": {
     "schema_version": "qc_acceptance_config_schema.v2",
-    "config_version": "qc_acceptance_v2.0.0",
+    "config_version": "qc_acceptance_v2.1.0",
     "config_name": "acceptance_gate",
     "config_path": "configs/qc_acceptance.yaml",
     "config_hash": "sha256:<64 lowercase hex characters>"
@@ -157,7 +157,7 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 ```json
 {
   "schema_version": "qc_acceptance_config_schema.v2",
-  "config_version": "qc_acceptance_v2.0.0",
+  "config_version": "qc_acceptance_v2.1.0",
   "config_name": "acceptance_gate",
   "config_path": "configs/qc_acceptance.yaml",
   "config_hash": "sha256:..."
@@ -265,6 +265,10 @@ module.thresholds
   `continue_to_next_module=false`、`next_module=null`。
 - runtime/evidence/config/CAS 错误：写 `runtime_errors[]`，module state 为
   `runtime_error`、顶层 `status=error`，不当成质量 fail。
+- Canonical SAM3 在 `metrics.supplier_hand_quality` 保存供应商 Evidence 与机器
+  逐帧结果的 confusion counts、numerator/denominator/rate 和排除计数；
+  `unknown/warning` 不进入一致率。`good + machine fail` 追加
+  `supplier_mask_disagreement` Warn，但不覆盖机器 `result_gate`。
 - 下游只读取上游 `exit_gate` 或顶层 `pipeline_state`，不解析自然语言原因。
 - 上游已 fail 时，后续高成本模块不得运行。
 

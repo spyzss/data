@@ -5,7 +5,7 @@ annotation pipeline. The canonical QC contract is v2:
 
 ```text
 asset_qc_report.v2
-qc_acceptance_config_schema.v2 / qc_acceptance_v2.0.0
+qc_acceptance_config_schema.v2 / qc_acceptance_v2.1.0
 <batch>/quality_archive/*.json
 ```
 
@@ -127,14 +127,14 @@ configs/qc_acceptance.yaml
 The immutable copy for the current release is:
 
 ```text
-configs/qc_acceptance/qc_acceptance_v2.0.0.yaml
+configs/qc_acceptance/qc_acceptance_v2.1.0.yaml
 ```
 
 The video parameters live under:
 
 ```yaml
 schema_version: qc_acceptance_config_schema.v2
-config_version: qc_acceptance_v2.0.0
+config_version: qc_acceptance_v2.1.0
 execution_profiles:
   acceptance:
     fail_action: stop
@@ -171,7 +171,7 @@ Run a different complete unified config:
 ```bash
 python run_acceptance_video_quality.py \
   --batch sampled/XJGT_20260616 \
-  --config configs/qc_acceptance/qc_acceptance_v2.0.0.yaml
+  --config configs/qc_acceptance/qc_acceptance_v2.1.0.yaml
 ```
 
 Output:
