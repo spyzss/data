@@ -413,6 +413,15 @@ supplier.hand_quality.status
 supplier.hand_quality.mapping_version
 ```
 
+Canonical 内存接口中的 `status` 是 `unknown/bad/warning/good` 语义枚举；Curated
+LeRobot v3 Parquet 为兼容冻结的官方 reader，使用版本化 `uint8 [T,2]` wire 编码：
+`0=unknown`、`1=bad`、`2=warning`、`3=good`。编码表写入
+`meta/episode_semantics.jsonl`，Adapter 回读后恢复字符串枚举。该编码与供应商
+`mapping_version` 是两层合同，不能混用，也不能按供应商裸数值猜测状态。
+`raw_value` 的 numeric/bool 类型保留在帧 Parquet；string/bytes 使用版本化 semantic
+sidecar 保存 dtype、`[T,2]` shape 与 utf8/base64 payload，由 Adapter 无损恢复，
+避免官方 reader 对 fixed-size string list 的解码限制。
+
 已是 LeRobot v3 的供应商数据也不能直接进入训练集。QC 通过后仍由我方 Publisher 重新生成 Curated LeRobot v3 的 meta、Parquet、索引、统计、checksum 和 ReleaseManifest。正式输出冻结为官方 `lerobot[dataset]==0.6.0` v3 合同；供应商旧方言只作为 Adapter 输入兼容，不原样透传。Publisher 保留 `fps_num/fps_den` 精确帧率，并把 Python、NumPy、PyArrow、Pandas、ffmpeg、libx264 工具链指纹绑定到 manifest 和 release ID。完整 `[0,T)` 且 frame count/PTS/hash 一致的 MP4 可独立复制；共享 span 必须裁剪，禁止 hardlink 源文件。
 
 ## 8. 各 QC 阶段的字段依赖

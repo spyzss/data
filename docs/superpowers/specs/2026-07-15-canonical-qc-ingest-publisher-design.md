@@ -239,6 +239,21 @@ supplier `unknown/warning` 和 machine `unavailable/review/skipped` 不进入一
 
 ## 9. LeRobotV3Publisher
 
+Canonical 内存中的 `supplier.hand_quality.status` 保持
+`unknown/bad/warning/good` 语义枚举。Curated LeRobot v3 的 Parquet wire contract
+使用官方 reader 可解码的 `uint8 [T,2]`：`0/1/2/3` 分别对应上述四种状态；
+`meta/episode_semantics.jsonl` 同时保存固定
+`supplier_hand_quality_status.v1` 编码表和供应商 `mapping_version`。Adapter 必须按
+编码版本还原语义枚举，不能按数值猜测。`normalized_score` 固定为 `float32 [T,2]`，
+`raw_value` 保留受支持的原始 primitive dtype；未提供 Evidence 时不得生成这些
+Parquet 列、info feature 或 encoding sidecar。
+
+`raw_value` 的 numeric/bool primitive 保持逐帧 Parquet 列；string/bytes 因冻结的
+官方 reader 无法可靠解码 fixed-size string list，改写入
+`supplier_hand_quality_raw_value.v1` semantic sidecar。Sidecar 绑定 numpy dtype、
+`[T,2]` shape 和 `utf8/base64` 编码，Adapter 必须无损恢复；不得因此缩窄
+Canonical 已支持的 raw Evidence 类型。
+
 ### 9.1 前置条件
 
 ```python

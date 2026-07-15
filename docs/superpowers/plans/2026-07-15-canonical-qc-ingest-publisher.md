@@ -279,6 +279,14 @@ release_root/.staging/releases dirfd 和进程锁，fsync 后再次完整验证�
 使用 no-replace rename，最后原子更新 CURRENT；孤儿 release 可验证恢复，同/不同 ID
 真实并发发布均有回归。
 
+Evidence 兼容修复：Canonical status 字符串在 Publisher wire 层编码为版本化
+`uint8 [T,2]`（0 unknown、1 bad、2 warning、3 good），编码表写入 episode semantics；
+Adapter 回读还原语义枚举。真实官方 reader provided-Evidence E2E、float32 score
+合同以及 missing-Evidence 不造 payload 均有回归测试。
+String/bytes `raw_value` 使用带 numpy dtype、shape 和 utf8/base64 编码的版本化
+semantic sidecar，numeric/bool raw 继续使用 Parquet；真实官方 reader string-raw
+E2E 证明该兼容路径可发布且 Adapter 无损回读。
+
 ## Task 10: CLI、版本化配置与端到端验收
 
 **Files:**

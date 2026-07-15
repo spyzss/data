@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 from annotation.lerobot_v3_dataset import LeRobotV3Dataset
+from canonical_qc import StandardHdf5Adapter, StandardLeRobotAdapter
 from lerobot_v3_publisher import (
     PublishPrerequisiteError,
     ValidationReport,
@@ -25,7 +26,8 @@ from lerobot_v3_publisher import (
 import lerobot_v3_publisher.publisher as publisher_module
 import lerobot_v3_publisher.validation as validation_module
 from tests.test_lerobot_v3_publish_prerequisites import _write_publish_fixture
-from tests.fixtures import solid_frame, write_test_video
+from tests.fixtures import solid_frame, write_standard_hdf5_episode, write_test_video
+from tests.test_lerobot_v3_writer import _plan_for_episode
 
 
 _ORIGINAL_OFFICIAL_READER = validation_module._validate_with_official_reader
@@ -119,6 +121,65 @@ def test_validate_staged_release_independently_reopens_complete_payload(
     assert report.official_reader_fingerprint == "f" * 64
     with pytest.raises(FrozenInstanceError):
         report.frame_count = 100  # type: ignore[misc]
+
+
+def test_provided_supplier_quality_passes_real_official_reader_and_round_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "asset-001"
+    write_standard_hdf5_episode(source, hand_quality="provided")
+    episode = StandardHdf5Adapter().load(source)
+    plan = _plan_for_episode(tmp_path / "publish", source, episode)
+    staged = write_staging(plan, plan.request.release_root / ".staging")
+    monkeypatch.setattr(
+        validation_module, "_validate_with_official_reader", _ORIGINAL_OFFICIAL_READER
+    )
+
+    report = validate_staged_release(staged, episode)
+    round_trip = StandardLeRobotAdapter().load(staged.root)
+
+    assert report.official_reader_version == "0.6.0"
+    assert round_trip.supplier_evidence.hand_quality is not None
+    actual = round_trip.supplier_evidence.hand_quality
+    expected = episode.supplier_evidence.hand_quality
+    assert expected is not None and actual.mapping_version == expected.mapping_version
+    assert actual.status is not None and np.array_equal(actual.status, expected.status)
+    assert actual.raw_value is not None and np.array_equal(actual.raw_value, expected.raw_value)
+    assert actual.normalized_score is not None
+    assert np.array_equal(actual.normalized_score, expected.normalized_score)
+
+
+def test_string_supplier_raw_evidence_passes_real_official_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "asset-001"
+    write_standard_hdf5_episode(source, hand_quality="provided")
+    episode = StandardHdf5Adapter().load(source)
+    quality = episode.supplier_evidence.hand_quality
+    assert quality is not None
+    raw = np.asarray([["left", "right"], ["左", "右"], ["", "unknown"]])
+    raw.setflags(write=False)
+    episode = replace(
+        episode,
+        supplier_evidence=replace(
+            episode.supplier_evidence,
+            hand_quality=replace(quality, raw_value=raw),
+        ),
+    )
+    plan = _plan_for_episode(tmp_path / "publish", source, episode)
+    staged = write_staging(plan, plan.request.release_root / ".staging")
+    monkeypatch.setattr(
+        validation_module, "_validate_with_official_reader", _ORIGINAL_OFFICIAL_READER
+    )
+
+    report = validate_staged_release(staged, episode)
+    round_trip = StandardLeRobotAdapter().load(staged.root)
+
+    assert report.official_reader_version == "0.6.0"
+    actual = round_trip.supplier_evidence.hand_quality
+    assert actual is not None and actual.raw_value is not None
+    assert actual.raw_value.dtype == raw.dtype
+    assert np.array_equal(actual.raw_value, raw)
 
 
 def test_validator_ignores_writer_memory_and_rejects_actual_checksum_drift(

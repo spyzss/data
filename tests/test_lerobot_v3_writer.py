@@ -325,6 +325,97 @@ def test_stats_cover_published_numeric_features_without_fabricating_video_stats(
     ]
 
 
+def test_supplier_quality_uses_official_reader_compatible_status_codes_and_mapping(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "asset-001"
+    write_standard_hdf5_episode(source, hand_quality="provided")
+    episode = StandardHdf5Adapter().load(source)
+    plan = _plan_for_episode(tmp_path / "publish", source, episode)
+
+    staged = write_staging(plan, plan.request.release_root / ".staging")
+    table = pq.read_table(staged.root / "data/chunk-000/file-000.parquet")
+    info = json.loads((staged.root / "meta/info.json").read_text())
+    semantics = json.loads(
+        (staged.root / "meta/episode_semantics.jsonl").read_text()
+    )
+
+    status_type = pa.list_(pa.uint8(), 2)
+    assert table.schema.field("supplier.hand_quality.status").type == status_type
+    assert info["features"]["supplier.hand_quality.status"] == {
+        "dtype": "uint8",
+        "shape": [2],
+        "names": None,
+    }
+    assert info["features"]["supplier.hand_quality.normalized_score"]["dtype"] == "float32"
+    assert semantics["supplier_hand_quality"]["status_encoding"] == {
+        "schema_version": "supplier_hand_quality_status.v1",
+        "codes": {"0": "unknown", "1": "bad", "2": "warning", "3": "good"},
+    }
+
+
+def test_missing_supplier_quality_does_not_create_payload_or_sidecar(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "asset-001"
+    write_standard_hdf5_episode(source, hand_quality="missing")
+    episode = StandardHdf5Adapter().load(source)
+    plan = _plan_for_episode(tmp_path / "publish", source, episode)
+
+    staged = write_staging(plan, plan.request.release_root / ".staging")
+    table = pq.read_table(staged.root / "data/chunk-000/file-000.parquet")
+    info = json.loads((staged.root / "meta/info.json").read_text())
+    semantics = json.loads(
+        (staged.root / "meta/episode_semantics.jsonl").read_text()
+    )
+
+    assert not any(name.startswith("supplier.hand_quality.") for name in table.column_names)
+    assert not any(name.startswith("supplier.hand_quality.") for name in info["features"])
+    assert "supplier_hand_quality" not in semantics
+
+
+def test_string_supplier_raw_value_uses_source_faithful_versioned_sidecar(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "asset-001"
+    write_standard_hdf5_episode(source, hand_quality="provided")
+    episode = StandardHdf5Adapter().load(source)
+    quality = episode.supplier_evidence.hand_quality
+    assert quality is not None
+    raw = np.asarray([["left-0", "right-0"], ["左手", "右手"], ["", "unknown"]])
+    raw.setflags(write=False)
+    episode = replace(
+        episode,
+        supplier_evidence=replace(
+            episode.supplier_evidence,
+            hand_quality=replace(quality, raw_value=raw),
+        ),
+    )
+    plan = _plan_for_episode(tmp_path / "publish", source, episode)
+
+    staged = write_staging(plan, plan.request.release_root / ".staging")
+    table = pq.read_table(staged.root / "data/chunk-000/file-000.parquet")
+    info = json.loads((staged.root / "meta/info.json").read_text())
+    semantics = json.loads(
+        (staged.root / "meta/episode_semantics.jsonl").read_text()
+    )
+    round_trip = StandardLeRobotAdapter().load(staged.root)
+
+    assert "supplier.hand_quality.raw_value" not in table.column_names
+    assert "supplier.hand_quality.raw_value" not in info["features"]
+    assert semantics["supplier_hand_quality"]["raw_value_sidecar"] == {
+        "schema_version": "supplier_hand_quality_raw_value.v1",
+        "numpy_dtype": str(raw.dtype),
+        "encoding": "utf8",
+        "shape": [3, 2],
+        "values": raw.tolist(),
+    }
+    actual = round_trip.supplier_evidence.hand_quality
+    assert actual is not None and actual.raw_value is not None
+    assert actual.raw_value.dtype == raw.dtype
+    assert np.array_equal(actual.raw_value, raw)
+
+
 def test_revalidates_before_creating_any_staging_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

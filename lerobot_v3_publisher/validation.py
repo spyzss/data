@@ -20,6 +20,11 @@ import pyarrow.parquet as pq
 from annotation.lerobot_v3_dataset import LeRobotV3Dataset
 from canonical_qc.contracts import CanonicalQcEpisode
 from canonical_qc.errors import CanonicalInputError
+from canonical_qc.hand_quality_encoding import (
+    STATUS_ENCODING_SIDECAR,
+    decode_status,
+    encode_raw_value_sidecar,
+)
 from canonical_qc.video_probe import probe_video
 
 from .contracts import (
@@ -259,7 +264,7 @@ def _validate_frame_data(reader: _ReleaseReader, expected: CanonicalQcEpisode) -
     quality = expected.supplier_evidence.hand_quality
     optional: set[str] = set()
     if quality is not None and quality.provided:
-        if quality.raw_value is not None:
+        if quality.raw_value is not None and quality.raw_value.dtype.kind not in {"U", "S"}:
             optional.add("supplier.hand_quality.raw_value")
         if quality.normalized_score is not None:
             optional.add("supplier.hand_quality.normalized_score")
@@ -325,16 +330,21 @@ def _validate_frame_data(reader: _ReleaseReader, expected: CanonicalQcEpisode) -
         ):
             if expected_array is None:
                 continue
+            if suffix == "raw_value" and expected_array.dtype.kind in {"U", "S"}:
+                continue
             name = f"supplier.hand_quality.{suffix}"
             value_type = (
-                pa.string()
-                if expected_array.dtype.kind in {"O", "U", "S"}
+                pa.uint8()
+                if suffix == "status"
                 else pa.from_numpy_dtype(expected_array.dtype)
             )
             expected_type = pa.list_(value_type, 2)
             if table.schema.field(name).type != expected_type:
                 _reject(name, f"expected Arrow type {expected_type}")
-            observed = np.asarray(table[name].to_pylist(), dtype=expected_array.dtype)
+            observed_wire = np.asarray(
+                table[name].to_pylist(), dtype=np.uint8 if suffix == "status" else expected_array.dtype
+            )
+            observed = decode_status(observed_wire) if suffix == "status" else observed_wire
             if observed.shape != expected_array.shape or not np.array_equal(
                 observed, expected_array, equal_nan=expected_array.dtype.kind == "f"
             ):
@@ -549,9 +559,11 @@ def _validate_registered_metadata(
             ("status", quality.status),
         ):
             if value is not None:
+                if suffix == "raw_value" and value.dtype.kind in {"U", "S"}:
+                    continue
                 dtype = (
-                    "string"
-                    if value.dtype.kind in {"O", "U", "S"}
+                    "uint8"
+                    if suffix == "status"
                     else str(value.dtype)
                 )
                 features[f"supplier.hand_quality.{suffix}"] = {
@@ -639,6 +651,11 @@ def _validate_semantics(reader: _ReleaseReader, expected: CanonicalQcEpisode) ->
         state: dict[str, object] = {"provided": quality.provided}
         if quality.provided:
             state["mapping_version"] = quality.mapping_version
+            state["status_encoding"] = STATUS_ENCODING_SIDECAR
+            if quality.raw_value is not None and quality.raw_value.dtype.kind in {"U", "S"}:
+                state["raw_value_sidecar"] = encode_raw_value_sidecar(
+                    quality.raw_value
+                )
         wanted["supplier_hand_quality"] = state
     if payload != wanted:
         _reject("meta/episode_semantics.jsonl", "differs from complete Canonical semantics")

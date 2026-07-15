@@ -21,6 +21,11 @@ import pyarrow.parquet as pq
 
 from canonical_qc.contracts import CanonicalQcEpisode
 from canonical_qc.errors import CanonicalInputError
+from canonical_qc.hand_quality_encoding import (
+    STATUS_ENCODING_SIDECAR,
+    encode_raw_value_sidecar,
+    encode_status,
+)
 from canonical_qc.video_probe import probe_video
 
 from .contracts import (
@@ -564,14 +569,16 @@ def _data_table(episode: CanonicalQcEpisode) -> pa.Table:
     }
     quality = episode.supplier_evidence.hand_quality
     if quality is not None and quality.provided:
-        if quality.raw_value is not None:
+        if quality.raw_value is not None and quality.raw_value.dtype.kind not in {"U", "S"}:
             columns["supplier.hand_quality.raw_value"] = _fixed_array(quality.raw_value)
         if quality.normalized_score is not None:
             columns["supplier.hand_quality.normalized_score"] = _fixed_array(
                 quality.normalized_score
             )
         if quality.status is not None:
-            columns["supplier.hand_quality.status"] = _fixed_array(quality.status)
+            columns["supplier.hand_quality.status"] = _fixed_array(
+                encode_status(quality.status)
+            )
     return pa.table(columns)
 
 
@@ -629,7 +636,7 @@ def _features(episode: CanonicalQcEpisode, probed: Any, table: pa.Table) -> dict
         if pa.types.is_string(value_type):
             dtype = "string"
         else:
-            dtype = str(value_type)
+            dtype = np.dtype(value_type.to_pandas_dtype()).name
         features[name] = _feature(dtype, [2], names=None)
     return features
 
@@ -763,6 +770,11 @@ def _semantics(episode: CanonicalQcEpisode) -> dict[str, object]:
         state: dict[str, object] = {"provided": quality.provided}
         if quality.provided:
             state["mapping_version"] = quality.mapping_version
+            state["status_encoding"] = STATUS_ENCODING_SIDECAR
+            if quality.raw_value is not None and quality.raw_value.dtype.kind in {"U", "S"}:
+                state["raw_value_sidecar"] = encode_raw_value_sidecar(
+                    quality.raw_value
+                )
         payload["supplier_hand_quality"] = state
     return payload
 

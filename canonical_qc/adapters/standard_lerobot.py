@@ -31,6 +31,11 @@ from ..contracts import (
     VideoStream,
 )
 from ..errors import CanonicalInputError
+from ..hand_quality_encoding import (
+    STATUS_ENCODING_SIDECAR,
+    decode_raw_value_sidecar,
+    decode_status,
+)
 from ..provenance import source_fingerprint
 from ..validation import validate_episode, validate_video_alignment
 from ..video_probe import probe_video
@@ -934,15 +939,24 @@ class StandardLeRobotAdapter:
         state = semantic.get("supplier_hand_quality")
         names = {"supplier.hand_quality.raw_value", "supplier.hand_quality.normalized_score", "supplier.hand_quality.status"}
         present = names.intersection(table.column_names)
+        registered = names.intersection(info["features"])
         if state is None:
-            if present:
-                _fail("field_mapping_error", "supplier.hand_quality", "payload requires authoritative semantic state")
+            if present or registered:
+                _fail(
+                    "field_mapping_error",
+                    "supplier.hand_quality",
+                    "payload or feature registration requires authoritative semantic state",
+                )
             return SupplierEvidence()
         if not isinstance(state, dict) or not isinstance(state.get("provided"), bool):
             _fail("field_mapping_error", "supplier_hand_quality.provided", "must be bool")
         if not state["provided"]:
-            if present or "mapping_version" in state:
-                _fail("field_mapping_error", "supplier.hand_quality", "provided=false forbids payload and mapping_version")
+            if set(state) != {"provided"} or present or registered:
+                _fail(
+                    "field_mapping_error",
+                    "supplier.hand_quality",
+                    "provided=false permits only the provided flag and forbids payload or feature registration",
+                )
             return SupplierEvidence(hand_quality=SupplierHandQuality(provided=False, status=np.full((frame_count, 2), "unknown", dtype="<U7")))
         status_name = "supplier.hand_quality.status"
         raw_name = "supplier.hand_quality.raw_value"
@@ -970,31 +984,54 @@ class StandardLeRobotAdapter:
             if table.schema.field(name).type != arrow_type:
                 _fail("field_mapping_error", name, f"expected Arrow type {arrow_type}, got {table.schema.field(name).type}")
 
-        declared(status_name, "string", pa.list_(pa.string(), 2))
+        encoding = state.get("status_encoding")
+        if encoding is None:
+            declared(status_name, "string", pa.list_(pa.string(), 2))
+        elif encoding == STATUS_ENCODING_SIDECAR:
+            declared(status_name, "uint8", pa.list_(pa.uint8(), 2))
+        else:
+            _fail(
+                "field_mapping_error",
+                "supplier_hand_quality.status_encoding",
+                "must match the registered supplier hand-quality status encoding",
+            )
         status_values = table[status_name].to_pylist()
         if len(status_values) != frame_count or any(
             not isinstance(row, list) or len(row) != 2 for row in status_values
         ):
             _fail("field_mapping_error", status_name, "must have shape (T, 2)")
-        allowed_status = {"unknown", "bad", "warning", "good"}
-        invalid_status = sorted(
-            {
-                value
-                for row in status_values
-                for value in row
-                if not isinstance(value, str) or value not in allowed_status
-            },
-            key=repr,
-        )
-        if invalid_status:
-            _fail(
-                "field_mapping_error",
-                status_name,
-                f"unknown canonical status values {invalid_status!r}",
+        if encoding is None:
+            allowed_status = {"unknown", "bad", "warning", "good"}
+            invalid_status = sorted(
+                {
+                    value
+                    for row in status_values
+                    for value in row
+                    if not isinstance(value, str) or value not in allowed_status
+                },
+                key=repr,
             )
-        status = np.asarray(status_values, dtype="<U7")
+            if invalid_status:
+                _fail(
+                    "field_mapping_error",
+                    status_name,
+                    f"unknown canonical status values {invalid_status!r}",
+                )
+            status = np.asarray(status_values, dtype="<U7")
+        else:
+            try:
+                status = decode_status(np.asarray(status_values, dtype=np.uint8))
+            except (TypeError, ValueError) as exc:
+                _fail("field_mapping_error", status_name, str(exc))
 
         raw: np.ndarray | None = None
+        raw_sidecar = state.get("raw_value_sidecar")
+        if raw_sidecar is not None and raw_name in present:
+            _fail(
+                "field_mapping_error",
+                raw_name,
+                "must not appear in both Parquet and the semantic sidecar",
+            )
         if raw_name in present:
             declaration = features.get(raw_name)
             if not isinstance(declaration, dict):
@@ -1032,6 +1069,17 @@ class StandardLeRobotAdapter:
             ):
                 _fail("field_mapping_error", raw_name, "must have shape (T, 2) without nulls")
             raw = np.asarray(raw_values, dtype=numpy_dtype)
+        elif raw_sidecar is not None:
+            try:
+                raw = decode_raw_value_sidecar(raw_sidecar)
+            except ValueError as exc:
+                _fail("field_mapping_error", "supplier_hand_quality.raw_value_sidecar", str(exc))
+            if raw.shape != (frame_count, 2):
+                _fail(
+                    "field_mapping_error",
+                    "supplier_hand_quality.raw_value_sidecar",
+                    f"expected shape {(frame_count, 2)}, got {raw.shape}",
+                )
 
         score: np.ndarray | None = None
         if score_name in present:

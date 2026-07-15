@@ -269,6 +269,86 @@ def test_provided_supplier_quality_requires_declared_features_and_preserves_stat
     assert quality.status is not None and quality.status.tolist()[1] == ["warning", "good"]
 
 
+def test_provided_supplier_quality_decodes_versioned_uint8_status_contract(
+    tmp_path: Path,
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "dataset")
+    data_path = next((root / "data").rglob("*.parquet"))
+    table = pq.read_table(data_path).append_column(
+        "supplier.hand_quality.status",
+        pa.array([[0, 1], [2, 3], [3, 0]], type=pa.list_(pa.uint8(), 2)),
+    )
+    pq.write_table(table, data_path)
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["features"]["supplier.hand_quality.status"] = {
+        "dtype": "uint8", "shape": [2]
+    }
+    info_path.write_text(json.dumps(info))
+    semantics_path = root / "meta" / "episode_semantics.jsonl"
+    semantics = json.loads(semantics_path.read_text())
+    semantics["supplier_hand_quality"] = {
+        "provided": True,
+        "mapping_version": "supplier-001.hand-quality.v1",
+        "status_encoding": {
+            "schema_version": "supplier_hand_quality_status.v1",
+            "codes": {"0": "unknown", "1": "bad", "2": "warning", "3": "good"},
+        },
+    }
+    semantics_path.write_text(json.dumps(semantics) + "\n")
+
+    quality = StandardLeRobotAdapter().load(root).supplier_evidence.hand_quality
+
+    assert quality is not None and quality.status is not None
+    assert quality.status.tolist() == [
+        ["unknown", "bad"], ["warning", "good"], ["good", "unknown"]
+    ]
+
+
+@pytest.mark.parametrize("extra_key", ["mapping_version", "status_encoding", "raw_value_sidecar"])
+def test_unprovided_supplier_quality_rejects_all_hidden_payload_metadata(
+    tmp_path: Path, extra_key: str
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "dataset")
+    semantics_path = root / "meta" / "episode_semantics.jsonl"
+    semantics = json.loads(semantics_path.read_text())
+    semantics["supplier_hand_quality"] = {
+        "provided": False,
+        extra_key: "hidden-payload",
+    }
+    semantics_path.write_text(json.dumps(semantics) + "\n")
+
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="field_mapping_error",
+        field="supplier.hand_quality",
+    )
+
+
+@pytest.mark.parametrize("state", [None, {"provided": False}])
+def test_missing_or_unprovided_supplier_quality_rejects_orphan_feature_registration(
+    tmp_path: Path, state: dict[str, object] | None
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "dataset")
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["features"]["supplier.hand_quality.status"] = {
+        "dtype": "uint8", "shape": [2]
+    }
+    info_path.write_text(json.dumps(info))
+    if state is not None:
+        semantics_path = root / "meta" / "episode_semantics.jsonl"
+        semantics = json.loads(semantics_path.read_text())
+        semantics["supplier_hand_quality"] = state
+        semantics_path.write_text(json.dumps(semantics) + "\n")
+
+    _assert_error(
+        lambda: StandardLeRobotAdapter().load(root),
+        code="field_mapping_error",
+        field="supplier.hand_quality",
+    )
+
+
 def test_fixed_feature_metadata_constants_are_not_inferred(tmp_path: Path) -> None:
     root = write_standard_lerobot_dataset(tmp_path / "dataset")
     info_path = root / "meta" / "info.json"
