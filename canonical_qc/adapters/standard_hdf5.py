@@ -79,6 +79,25 @@ def _file_metadata(path: Path, *, role: str, relative_path: str) -> SourceFile:
     )
 
 
+def _reject_symlink_chain(path: Path, *, field: str) -> None:
+    """Reject symlinks in an absolute lexical path before any resolution."""
+
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError:
+            # Preserve the caller's existing missing/not-a-directory diagnostic.
+            return
+        if stat.S_ISLNK(metadata.st_mode):
+            _fail(
+                "source_integrity_error",
+                field,
+                f"path component {current} must not be a symlink",
+            )
+
+
 class StandardHdf5Adapter:
     adapter_id = "standard_hdf5"
     adapter_version = "1.0.0"
@@ -100,8 +119,10 @@ class StandardHdf5Adapter:
         source_path = Path(source).expanduser()
         if not source_path.is_absolute():
             source_path = Path.cwd() / source_path
+        _reject_symlink_chain(source_path, field="source")
         if source_path.is_dir():
-            source_root = source_path.resolve()
+            source_root_input = source_path
+            source_root = source_root_input.resolve()
             candidates = sorted(source_root.glob("*.h5"))
             if len(candidates) != 1:
                 _fail(
@@ -109,21 +130,11 @@ class StandardHdf5Adapter:
                     "source",
                     f"episode directory must contain exactly one .h5 file, found {len(candidates)}",
                 )
-            if candidates[0].is_symlink():
-                _fail(
-                    "source_integrity_error",
-                    "source",
-                    "HDF5 path must not be a symlink",
-                )
+            _reject_symlink_chain(candidates[0], field="source")
             hdf5_path = candidates[0].resolve()
         elif source_path.suffix == ".h5" and source_path.is_file():
-            if source_path.is_symlink():
-                _fail(
-                    "source_integrity_error",
-                    "source",
-                    "HDF5 path must not be a symlink",
-                )
-            source_root = source_path.parent.resolve()
+            source_root_input = source_path.parent
+            source_root = source_root_input.resolve()
             hdf5_path = source_path.resolve()
         else:
             _fail(
@@ -131,13 +142,8 @@ class StandardHdf5Adapter:
                 "source",
                 "must be an episode directory or an existing .h5 file",
             )
-        main_video_source = source_root / "main.mp4"
-        if main_video_source.is_symlink():
-            _fail(
-                "source_integrity_error",
-                "main_video.path",
-                "main.mp4 must not be a symlink alias",
-            )
+        main_video_source = source_root_input / "main.mp4"
+        _reject_symlink_chain(main_video_source, field="main_video.path")
         main_video_path = main_video_source.resolve()
         if hdf5_path.parent != source_root:
             _fail("source_integrity_error", "source", "HDF5 path escapes source root")

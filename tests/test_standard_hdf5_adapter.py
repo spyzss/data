@@ -163,6 +163,37 @@ def test_directory_resolution_rejects_main_video_symlink_alias(tmp_path: Path) -
     )
 
 
+def test_inspect_rejects_a_symlink_episode_directory_source(tmp_path: Path) -> None:
+    real_episode = tmp_path / "real" / "asset-001"
+    write_standard_hdf5_episode(real_episode)
+    linked_episode = tmp_path / "asset-001"
+    linked_episode.symlink_to(real_episode, target_is_directory=True)
+
+    _assert_error(
+        lambda: StandardHdf5Adapter().inspect(linked_episode),
+        code="source_integrity_error",
+        field="source",
+    )
+
+
+def test_inspect_rejects_an_explicit_hdf5_beneath_a_symlink_parent(
+    tmp_path: Path,
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_episode = real_parent / "asset-001"
+    write_standard_hdf5_episode(real_episode)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    explicit_hdf5 = linked_parent / "asset-001" / "asset-001.h5"
+    assert explicit_hdf5.is_symlink() is False
+
+    _assert_error(
+        lambda: StandardHdf5Adapter().inspect(explicit_hdf5),
+        code="source_integrity_error",
+        field="source",
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "code", "field"),
     [
