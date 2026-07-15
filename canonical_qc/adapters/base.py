@@ -17,8 +17,17 @@ class SourceInspection:
     source_schema_version: str
     asset_id: str
     source_root: Path
-    hdf5_path: Path
     main_video_path: Path
+    hdf5_path: Path | None = None
+    info_path: Path | None = None
+    episode_metadata_paths: tuple[Path, ...] = ()
+    data_path: Path | None = None
+    semantics_path: Path | None = None
+    episode_index: int | None = None
+    frame_count: int | None = None
+    data_row_offset: int = 0
+    video_frame_offset: int = 0
+    layout_version: Literal["v3", "v2.1"] | None = None
 
 
 class SourceAdapter(Protocol):

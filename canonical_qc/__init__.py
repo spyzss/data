@@ -1,6 +1,6 @@
 """Public contract boundary for canonical QC ingestion."""
 
-from .adapters import SourceAdapter, SourceInspection, StandardHdf5Adapter
+from .adapters import SourceAdapter, SourceInspection, StandardHdf5Adapter, StandardLeRobotAdapter
 from .contracts import (
     CameraCalibration,
     CanonicalQcEpisode,
@@ -34,6 +34,7 @@ __all__ = [
     "SourceInspection",
     "SourceProvenance",
     "StandardHdf5Adapter",
+    "StandardLeRobotAdapter",
     "Subtask",
     "SupplierEvidence",
     "SupplierHandQuality",
