@@ -426,6 +426,37 @@ def test_batch_write_preflights_all_scalar_expected_revisions_before_mutating(
     assert load_asset_qc_report(second_path)["report_revision"] == 2
 
 
+def test_exact_cli_batch_repeat_is_idempotent_with_original_expected_revision(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report_path = _report(tmp_path, issue_ids=("warn-1",))
+    csv_path = _csv(tmp_path, [_row("warn-1", "false_positive")])
+    argv = [
+        "--quality-archive",
+        str(report_path.parent),
+        "--csv",
+        str(csv_path),
+        "--reviewer",
+        "migration-bot",
+        "--expected-revision",
+        "1",
+    ]
+
+    assert legacy_cli.main(argv) == 0
+    first_output = json.loads(capsys.readouterr().out)
+    assert load_asset_qc_report(report_path)["report_revision"] == 2
+
+    assert legacy_cli.main(argv) == 0
+    second_output = json.loads(capsys.readouterr().out)
+
+    assert first_output["results"][0]["written"] is True
+    assert second_output["results"][0]["matched"] == 1
+    assert second_output["results"][0]["idempotent"] == 1
+    assert second_output["results"][0]["written"] is False
+    assert second_output["results"][0]["report_revision"] == 2
+    assert load_asset_qc_report(report_path)["report_revision"] == 2
+
+
 def test_audit_hash_uses_same_csv_byte_snapshot_as_imported_decision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

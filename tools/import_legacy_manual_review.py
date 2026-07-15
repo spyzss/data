@@ -110,12 +110,33 @@ def main(argv: list[str] | None = None) -> int:
             )
         loaded_targets.append((requested_asset_id, path, report))
 
+    directory_mode = args.quality_archive.is_dir()
+    plans: list[ImportResult] = []
+    for _requested_asset_id, path, report in loaded_targets:
+        current_revision = int(report.get("report_revision", 0))
+        plans.append(
+            import_legacy_manual_review(
+                path,
+                args.csv,
+                args.progress_json,
+                expected_revision=current_revision,
+                reviewer=args.reviewer,
+                dry_run=True,
+                issue_mapping_path=args.issue_mapping,
+                asset_scope_only=directory_mode,
+                _csv_bytes=csv_bytes,
+                _progress_bytes=progress_bytes,
+                _mapping_bytes=mapping_bytes,
+            )
+        )
+
     if not args.dry_run:
         expected = int(args.expected_revision)
         stale = [
             (path, int(report.get("report_revision", 0)))
-            for _asset_id, path, report in loaded_targets
-            if int(report.get("report_revision", 0)) != expected
+            for (_asset_id, path, report), plan in zip(loaded_targets, plans, strict=True)
+            if plan.matched_count > plan.idempotent_count
+            and int(report.get("report_revision", 0)) != expected
         ]
         if stale:
             details = ", ".join(f"{path}={revision}" for path, revision in stale)
@@ -123,26 +144,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"batch preflight expected revision {expected}; mismatches: {details}"
             )
 
-    results: list[ImportResult] = []
-    directory_mode = args.quality_archive.is_dir()
-    for _requested_asset_id, path, report in loaded_targets:
-        current_revision = int(report.get("report_revision", 0))
-        result = import_legacy_manual_review(
-            path,
-            args.csv,
-            args.progress_json,
-            expected_revision=(
-                current_revision if args.dry_run else int(args.expected_revision)
-            ),
-            reviewer=args.reviewer,
-            dry_run=args.dry_run,
-            issue_mapping_path=args.issue_mapping,
-            asset_scope_only=directory_mode,
-            _csv_bytes=csv_bytes,
-            _progress_bytes=progress_bytes,
-            _mapping_bytes=mapping_bytes,
-        )
-        results.append(result)
+    if args.dry_run:
+        results = plans
+    else:
+        results = []
+        for _requested_asset_id, path, _report in loaded_targets:
+            result = import_legacy_manual_review(
+                path,
+                args.csv,
+                args.progress_json,
+                expected_revision=int(args.expected_revision),
+                reviewer=args.reviewer,
+                dry_run=False,
+                issue_mapping_path=args.issue_mapping,
+                asset_scope_only=directory_mode,
+                _csv_bytes=csv_bytes,
+                _progress_bytes=progress_bytes,
+                _mapping_bytes=mapping_bytes,
+            )
+            results.append(result)
 
     unmatched = empty_asset_rows + sum(asset_counts[asset_id] for asset_id in unknown_assets)
     unmatched += sum(result.unmatched_count for result in results)
