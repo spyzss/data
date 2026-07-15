@@ -316,7 +316,7 @@ test("non-empty warn candidates do not auto-complete when selection is temporari
       return { render: () => {} };
     },
   });
-  assert.equal(app.advanceStage({
+  const queuedTask = {
     ...warnTask,
     warn: {
       ...warnTask.warn,
@@ -324,8 +324,13 @@ test("non-empty warn candidates do not auto-complete when selection is temporari
       selected_issue_ids: [],
       selected_issues: {},
     },
-  }), "warn_review");
+  };
+  assert.equal(app.advanceStage(queuedTask), "warn_review");
   assert.equal(warnConstructed, 1);
+  const markup = renderWarnMarkup(queuedTask);
+  assert.match(markup, /data-warn-queued/);
+  assert.match(markup, /1 个.*等待选择/);
+  assert.doesNotMatch(markup, /任务已完成|data-action="complete-warn"/);
 });
 
 test("configured warn evidence video hides the opaque media placeholder", () => {
@@ -343,6 +348,45 @@ test("configured warn evidence video hides the opaque media placeholder", () => 
   assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
   assert.equal(video.currentTime, 0);
   assert.equal(videoPlaceholder.hidden, true);
+});
+
+test("switching from a clipped issue to an issue without a clip clears stale video", () => {
+  let loadCount = 0;
+  let pauseCount = 0;
+  let removedSource = false;
+  const video = {
+    src: "",
+    currentTime: -1,
+    dataset: {},
+    addEventListener() {},
+    removeEventListener() {},
+    removeAttribute(name) {
+      if (name === "src") {
+        removedSource = true;
+        this.src = "";
+      }
+    },
+    load() { loadCount += 1; },
+    pause() { pauseCount += 1; },
+  };
+  const videoPlaceholder = { hidden: false };
+  const adapter = new WarnReviewAdapter({ video, videoPlaceholder });
+  const sequentialTask = structuredClone(warnTask);
+  sequentialTask.evidence.push({
+    issue_id: "warn-2",
+    generation_error: "clip generation failed",
+  });
+  adapter.task = sequentialTask;
+  adapter.configureVideo(buildWarnIssueModel(sequentialTask, "warn-1"));
+  assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
+  assert.equal(videoPlaceholder.hidden, true);
+
+  adapter.configureVideo(buildWarnIssueModel(sequentialTask, "warn-2"));
+  assert.equal(removedSource, true);
+  assert.equal(video.src, "");
+  assert.equal(loadCount, 1);
+  assert.equal(pauseCount, 1);
+  assert.equal(videoPlaceholder.hidden, false);
 });
 
 test("rejected Pass or Fail saves are caught and shown in the warn error region", async () => {

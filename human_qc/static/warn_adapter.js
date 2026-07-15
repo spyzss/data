@@ -115,7 +115,13 @@ export function allSelectedIssuesReviewed(task) {
 export function renderWarnMarkup(task, issueId = null) {
   const ids = selectedIds(task);
   if (!ids.length) {
-    return '<div class="empty-stage" data-warn-empty>没有需要人工复核的 Warn，任务已完成。</div>';
+    const candidates = Array.isArray(task?.warn?.candidate_issue_ids)
+      ? task.warn.candidate_issue_ids
+      : [];
+    if (candidates.length) {
+      return `<div class="empty-stage" data-warn-queued><span>${candidates.length} 个 Warn 候选，等待选择人工复核项。</span></div>`;
+    }
+    return '<div class="empty-stage" data-warn-empty>没有需要人工复核的 Warn。</div>';
   }
   const model = buildWarnIssueModel(task, issueId);
   const reviews = objectOrEmpty(task?.warn?.issue_reviews);
@@ -254,8 +260,13 @@ export class WarnReviewAdapter {
       video.src = model.clipUrl;
       video.currentTime = 0;
       if (this.videoPlaceholder) this.videoPlaceholder.hidden = true;
-    } else if (fps > 0 && Number.isInteger(startFrame)) {
-      video.currentTime = startFrame / fps;
+    } else {
+      video.pause?.();
+      if (typeof video.removeAttribute === "function") video.removeAttribute("src");
+      else video.src = "";
+      video.load?.();
+      video.currentTime = 0;
+      if (this.videoPlaceholder) this.videoPlaceholder.hidden = false;
     }
     video.dataset && (video.dataset.windowStartFrame = String(startFrame ?? ""));
     video.dataset && (video.dataset.windowEndFrameExclusive = String(endFrame ?? ""));
