@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from qc_reporting.projection import BatchProjection, project_quality_archive
-from tests.qc_report_fixtures import make_v2_report
+from tests.qc_report_fixtures import make_manual_block, make_v2_report
 
 
 def _issue(issue_id: str, severity: str = "warn", module: str = "video_quality") -> dict[str, Any]:
@@ -52,16 +52,17 @@ def _write_report(
         "stop_reason": None,
     }
     report["issues"] = copy.deepcopy(issues or [])
-    report["manual_review"] = {
-        "required": any(item["severity"] == "warn" for item in report["issues"]),
-        "state": "queued" if issues else "not_required",
-        "candidate_issue_ids": [
-            item["issue_id"] for item in report["issues"] if item["severity"] == "warn"
-        ],
-        "failures_for_batch_stats_issue_ids": [
-            item["issue_id"] for item in report["issues"] if item["severity"] == "fail"
-        ],
-    }
+    candidate_ids = [
+        item["issue_id"] for item in report["issues"] if item["severity"] == "warn"
+    ]
+    report["manual_review"] = make_manual_block(
+        state="queued" if candidate_ids else "not_required",
+        candidate_issue_ids=candidate_ids,
+    )
+    report["manual_review"]["required"] = bool(candidate_ids)
+    report["manual_review"]["failures_for_batch_stats_issue_ids"] = [
+        item["issue_id"] for item in report["issues"] if item["severity"] == "fail"
+    ]
     path = archive / f"{asset_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")

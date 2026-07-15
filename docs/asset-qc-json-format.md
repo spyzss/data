@@ -12,14 +12,13 @@
 不得创建另一份模块专属主报告。CSV、HTML、sidecar、overlay 和 ledger 都只是
 证据或批次派生产物。
 
-当前 schema：
+当前正式 schema：
 
 ```text
-schemas/asset_qc_report.v1.schema.json
+schemas/asset_qc_report.v2.schema.json
 ```
 
-当前代码已实现 `video_quality` 的写入合同；其余模块按
-`docs/PRD-qc-gated-json.md` 接入。
+旧 v1 报告必须先迁移到 v2；人工语义校准和 Warn 复核只写 v2 报告。
 
 ## 2. 顶层结构
 
@@ -27,16 +26,21 @@ schemas/asset_qc_report.v1.schema.json
 
 ```json
 {
-  "schema_version": "asset_qc_report.v1",
+  "schema_version": "asset_qc_report.v2",
   "qc_config": {
-    "schema_version": "qc_acceptance_config_schema.v1",
-    "config_version": "qc_acceptance_v1.1.0",
+    "schema_version": "qc_acceptance_config_schema.v2",
+    "config_version": "qc_acceptance_v2.0.0",
     "config_name": "acceptance_gate",
     "config_path": "configs/qc_acceptance.yaml",
     "config_hash": "sha256:<64 lowercase hex characters>"
   },
   "asset_id": "file-008",
   "report_revision": 3,
+  "execution": {
+    "profile": "acceptance",
+    "started_at": "2026-07-15T00:00:00Z",
+    "updated_at": "2026-07-15T00:05:00Z"
+  },
   "pipeline_state": {
     "status": "running",
     "last_completed_module": "video_quality",
@@ -126,7 +130,7 @@ schemas/asset_qc_report.v1.schema.json
 
 | 字段 | 规则 |
 |---|---|
-| `schema_version` | 固定为 `asset_qc_report.v1`。 |
+| `schema_version` | 正式人工流程固定为 `asset_qc_report.v2`；v1 只作为迁移输入。 |
 | `qc_config` | 本次 pipeline 初始化时锁定的统一配置引用。 |
 | `asset_id` | 资产唯一 ID，也是 JSON 文件名。 |
 | `report_revision` | 每次成功写回加 1，用于防止旧结果覆盖新结果。 |
@@ -142,8 +146,8 @@ schemas/asset_qc_report.v1.schema.json
 
 ```json
 {
-  "schema_version": "qc_acceptance_config_schema.v1",
-  "config_version": "qc_acceptance_v1.1.0",
+  "schema_version": "qc_acceptance_config_schema.v2",
+  "config_version": "qc_acceptance_v2.0.0",
   "config_name": "acceptance_gate",
   "config_path": "configs/qc_acceptance.yaml",
   "config_hash": "sha256:..."
@@ -164,11 +168,11 @@ schemas/asset_qc_report.v1.schema.json
 | `pending` | 已建档，尚未开始或等待当前 gate。 | 必须为 `null` |
 | `running` | 自动 QC 仍在继续。 | 必须为 `null` |
 | `stopped` | 某个模块 hard fail，后续 QC 已停止。 | 必须为 `fail` |
-| `completed` | 所有应运行模块完成。 | `pass` 或 `warn` |
+| `completed` | 所有应运行模块及适用的人工阶段完成。 | `pass` 或 `fail` |
 
 `pending` 不是质量等级，也不等于 warn。`warn` 是模块对具体问题的判定；
 流程未结束时只保存在 module verdict 和 `issues`，不提前写进
-`overall_decision`。
+`overall_decision`。人工阶段尚未完成或出现运行错误时也必须为 `null`。
 
 ## 4. Issue 结构
 
@@ -245,7 +249,43 @@ module.thresholds
 - 下游只读取上游 `exit_gate` 或顶层 `pipeline_state`，不解析自然语言原因。
 - 上游已 fail 时，后续高成本模块不得运行。
 
-## 6. `manual_review`
+## 6. 人工串行阶段
+
+正式顺序是自动 QC → `semantic_calibration` → `manual_review`。两个人工阶段
+复用同一份 QC JSON、同一 `report_revision` 与单资产 lease；CSV、progress JSON
+和浏览器 localStorage 都不是正式事实源。
+
+### 6.1 `semantic_calibration`
+
+语义时间轴内部采用共享边界 `b_0...b_n` 和半开区间
+`[start_frame, end_frame_exclusive)`。供应商 HDF5 使用闭区间，因此界面显示的
+结束帧恒为 `end_frame_exclusive - 1`。首尾边界固定，只显示内部边界手柄；整段
+色块不能拖动，也不支持拆分、合并、删除或整段平移。
+
+拖动内部边界 `b_i` 会在同一 pending transaction 中同时修改左段结束帧和右段
+起始帧。transaction 必须保存两段的 before/after 和两个 segment ID，但确认一次
+只增加一次 `timeline_edit_count`。取消恢复两段且不计数。文字修改独立增加
+`subtask_text_edit_count`。
+
+```json
+{
+  "state": "in_progress",
+  "source_dataset_path": "/label/subtask_label",
+  "base_hdf5_sha256": "sha256:...",
+  "final_hdf5_sha256": null,
+  "timeline_edit_count": 1,
+  "subtask_text_edit_count": 0,
+  "pending_edit": null,
+  "audit": []
+}
+```
+
+存在 pending edit 时，其他边界、文字、任务切换、完成样本和下一资产都锁定，
+必须先逐次确认或取消。完成语义阶段时，服务端在 HDF5 同目录生成临时副本，验证
+只有 `/label/subtask_label` 的 canonical 内容变化并 `fsync`，随后原子替换；不
+生成持久 `.bak`。
+
+### 6.2 `manual_review`
 
 自动模块只负责累计候选：
 
@@ -266,7 +306,15 @@ module.thresholds
   批次统计和返工使用。
 
 人工结果必须引用 `issue_id`，并写结构化结论、reviewer、时间和备注；不得覆盖
-机器观测值。完整字段由 `docs/PRD-qc-gated-json.md` 约束。
+机器观测、阈值、evidence 或机器 verdict：
+
+- 人工 Pass：该机器 Warn 被消解，effective verdict 为 pass；
+- 人工 Fail：确认该 Warn 为 fail，effective verdict 为 fail；
+- 自动 hard fail：始终保持 fail，人工 Pass 不能覆盖。
+
+每个 selected issue 都有 Pass/Fail 后才能完成样本。刷新页面从服务端 QC JSON
+恢复状态；写入必须带 lease token 和 expected revision。lease 无效返回 423；
+revision 过期返回 409，复核员应刷新后重新确认，禁止覆盖新 revision。
 
 ## 7. Video QC Block
 
@@ -343,3 +391,19 @@ revision 与预期不一致时必须报 stale-write 错误，不能静默覆盖�
 
 `sidecar` 是大体积模块明细的旁路文件；`ledger events` 是流程事件日志；CSV 是
 表格视图。它们可被 JSON 用相对路径引用，但不能代替 `<asset_id>.json`。
+
+正式聚合按 profile 输出下列指标，且同一资产只使用最大 `report_revision`：
+
+| 字段 | 定义 |
+|---|---|
+| `auto_fail_assets` / `auto_fail_issues` | 机器 hard-fail 的去重资产数 / issue 数。 |
+| `machine_warn_issues` | 顶层 `issues` 中机器 severity=warn 的总数，人工结果不会改写它。 |
+| `human_checked_warn_issues` | 已写 Pass 或 Fail 的 warn 数。 |
+| `human_resolved_warn_issues` | 人工 Pass、已消解的 warn 数。 |
+| `human_confirmed_fail_issues` | 人工 Fail、确认失败的 warn 数。 |
+| `timeline_edit_count` | 已确认共享边界事务数；按事务计数而不是按两个受影响段计数。 |
+| `subtask_text_edit_count` | 已确认文字修改事务数。 |
+| `final_pass_assets` / `final_fail_assets` | 最终二元结论的资产数。未完成和错误资产不进入通过率分母。 |
+
+旧 manual CSV/progress JSON 只能通过一次性导入工具迁移到当前 QC JSON，且导入
+前默认 dry-run；它们不能直接参与正式聚合。

@@ -24,7 +24,10 @@ def test_aggregation_counts_assets_and_issues_separately(tmp_path: Path) -> None
     assert stats["overall"]["asset_count"] == 2
     assert stats["overall"]["automatic_hard_fail_asset_count"] == 1
     assert stats["overall"]["automatic_hard_fail_issue_count"] == 2
+    assert stats["overall"]["auto_fail_assets"] == 1
+    assert stats["overall"]["auto_fail_issues"] == 2
     assert stats["overall"]["final_fail_asset_count"] == 1
+    assert stats["overall"]["final_fail_assets"] == 1
     assert stats["by_profile"]["acceptance"]["asset_count"] == 1
     assert stats["by_profile"]["supplier_evaluation"]["module_coverage"]["sam3_containment"] == 1.0
 

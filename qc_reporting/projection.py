@@ -34,6 +34,7 @@ class BatchProjection:
     issue_rows: tuple[dict[str, Any], ...]
     execution_rows: tuple[dict[str, Any], ...]
     source_manifest: tuple[dict[str, Any], ...]
+    human_review_rows: tuple[dict[str, Any], ...] = ()
 
 
 def _json_files(quality_archive: Path) -> tuple[Path, ...]:
@@ -90,15 +91,31 @@ def project_quality_archive(quality_archive: Path) -> BatchProjection:
     issue_rows: list[dict[str, Any]] = []
     execution_rows: list[dict[str, Any]] = []
     source_manifest: list[dict[str, Any]] = []
+    human_review_rows: list[dict[str, Any]] = []
 
     for path, report in _iter_asset_reports_with_paths(quality_archive):
         try:
             asset_row, issues, execution = _project_report_rows(path, report)
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"cannot project QC report {path}: {exc}") from exc
+        try:
+            human_rows = tuple(project_human_review_rows(report))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"cannot project QC report {path}: {exc}") from exc
+        if human_rows:
+            human = human_rows[0]
+            asset_row.update(
+                {
+                    "semantic_state": human["semantic_state"],
+                    "manual_review_state": human["manual_review_state"],
+                    "timeline_edit_count": human["timeline_edit_count"],
+                    "subtask_text_edit_count": human["subtask_text_edit_count"],
+                }
+            )
         asset_rows.append(asset_row)
         issue_rows.extend(issues)
         execution_rows.extend(execution)
+        human_review_rows.extend(human_rows)
         source_manifest.append(
             {
                 "path": str(path),
@@ -117,7 +134,89 @@ def project_quality_archive(quality_archive: Path) -> BatchProjection:
         issue_rows=tuple(issue_rows),
         execution_rows=tuple(execution_rows),
         source_manifest=tuple(source_manifest),
+        human_review_rows=tuple(human_review_rows),
     )
+
+
+def project_human_review_rows(
+    report: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Project the report-owned human state into one revision-scoped asset row.
+
+    The row intentionally contains only fields from ``semantic_calibration``
+    and ``manual_review`` plus stable join keys.  In particular, no CSV,
+    progress file, browser storage, or audit-entry recount participates in
+    these metrics.  The persisted counters already represent confirmed edit
+    transactions, so a shared boundary that changes two segments is counted
+    once.
+    """
+
+    if not isinstance(report, Mapping):
+        raise ValueError("asset QC report must be an object")
+    asset_id = report.get("asset_id")
+    if not isinstance(asset_id, str) or not asset_id:
+        raise ValueError("asset_id must be a non-empty string")
+
+    execution = report.get("execution")
+    execution_map = execution if isinstance(execution, Mapping) else {}
+    semantic = report.get("semantic_calibration")
+    semantic_map = semantic if isinstance(semantic, Mapping) else {}
+    manual = report.get("manual_review")
+    manual_map = manual if isinstance(manual, Mapping) else {}
+
+    reviews = manual_map.get("issue_reviews", {})
+    if not isinstance(reviews, Mapping):
+        raise ValueError("manual_review.issue_reviews must be an object")
+    normalized_reviews: dict[str, dict[str, str]] = {}
+    for issue_id, raw_review in reviews.items():
+        if not isinstance(issue_id, str) or not issue_id:
+            raise ValueError("manual_review.issue_reviews keys must be non-empty strings")
+        if not isinstance(raw_review, Mapping):
+            raise ValueError(f"manual_review.issue_reviews.{issue_id} must be an object")
+        human = raw_review.get("human_verdict", raw_review.get("verdict"))
+        if human not in {"pass", "fail"}:
+            raise ValueError(
+                f"manual_review.issue_reviews.{issue_id}.verdict must be pass or fail"
+            )
+        effective = raw_review.get("effective_verdict", human)
+        if effective not in {"pass", "fail"}:
+            raise ValueError(
+                f"manual_review.issue_reviews.{issue_id}.effective_verdict must be pass or fail"
+            )
+        normalized_reviews[issue_id] = {
+            "human_verdict": str(human),
+            "effective_verdict": str(effective),
+        }
+
+    return (
+        {
+            "asset_id": asset_id,
+            "supplier_id": _supplier_id(report),
+            "profile": str(
+                execution_map.get("profile") or report.get("profile") or "unknown"
+            ),
+            "report_revision": _nonnegative_int(
+                report.get("report_revision", 0), "report_revision"
+            ),
+            "semantic_state": str(semantic_map.get("state") or "not_evaluated"),
+            "manual_review_state": str(manual_map.get("state") or "not_evaluated"),
+            "timeline_edit_count": _nonnegative_int(
+                semantic_map.get("timeline_edit_count", 0),
+                "semantic_calibration.timeline_edit_count",
+            ),
+            "subtask_text_edit_count": _nonnegative_int(
+                semantic_map.get("subtask_text_edit_count", 0),
+                "semantic_calibration.subtask_text_edit_count",
+            ),
+            "issue_reviews": normalized_reviews,
+        },
+    )
+
+
+def _nonnegative_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
 
 
 _REPORT_TOP_LEVEL_KEYS = frozenset(

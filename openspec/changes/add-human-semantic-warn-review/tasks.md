@@ -2,7 +2,7 @@
 
 - [ ] 1.1 扩展 QC JSON Schema，加入 semantic calibration 状态、pending edit、审计计数和 HDF5 hash
 - [ ] 1.2 扩展 manual review Schema，加入 selected issue、逐 issue 人工 verdict、effective verdict 和完成约束
-- [ ] 1.3 更新批次投影，统计人工检查/消解/确认失败以及两类语义修改次数
+- [x] 1.3 更新批次投影，统计人工检查/消解/确认失败以及两类语义修改次数
 
 ## 2. 语义校准服务
 
@@ -34,7 +34,7 @@
 
 ## 6. 文档与端到端验证
 
-- [ ] 6.1 同步 PRD、JSON 格式文档和人工操作说明中的串行流程及逐次确认规则
+- [x] 6.1 同步 PRD、JSON 格式文档和人工操作说明中的串行流程及逐次确认规则
 - [ ] 6.2 测试全 Pass 跳过人工质检、warn 人工 Pass、warn 人工 Fail 和多 warn 未完成四类流程
 - [ ] 6.3 测试浏览器刷新、并发 reviewer stale revision、overlay 生成失败和 HDF5 原子写入失败
 - [ ] 6.4 运行全量测试并验证每份最终 QC JSON 可独立生成资产质量报告

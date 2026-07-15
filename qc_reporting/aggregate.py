@@ -33,6 +33,7 @@ def aggregate_projection(projection: BatchProjection) -> dict[str, Any]:
     assets = tuple(_rows(projection, "asset_rows"))
     issues = tuple(_rows(projection, "issue_rows"))
     executions = tuple(_rows(projection, "execution_rows"))
+    human_reviews = tuple(_rows(projection, "human_review_rows"))
     profiles = sorted(
         {
             str(row.get("profile") or "unknown")
@@ -40,12 +41,13 @@ def aggregate_projection(projection: BatchProjection) -> dict[str, Any]:
         }
     )
     return {
-        "overall": _aggregate_group(assets, issues, executions),
+        "overall": _aggregate_group(assets, issues, executions, human_reviews),
         "by_profile": {
             profile: _aggregate_group(
                 tuple(row for row in assets if _profile(row) == profile),
                 tuple(row for row in issues if _profile(row) == profile),
                 tuple(row for row in executions if _profile(row) == profile),
+                tuple(row for row in human_reviews if _profile(row) == profile),
             )
             for profile in profiles
         },
@@ -106,11 +108,20 @@ def _aggregate_group(
     asset_rows: Iterable[Mapping[str, Any]],
     issue_rows: Iterable[Mapping[str, Any]],
     execution_rows: Iterable[Mapping[str, Any]],
+    human_review_rows: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
     assets = _latest_rows(asset_rows, _asset_key)
-    issues = _latest_rows(issue_rows, _issue_key)
-    executions = _latest_rows(execution_rows, _execution_key)
     asset_keys = {_asset_key(row) for row in assets}
+    current_revisions = {_asset_key(row): _revision(row) for row in assets}
+    issues = _latest_rows(
+        _at_current_revision(issue_rows, current_revisions), _issue_key
+    )
+    executions = _latest_rows(
+        _at_current_revision(execution_rows, current_revisions), _execution_key
+    )
+    human_reviews = _latest_rows(
+        _at_current_revision(human_review_rows, current_revisions), _asset_key
+    )
 
     hard_fail_issues = tuple(
         row for row in issues if _machine_severity(row) == "fail"
@@ -143,22 +154,36 @@ def _aggregate_group(
         if row.get("decision", row.get("overall_decision")) == "fail"
     }
 
-    human_checked = {
-        _issue_key(row)
-        for row in warn_issues
-        if _is_human_verdict(row.get("human_verdict"))
-    }
+    warn_keys = {_issue_key(row) for row in warn_issues}
+    reviewed_verdicts = _reviewed_warn_verdicts(human_reviews, warn_keys)
+    if not human_reviews:
+        # Compatibility for projections produced before the dedicated human
+        # row was introduced.  New formal projections always use the
+        # revision-scoped human rows above.
+        reviewed_verdicts = {
+            _issue_key(row): str(row.get("human_verdict") or "").lower()
+            for row in warn_issues
+            if _is_human_verdict(row.get("human_verdict"))
+        }
+    human_checked = set(reviewed_verdicts)
     human_resolved = {
-        _issue_key(row)
-        for row in warn_issues
-        if _is_human_verdict(row.get("effective_verdict"))
+        issue_key for issue_key, verdict in reviewed_verdicts.items() if verdict == "pass"
     }
     human_confirmed_fail = {
-        _issue_key(row)
-        for row in warn_issues
-        if row.get("effective_verdict") == "fail"
-        or row.get("human_verdict") == "fail"
+        issue_key for issue_key, verdict in reviewed_verdicts.items() if verdict == "fail"
     }
+
+    human_counter_rows = human_reviews if human_reviews else assets
+    timeline_edit_count = sum(
+        _count_value(row.get("timeline_edit_count", 0), "timeline_edit_count")
+        for row in human_counter_rows
+    )
+    subtask_text_edit_count = sum(
+        _count_value(
+            row.get("subtask_text_edit_count", 0), "subtask_text_edit_count"
+        )
+        for row in human_counter_rows
+    )
 
     module_coverage, module_state_counts = _module_metrics(executions, asset_keys)
     stop_position = Counter(
@@ -182,7 +207,7 @@ def _aggregate_group(
     final_asset_count = len(final_pass | final_fail)
     pass_rate = len(final_pass) / final_asset_count if final_asset_count else 0.0
     asset_count = len(assets)
-    return {
+    result = {
         "asset_count": asset_count,
         "total_asset_count": asset_count,
         "issue_count": len(issues),
@@ -197,6 +222,8 @@ def _aggregate_group(
         "human_checked_warn_issue_count": len(human_checked),
         "human_resolved_warn_issue_count": len(human_resolved),
         "human_confirmed_fail_issue_count": len(human_confirmed_fail),
+        "timeline_edit_count": timeline_edit_count,
+        "subtask_text_edit_count": subtask_text_edit_count,
         "final_pass_asset_count": len(final_pass),
         "final_fail_asset_count": len(final_fail),
         "final_asset_count": final_asset_count,
@@ -207,6 +234,58 @@ def _aggregate_group(
         "continued_after_fail_asset_count": len(continued_assets),
         "runtime_error_asset_count": len(runtime_error_assets),
     }
+    result.update(
+        {
+            "auto_fail_assets": len(hard_fail_assets),
+            "auto_fail_issues": len(hard_fail_issues),
+            "machine_warn_issues": len(warn_issues),
+            "human_checked_warn_issues": len(human_checked),
+            "human_resolved_warn_issues": len(human_resolved),
+            "human_confirmed_fail_issues": len(human_confirmed_fail),
+            "final_pass_assets": len(final_pass),
+            "final_fail_assets": len(final_fail),
+        }
+    )
+    return result
+
+
+def _at_current_revision(
+    rows: Iterable[Mapping[str, Any]],
+    current_revisions: Mapping[tuple[str, str], int],
+) -> tuple[Mapping[str, Any], ...]:
+    return tuple(
+        row
+        for row in rows
+        if _asset_key(row) in current_revisions
+        and _revision(row) == current_revisions[_asset_key(row)]
+    )
+
+
+def _reviewed_warn_verdicts(
+    human_rows: Iterable[Mapping[str, Any]],
+    warn_keys: set[tuple[str, str, str]],
+) -> dict[tuple[str, str, str], str]:
+    verdicts: dict[tuple[str, str, str], str] = {}
+    for row in human_rows:
+        reviews = row.get("issue_reviews", {})
+        if not isinstance(reviews, Mapping):
+            raise TypeError("human_review_rows.issue_reviews must be a mapping")
+        for issue_id, review in reviews.items():
+            if not isinstance(review, Mapping):
+                raise TypeError("human review entries must be mappings")
+            issue_key = (*_asset_key(row), str(issue_id))
+            verdict = str(
+                review.get("human_verdict") or review.get("verdict") or ""
+            ).lower()
+            if issue_key in warn_keys and _is_human_verdict(verdict):
+                verdicts[issue_key] = verdict
+    return verdicts
+
+
+def _count_value(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TypeError(f"{field} must be a non-negative integer")
+    return value
 
 
 def _machine_severity(row: Mapping[str, Any]) -> str:
