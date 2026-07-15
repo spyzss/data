@@ -65,11 +65,11 @@ def probe_video(path: Path) -> ProbedVideo: ...
 def validate_video_alignment(time_axis: TimeAxis, video: ProbedVideo, *, max_delta_ns: int) -> None: ...
 ```
 
-- [ ] Step 1: 用 tiny MP4/monkeypatched ffprobe 添加 frame count、尺寸、codec、逐帧 PTS、PTS 归零、数量不足、偏差超限和 ffprobe 缺失测试。
-- [ ] Step 2: 运行新增测试，确认函数缺失导致失败。
-- [ ] Step 3: 实现无 shell 插值的 `subprocess.run([...])`，解析 rational FPS 和 frame PTS；不使用 FPS 合成 PTS。
-- [ ] Step 4: 运行新增测试和 `tests/test_acceptance_video_quality.py` 的时间轴用例。
-- [ ] Step 5: 提交 `feat(canonical): validate video timestamps against canonical time`。
+- [x] Step 1: 用 tiny MP4/monkeypatched ffprobe 添加 frame count、尺寸、codec、逐帧 PTS、PTS 归零、数量不足、偏差超限和 ffprobe 缺失测试。
+- [x] Step 2: 运行新增测试，确认函数缺失导致失败。
+- [x] Step 3: 实现无 shell 插值的 `subprocess.run([...])`，解析 rational FPS 和 frame PTS；不使用 FPS 合成 PTS。
+- [x] Step 4: 运行新增测试和 `tests/test_acceptance_video_quality.py` 的时间轴用例。
+- [x] Step 5: 提交 `feat(canonical): validate video timestamps against canonical time`。
 
 ## Task 3: 实现 StandardHdf5Adapter
 
