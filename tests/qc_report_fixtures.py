@@ -150,12 +150,22 @@ def make_boundary_edit(
 
 def make_text_edit(*, affected_segment_ids: list[str] | tuple[str, ...] = ("segment-0",)) -> dict[str, Any]:
     ids = list(affected_segment_ids)
+    segment_id = ids[0] if ids else "segment-0"
+    before = {
+        "internal_id": segment_id,
+        "start_frame": 0,
+        "end_frame_exclusive": 10,
+        "text_cn": "旧文本",
+        "text_en": "old text",
+    }
+    after = copy.deepcopy(before)
+    after.update({"text_cn": "新文本", "text_en": "new text"})
     return {
         "edit_type": "text",
-        "segment_id": ids[0] if ids else "segment-0",
+        "segment_id": segment_id,
         "affected_segment_ids": ids,
-        "before": {"text_cn": "旧文本", "text_en": "old text"},
-        "after": {"text_cn": "新文本", "text_en": "new text"},
+        "before": before,
+        "after": after,
         "reviewer": "alice",
         "created_at": "2026-07-15T00:00:00Z",
     }

@@ -10,6 +10,7 @@ non-authoritative.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -189,11 +190,32 @@ class WorkbenchService:
         resolver = getattr(service, "resolve", None)
         if not callable(resolver):
             return result
+        evidence_by_id: dict[str, Mapping[str, Any]] = {}
+        for block in report.values():
+            if not isinstance(block, Mapping):
+                continue
+            rows = block.get("evidence")
+            if not isinstance(rows, (list, tuple)):
+                continue
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                evidence_id = row.get("evidence_id")
+                if isinstance(evidence_id, str) and evidence_id:
+                    evidence_by_id[evidence_id] = row
         for issue in issues:
             if not isinstance(issue, Mapping) or issue.get("issue_id") not in selected_set:
                 continue
+            resolved_issue = deepcopy(dict(issue))
+            evidence_ids = issue.get("evidence_ids", [])
+            if isinstance(evidence_ids, (list, tuple)) and evidence_ids:
+                resolved_issue["evidence"] = [
+                    deepcopy(dict(evidence_by_id[evidence_id]))
+                    for evidence_id in evidence_ids
+                    if isinstance(evidence_id, str) and evidence_id in evidence_by_id
+                ]
             try:
-                view = resolver(issue, context)
+                view = resolver(resolved_issue, context)
             except Exception as exc:
                 # Evidence is optional in the task DTO.  Preserve the issue
                 # identifier and a stable error so the UI can show a retry.
@@ -209,6 +231,8 @@ class WorkbenchService:
             raise ValueError("asset_id must be a non-empty string")
         context = self._context(asset_id)
         report = self._report(asset_id, context)
+        if self._recover_external_resume(asset_id, report):
+            report = self._report(asset_id, context)
         pipeline = report.get("pipeline_state") if isinstance(report, Mapping) else None
         pipeline_status = pipeline.get("status") if isinstance(pipeline, Mapping) else None
         pipeline_next = pipeline.get("next_module") if isinstance(pipeline, Mapping) else None
@@ -430,6 +454,63 @@ class WorkbenchService:
             expected_revision=int(report.get("report_revision", 0)),
             registry=registry,
         )
+
+    def _recover_external_resume(
+        self,
+        asset_id: str,
+        report: Mapping[str, Any] | None,
+    ) -> bool:
+        """Consume a durable domain-completion marker at the exact cursor."""
+
+        if self.config is None or not isinstance(report, Mapping):
+            return False
+        pipeline = report.get("pipeline_state")
+        if not isinstance(pipeline, Mapping) or pipeline.get("status") != "awaiting_external":
+            return False
+        completed_module = pipeline.get("next_module")
+        if completed_module == "semantic_consistency":
+            block = report.get("semantic_calibration")
+            completed = isinstance(block, Mapping) and block.get("state") == "completed"
+        elif completed_module == "manual_review":
+            block = report.get("manual_review")
+            completed = isinstance(block, Mapping) and block.get("state") in {
+                "completed",
+                "not_required",
+            }
+        else:
+            return False
+        if not completed or not block.get("orchestrator_resume_required", False):
+            return False
+        try:
+            self._resume_external(asset_id, completed_module)
+        except Exception:
+            # A competing fetch (or a failure after the transition write) may
+            # already have consumed the exact marker.  Treat that as success;
+            # retry only while the same durable crash window remains.
+            latest = self._report(asset_id, self._context(asset_id))
+            latest_pipeline = (
+                latest.get("pipeline_state") if isinstance(latest, Mapping) else None
+            )
+            if completed_module == "semantic_consistency":
+                latest_block = (
+                    latest.get("semantic_calibration")
+                    if isinstance(latest, Mapping)
+                    else None
+                )
+            else:
+                latest_block = (
+                    latest.get("manual_review") if isinstance(latest, Mapping) else None
+                )
+            still_pending = (
+                isinstance(latest_pipeline, Mapping)
+                and latest_pipeline.get("status") == "awaiting_external"
+                and latest_pipeline.get("next_module") == completed_module
+                and isinstance(latest_block, Mapping)
+                and latest_block.get("orchestrator_resume_required", False)
+            )
+            if still_pending:
+                raise
+        return True
 
     def semantic_boundary_pending(
         self,

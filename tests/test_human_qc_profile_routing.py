@@ -518,6 +518,215 @@ def test_workbench_semantic_completion_keeps_cursor_for_orchestrator(
     assert persisted["pipeline_state"]["last_completed_module"] == "tail"
 
 
+def test_task_fetch_recovers_semantic_domain_completion_crash_window_once(
+    tmp_path: Path,
+) -> None:
+    asset_id = "semantic-recovery"
+    hdf5_path = tmp_path / "source" / f"{asset_id}.hdf5"
+    hdf5_path.parent.mkdir(parents=True)
+    payload = {
+        "id": asset_id,
+        "scene": "kitchen",
+        "task": "move block",
+        "fps": 30.0,
+        "frame_count": 30,
+        "annotations": [
+            {
+                "start_frame": 0,
+                "end_frame": 29,
+                "start_time_sec": 0.0,
+                "end_time_sec": 29 / 30,
+                "subtask_cn": "移动方块",
+                "subtask_en": "move block",
+                "verb": "move",
+                "object": "block",
+                "target": "tray",
+                "hand": "right",
+                "phase": "move",
+                "evidence_frames": [0, 29],
+                "confidence": 0.9,
+                "status": "confirmed",
+            }
+        ],
+    }
+    with h5py.File(hdf5_path, "w") as handle:
+        dataset = handle.create_group("label").create_dataset(
+            "subtask_label", shape=(), dtype="S65536"
+        )
+        dataset[()] = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    context = AssetContext(
+        asset_id,
+        tmp_path,
+        tmp_path / "quality_archive" / f"{asset_id}.json",
+        {"hdf5": {"path": hdf5_path.relative_to(tmp_path).as_posix()}},
+    )
+    config = _config(tmp_path, ["auto", "semantic_consistency", "tail"])
+    calls: list[str] = []
+    registry = _registry(calls=calls)
+    first = run_asset(context, config=config, profile="acceptance", registry=registry)
+    semantic = SemanticCalibrationService(
+        assets={asset_id: hdf5_path},
+        reports={asset_id: context.report_path},
+        leases={asset_id: "lease"},
+    )
+
+    semantic.complete(
+        asset_id,
+        first.report["report_revision"],
+        "lease",
+        advance_pipeline=False,
+    )
+    crashed = load_asset_qc_report(context.report_path)
+    assert crashed is not None
+    assert crashed["semantic_calibration"]["orchestrator_resume_required"] is True
+    assert crashed["pipeline_state"]["next_module"] == "semantic_consistency"
+    service = WorkbenchService(
+        semantic_service=SemanticCalibrationService(
+            assets={asset_id: hdf5_path}, reports={asset_id: context.report_path}
+        ),
+        asset_contexts={asset_id: context},
+        profile="acceptance",
+        config=config,
+        registry_factory=lambda *_: registry,
+    )
+    real_resume = service._resume_external
+    attempts = 0
+
+    def fail_first_resume(asset: str, module: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("orchestrator temporarily unavailable")
+        real_resume(asset, module)
+
+    service._resume_external = fail_first_resume
+    before_failed_retry = context.report_path.read_bytes()
+    with pytest.raises(RuntimeError, match="temporarily unavailable"):
+        service.get_asset_task(asset_id)
+    assert context.report_path.read_bytes() == before_failed_retry
+
+    recovered = service.get_asset_task(asset_id)
+    after_first_fetch = context.report_path.read_bytes()
+    recovered_again = service.get_asset_task(asset_id)
+
+    assert recovered["task_type"] == recovered_again["task_type"] == "completed"
+    assert calls == ["auto", "tail"]
+    persisted = load_asset_qc_report(context.report_path)
+    assert persisted is not None
+    assert persisted["pipeline_state"]["last_completed_module"] == "tail"
+    assert "orchestrator_resume_required" not in persisted["semantic_calibration"]
+    assert context.report_path.read_bytes() == after_first_fetch
+
+
+def test_task_fetch_recovers_warn_domain_completion_crash_window_once(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path, "warn-recovery")
+    config = _config(
+        tmp_path,
+        ["auto", "semantic_consistency", "manual_review", "tail"],
+    )
+    calls: list[str] = []
+    registry = _registry(calls=calls, auto_issues=(_warn_issue(),))
+    first = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=registry,
+    )
+    report = load_asset_qc_report(context.report_path)
+    assert report is not None
+    report["manual_review"].update(
+        {
+            "required": True,
+            "state": "queued",
+            "selected_issue_ids": ["warn-1"],
+            "selected_issue_id": "warn-1",
+            "issue_reviews": {},
+            "completed_at": None,
+        }
+    )
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    resume_after_external(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        completed_module="semantic_consistency",
+        expected_revision=first.report["report_revision"],
+        registry=registry,
+    )
+    report = load_asset_qc_report(context.report_path)
+    assert report is not None
+    report["semantic_calibration"] = {
+        "state": "completed",
+        "source_dataset_path": "/label/subtask_label",
+        "base_hdf5_sha256": "sha256:" + "0" * 64,
+        "final_hdf5_sha256": "sha256:" + "1" * 64,
+        "timeline_edit_count": 0,
+        "subtask_text_edit_count": 0,
+        "pending_edit": None,
+        "audit": [],
+    }
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    warn = WarnReviewService(
+        reports={context.asset_id: context.report_path},
+        leases={context.asset_id: "lease"},
+        reviewer="alice",
+    )
+    reviewed = warn.submit_verdict(
+        context.asset_id,
+        "warn-1",
+        "pass",
+        None,
+        report["report_revision"],
+        "lease",
+    )
+    warn.complete(
+        context.asset_id,
+        reviewed.report_revision,
+        "lease",
+        advance_pipeline=False,
+    )
+    crashed = load_asset_qc_report(context.report_path)
+    assert crashed is not None
+    assert crashed["manual_review"]["orchestrator_resume_required"] is True
+    assert crashed["pipeline_state"]["next_module"] == "manual_review"
+    service = WorkbenchService(
+        warn_service=WarnReviewService(reports={context.asset_id: context.report_path}),
+        asset_contexts={context.asset_id: context},
+        profile="supplier_evaluation",
+        config=config,
+        registry_factory=lambda *_: registry,
+    )
+    real_resume = service._resume_external
+    attempts = 0
+
+    def fail_first_resume(asset: str, module: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("orchestrator temporarily unavailable")
+        real_resume(asset, module)
+
+    service._resume_external = fail_first_resume
+    before_failed_retry = context.report_path.read_bytes()
+    with pytest.raises(RuntimeError, match="temporarily unavailable"):
+        service.get_asset_task(context.asset_id)
+    assert context.report_path.read_bytes() == before_failed_retry
+
+    recovered = service.get_asset_task(context.asset_id)
+    after_first_fetch = context.report_path.read_bytes()
+    recovered_again = service.get_asset_task(context.asset_id)
+
+    assert recovered["task_type"] == recovered_again["task_type"] == "completed"
+    assert calls == ["auto", "tail"]
+    persisted = load_asset_qc_report(context.report_path)
+    assert persisted is not None
+    assert persisted["pipeline_state"]["last_completed_module"] == "tail"
+    assert "orchestrator_resume_required" not in persisted["manual_review"]
+    assert context.report_path.read_bytes() == after_first_fetch
+
+
 def test_workbench_lists_only_profile_matching_external_assets(tmp_path: Path) -> None:
     supplier = _context(tmp_path, "supplier")
     stopped = _context(tmp_path, "stopped")
@@ -545,6 +754,31 @@ def test_workbench_lists_only_profile_matching_external_assets(tmp_path: Path) -
     assert service.get_asset_task("stopped")["task_type"] == "completed"
     with pytest.raises(KeyError):
         service.acquire_lease("stopped", "alice", 60)
+
+
+def test_acceptance_hard_stop_exposes_no_semantic_task_or_lease(tmp_path: Path) -> None:
+    context = _context(tmp_path, "acceptance-hard-stop")
+    config = _config(
+        tmp_path,
+        ["auto", "semantic_consistency", "manual_review", "tail"],
+    )
+    outcome = run_asset(
+        context,
+        config=config,
+        profile="acceptance",
+        registry=_registry("fail"),
+    )
+
+    assert outcome.report["semantic_calibration"]["state"] == "skipped_due_to_fail"
+    service = WorkbenchService(
+        asset_contexts={context.asset_id: context},
+        profile="acceptance",
+        config=config,
+    )
+    assert service.get_asset_task(context.asset_id)["task_type"] == "completed"
+    assert service.list_actionable_assets("acceptance") == ()
+    with pytest.raises(KeyError, match="not actionable"):
+        service.acquire_lease(context.asset_id, "alice", 60)
 
 
 class _StaleSemanticProjection:

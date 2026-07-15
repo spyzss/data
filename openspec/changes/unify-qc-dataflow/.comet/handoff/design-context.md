@@ -357,4 +357,3 @@ OpenSpec remains the canonical capability spec. This handoff is a deterministic,
 - **THEN** 报告记录运行错误和最后成功模块
 - **THEN** `overall_decision` 保持 null
 ```
-

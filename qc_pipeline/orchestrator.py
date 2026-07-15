@@ -422,6 +422,14 @@ def resume_after_external(
     block["state"] = "completed"
     block["execution_kind"] = "external"
     candidate[completed_module] = block
+    if completed_module == "semantic_consistency":
+        semantic = candidate.get("semantic_calibration")
+        if isinstance(semantic, dict):
+            semantic.pop("orchestrator_resume_required", None)
+    elif completed_module == "manual_review":
+        manual = candidate.get("manual_review")
+        if isinstance(manual, dict):
+            manual.pop("orchestrator_resume_required", None)
     execution = candidate.get("execution")
     if not isinstance(execution, dict):
         raise ValueError("execution must be an object")

@@ -109,11 +109,27 @@ class EvidenceService:
     def _window(issue: Mapping[str, Any], context: AssetContext) -> tuple[int, int]:
         nested = issue.get("window")
         nested = nested if isinstance(nested, Mapping) else {}
-        start_value = issue.get("start_frame", nested.get("start_frame"))
-        end_value = issue.get(
-            "end_frame_exclusive",
-            issue.get("end_frame", nested.get("end_frame_exclusive", nested.get("end_frame"))),
+        issue_context = issue.get("context")
+        issue_context = issue_context if isinstance(issue_context, Mapping) else {}
+        start_value = issue.get(
+            "start_frame",
+            nested.get("start_frame", issue_context.get("start_frame")),
         )
+        end_value = issue.get("end_frame_exclusive")
+        if end_value is None:
+            end_value = nested.get("end_frame_exclusive")
+        if end_value is None:
+            end_value = issue_context.get("end_frame_exclusive")
+        if end_value is None and "end_frame" in issue_context:
+            inclusive_end = _strict_frame(
+                issue_context.get("end_frame"), "issue context end_frame"
+            )
+            end_value = inclusive_end + 1
+        if end_value is None:
+            # Legacy top-level/window end_frame values were already emitted as
+            # half-open endpoints.  Keep that compatibility distinct from the
+            # canonical inclusive Issue.context contract above.
+            end_value = issue.get("end_frame", nested.get("end_frame"))
         start = _strict_frame(start_value, "issue start_frame")
         end = _strict_frame(end_value, "issue end_frame")
         if end <= start:

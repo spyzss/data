@@ -36,6 +36,46 @@ def _is_string_sequence(value: object) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
 
 
+def _validate_pending_snapshot(
+    value: object,
+    *,
+    path: str,
+    expected_segment_id: str,
+) -> None:
+    if not isinstance(value, Mapping):
+        _human_validation_error(path, "snapshot must be an object")
+    required = (
+        "internal_id",
+        "start_frame",
+        "end_frame_exclusive",
+        "text_cn",
+        "text_en",
+    )
+    for field in required:
+        if field not in value:
+            _human_validation_error(f"{path}.{field}", "is required")
+    internal_id = value.get("internal_id")
+    if not isinstance(internal_id, str) or not internal_id:
+        _human_validation_error(f"{path}.internal_id", "must be a non-empty string")
+    if internal_id != expected_segment_id:
+        _human_validation_error(
+            f"{path}.internal_id",
+            f"must match affected segment {expected_segment_id}",
+        )
+    start = value.get("start_frame")
+    end = value.get("end_frame_exclusive")
+    if not isinstance(start, int) or isinstance(start, bool) or start < 0:
+        _human_validation_error(f"{path}.start_frame", "must be a non-negative integer")
+    if not isinstance(end, int) or isinstance(end, bool) or end <= start:
+        _human_validation_error(
+            f"{path}.end_frame_exclusive",
+            "must be an integer greater than start_frame",
+        )
+    for field in ("text_cn", "text_en"):
+        if not isinstance(value.get(field), str):
+            _human_validation_error(f"{path}.{field}", "must be a string")
+
+
 def _validate_pending_edit(pending_edit: Mapping[str, Any]) -> None:
     kind = pending_edit.get("edit_type")
     if kind is None:
@@ -79,21 +119,26 @@ def _validate_pending_edit(pending_edit: Mapping[str, Any]) -> None:
     for field in ("before", "after"):
         value = pending_edit.get(field)
         if kind == "boundary":
-            if isinstance(value, Mapping):
-                valid_boundary_snapshots = len(value) == 2
-            else:
-                valid_boundary_snapshots = _is_string_sequence(value) and len(value) == 2
-            if not valid_boundary_snapshots:
+            if not _is_string_sequence(value) or len(value) != 2:
                 _human_validation_error(
                     f"semantic_calibration.pending_edit.{field}",
                     "boundary pending edit must contain exactly two snapshots",
                 )
-        elif not isinstance(value, Mapping) and (
-            not _is_string_sequence(value) or len(value) != 1
-        ):
+            snapshots = list(value)
+        elif isinstance(value, Mapping):
+            snapshots = [value]
+        elif _is_string_sequence(value) and len(value) == 1:
+            snapshots = list(value)
+        else:
             _human_validation_error(
                 f"semantic_calibration.pending_edit.{field}",
                 "text pending edit must contain one segment snapshot",
+            )
+        for index, snapshot in enumerate(snapshots):
+            _validate_pending_snapshot(
+                snapshot,
+                path=f"semantic_calibration.pending_edit.{field}.{index}",
+                expected_segment_id=affected[index],
             )
 
 

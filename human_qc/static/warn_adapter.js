@@ -61,13 +61,15 @@ const frameWindow = (issue, evidence) => {
   const context = objectOrEmpty(issue.context);
   const nested = objectOrEmpty(issue.window);
   const start = evidence.start_frame ?? issue.start_frame ?? nested.start_frame ?? context.start_frame;
-  const end = evidence.end_frame_exclusive
+  const exclusiveEnd = evidence.end_frame_exclusive
     ?? issue.end_frame_exclusive
     ?? nested.end_frame_exclusive
     ?? issue.end_frame
     ?? nested.end_frame
-    ?? context.end_frame_exclusive
-    ?? context.end_frame;
+    ?? context.end_frame_exclusive;
+  const end = Number.isInteger(exclusiveEnd)
+    ? exclusiveEnd
+    : (Number.isInteger(context.end_frame) ? context.end_frame + 1 : null);
   return {
     startFrame: Number.isInteger(start) ? start : null,
     endFrameExclusive: Number.isInteger(end) ? end : null,

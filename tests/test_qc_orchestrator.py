@@ -345,6 +345,8 @@ def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
     assert acceptance["pipeline_state"]["status"] == "stopped"
     assert acceptance["overall_decision"] == "fail"
     assert acceptance["manual_review"]["state"] == "skipped_due_to_fail"
+    assert acceptance["semantic_calibration"]["state"] == "skipped_due_to_fail"
+    assert acceptance["semantic_calibration"]["pending_edit"] is None
     assert "sam3_containment" not in acceptance
     assert "semantic_consistency" not in acceptance
     assert acceptance["execution"]["module_states"] == {
@@ -390,6 +392,16 @@ def test_fail_skip_marking_is_copy_on_write_and_config_ordered() -> None:
         "semantic_consistency": {"state": "skipped_due_to_fail"},
     }
     assert marked["manual_review"]["state"] == "skipped_due_to_fail"
+    assert marked["semantic_calibration"] == {
+        "state": "skipped_due_to_fail",
+        "source_dataset_path": None,
+        "base_hdf5_sha256": None,
+        "final_hdf5_sha256": None,
+        "timeline_edit_count": 0,
+        "subtask_text_edit_count": 0,
+        "pending_edit": None,
+        "audit": [],
+    }
 
 
 def test_supplier_profile_preserves_prior_fail_at_automatic_completion(

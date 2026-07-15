@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from qc_common.schema import validate_asset_qc_report
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report, write_asset_qc_report
@@ -58,6 +59,59 @@ def test_semantic_pending_text_requires_one_affected_segment() -> None:
 
     with pytest.raises(ValueError):
         validate_asset_qc_report(report)
+
+
+@pytest.mark.parametrize(
+    "malformed_snapshot",
+    [
+        7,
+        {"start_frame": 0, "end_frame_exclusive": 10, "text_cn": "a", "text_en": "b"},
+        {"internal_id": "segment-0", "end_frame_exclusive": 10, "text_cn": "a", "text_en": "b"},
+        {"internal_id": "segment-0", "start_frame": 0, "text_cn": "a", "text_en": "b"},
+        {"internal_id": "segment-0", "start_frame": 0, "end_frame_exclusive": 10},
+    ],
+)
+def test_pending_snapshot_requires_identity_range_and_text(
+    malformed_snapshot: object,
+) -> None:
+    report = make_v2_report()
+    pending = make_text_edit()
+    pending["before"] = malformed_snapshot
+    report["semantic_calibration"] = make_semantic_block(
+        state="in_progress",
+        pending_edit=pending,
+    )
+
+    with pytest.raises(ValueError, match="pending_edit|snapshot|before"):
+        validate_asset_qc_report(report)
+
+
+def test_json_schema_rejects_primitive_pending_snapshots() -> None:
+    report = make_v2_report()
+    pending = make_boundary_edit()
+    pending["after"] = ["segment-0", "segment-1"]
+    report["semantic_calibration"] = make_semantic_block(
+        state="in_progress",
+        pending_edit=pending,
+    )
+    schema = json.loads(
+        (Path(__file__).parents[1] / "schemas" / "asset_qc_report.v2.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert list(Draft202012Validator(schema).iter_errors(report))
+
+
+@pytest.mark.parametrize("pending", [make_boundary_edit(), make_text_edit()])
+def test_valid_boundary_and_text_pending_snapshots_validate(pending: dict) -> None:
+    report = make_v2_report()
+    report["semantic_calibration"] = make_semantic_block(
+        state="in_progress",
+        pending_edit=pending,
+    )
+
+    validate_asset_qc_report(report)
 
 
 def test_completed_manual_review_requires_every_selected_verdict() -> None:

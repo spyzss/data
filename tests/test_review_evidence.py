@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from human_qc.evidence import EvidenceError, EvidenceService
+from human_qc.warn_service import WarnReviewService
+from human_qc.workbench_service import WorkbenchService
+from qc_common.contracts import EvidenceRef, Issue
 from qc_pipeline.context import AssetContext
+from tests.qc_report_fixtures import make_v2_report
 
 
 ASSET_ID = "617856"
@@ -142,3 +147,90 @@ def test_evidence_path_escape_is_rejected(tmp_path: Path) -> None:
         service.resolve(
             _issue(evidence=[{"kind": "clip", "path": "../outside.mp4"}]), context
         )
+
+
+def test_workbench_joins_canonical_issue_evidence_and_converts_inclusive_context(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    clip = tmp_path / "evidence" / "warn-1.mp4"
+    clip.parent.mkdir()
+    clip.write_bytes(b"canonical-clip")
+    issue = Issue(
+        issue_id="warn-1",
+        code="blur",
+        severity="warn",
+        module="video_quality",
+        issue_type="metric_threshold",
+        metric="blur_score",
+        observed_value=0.2,
+        operator="<",
+        boundary_value=0.5,
+        rule_id="video_quality.blur",
+        needs_manual_review=True,
+        context={"start_frame": 10, "end_frame": 19},
+        evidence_ids=("evidence-1",),
+    ).to_dict()
+    evidence = EvidenceRef(
+        evidence_id="evidence-1",
+        kind="clip",
+        path="evidence/warn-1.mp4",
+        coordinate_system="source_frame_inclusive",
+        start_frame=10,
+        end_frame=19,
+    ).to_dict()
+    report = make_v2_report(status="awaiting_external")
+    report["asset_id"] = ASSET_ID
+    report["pipeline_state"].update(
+        {
+            "last_completed_module": "semantic_consistency",
+            "next_module": "manual_review",
+            "stop_reason": None,
+        }
+    )
+    report["semantic_calibration"] = {
+        "state": "completed",
+        "source_dataset_path": "/label/subtask_label",
+        "base_hdf5_sha256": "sha256:" + "a" * 64,
+        "final_hdf5_sha256": "sha256:" + "b" * 64,
+        "timeline_edit_count": 0,
+        "subtask_text_edit_count": 0,
+        "pending_edit": None,
+        "audit": [],
+    }
+    report["issues"] = [issue]
+    report["manual_review"].update(
+        {
+            "required": True,
+            "state": "queued",
+            "candidate_issue_ids": ["warn-1"],
+            "selected_issue_ids": ["warn-1"],
+            "selected_issue_id": "warn-1",
+            "issue_reviews": {},
+            "completed_at": None,
+        }
+    )
+    report["video_quality"] = {"evidence": [evidence]}
+    context.report_path.parent.mkdir(parents=True)
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    service = WorkbenchService(
+        warn_service=WarnReviewService(reports={ASSET_ID: context.report_path}),
+        evidence_service=EvidenceService(
+            tmp_path / "cache",
+            ffmpeg_runner=lambda *_: pytest.fail("canonical clip should be reused"),
+        ),
+        asset_contexts={ASSET_ID: context},
+    )
+
+    task = service.get_asset_task(ASSET_ID)
+
+    assert task["evidence"] == [
+        {
+            "issue_id": "warn-1",
+            "start_frame": 10,
+            "end_frame_exclusive": 20,
+            "clip_url": "/evidence/evidence/warn-1.mp4",
+            "overlay_url": None,
+            "generation_error": None,
+        }
+    ]

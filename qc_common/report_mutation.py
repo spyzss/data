@@ -413,6 +413,26 @@ def mark_remaining_skipped_due_to_fail(
     if not isinstance(manual_review, dict):
         raise ValueError("manual_review must be an object")
     manual_review["state"] = "skipped_due_to_fail"
+    semantic = marked.get("semantic_calibration")
+    if semantic is None:
+        semantic = {}
+    elif not isinstance(semantic, dict):
+        raise ValueError("semantic_calibration must be an object")
+    semantic_defaults = {
+        "source_dataset_path": None,
+        "base_hdf5_sha256": None,
+        "final_hdf5_sha256": None,
+        "timeline_edit_count": 0,
+        "subtask_text_edit_count": 0,
+        "pending_edit": None,
+        "audit": [],
+    }
+    for key, value in semantic_defaults.items():
+        semantic.setdefault(key, copy.deepcopy(value))
+    semantic["state"] = "skipped_due_to_fail"
+    semantic["pending_edit"] = None
+    semantic.pop("orchestrator_resume_required", None)
+    marked["semantic_calibration"] = semantic
     return marked
 
 

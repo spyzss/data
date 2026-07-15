@@ -263,12 +263,94 @@
         "pending_edit": {
           "oneOf": [
             {"type": "null"},
-            {"type": "object", "additionalProperties": true}
+            {"$ref": "#/$defs/pendingBoundaryEdit"},
+            {"$ref": "#/$defs/pendingTextEdit"}
           ]
         },
         "audit": {
           "type": "array",
           "items": {"type": "object", "additionalProperties": true}
+        }
+      }
+    },
+    "pendingSnapshot": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "internal_id",
+        "start_frame",
+        "end_frame_exclusive",
+        "text_cn",
+        "text_en"
+      ],
+      "properties": {
+        "internal_id": {"type": "string", "minLength": 1},
+        "start_frame": {"type": "integer", "minimum": 0},
+        "end_frame_exclusive": {"type": "integer", "minimum": 1},
+        "text_cn": {"type": "string"},
+        "text_en": {"type": "string"}
+      }
+    },
+    "pendingBoundaryEdit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["edit_type", "affected_segment_ids", "before", "after"],
+      "properties": {
+        "edit_type": {"const": "boundary"},
+        "affected_segment_ids": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "before": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"$ref": "#/$defs/pendingSnapshot"}
+        },
+        "after": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"$ref": "#/$defs/pendingSnapshot"}
+        }
+      }
+    },
+    "pendingTextEdit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["edit_type", "affected_segment_ids", "before", "after"],
+      "properties": {
+        "edit_type": {"const": "text"},
+        "affected_segment_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "before": {
+          "oneOf": [
+            {"$ref": "#/$defs/pendingSnapshot"},
+            {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "items": {"$ref": "#/$defs/pendingSnapshot"}
+            }
+          ]
+        },
+        "after": {
+          "oneOf": [
+            {"$ref": "#/$defs/pendingSnapshot"},
+            {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "items": {"$ref": "#/$defs/pendingSnapshot"}
+            }
+          ]
         }
       }
     },

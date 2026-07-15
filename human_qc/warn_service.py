@@ -416,6 +416,10 @@ class WarnReviewService:
                 block["selected_issue_id"] = None
                 block["completed_at"] = None
             if advance_pipeline:
+                block.pop("orchestrator_resume_required", None)
+            else:
+                block["orchestrator_resume_required"] = True
+            if advance_pipeline:
                 pipeline_now = candidate.get("pipeline_state")
                 if not isinstance(pipeline_now, dict):
                     raise WarnStateError("pipeline_state block is missing")

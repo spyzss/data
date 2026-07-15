@@ -221,6 +221,23 @@ test("warn model keeps machine reason metrics threshold and half-open evidence r
   assert.doesNotMatch(markup, /timeline-track|semantic-text-slot|boundary-handle/);
 });
 
+test("warn model converts inclusive canonical context end when evidence projection degrades", () => {
+  const canonicalTask = structuredClone(warnTask);
+  canonicalTask.evidence = [];
+  const issue = canonicalTask.warn.selected_issues["warn-1"];
+  delete issue.start_frame;
+  delete issue.end_frame_exclusive;
+  issue.context = {
+    ...issue.context,
+    start_frame: 30,
+    end_frame: 42,
+  };
+
+  const model = buildWarnIssueModel(canonicalTask, "warn-1");
+
+  assert.deepEqual(model.window, { startFrame: 30, endFrameExclusive: 43 });
+});
+
 test("warn completion stays disabled until every selected issue has a verdict", () => {
   assert.equal(allSelectedIssuesReviewed(warnTask), false);
   assert.match(renderWarnMarkup(warnTask, "warn-1"), /data-action="complete-warn"[^>]*disabled/);
