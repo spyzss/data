@@ -21,7 +21,7 @@ from qc_common.module_registry import ModuleRegistry
 from qc_common.report import load_asset_qc_report
 from qc_pipeline.context import AssetContext
 from qc_pipeline.default_registry import build_default_registry
-from qc_pipeline.orchestrator import resume_after_external
+from qc_pipeline.orchestrator import resume_after_external, run_asset
 
 from .evidence import EvidenceService
 from .lease import Lease, LeaseStore
@@ -465,7 +465,66 @@ class WorkbenchService:
         if self.config is None or not isinstance(report, Mapping):
             return False
         pipeline = report.get("pipeline_state")
-        if not isinstance(pipeline, Mapping) or pipeline.get("status") != "awaiting_external":
+        if not isinstance(pipeline, Mapping):
+            return False
+        if pipeline.get("status") == "running":
+            handoff = pipeline.get("external_resume")
+            completed_module = (
+                handoff.get("completed_module") if isinstance(handoff, Mapping) else None
+            )
+            transition_revision = (
+                handoff.get("transition_revision") if isinstance(handoff, Mapping) else None
+            )
+            next_module = pipeline.get("next_module")
+            if completed_module not in {"semantic_consistency", "manual_review"}:
+                return False
+            if (
+                not isinstance(transition_revision, int)
+                or isinstance(transition_revision, bool)
+                or transition_revision > int(report.get("report_revision", 0))
+                or not isinstance(next_module, str)
+            ):
+                return False
+            if completed_module == "semantic_consistency":
+                domain = report.get("semantic_calibration")
+                domain_completed = (
+                    isinstance(domain, Mapping) and domain.get("state") == "completed"
+                )
+            else:
+                domain = report.get("manual_review")
+                domain_completed = isinstance(domain, Mapping) and domain.get("state") in {
+                    "completed",
+                    "not_required",
+                }
+            modules = self.config.pipeline_modules
+            if (
+                not domain_completed
+                or completed_module not in modules
+                or next_module not in modules
+                or modules.index(next_module) <= modules.index(completed_module)
+            ):
+                return False
+            context = self._context(asset_id)
+            if context is None:
+                raise KeyError(f"asset context is not configured for {asset_id}")
+            execution = report.get("execution")
+            report_profile = (
+                execution.get("profile") if isinstance(execution, Mapping) else None
+            )
+            profile = (
+                report_profile
+                if isinstance(report_profile, str)
+                else self.profile or self.config.default_profile
+            )
+            registry = self.registry_factory(context, self.config)
+            run_asset(
+                context,
+                config=self.config,
+                profile=profile,
+                registry=registry,
+            )
+            return True
+        if pipeline.get("status") != "awaiting_external":
             return False
         completed_module = pipeline.get("next_module")
         if completed_module == "semantic_consistency":

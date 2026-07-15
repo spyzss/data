@@ -18,6 +18,7 @@ from qc_common.report import (
     load_asset_qc_report,
 )
 from qc_pipeline.context import AssetContext
+from qc_pipeline import orchestrator as orchestrator_module
 from qc_pipeline.orchestrator import resume_after_external, run_asset
 
 
@@ -725,6 +726,152 @@ def test_task_fetch_recovers_warn_domain_completion_crash_window_once(
     assert persisted["pipeline_state"]["last_completed_module"] == "tail"
     assert "orchestrator_resume_required" not in persisted["manual_review"]
     assert context.report_path.read_bytes() == after_first_fetch
+
+
+@pytest.mark.parametrize("completed_module", ["semantic_consistency", "manual_review"])
+def test_task_fetch_recovers_transition_persisted_before_successor_run_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completed_module: str,
+) -> None:
+    context = _context(tmp_path, f"post-transition-{completed_module}")
+    modules = ["auto", "semantic_consistency", "tail"]
+    if completed_module == "manual_review":
+        modules = ["auto", "semantic_consistency", "manual_review", "tail"]
+    config = _config(tmp_path, modules)
+    calls: list[str] = []
+    registry = _registry(calls=calls, auto_issues=(_warn_issue(),))
+    first = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=registry,
+    )
+    report = load_asset_qc_report(context.report_path)
+    assert report is not None
+    report["semantic_calibration"] = {
+        "state": "completed",
+        "source_dataset_path": "/label/subtask_label",
+        "base_hdf5_sha256": "sha256:" + "0" * 64,
+        "final_hdf5_sha256": "sha256:" + "1" * 64,
+        "timeline_edit_count": 0,
+        "subtask_text_edit_count": 0,
+        "pending_edit": None,
+        "audit": [],
+        "orchestrator_resume_required": True,
+    }
+    if completed_module == "manual_review":
+        report["manual_review"].update(
+            {
+                "required": True,
+                "state": "queued",
+                "selected_issue_ids": ["warn-1"],
+                "selected_issue_id": "warn-1",
+                "issue_reviews": {},
+                "completed_at": None,
+            }
+        )
+        context.report_path.write_text(json.dumps(report), encoding="utf-8")
+        resume_after_external(
+            context,
+            config=config,
+            profile="supplier_evaluation",
+            completed_module="semantic_consistency",
+            expected_revision=first.report["report_revision"],
+            registry=registry,
+        )
+        report = load_asset_qc_report(context.report_path)
+        assert report is not None
+        report["manual_review"].update(
+            {
+                "state": "completed",
+                "issue_reviews": {"warn-1": {"verdict": "pass"}},
+                "completed_at": "2026-07-15T00:00:00Z",
+                "orchestrator_resume_required": True,
+            }
+        )
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    expected_revision = int(report["report_revision"])
+    real_run_asset = orchestrator_module.run_asset
+    downstream_attempts = 0
+
+    def crash_once_after_transition(*args, **kwargs):
+        nonlocal downstream_attempts
+        downstream_attempts += 1
+        if downstream_attempts == 1:
+            raise RuntimeError("crash after external transition persistence")
+        return real_run_asset(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "run_asset", crash_once_after_transition)
+    monkeypatch.setattr("human_qc.workbench_service.run_asset", crash_once_after_transition)
+
+    with pytest.raises(RuntimeError, match="after external transition persistence"):
+        resume_after_external(
+            context,
+            config=config,
+            profile="supplier_evaluation",
+            completed_module=completed_module,
+            expected_revision=expected_revision,
+            registry=registry,
+        )
+
+    crashed = load_asset_qc_report(context.report_path)
+    assert crashed is not None
+    assert crashed["pipeline_state"]["status"] == "running"
+    assert crashed["pipeline_state"]["next_module"] == "tail"
+    assert crashed["pipeline_state"]["external_resume"]["completed_module"] == completed_module
+    transition_revision = crashed["report_revision"]
+    service = WorkbenchService(
+        asset_contexts={context.asset_id: context},
+        profile="supplier_evaluation",
+        config=config,
+        registry_factory=lambda *_: registry,
+    )
+
+    recovered = service.get_asset_task(context.asset_id)
+    after_recovery = context.report_path.read_bytes()
+    recovered_again = service.get_asset_task(context.asset_id)
+
+    assert recovered["task_type"] == recovered_again["task_type"] == "completed"
+    assert calls == ["auto", "tail"]
+    assert downstream_attempts == 2
+    persisted = load_asset_qc_report(context.report_path)
+    assert persisted is not None
+    assert persisted["report_revision"] == transition_revision + 1
+    assert "external_resume" not in persisted["pipeline_state"]
+    assert context.report_path.read_bytes() == after_recovery
+
+
+def test_task_fetch_does_not_run_unowned_running_pipeline(tmp_path: Path) -> None:
+    context = _context(tmp_path, "unowned-running")
+    config = _config(tmp_path, ["auto", "semantic_consistency", "tail"])
+    calls: list[str] = []
+    registry = _registry(calls=calls)
+    first = run_asset(
+        context,
+        config=config,
+        profile="acceptance",
+        registry=registry,
+    )
+    report = first.report
+    report["pipeline_state"].update(
+        {"status": "running", "next_module": "tail", "stop_reason": None}
+    )
+    report["pipeline_state"].pop("external_resume", None)
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    before = context.report_path.read_bytes()
+    service = WorkbenchService(
+        asset_contexts={context.asset_id: context},
+        profile="acceptance",
+        config=config,
+        registry_factory=lambda *_: registry,
+    )
+
+    task = service.get_asset_task(context.asset_id)
+
+    assert task["task_type"] == "completed"
+    assert calls == ["auto"]
+    assert context.report_path.read_bytes() == before
 
 
 def test_workbench_lists_only_profile_matching_external_assets(tmp_path: Path) -> None:

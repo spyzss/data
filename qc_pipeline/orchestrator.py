@@ -130,6 +130,8 @@ def _record_empty_manual_review(
             "stop_reason": None,
         }
     )
+    if next_module is None:
+        pipeline.pop("external_resume", None)
     candidate["overall_decision"] = (
         None
         if next_module is not None
@@ -449,6 +451,13 @@ def resume_after_external(
             "stop_reason": None,
         }
     )
+    if next_module is None:
+        pipeline_state.pop("external_resume", None)
+    else:
+        pipeline_state["external_resume"] = {
+            "completed_module": completed_module,
+            "transition_revision": expected_revision + 1,
+        }
     candidate["pipeline_state"] = pipeline_state
     if next_module is None:
         manual = candidate.get("manual_review")

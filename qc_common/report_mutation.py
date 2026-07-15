@@ -532,6 +532,8 @@ def apply_module_result(
         "next_module": pipeline_next,
         "stop_reason": stop_reason,
     }
+    if pipeline_status in {"stopped", "completed"}:
+        report["pipeline_state"].pop("external_resume", None)
     execution = report.get("execution")
     if not isinstance(execution, dict):
         raise ValueError("execution must be an object")
@@ -616,6 +618,7 @@ def record_awaiting_external(
             "stop_reason": None,
         }
     )
+    pipeline_state.pop("external_resume", None)
     report["overall_decision"] = None
     execution = report.get("execution")
     if not isinstance(execution, dict):
@@ -691,6 +694,8 @@ def record_disabled_transition(
             "stop_reason": None,
         }
     )
+    if completed:
+        pipeline_state.pop("external_resume", None)
     report["overall_decision"] = overall_decision
     report["report_revision"] = expected_revision + 1
     write_asset_qc_report(
@@ -772,6 +777,7 @@ def record_runtime_error(
             "stop_reason": error_type,
         }
     )
+    pipeline_state.pop("external_resume", None)
     report["overall_decision"] = None
     report["report_revision"] = expected_revision + 1
     write_asset_qc_report(
