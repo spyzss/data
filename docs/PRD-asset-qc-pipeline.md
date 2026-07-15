@@ -66,3 +66,8 @@ revision 加一；过期 revision 返回 409，lease 冲突或过期返回 423�
 dry-run 并报告 matched/unmatched/conflict，实际写入必须使用 expected revision。
 所有批次 CSV、Parquet、Markdown 和 XLSX 使用同一投影字段，不能自行读取旧
 人工文件重新计算结论。
+
+正式聚合导出通过 `qc_reporting.export.write_aggregate_outputs` 完成。该 API 从
+同一个 `scope/profile/metric/value_json` 长表写出 CSV、Parquet、XLSX `Metrics`
+sheet 和 Markdown，禁止为某个格式单独重算指标。缺少任一正式指标时整次导出
+失败，以避免跨格式列漂移。

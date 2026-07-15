@@ -407,3 +407,14 @@ revision 与预期不一致时必须报 stale-write 错误，不能静默覆盖�
 
 旧 manual CSV/progress JSON 只能通过一次性导入工具迁移到当前 QC JSON，且导入
 前默认 dry-run；它们不能直接参与正式聚合。
+
+`qc_reporting.export.write_aggregate_outputs` 将 overall 和每个 profile 的上述正式
+指标先规范化为同一组长表行，再分别写为：
+
+- `human_qc_aggregate.csv`；
+- `human_qc_aggregate.parquet`；
+- `human_qc_aggregate.xlsx` 的 `Metrics` sheet；
+- `human_qc_aggregate.md`。
+
+四种格式的列统一为 `scope/profile/metric/value_json`，指标名和 JSON 标量值必须
+逐项一致。任何 profile 缺少正式指标时导出直接失败，不允许某一种格式静默缺列。
