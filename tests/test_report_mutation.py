@@ -557,6 +557,25 @@ def test_terminal_supplier_fail_remains_machine_fail(tmp_path: Path) -> None:
     assert report["pipeline_state"]["status"] == "completed"
     assert report["overall_decision"] == "fail"
     assert report["effective_duration"]["flow"]["result_gate"]["verdict"] == "fail"
+    assert report["effective_duration"]["flow"]["exit_gate"] == {
+        "state": "complete_qc",
+        "continue_to_next_module": False,
+        "next_module": None,
+    }
+
+    rerun = apply_module_result(
+        context.report_path,
+        context=context,
+        config=config,
+        profile="supplier_evaluation",
+        result=ModuleResult("effective_duration", "fail", {}, {"rerun": True}),
+        expected_revision=report["report_revision"],
+        next_module=None,
+        now="2026-07-14T00:01:00Z",
+    )
+
+    assert rerun["report_revision"] == report["report_revision"] + 1
+    assert rerun["effective_duration"]["flow"]["exit_gate"]["state"] == "complete_qc"
 
 
 def test_generic_pipeline_transition_rejects_error_without_mutating_report(

@@ -208,25 +208,6 @@ def test_physical_video_range_participates_in_source_and_semantic_identity() -> 
         field="provenance.source_fingerprint",
     )
 
-    legacy_without_range = replace(
-        episode,
-        provenance=replace(
-            episode.provenance,
-            source_fingerprint=source_fingerprint(
-                episode.provenance.source_files,
-                source_schema_version=episode.identity.source_schema_version,
-                adapter_id=episode.provenance.adapter_id,
-                adapter_version=episode.provenance.adapter_version,
-            ),
-        ),
-    )
-    _assert_error(
-        legacy_without_range,
-        code="source_fingerprint_mismatch",
-        field="provenance.source_fingerprint",
-    )
-
-
 def _assert_error(
     episode: CanonicalQcEpisode, *, code: str, field: str
 ) -> CanonicalInputError:
@@ -809,6 +790,7 @@ def test_source_fingerprint_is_order_independent_and_adapter_sensitive() -> None
         "source_schema_version": "egodata_hdf5_qc_input.v1",
         "adapter_id": "standard_hdf5",
         "adapter_version": "1.0.0",
+        "main_video_source_frame_range": (0, 3),
     }
 
     first = source_fingerprint(files, **kwargs)
@@ -818,6 +800,33 @@ def test_source_fingerprint_is_order_independent_and_adapter_sensitive() -> None
     assert first == reordered
     assert len(first) == 64
     assert first != upgraded
+
+
+def test_source_fingerprint_requires_physical_video_range() -> None:
+    with pytest.raises(TypeError, match="main_video_source_frame_range"):
+        source_fingerprint(
+            _source_files(),
+            source_schema_version="egodata_hdf5_qc_input.v1",
+            adapter_id="standard_hdf5",
+            adapter_version="1.0.0",
+        )
+
+
+@pytest.mark.parametrize(
+    "source_range",
+    [None, [0, 3], (False, 3), (0, 0), (-1, 2), (0, 2, 3)],
+)
+def test_source_fingerprint_rejects_invalid_physical_video_range(
+    source_range: object,
+) -> None:
+    with pytest.raises(ValueError, match="main_video_source_frame_range"):
+        source_fingerprint(
+            _source_files(),
+            source_schema_version="egodata_hdf5_qc_input.v1",
+            adapter_id="standard_hdf5",
+            adapter_version="1.0.0",
+            main_video_source_frame_range=source_range,
+        )
 
 
 def test_source_fingerprint_normalizes_numpy_integral_size() -> None:
@@ -830,6 +839,7 @@ def test_source_fingerprint_normalizes_numpy_integral_size() -> None:
         "source_schema_version": "egodata_hdf5_qc_input.v1",
         "adapter_id": "standard_hdf5",
         "adapter_version": "1.0.0",
+        "main_video_source_frame_range": (0, 3),
     }
 
     assert source_fingerprint(native, **kwargs) == source_fingerprint(

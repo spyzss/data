@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 import numpy as np
 
 FINGER_NAMES = ("Thumb", "Index", "Middle", "Ring", "Little")
@@ -44,6 +46,35 @@ ACCEPTANCE_HAND_BASE_NAMES = (
     *ACCEPTANCE_FINGER_CHAINS["Middle"],
     *ACCEPTANCE_FINGER_CHAINS["Ring"],
     *ACCEPTANCE_FINGER_CHAINS["Little"],
+)
+
+# Frozen array-index contract for ``joint_topology=egodata_hand21.v1``.
+# This is deliberately separate from ACCEPTANCE_HAND_BASE_NAMES, whose order is
+# anatomical/display order rather than the serialized MANO-style array order.
+EGODATA_HAND21_INDEX_TO_ACCEPTANCE_BASE = MappingProxyType(
+    {
+        0: "Hand",
+        1: "IndexFingerKnuckle",
+        2: "IndexFingerIntermediateBase",
+        3: "IndexFingerIntermediateTip",
+        4: "MiddleFingerKnuckle",
+        5: "MiddleFingerIntermediateBase",
+        6: "MiddleFingerIntermediateTip",
+        7: "LittleFingerKnuckle",
+        8: "LittleFingerIntermediateBase",
+        9: "LittleFingerIntermediateTip",
+        10: "RingFingerKnuckle",
+        11: "RingFingerIntermediateBase",
+        12: "RingFingerIntermediateTip",
+        13: "ThumbKnuckle",
+        14: "ThumbIntermediateBase",
+        15: "ThumbIntermediateTip",
+        16: "ThumbTip",
+        17: "IndexFingerTip",
+        18: "MiddleFingerTip",
+        19: "RingFingerTip",
+        20: "LittleFingerTip",
+    }
 )
 
 

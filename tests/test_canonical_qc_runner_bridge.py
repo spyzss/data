@@ -214,6 +214,103 @@ def test_shifted_video_report_rebases_all_producer_frame_coordinates(
     assert all(issue.context["end_frame"] == 9 for issue in result.issues)
 
 
+def test_video_runner_rejects_producer_frame_outside_selected_logical_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "asset-001"
+    write_standard_hdf5_episode(source_root, frame_count=10)
+    episode = StandardHdf5Adapter().load(source_root)
+    bridge = CanonicalQcBridge(episode, source_root=source_root)
+    context = bridge.asset_context(
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-001.json",
+        source_range=(2, 5),
+    )
+    from acceptance_pull import video_quality as producer
+
+    original = producer.analyze_video_frame_range
+
+    def outside_selection(*args, **kwargs):
+        analysis = original(*args, **kwargs)
+        interval = producer.FrozenInterval(
+            start_frame=0,
+            end_frame=0,
+            frame_count=1,
+            start_time_sec=0.0,
+            end_time_sec=0.1,
+            duration_sec=0.1,
+            duration_ms=100.0,
+        )
+        return replace(
+            analysis,
+            metrics=replace(
+                analysis.metrics,
+                frozen_intervals=(interval,),
+                errors=("range_decode_failed:0",),
+            ),
+        )
+
+    monkeypatch.setattr(
+        producer,
+        "analyze_video_frame_range",
+        outside_selection,
+    )
+
+    with pytest.raises(ValueError, match="selected canonical range"):
+        video_quality.run(context, load_qc_acceptance_config())
+
+
+def test_video_runner_accepts_only_frames_inside_selected_logical_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "asset-001"
+    write_standard_hdf5_episode(source_root, frame_count=10)
+    episode = StandardHdf5Adapter().load(source_root)
+    bridge = CanonicalQcBridge(episode, source_root=source_root)
+    context = bridge.asset_context(
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-001.json",
+        source_range=(2, 5),
+    )
+    from acceptance_pull import video_quality as producer
+
+    original = producer.analyze_video_frame_range
+
+    def inside_selection(*args, **kwargs):
+        analysis = original(*args, **kwargs)
+        interval = producer.FrozenInterval(
+            start_frame=2,
+            end_frame=4,
+            frame_count=3,
+            start_time_sec=0.2,
+            end_time_sec=0.5,
+            duration_sec=0.3,
+            duration_ms=300.0,
+        )
+        return replace(
+            analysis,
+            metrics=replace(
+                analysis.metrics,
+                frozen_intervals=(interval,),
+                errors=("range_decode_failed:4",),
+            ),
+        )
+
+    monkeypatch.setattr(
+        producer,
+        "analyze_video_frame_range",
+        inside_selection,
+    )
+
+    result = video_quality.run(context, load_qc_acceptance_config())
+
+    interval = result.metrics["freeze_metrics"]["frozen_intervals"][0]
+    assert (interval["start_frame"], interval["end_frame"]) == (2, 4)
+    assert result.runtime["errors"] == ["range_decode_failed:4"]
+
+
 def test_video_runner_fails_if_nonvideo_source_mutates_during_producer(
     tmp_path: Path,
     monkeypatch,

@@ -108,7 +108,7 @@ Validator 不截断数组、不补默认 FPS、不重新生成时间戳，也不
 
 ### 4.3 两种 fingerprint
 
-- `source_fingerprint`：输入 schema、Adapter 版本、所有源文件相对路径/size/hash 的稳定 JSON SHA-256。用于检测源文件漂移。
+- `source_fingerprint`：输入 schema、Adapter 版本、所有源文件相对路径/size/hash，以及必填的物理 `main_video.source_frame_range` 的稳定 JSON SHA-256。范围必须是非负、非空的严格整数半开 tuple，不能省略或传 `None`/list/bool。用于检测源文件漂移并防止共享 MP4 的 span 身份碰撞。
 - `semantic_fingerprint`：忽略 `source_format` 与路径，仅对 Canonical Core 值、时间轴、标定和语义计算。用于证明同一 episode 的 HDF5 与 LeRobot 归一结果等价。
 
 浮点数组按固定 dtype、shape、C-order bytes 计算；JSON 字符串使用 UTF-8、排序键和禁止 NaN 的稳定编码。
@@ -195,6 +195,11 @@ class CanonicalQcBridge:
 - `apply_module_result()` 继续负责 issue 所有权、revision CAS 和 QC JSON 原子写入。
 
 Bridge 是半开区间和旧闭区间之间唯一转换层。Canonical 内部永远使用 `[start,end_exclusive)`；旧 evidence 若要求 inclusive end，Bridge 显式写 `end_frame=end_exclusive-1` 和 `coordinate_system=source_inclusive`。
+
+统一 QC CLI 的 Canonical manifest 也直接使用 `start_frame` 与
+`end_frame_exclusive`；legacy manifest 才允许 `start_frame/end_frame` 并在入口
+执行一次 `+1`。Canonical 行出现 inclusive `end_frame` 必须拒绝，禁止按调用方
+猜测区间语义。
 
 ### 7.2 Keypoint 视图
 

@@ -7,32 +7,13 @@ from pathlib import Path
 import numpy as np
 
 from qc_common.hdf5_loader import read_scalar_json
+from qc_common.keypoints import EGODATA_HAND21_INDEX_TO_ACCEPTANCE_BASE
 from qc_common.types import ClipInputs
 
 
-MANO_JOINT_INDEX_TO_ACCEPTANCE_BASE = {
-    0: "Hand",
-    13: "ThumbKnuckle",
-    14: "ThumbIntermediateBase",
-    15: "ThumbIntermediateTip",
-    16: "ThumbTip",
-    1: "IndexFingerKnuckle",
-    2: "IndexFingerIntermediateBase",
-    3: "IndexFingerIntermediateTip",
-    17: "IndexFingerTip",
-    4: "MiddleFingerKnuckle",
-    5: "MiddleFingerIntermediateBase",
-    6: "MiddleFingerIntermediateTip",
-    18: "MiddleFingerTip",
-    10: "RingFingerKnuckle",
-    11: "RingFingerIntermediateBase",
-    12: "RingFingerIntermediateTip",
-    19: "RingFingerTip",
-    7: "LittleFingerKnuckle",
-    8: "LittleFingerIntermediateBase",
-    9: "LittleFingerIntermediateTip",
-    20: "LittleFingerTip",
-}
+# Compatibility alias for existing callers. The authoritative frozen topology
+# lives in qc_common so Canonical and supplier adapters cannot drift apart.
+MANO_JOINT_INDEX_TO_ACCEPTANCE_BASE = EGODATA_HAND21_INDEX_TO_ACCEPTANCE_BASE
 
 
 def load_supplier_hdf5_clip(

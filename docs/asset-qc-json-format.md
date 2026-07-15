@@ -260,6 +260,9 @@ module.thresholds
   `pipeline_state.status=stopped` 且 `pipeline_state.next_module=null`。
 - `supplier_evaluation` + `fail`：机器 verdict 仍为 `fail`，出口继续，并在 module
   runtime 写 `continued_after_fail=true`；完成时 `overall_decision=fail`。
+- 非终态正常流转使用 `state=continue`、`continue_to_next_module=true` 和明确的
+  `next_module`；最后一个模块正常完成必须使用 `state=complete_qc`、
+  `continue_to_next_module=false`、`next_module=null`。
 - runtime/evidence/config/CAS 错误：写 `runtime_errors[]`，module state 为
   `runtime_error`、顶层 `status=error`，不当成质量 fail。
 - 下游只读取上游 `exit_gate` 或顶层 `pipeline_state`，不解析自然语言原因。

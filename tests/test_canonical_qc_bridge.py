@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 
@@ -7,7 +8,12 @@ import h5py
 import numpy as np
 import pytest
 
-from canonical_qc import CanonicalInputError, StandardHdf5Adapter, StandardLeRobotAdapter
+from canonical_qc import (
+    CanonicalInputError,
+    StandardHdf5Adapter,
+    StandardLeRobotAdapter,
+    source_fingerprint,
+)
 from canonical_qc.bridge import CanonicalQcBridge
 from tests.fixtures import write_standard_hdf5_episode, write_standard_lerobot_dataset
 from tools.run_qc_pipeline import contexts_from_manifest
@@ -18,25 +24,25 @@ _JOINT_NAMES = tuple(
     for side in ("left", "right")
     for base in (
         "Hand",
+        "IndexFingerKnuckle",
+        "IndexFingerIntermediateBase",
+        "IndexFingerIntermediateTip",
+        "MiddleFingerKnuckle",
+        "MiddleFingerIntermediateBase",
+        "MiddleFingerIntermediateTip",
+        "LittleFingerKnuckle",
+        "LittleFingerIntermediateBase",
+        "LittleFingerIntermediateTip",
+        "RingFingerKnuckle",
+        "RingFingerIntermediateBase",
+        "RingFingerIntermediateTip",
         "ThumbKnuckle",
         "ThumbIntermediateBase",
         "ThumbIntermediateTip",
         "ThumbTip",
-        "IndexFingerKnuckle",
-        "IndexFingerIntermediateBase",
-        "IndexFingerIntermediateTip",
         "IndexFingerTip",
-        "MiddleFingerKnuckle",
-        "MiddleFingerIntermediateBase",
-        "MiddleFingerIntermediateTip",
         "MiddleFingerTip",
-        "RingFingerKnuckle",
-        "RingFingerIntermediateBase",
-        "RingFingerIntermediateTip",
         "RingFingerTip",
-        "LittleFingerKnuckle",
-        "LittleFingerIntermediateBase",
-        "LittleFingerIntermediateTip",
         "LittleFingerTip",
     )
 )
@@ -82,10 +88,14 @@ def test_bridge_projects_exact_legacy_clip_without_mutating_episode(tmp_path: Pa
             np.testing.assert_array_equal(projected, expected)
             assert projected.dtype == np.float32
             assert projected.flags.writeable is False
-    assert np.isnan(clip.keypoints["leftThumbTip"][0]).all()
+    assert np.isnan(clip.keypoints["leftMiddleFingerKnuckle"][0]).all()
     np.testing.assert_array_equal(
         clip.keypoints["leftIndexFingerKnuckle"],
-        np.tile(np.array([50, 51, 52], dtype=np.float32), (2, 1)),
+        np.tile(np.array([10, 11, 12], dtype=np.float32), (2, 1)),
+    )
+    np.testing.assert_array_equal(
+        clip.keypoints["leftThumbKnuckle"],
+        np.tile(np.array([130, 131, 132], dtype=np.float32), (2, 1)),
     )
     np.testing.assert_array_equal(
         clip.keypoints["rightLittleFingerTip"],
@@ -173,7 +183,7 @@ def test_manifest_entrypoint_builds_canonical_context_without_legacy_loading(tmp
     manifest.write_text(
         '{"asset_id":"asset-001","canonical_format":"hdf5",'
         '"canonical_source_path":"asset-001","candidate_windows_path":'
-        '"candidate-windows.json","start_frame":1,"end_frame":2}\n',
+        '"candidate-windows.json","start_frame":1,"end_frame_exclusive":3}\n',
         encoding="utf-8",
     )
 
@@ -185,6 +195,22 @@ def test_manifest_entrypoint_builds_canonical_context_without_legacy_loading(tmp
     assert context.metadata["canonical_episode"].identity.source_format == "hdf5"
     assert context.source_files["video"]["path"] == "asset-001/main.mp4"
     assert context.source_files["candidate_windows"]["path"] == "candidate-windows.json"
+
+
+def test_canonical_manifest_rejects_legacy_inclusive_end_frame(tmp_path: Path) -> None:
+    batch = tmp_path / "batch"
+    source_root = batch / "asset-001"
+    write_standard_hdf5_episode(source_root)
+    manifest = batch / "manifest.jsonl"
+    manifest.write_text(
+        '{"asset_id":"asset-001","canonical_format":"hdf5",'
+        '"canonical_source_path":"asset-001","start_frame":1,'
+        '"end_frame":2}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="end_frame_exclusive"):
+        contexts_from_manifest(manifest, batch_root=batch)
 
 
 def test_manifest_entrypoint_selects_exact_lerobot_episode(tmp_path: Path) -> None:
@@ -238,6 +264,38 @@ def test_video_resolution_rejects_post_load_symlink_and_hash_drift(tmp_path: Pat
 
     with pytest.raises(CanonicalInputError, match="provenance.source_files"):
         CanonicalQcBridge(drift_episode, source_root=drift_root).video_path()
+
+
+def test_video_resolution_rejects_physical_span_beyond_mp4_frame_count(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "asset-001"
+    write_standard_hdf5_episode(source_root)
+    episode = StandardHdf5Adapter().load(source_root)
+    forged_range = (100, 103)
+    forged = replace(
+        episode,
+        provenance=replace(
+            episode.provenance,
+            source_fingerprint=source_fingerprint(
+                episode.provenance.source_files,
+                source_schema_version=episode.identity.source_schema_version,
+                adapter_id=episode.provenance.adapter_id,
+                adapter_version=episode.provenance.adapter_version,
+                main_video_source_frame_range=forged_range,
+            ),
+        ),
+        main_video=replace(
+            episode.main_video,
+            source_frame_range=forged_range,
+        ),
+    )
+
+    with pytest.raises(
+        CanonicalInputError,
+        match="main_video.source_frame_range",
+    ):
+        CanonicalQcBridge(forged, source_root=source_root).video_path()
 
 
 def test_canonical_reserved_sources_override_supplemental_poison(tmp_path: Path) -> None:

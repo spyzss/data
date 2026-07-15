@@ -202,21 +202,48 @@ def contexts_from_manifest(
             source_files[source_name] = {"path": relative}
             row[column] = absolute
 
-        start_text = _text(row.get("start_frame"))
-        end_text = _text(row.get("end_frame"))
-        source_range: tuple[int, int] | None = None
-        if start_text or end_text:
-            if not start_text or not end_text:
-                raise ValueError(
-                    f"manifest row {row_index} must define both start_frame and end_frame"
-                )
-            start = _integer(row.get("start_frame"), "start_frame")
-            inclusive_end = _integer(row.get("end_frame"), "end_frame")
-            source_range = (start, inclusive_end + 1)
-
         canonical_format = _text(row.get("canonical_format")).lower()
         canonical_source = _text(row.get("canonical_source_path"))
-        if canonical_format or canonical_source:
+        canonical = bool(canonical_format or canonical_source)
+        start_text = _text(row.get("start_frame"))
+        inclusive_end_text = _text(row.get("end_frame"))
+        exclusive_end_text = _text(row.get("end_frame_exclusive"))
+        source_range: tuple[int, int] | None = None
+        if canonical:
+            if inclusive_end_text:
+                raise ValueError(
+                    f"manifest row {row_index} canonical ranges require "
+                    "end_frame_exclusive; end_frame is not allowed"
+                )
+            if start_text or exclusive_end_text:
+                if not start_text or not exclusive_end_text:
+                    raise ValueError(
+                        f"manifest row {row_index} must define both start_frame "
+                        "and end_frame_exclusive"
+                    )
+                source_range = (
+                    _integer(row.get("start_frame"), "start_frame"),
+                    _integer(
+                        row.get("end_frame_exclusive"),
+                        "end_frame_exclusive",
+                    ),
+                )
+        else:
+            if exclusive_end_text:
+                raise ValueError(
+                    f"manifest row {row_index} legacy ranges use inclusive end_frame"
+                )
+            if start_text or inclusive_end_text:
+                if not start_text or not inclusive_end_text:
+                    raise ValueError(
+                        f"manifest row {row_index} must define both start_frame "
+                        "and end_frame"
+                    )
+                start = _integer(row.get("start_frame"), "start_frame")
+                inclusive_end = _integer(row.get("end_frame"), "end_frame")
+                source_range = (start, inclusive_end + 1)
+
+        if canonical:
             if canonical_format not in {"hdf5", "lerobot"}:
                 raise ValueError(
                     f"manifest row {row_index} canonical_format must be hdf5 or lerobot"

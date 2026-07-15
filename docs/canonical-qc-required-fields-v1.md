@@ -57,7 +57,7 @@
 | `source_format` | enum | R | `hdf5` 或 `lerobot`。 |
 | `source_schema_version` | string | R | 输入合同版本；未知 major 版本拒绝接入。 |
 | `source_files[]` | object[] | A | 相对路径、文件角色、字节数、SHA-256；Adapter 对实际文件计算。 |
-| `source_fingerprint` | SHA-256 | A | 对源文件 hash、输入 schema 和 Adapter 版本计算；用于缓存失效和发布前复核。 |
+| `source_fingerprint` | SHA-256 | A | 对源文件 hash、输入 schema、Adapter 版本和必填的 `main_video.source_frame_range` 计算；用于缓存失效和发布前复核。范围参数必须是非负、非空的严格整数半开 tuple，禁止 `None`、list 或 bool。 |
 
 ### 3.2 权威时间轴
 
@@ -95,6 +95,14 @@ Canonical 内部及 QC JSON 始终使用逻辑帧号 `[0,T)`；`source_frame_ran
 转换回逻辑坐标，禁止把共享文件 offset 写入 QC metrics、issues 或 evidence。
 物理区间参与 source fingerprint 和当前 v1 semantic fingerprint，避免同一共享
 MP4 文件中不同 span 发生身份碰撞。
+Bridge 在任何 Runner 读取前重新探测物理 MP4；若 `source_frame_range.end`
+超过实际物理帧数，必须以输入完整性错误拒绝，禁止依赖解码器静默截断。
+
+运行期信任边界：源 bucket 从 Adapter 建立 Canonical provenance 起，到该样本
+全部 QC Runner 完成为止必须保持只读。系统在文件型 producer 前后复核来源的
+size/SHA-256，用于发现误写和普通漂移；不会为每个 Runner 复制整份 MP4。
+能够精确卡在两次复核之间替换文件并在复核前恢复的主动对抗写入者不属于首版
+威胁模型，存储 ACL 必须在部署层阻止此类写入。
 
 ### 3.4 双手 21 点 Core
 
@@ -119,6 +127,33 @@ MP4 文件中不同 span 发生身份碰撞。
 - 3D 与 2D 的 `T`、hand 顺序和 joint 顺序必须一致。
 
 这些字段是 Keypoint Presence、Morphology、Temporal、Overlay 和 SAM3 Containment 的共同输入。
+
+`egodata_hand21.v1` 的数组索引是冻结的序列化合同，不等同于按手指分组的
+展示顺序。左右手都使用同一张表，仅由 hand 维度区分 side：
+
+| index | Acceptance base name |
+| ---: | --- |
+| 0 | `Hand` |
+| 1 | `IndexFingerKnuckle` |
+| 2 | `IndexFingerIntermediateBase` |
+| 3 | `IndexFingerIntermediateTip` |
+| 4 | `MiddleFingerKnuckle` |
+| 5 | `MiddleFingerIntermediateBase` |
+| 6 | `MiddleFingerIntermediateTip` |
+| 7 | `LittleFingerKnuckle` |
+| 8 | `LittleFingerIntermediateBase` |
+| 9 | `LittleFingerIntermediateTip` |
+| 10 | `RingFingerKnuckle` |
+| 11 | `RingFingerIntermediateBase` |
+| 12 | `RingFingerIntermediateTip` |
+| 13 | `ThumbKnuckle` |
+| 14 | `ThumbIntermediateBase` |
+| 15 | `ThumbIntermediateTip` |
+| 16 | `ThumbTip` |
+| 17 | `IndexFingerTip` |
+| 18 | `MiddleFingerTip` |
+| 19 | `RingFingerTip` |
+| 20 | `LittleFingerTip` |
 
 ### 3.5 主相机标定
 
@@ -406,7 +441,7 @@ supplier.hand_quality.mapping_version
 | `canonical_format` | 是 | 仅允许 `hdf5` 或 `lerobot`。 |
 | `canonical_source_path` | 是 | 位于 `batch_root` 内的标准 HDF5 episode 路径或 LeRobot dataset 根目录。 |
 | `episode_index` | LeRobot 多 episode 时是 | 必须精确选择一个 episode；不允许默认取第一条。 |
-| `start_frame` / `end_frame` | 否 | manifest 边界仍为闭区间输入，入口仅转换一次为内部半开区间。必须成对出现。 |
+| `start_frame` / `end_frame_exclusive` | 否 | Canonical manifest 直接使用逻辑半开区间 `[start_frame,end_frame_exclusive)`，必须成对出现；禁止使用 legacy 的 inclusive `end_frame`。 |
 | `candidate_windows_path` | SAM3 时是 | supplemental source；必须位于 `batch_root` 内。 |
 | `sam3_model` / `sam3_model_path` | 无注入模型时是 | supplemental source；必须位于 `batch_root` 内。 |
 | `manifest` 及其他既有 runner 输入 | 按模块 | 作为 supplemental source 保留；Canonical 生成的 `video`、`hdf5/parquet` 和 provenance 保留键拥有最终优先级。 |
@@ -414,6 +449,10 @@ supplier.hand_quality.mapping_version
 入口会在 worker 前严格加载 Adapter、验证所有 provenance 文件，并把完整、纯 JSON
 的 Canonical provenance 写入 `AssetContext.source_files`。不得在 manifest 中放置
 Python 对象或覆盖 Canonical 保留键。
+
+非 Canonical legacy manifest 为兼容既有调用仍使用 `start_frame/end_frame`
+闭区间，并仅在 legacy 入口执行一次 `end_frame + 1`。两个合同按
+`canonical_format/canonical_source_path` 显式分支，禁止在同一行混用。
 
 ## 10. 错误与最终状态
 

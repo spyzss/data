@@ -10,13 +10,14 @@ from typing import Any
 
 import numpy as np
 
-from qc_common.keypoints import acceptance_joint_names
+from qc_common.keypoints import EGODATA_HAND21_INDEX_TO_ACCEPTANCE_BASE
 from qc_common.types import ClipInputs
 from qc_pipeline.context import AssetContext
 
 from .contracts import CanonicalQcEpisode
 from .errors import CanonicalInputError
 from .validation import validate_episode
+from .video_probe import probe_video
 
 
 def _fail(field: str, detail: str) -> None:
@@ -139,6 +140,14 @@ class CanonicalQcBridge:
         path = verified[video.path]
         if video.sha256 != declared[0].sha256:
             _fail("main_video.sha256", "source file does not match canonical provenance")
+        physical_frame_count = probe_video(path).frame_count
+        _physical_start, physical_end = video.source_frame_range
+        if physical_end > physical_frame_count:
+            _fail(
+                "main_video.source_frame_range",
+                f"ends at {physical_end}, beyond physical MP4 frame count "
+                f"{physical_frame_count}",
+            )
         return path
 
     def semantic_payload(self) -> Mapping[str, Any]:
@@ -177,13 +186,12 @@ class CanonicalQcBridge:
         episode = self._episode
         start, end = _range(source_range, episode.time_axis.frame_count)
         points = episode.observation.hand_keypoints_3d[start:end]
-        names = acceptance_joint_names()
         keypoints = {
-            name: _readonly(points[:, hand_index, joint_index, :])
-            for hand_index in range(2)
-            for joint_index, name in enumerate(
-                names[hand_index * 21 : (hand_index + 1) * 21]
+            f"{side}{base_name}": _readonly(
+                points[:, hand_index, joint_index, :]
             )
+            for hand_index, side in enumerate(("left", "right"))
+            for joint_index, base_name in EGODATA_HAND21_INDEX_TO_ACCEPTANCE_BASE.items()
         }
         payload = self._semantic_payload()
         legacy_text_label = dict(payload)

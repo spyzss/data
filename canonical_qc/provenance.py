@@ -41,9 +41,23 @@ def source_fingerprint(
     source_schema_version: str,
     adapter_id: str,
     adapter_version: str,
-    main_video_source_frame_range: tuple[int, int] | None = None,
+    main_video_source_frame_range: tuple[int, int],
 ) -> str:
     """Hash source identity independent of input enumeration order."""
+
+    if (
+        type(main_video_source_frame_range) is not tuple
+        or len(main_video_source_frame_range) != 2
+        or any(type(value) is not int for value in main_video_source_frame_range)
+    ):
+        raise ValueError(
+            "main_video_source_frame_range must be an exact integer half-open tuple"
+        )
+    source_start, source_end = main_video_source_frame_range
+    if source_start < 0 or source_end <= source_start:
+        raise ValueError(
+            "main_video_source_frame_range must be non-negative and non-empty"
+        )
 
     files = sorted(
         (

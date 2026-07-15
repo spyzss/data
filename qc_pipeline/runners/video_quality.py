@@ -21,15 +21,18 @@ def _rebase_canonical_metrics(
     metrics: Any,
     *,
     physical_origin: int,
-    logical_frame_count: int,
+    logical_start: int,
+    logical_end: int,
 ) -> Any:
     """Convert producer physical MP4 coordinates to Canonical frame numbers once."""
     intervals = []
     for interval in metrics.frozen_intervals:
         start = interval.start_frame - physical_origin
         end = interval.end_frame - physical_origin
-        if start < 0 or end < start or end >= logical_frame_count:
-            raise ValueError("video producer returned a frame outside canonical bounds")
+        if start < logical_start or end < start or end >= logical_end:
+            raise ValueError(
+                "video producer returned a frame outside selected canonical range"
+            )
         intervals.append(
             replace(
                 interval,
@@ -46,8 +49,10 @@ def _rebase_canonical_metrics(
             errors.append(error)
             continue
         logical = int(match.group(1)) - physical_origin
-        if not 0 <= logical < logical_frame_count:
-            raise ValueError("video producer error frame is outside canonical bounds")
+        if not logical_start <= logical < logical_end:
+            raise ValueError(
+                "video producer error frame is outside selected canonical range"
+            )
         errors.append(f"range_decode_failed:{logical}")
     return replace(metrics, frozen_intervals=tuple(intervals), errors=tuple(errors))
 
@@ -174,10 +179,15 @@ def run(context: AssetContext, config: LoadedQcConfig) -> ModuleResult:
             )
     if canonical:
         physical_origin, _ = canonical_episode.main_video.source_frame_range
+        logical_start, logical_end = context.source_range or (
+            0,
+            canonical_episode.time_axis.frame_count,
+        )
         metrics = _rebase_canonical_metrics(
             metrics,
             physical_origin=physical_origin,
-            logical_frame_count=canonical_episode.time_axis.frame_count,
+            logical_start=logical_start,
+            logical_end=logical_end,
         )
         bridge.verify_sources()
     metrics = replace(metrics, asset_id=context.asset_id)

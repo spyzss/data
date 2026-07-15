@@ -220,13 +220,21 @@ def _assert_module_order(
                 continue_to_next = exit_gate.get("continue_to_next_module")
                 recorded_next = exit_gate.get("next_module")
     if last_completed == result_module:
-        continuing_status = "completed" if next_module is None else "running"
         continuing_rerun = (
-            exit_state == "continue"
+            next_module is not None
+            and exit_state == "continue"
             and continue_to_next is True
             and recorded_next == next_module
             and current_next == next_module
-            and pipeline_status == continuing_status
+            and pipeline_status == "running"
+        )
+        completed_rerun = (
+            next_module is None
+            and exit_state == "complete_qc"
+            and continue_to_next is False
+            and recorded_next is None
+            and current_next is None
+            and pipeline_status == "completed"
         )
         stopped_rerun = (
             exit_state == "stop_qc"
@@ -235,7 +243,7 @@ def _assert_module_order(
             and current_next is None
             and pipeline_status == "stopped"
         )
-        if continuing_rerun or stopped_rerun:
+        if continuing_rerun or completed_rerun or stopped_rerun:
             return
 
     raise ModuleOrderError(
@@ -478,8 +486,15 @@ def apply_module_result(
     evidence = _preflight_evidence(context, result)
     hard_stop = result.verdict == "fail" and profile_config["fail_action"] == "stop"
     continued_after_fail = result.verdict == "fail" and not hard_stop
-    continue_to_next = not hard_stop
-    exit_state = "continue" if continue_to_next else "stop_qc"
+    if hard_stop:
+        exit_state = "stop_qc"
+        continue_to_next = False
+    elif next_module is None:
+        exit_state = "complete_qc"
+        continue_to_next = False
+    else:
+        exit_state = "continue"
+        continue_to_next = True
     module_block = _module_block(
         result,
         evidence=evidence,

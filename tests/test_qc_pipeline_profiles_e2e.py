@@ -14,6 +14,8 @@ import pytest
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import Issue, ModuleResult
 from qc_common.module_registry import ModulePrerequisiteError, ModuleRegistry
+from qc_common.report import StaleReportRevisionError, write_asset_qc_report
+from qc_common.report_mutation import initialize_v2_report
 from qc_pipeline.context import AssetContext
 from qc_pipeline.default_registry import build_default_registry
 from qc_pipeline.orchestrator import run_asset
@@ -439,6 +441,7 @@ def test_equivalent_standard_sources_have_same_machine_gate_and_revision(
         assert left_evaluation == right_evaluation
         assert left[module]["metrics"] == right[module]["metrics"]
         assert left[module]["flow"]["result_gate"] == right[module]["flow"]["result_gate"]
+        assert left[module]["flow"]["exit_gate"] == right[module]["flow"]["exit_gate"]
         normalized_left = [
             {
                 key: issue.get(key)
@@ -573,5 +576,66 @@ def test_shared_lerobot_video_runs_logically_rebased_video_and_sam3_pipeline(
     assert intervals[0]["end_frame"] == 10
     assert physical_reads == [11]
     assert report["sam3_containment"]["flow"]["result_gate"]["verdict"] == "pass"
+    assert report["sam3_containment"]["flow"]["exit_gate"] == {
+        "state": "complete_qc",
+        "continue_to_next_module": False,
+        "next_module": None,
+    }
     assert report["pipeline_state"]["status"] == "completed"
     assert report["report_revision"] == 2
+
+
+def test_canonical_pipeline_stale_cas_preserves_concurrent_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_common.config import load_qc_acceptance_config
+
+    batch = tmp_path / "batch"
+    source_root = batch / "asset-001"
+    write_standard_hdf5_episode(source_root)
+    episode = StandardHdf5Adapter().load(source_root)
+    context = CanonicalQcBridge(episode, source_root=source_root).asset_context(
+        batch_root=batch,
+        report_path=batch / "quality_archive" / "asset-001.json",
+    )
+    loaded = load_qc_acceptance_config()
+    raw = json.loads(json.dumps(loaded.raw))
+    raw["pipeline"]["modules"] = ["video_quality"]
+    config = LoadedQcConfig(path=loaded.path, raw=raw, sha256=loaded.sha256)
+
+    def stale_apply(*args: object, **kwargs: object) -> dict[str, Any]:
+        concurrent = initialize_v2_report(
+            context,
+            config,
+            "supplier_evaluation",
+            "2026-07-15T00:00:00Z",
+        )
+        concurrent["future_extension"] = {"keep": True}
+        concurrent["report_revision"] = 1
+        write_asset_qc_report(
+            context.report_path,
+            concurrent,
+            expected_revision=0,
+            profile="supplier_evaluation",
+        )
+        raise StaleReportRevisionError("expected revision 0, found 1")
+
+    monkeypatch.setattr(
+        "qc_pipeline.orchestrator.apply_module_result",
+        stale_apply,
+    )
+
+    outcome = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=build_default_registry(context, config),
+        now=lambda: "2026-07-15T00:01:00Z",
+    )
+
+    assert outcome.status == "error"
+    assert outcome.report["report_revision"] == 2
+    assert outcome.report["future_extension"] == {"keep": True}
+    assert outcome.report["runtime_errors"][0]["error_type"] == "stale_revision"
+    assert outcome.report["runtime_errors"][0]["retryable"] is True
