@@ -142,12 +142,12 @@ class CanonicalQcBridge:
     def semantic_payload(...) -> Mapping[str, Any]: ...
 ```
 
-- [ ] Step 1: 添加 bridge 映射测试：21 点顺序、数值不变、半开 slice、invalid NaN、video path 和 semantics。
-- [ ] Step 2: 确认测试因 Bridge 缺失失败。
-- [ ] Step 3: 实现只读视图；`quality_hand` 不进入 legacy machine validity，新增 `supplier_hand_quality_status` 只读属性。
-- [ ] Step 4: 让三个 runner 在存在 `canonical_episode` 时优先使用 Bridge；无 Canonical 时 legacy 路径行为不变。
-- [ ] Step 5: 添加标准 HDF5 和 LeRobot 各自进入现有 orchestrator 的 E2E，断言同一机器结果、相同 Gate 和 QC JSON CAS revision。
-- [ ] Step 6: 运行 QC orchestrator、precheck、video、SAM3 回归；提交 `feat(qc): bridge canonical episodes into existing runners`。
+- [x] Step 1: 添加 bridge 映射测试：21 点顺序、数值不变、半开 slice、invalid NaN、video path 和 semantics。
+- [x] Step 2: 确认测试因 Bridge 缺失失败。
+- [x] Step 3: 实现只读视图；`quality_hand` 不进入 legacy machine validity，新增 `supplier_hand_quality_status` 只读属性。
+- [x] Step 4: 让三个 runner 在存在 `canonical_episode` 时优先使用 Bridge；无 Canonical 时 legacy 路径行为不变。
+- [x] Step 5: 添加标准 HDF5 和 LeRobot 各自进入现有 orchestrator 的 E2E，断言同一机器结果、相同 Gate 和 QC JSON CAS revision。
+- [x] Step 6: 运行 QC orchestrator、precheck、video、SAM3 回归；提交 `feat(qc): bridge canonical episodes into existing runners`。
 
 ## Task 6: 标准化 optional hand quality Evidence 与分歧统计
 
