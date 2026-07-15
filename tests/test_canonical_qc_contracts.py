@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -160,6 +161,64 @@ def _assert_error(
     return caught.value
 
 
+def _duck(value: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        **{item.name: getattr(value, item.name) for item in fields(value)}
+    )
+
+
+def _episode_with_duck(field: str) -> CanonicalQcEpisode:
+    episode = make_episode()
+    if field == "identity":
+        return replace(episode, identity=_duck(episode.identity))
+    if field == "provenance":
+        return replace(episode, provenance=_duck(episode.provenance))
+    if field == "provenance.source_files[0]":
+        source_files = (
+            _duck(episode.provenance.source_files[0]),
+            episode.provenance.source_files[1],
+        )
+        return replace(
+            episode,
+            provenance=replace(episode.provenance, source_files=source_files),
+        )
+    if field == "time_axis":
+        return replace(episode, time_axis=_duck(episode.time_axis))
+    if field == "main_video":
+        return replace(episode, main_video=_duck(episode.main_video))
+    if field == "observation":
+        return replace(episode, observation=_duck(episode.observation))
+    if field == "calibration":
+        return replace(episode, calibration=_duck(episode.calibration))
+    if field == "semantics":
+        return replace(episode, semantics=_duck(episode.semantics))
+    if field == "semantics.subtask_sequence[0]":
+        subtasks = (
+            _duck(episode.semantics.subtask_sequence[0]),
+            episode.semantics.subtask_sequence[1],
+        )
+        return replace(
+            episode,
+            semantics=replace(episode.semantics, subtask_sequence=subtasks),
+        )
+    if field == "supplier_evidence":
+        return replace(
+            episode,
+            supplier_evidence=_duck(episode.supplier_evidence),
+        )
+    if field == "supplier_evidence.hand_quality":
+        quality = SupplierHandQuality(
+            provided=True,
+            status=np.full((3, 2), "unknown"),
+            mapping_version="supplier-001.hand-quality.v1",
+        )
+        return replace(
+            episode,
+            supplier_evidence=SupplierEvidence(hand_quality=_duck(quality)),
+        )
+    raise AssertionError(f"unknown test field: {field}")
+
+
 def test_minimal_episode_is_valid_and_keeps_authoritative_timestamps() -> None:
     episode = make_episode()
 
@@ -169,6 +228,32 @@ def test_minimal_episode_is_valid_and_keeps_authoritative_timestamps() -> None:
     assert episode.time_axis.timestamps_ns.tolist() == [0, 20_000_000, 55_000_000]
     assert episode.time_axis.frame_index_base == 0
     assert episode.time_axis.interval_semantics == "half_open"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "identity",
+        "provenance",
+        "provenance.source_files[0]",
+        "time_axis",
+        "main_video",
+        "observation",
+        "calibration",
+        "semantics",
+        "semantics.subtask_sequence[0]",
+        "supplier_evidence",
+        "supplier_evidence.hand_quality",
+    ],
+)
+def test_validator_rejects_every_nested_duck_typed_contract(field: str) -> None:
+    episode = _episode_with_duck(field)
+
+    _assert_error(
+        episode,
+        code="invalid_contract_type",
+        field=field,
+    )
 
 
 def test_contracts_and_all_arrays_are_deeply_immutable() -> None:
@@ -308,6 +393,29 @@ def test_timestamp_order_check_cannot_overflow_int64() -> None:
 
 
 @pytest.mark.parametrize(
+    "frame_index_base",
+    [False, 0.0, np.bool_(False), np.float32(0.0)],
+)
+def test_frame_index_base_rejects_equal_zero_non_integral_types(
+    frame_index_base: object,
+) -> None:
+    episode = make_episode()
+    changed = replace(
+        episode,
+        time_axis=replace(
+            episode.time_axis,
+            frame_index_base=frame_index_base,
+        ),
+    )
+
+    _assert_error(
+        changed,
+        code="invalid_integer",
+        field="time_axis.frame_index_base",
+    )
+
+
+@pytest.mark.parametrize(
     ("calibration", "code", "field"),
     [
         (
@@ -384,6 +492,96 @@ def test_missing_optional_hand_quality_is_valid() -> None:
     validate_episode(episode)
 
 
+def test_provided_false_allows_absent_or_all_unknown_status() -> None:
+    episode = make_episode()
+    for status in (None, np.full((3, 2), "unknown")):
+        changed = replace(
+            episode,
+            supplier_evidence=SupplierEvidence(
+                hand_quality=SupplierHandQuality(provided=False, status=status)
+            ),
+        )
+        validate_episode(changed)
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"raw_value": np.zeros((3, 2), dtype=np.uint8)},
+        {"normalized_score": np.zeros((3, 2), dtype=np.float32)},
+        {"mapping_version": "supplier-001.hand-quality.v1"},
+    ],
+)
+def test_provided_false_rejects_actual_hand_quality_evidence(
+    evidence: dict[str, object],
+) -> None:
+    episode = make_episode()
+    changed = replace(
+        episode,
+        supplier_evidence=SupplierEvidence(
+            hand_quality=SupplierHandQuality(
+                provided=False,
+                status=np.full((3, 2), "unknown"),
+                **evidence,
+            )
+        ),
+    )
+
+    _assert_error(
+        changed,
+        code="invalid_hand_quality_state",
+        field="supplier_evidence.hand_quality",
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "mapping_version", "field"),
+    [
+        (None, "supplier-001.hand-quality.v1", "supplier_evidence.hand_quality.status"),
+        (np.full((3, 2), "unknown"), None, "supplier_evidence.hand_quality.mapping_version"),
+        (np.full((3, 2), "unknown"), "", "supplier_evidence.hand_quality.mapping_version"),
+    ],
+)
+def test_provided_true_requires_status_and_nonempty_mapping_version(
+    status: np.ndarray | None,
+    mapping_version: str | None,
+    field: str,
+) -> None:
+    episode = make_episode()
+    changed = replace(
+        episode,
+        supplier_evidence=SupplierEvidence(
+            hand_quality=SupplierHandQuality(
+                provided=True,
+                status=status,
+                mapping_version=mapping_version,
+            )
+        ),
+    )
+
+    _assert_error(
+        changed,
+        code="invalid_hand_quality_state",
+        field=field,
+    )
+
+
+def test_provided_true_allows_status_and_mapping_without_score_or_raw() -> None:
+    episode = make_episode()
+    changed = replace(
+        episode,
+        supplier_evidence=SupplierEvidence(
+            hand_quality=SupplierHandQuality(
+                provided=True,
+                status=np.full((3, 2), "unknown"),
+                mapping_version="supplier-001.hand-quality.v1",
+            )
+        ),
+    )
+
+    validate_episode(changed)
+
+
 def test_hand_quality_validates_only_its_own_optional_contract() -> None:
     episode = make_episode()
     hand_quality = SupplierHandQuality(
@@ -434,6 +632,23 @@ def test_source_fingerprint_is_order_independent_and_adapter_sensitive() -> None
     assert first == reordered
     assert len(first) == 64
     assert first != upgraded
+
+
+def test_source_fingerprint_normalizes_numpy_integral_size() -> None:
+    native = _source_files()
+    numpy_sized = (
+        replace(native[0], size_bytes=np.int64(native[0].size_bytes)),
+        replace(native[1], size_bytes=np.int64(native[1].size_bytes)),
+    )
+    kwargs = {
+        "source_schema_version": "egodata_hdf5_qc_input.v1",
+        "adapter_id": "standard_hdf5",
+        "adapter_version": "1.0.0",
+    }
+
+    assert source_fingerprint(native, **kwargs) == source_fingerprint(
+        numpy_sized, **kwargs
+    )
 
 
 def test_validator_rejects_source_fingerprint_drift() -> None:
@@ -495,7 +710,11 @@ def test_invalid_utf8_hand_quality_status_has_stable_diagnostic() -> None:
     changed = replace(
         episode,
         supplier_evidence=SupplierEvidence(
-            hand_quality=SupplierHandQuality(provided=True, status=status)
+            hand_quality=SupplierHandQuality(
+                provided=True,
+                status=status,
+                mapping_version="supplier-001.hand-quality.v1",
+            )
         ),
     )
 
@@ -539,3 +758,107 @@ def test_semantic_fingerprint_changes_with_core_array_value() -> None:
     )
 
     assert semantic_fingerprint(first) != semantic_fingerprint(second)
+
+
+def test_semantic_fingerprint_canonicalizes_invalid_nan_payload_bits() -> None:
+    first = make_episode()
+    second = make_episode()
+    first_points = first.observation.hand_keypoints_3d.copy()
+    second_points = second.observation.hand_keypoints_3d.copy()
+    first_valid = first.observation.hand_joint_valid_3d.copy()
+    second_valid = second.observation.hand_joint_valid_3d.copy()
+    first_nan = np.array([0x7FC00000], dtype=np.uint32).view(np.float32)[0]
+    second_nan = np.array([0x7FC00001], dtype=np.uint32).view(np.float32)[0]
+    first_points[0, 0, 0] = first_nan
+    second_points[0, 0, 0] = second_nan
+    first_valid[0, 0, 0] = False
+    second_valid[0, 0, 0] = False
+    first = replace(
+        first,
+        observation=replace(
+            first.observation,
+            hand_keypoints_3d=first_points,
+            hand_joint_valid_3d=first_valid,
+        ),
+    )
+    second = replace(
+        second,
+        observation=replace(
+            second.observation,
+            hand_keypoints_3d=second_points,
+            hand_joint_valid_3d=second_valid,
+        ),
+    )
+
+    assert semantic_fingerprint(first) == semantic_fingerprint(second)
+    assert first.observation.hand_keypoints_3d[0, 0, 0, 0].view(np.uint32) == 0x7FC00000
+    assert second.observation.hand_keypoints_3d[0, 0, 0, 0].view(np.uint32) == 0x7FC00001
+
+
+def test_semantic_fingerprint_canonicalizes_signed_zero_without_mutation() -> None:
+    first = make_episode()
+    second = make_episode()
+    first_points = first.observation.hand_keypoints_3d.copy()
+    second_points = second.observation.hand_keypoints_3d.copy()
+    first_points[0, 0, 0, 0] = np.float32(0.0)
+    second_points[0, 0, 0, 0] = np.float32(-0.0)
+    first = replace(
+        first,
+        observation=replace(first.observation, hand_keypoints_3d=first_points),
+    )
+    second = replace(
+        second,
+        observation=replace(second.observation, hand_keypoints_3d=second_points),
+    )
+
+    assert semantic_fingerprint(first) == semantic_fingerprint(second)
+    assert np.signbit(second.observation.hand_keypoints_3d[0, 0, 0, 0])
+
+
+def test_semantic_fingerprint_normalizes_all_numpy_integral_contract_fields() -> None:
+    native = make_episode()
+    source_files = tuple(
+        replace(item, size_bytes=np.int64(item.size_bytes))
+        for item in native.provenance.source_files
+    )
+    numpy_episode = replace(
+        native,
+        provenance=_provenance(
+            source_files=source_files,
+            source_schema_version=native.identity.source_schema_version,
+        ),
+        time_axis=replace(
+            native.time_axis,
+            frame_count=np.int64(native.time_axis.frame_count),
+            fps_num=np.int64(native.time_axis.fps_num),
+            fps_den=np.int64(native.time_axis.fps_den),
+            frame_index_base=np.int64(native.time_axis.frame_index_base),
+        ),
+        main_video=replace(
+            native.main_video,
+            frame_count=np.int64(native.main_video.frame_count),
+            width_px=np.int64(native.main_video.width_px),
+            height_px=np.int64(native.main_video.height_px),
+            fps_num=np.int64(native.main_video.fps_num),
+            fps_den=np.int64(native.main_video.fps_den),
+        ),
+        calibration=replace(
+            native.calibration,
+            image_width_px=np.int64(native.calibration.image_width_px),
+            image_height_px=np.int64(native.calibration.image_height_px),
+        ),
+        semantics=replace(
+            native.semantics,
+            subtask_sequence=tuple(
+                replace(
+                    item,
+                    start_frame=np.int64(item.start_frame),
+                    end_frame_exclusive=np.int64(item.end_frame_exclusive),
+                )
+                for item in native.semantics.subtask_sequence
+            ),
+        ),
+    )
+
+    validate_episode(numpy_episode)
+    assert semantic_fingerprint(native) == semantic_fingerprint(numpy_episode)

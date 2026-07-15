@@ -8,7 +8,20 @@ import re
 
 import numpy as np
 
-from .contracts import CanonicalQcEpisode
+from .contracts import (
+    CameraCalibration,
+    CanonicalQcEpisode,
+    EpisodeIdentity,
+    EpisodeSemantics,
+    HandObservation,
+    SourceFile,
+    SourceProvenance,
+    Subtask,
+    SupplierEvidence,
+    SupplierHandQuality,
+    TimeAxis,
+    VideoStream,
+)
 from .errors import CanonicalInputError
 from .provenance import source_fingerprint
 
@@ -19,6 +32,49 @@ _HAND_QUALITY_STATUSES = frozenset({"bad", "warning", "good", "unknown"})
 
 def _fail(code: str, field: str, detail: str) -> None:
     raise CanonicalInputError(code, field, detail)
+
+
+def _contract_type(value: object, expected: type[object], field: str) -> None:
+    if not isinstance(value, expected):
+        _fail(
+            "invalid_contract_type",
+            field,
+            f"must be {expected.__name__}, got {type(value).__name__}",
+        )
+
+
+def _validate_contract_types(episode: CanonicalQcEpisode) -> None:
+    contracts = (
+        (episode.identity, EpisodeIdentity, "identity"),
+        (episode.provenance, SourceProvenance, "provenance"),
+        (episode.time_axis, TimeAxis, "time_axis"),
+        (episode.main_video, VideoStream, "main_video"),
+        (episode.observation, HandObservation, "observation"),
+        (episode.calibration, CameraCalibration, "calibration"),
+        (episode.semantics, EpisodeSemantics, "semantics"),
+        (episode.supplier_evidence, SupplierEvidence, "supplier_evidence"),
+    )
+    for value, expected, field in contracts:
+        _contract_type(value, expected, field)
+    for index, source_file in enumerate(episode.provenance.source_files):
+        _contract_type(
+            source_file,
+            SourceFile,
+            f"provenance.source_files[{index}]",
+        )
+    for index, subtask in enumerate(episode.semantics.subtask_sequence):
+        _contract_type(
+            subtask,
+            Subtask,
+            f"semantics.subtask_sequence[{index}]",
+        )
+    hand_quality = episode.supplier_evidence.hand_quality
+    if hand_quality is not None:
+        _contract_type(
+            hand_quality,
+            SupplierHandQuality,
+            "supplier_evidence.hand_quality",
+        )
 
 
 def _nonempty_string(value: object, field: str) -> None:
@@ -163,6 +219,7 @@ def _validate_time_axis(episode: CanonicalQcEpisode) -> None:
     _positive_int(time_axis.frame_count, "time_axis.frame_count")
     _positive_int(time_axis.fps_num, "time_axis.fps_num")
     _positive_int(time_axis.fps_den, "time_axis.fps_den")
+    _nonnegative_int(time_axis.frame_index_base, "time_axis.frame_index_base")
     _constant(time_axis.frame_index_base, 0, "time_axis.frame_index_base")
     _constant(time_axis.interval_semantics, "half_open", "time_axis.interval_semantics")
     _array(
@@ -368,6 +425,35 @@ def _validate_supplier_evidence(episode: CanonicalQcEpisode) -> None:
             "supplier_evidence.hand_quality.provided",
             "must be bool",
         )
+    if hand_quality.provided:
+        if hand_quality.status is None:
+            _fail(
+                "invalid_hand_quality_state",
+                "supplier_evidence.hand_quality.status",
+                "provided=true requires canonical status",
+            )
+        if (
+            not isinstance(hand_quality.mapping_version, str)
+            or not hand_quality.mapping_version.strip()
+        ):
+            _fail(
+                "invalid_hand_quality_state",
+                "supplier_evidence.hand_quality.mapping_version",
+                "provided=true requires a non-empty mapping version",
+            )
+    elif any(
+        value is not None
+        for value in (
+            hand_quality.raw_value,
+            hand_quality.normalized_score,
+            hand_quality.mapping_version,
+        )
+    ):
+        _fail(
+            "invalid_hand_quality_state",
+            "supplier_evidence.hand_quality",
+            "provided=false forbids raw, normalized, and mapping evidence",
+        )
     shape = (episode.time_axis.frame_count, 2)
     if hand_quality.raw_value is not None:
         if hand_quality.raw_value.dtype.hasobject:
@@ -446,6 +532,7 @@ def validate_episode(episode: CanonicalQcEpisode) -> None:
 
     if not isinstance(episode, CanonicalQcEpisode):
         _fail("invalid_episode_type", "episode", "must be CanonicalQcEpisode")
+    _validate_contract_types(episode)
     _validate_identity(episode)
     _validate_provenance(episode)
     _validate_time_axis(episode)

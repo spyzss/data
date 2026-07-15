@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
+from numbers import Integral
 from typing import Any, Iterable
 
 import numpy as np
@@ -11,9 +13,21 @@ import numpy as np
 from .contracts import CanonicalQcEpisode, SourceFile
 
 
+def _json_native(value: object) -> object:
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_native(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_native(item) for item in value]
+    return value
+
+
 def _stable_json(value: object) -> bytes:
     return json.dumps(
-        value,
+        _json_native(value),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -55,8 +69,17 @@ def source_fingerprint(
     }
     return hashlib.sha256(_stable_json(payload)).hexdigest()
 
-def _array_payload(array: np.ndarray) -> dict[str, Any]:
+def _array_payload(
+    array: np.ndarray,
+    *,
+    validity: np.ndarray | None = None,
+) -> dict[str, Any]:
     contiguous = np.ascontiguousarray(array)
+    if np.issubdtype(contiguous.dtype, np.floating):
+        contiguous = np.array(contiguous, copy=True, order="C")
+        contiguous[contiguous == 0] = contiguous.dtype.type(0)
+        if validity is not None:
+            contiguous[~validity] = contiguous.dtype.type(np.nan)
     return {
         "dtype": contiguous.dtype.str,
         "shape": list(contiguous.shape),
@@ -107,11 +130,17 @@ def semantic_fingerprint(episode: CanonicalQcEpisode) -> str:
             "camera_role": video.camera_role,
         },
         "observation": {
-            "hand_keypoints_3d": _array_payload(observation.hand_keypoints_3d),
+            "hand_keypoints_3d": _array_payload(
+                observation.hand_keypoints_3d,
+                validity=observation.hand_joint_valid_3d,
+            ),
             "hand_joint_valid_3d": _array_payload(
                 observation.hand_joint_valid_3d
             ),
-            "hand_keypoints_2d": _array_payload(observation.hand_keypoints_2d),
+            "hand_keypoints_2d": _array_payload(
+                observation.hand_keypoints_2d,
+                validity=observation.hand_joint_valid_2d,
+            ),
             "hand_joint_valid_2d": _array_payload(
                 observation.hand_joint_valid_2d
             ),
