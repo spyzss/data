@@ -96,6 +96,7 @@ h2 { font-size: 20px; }
 .timeline-track { position: relative; display: flex; min-width: 560px; height: 86px; padding-top: 17px; border-top: 1px solid var(--track-line); }
 .timeline-segment { position: relative; flex: 0 0 var(--segment-width); min-width: 66px; height: 57px; display: flex; flex-direction: column; justify-content: center; gap: 4px; padding: 9px 18px; background: #dceaff; border: 1px solid #a4c8ff; border-radius: 9px; color: #285996; transition: background .18s, border-color .18s, box-shadow .18s; }
 .timeline-segment.pending-affected { background: #c7ddff; border-color: var(--blue); box-shadow: 0 0 0 2px rgba(47, 118, 237, .13); }
+.timeline-segment.preview-affected { background: #fff1d9; border-color: var(--amber); transition: flex-basis .08s linear, background .18s, border-color .18s; }
 .segment-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 650; }
 .segment-range { color: #6c87a7; font-size: 10px; font-variant-numeric: tabular-nums; }
 .boundary-handle { position: relative; z-index: 2; flex: 0 0 12px; width: 12px; margin: 0 -6px; padding: 0; border: 0; border-radius: 8px; background: var(--blue); box-shadow: 0 0 0 3px #fff, 0 0 0 5px rgba(47, 118, 237, .17); cursor: ew-resize; touch-action: none; }
@@ -112,6 +113,7 @@ h2 { font-size: 20px; }
 .pending-actions button { padding: 7px 12px; font-size: 12px; }
 .pending-actions button[data-action="confirm-pending"] { color: #fff; background: var(--blue); border-color: var(--blue); }
 .semantic-preview-frame { display: block; min-height: 14px; margin-top: 6px; color: var(--amber); font-size: 11px; }
+.semantic-error { min-height: 0; margin-top: 8px; color: var(--danger); font-size: 11px; }
 .semantic-complete-row { display: flex; justify-content: end; margin-top: 17px; }
 .semantic-complete { padding: 9px 16px; color: #fff; background: var(--blue); border: 1px solid var(--blue); border-radius: 9px; font-size: 12px; }
 .semantic-text-slot { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }

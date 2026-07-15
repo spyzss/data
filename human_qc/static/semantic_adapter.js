@@ -97,6 +97,26 @@ export function pendingPresentation(pending) {
   };
 }
 
+export function linkedBoundaryPreview(model, boundaryIndex, frameExclusive) {
+  const previous = model?.segments?.[boundaryIndex - 1];
+  const following = model?.segments?.[boundaryIndex];
+  if (!previous || !following || !Number.isInteger(frameExclusive)) return null;
+  if (!(previous.start_frame < frameExclusive && frameExclusive < following.end_frame_exclusive)) return null;
+  const frameCount = Number(model.frameCount || 0);
+  return {
+    previous: {
+      startFrame: previous.start_frame,
+      endFrameExclusive: frameExclusive,
+      widthPercent: frameCount > 0 ? ((frameExclusive - previous.start_frame) / frameCount) * 100 : 0,
+    },
+    following: {
+      startFrame: frameExclusive,
+      endFrameExclusive: following.end_frame_exclusive,
+      widthPercent: frameCount > 0 ? ((following.end_frame_exclusive - frameExclusive) / frameCount) * 100 : 0,
+    },
+  };
+}
+
 export function renderTimelineMarkup(model, { pending = null, preview = null } = {}) {
   const affected = new Set(pendingPresentation(pending).affectedSegmentIds);
   const previewBoundary = preview?.boundary_index;
@@ -170,6 +190,7 @@ export class SemanticCalibrationAdapter {
       <div class="timeline-toolbar"><span class="timeline-caption">时间轴（帧）</span><span class="timeline-total">0–${displayEndFrame({ end_frame_exclusive: this.model.frameCount })}</span></div>
       <div class="timeline-host">${renderTimelineMarkup(this.model, { pending, preview: this.preview })}</div>
       <div class="semantic-pending-slot"></div>
+      <div class="semantic-error" role="alert" aria-live="polite"></div>
       <div class="semantic-text-slot"></div>
       <div class="semantic-complete-row"><button type="button" class="semantic-complete" data-action="complete-semantic" data-mutation-control>完成语义校准</button></div>
     </section>`;
@@ -233,14 +254,22 @@ export class SemanticCalibrationAdapter {
     handle.releasePointerCapture?.(event.pointerId);
     const drag = this.drag;
     this.drag = null;
-    if (cancelled) return;
+    if (cancelled) {
+      this.preview = null;
+      this.render(this.task, this.root);
+      return;
+    }
     const payload = makeBoundaryPayload({
       boundaryIndex: drag.boundaryIndex,
       actorSegmentId: drag.actorSegmentId,
       frameExclusive: drag.frameExclusive,
     });
     const result = this.postPending?.(payload) ?? this.onPending?.(payload);
-    if (result?.then) result.catch((error) => this.showError(error));
+    if (result?.then) result.catch((error) => {
+      this.preview = null;
+      this.render(this.task, this.root);
+      this.showError(error);
+    });
   }
 
   handleHandleKeydown(event, handle) {
@@ -302,10 +331,16 @@ export class SemanticCalibrationAdapter {
   }
 
   updatePreviewRanges(boundaryIndex, frameExclusive) {
+    const preview = linkedBoundaryPreview(this.model, boundaryIndex, frameExclusive);
+    if (!preview) return;
     const segments = this.root?.querySelectorAll?.(".timeline-segment") ?? [];
     const previous = segments[boundaryIndex - 1];
     const following = segments[boundaryIndex];
     if (!previous || !following) return;
+    previous.classList?.add("preview-affected");
+    following.classList?.add("preview-affected");
+    previous.style?.setProperty?.("--segment-width", `${preview.previous.widthPercent}%`);
+    following.style?.setProperty?.("--segment-width", `${preview.following.widthPercent}%`);
     previous.dataset.endFrame = String(frameExclusive - 1);
     following.dataset.startFrame = String(frameExclusive);
     previous.querySelector?.(".segment-range") && (previous.querySelector(".segment-range").textContent = `${previous.dataset.startFrame}–${frameExclusive - 1}`);

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   SemanticCalibrationAdapter,
   buildTimelineModel,
+  linkedBoundaryPreview,
   makeBoundaryPayload,
   pendingPresentation,
   renderTimelineMarkup,
@@ -61,6 +62,22 @@ test("boundary payload carries shared boundary index, actor segment, and exclusi
   );
 });
 
+test("drag preview resizes exactly the two adjacent segments", () => {
+  const model = buildTimelineModel(task.semantic);
+  const preview = linkedBoundaryPreview(model, 1, 60);
+  assert.deepEqual(preview.previous, {
+    startFrame: 0,
+    endFrameExclusive: 60,
+    widthPercent: (60 / 195) * 100,
+  });
+  assert.deepEqual(preview.following, {
+    startFrame: 60,
+    endFrameExclusive: 123,
+    widthPercent: (63 / 195) * 100,
+  });
+  assert.equal(model.segments[2].start_frame, 123);
+});
+
 test("pending presentation includes both affected before/after snapshots and locks edits", () => {
   const pendingTask = {
     ...task,
@@ -110,7 +127,26 @@ test("WorkbenchApp keeps server-conflict errors visible without overwriting the 
     }),
   });
   app.applyServerTask(task);
+  let statusRenders = 0;
+  app.renderStatus = () => { statusRenders += 1; };
   await assert.rejects(() => app.requestTask("asset-1"), /refresh/);
   assert.equal(app.task.revision, 4);
   assert.equal(app.lastError.code, "stale_revision");
+  assert.equal(statusRenders, 1);
+});
+
+test("loading a different asset clears the prior asset lease", async () => {
+  const app = new WorkbenchApp({ fetcher: null });
+  app.task = task;
+  app.assetId = "asset-1";
+  app.lease = { token: "old-token", expires_at: "later" };
+  app.leaseTimer = setInterval(() => {}, 60_000);
+  app.leaseTimer.unref?.();
+  app.requestTask = async (assetId) => {
+    assert.equal(assetId, "asset-2");
+    assert.equal(app.lease, null);
+    assert.equal(app.leaseTimer, null);
+    return { asset_id: assetId };
+  };
+  await app.loadAsset("asset-2");
 });

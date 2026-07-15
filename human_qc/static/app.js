@@ -69,6 +69,7 @@ export class WorkbenchApp {
       response = await this.fetcher(this.endpoint(path), options);
     } catch (error) {
       this.lastError = { code: "network_error", message: String(error?.message ?? error) };
+      this.renderStatus();
       throw error;
     }
     let value = null;
@@ -85,6 +86,7 @@ export class WorkbenchApp {
         status: error.status,
         current_revision: error.currentRevision,
       };
+      this.renderStatus();
       // Do not call applyServerTask here: a stale/conflicting response must
       // never replace the reviewer's current task snapshot.
       throw error;
@@ -108,8 +110,13 @@ export class WorkbenchApp {
       this.lastError = { code: error.code, message: error.message };
       throw error;
     }
-    this.assetId = String(assetId);
-    return this.requestTask(this.assetId);
+    const nextAssetId = String(assetId);
+    if (this.assetId !== nextAssetId) {
+      this.stopLeaseRenewal();
+      this.lease = null;
+      this.renderStatus();
+    }
+    return this.requestTask(nextAssetId);
   }
 
   applyServerTask(task) {
