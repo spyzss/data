@@ -951,9 +951,9 @@ def _open_staging_transaction(
     transaction_id = f"tx-{secrets.token_hex(16)}"
     try:
         release_stat = os.fstat(release_fd)
-        if _identity(release_stat) != _identity(
+        if _identity(release_stat)[:2] != _identity(
             os.stat(release_root, follow_symlinks=False)
-        ):
+        )[:2]:
             _reject("staging_root", "release_root identity changed", retryable=True)
         try:
             os.mkdir(".staging", mode=0o700, dir_fd=release_fd)
@@ -964,18 +964,18 @@ def _open_staging_transaction(
         staging_stat = os.fstat(staging_fd)
         if staging_stat.st_dev != release_stat.st_dev:
             _reject("staging_root", "staging must use the release filesystem")
-        if _identity(staging_stat) != _identity(
+        if _identity(staging_stat)[:2] != _identity(
             os.stat(candidate, follow_symlinks=False)
-        ):
+        )[:2]:
             _reject("staging_root", "staging root identity changed", retryable=True)
         os.mkdir(transaction_id, mode=0o700, dir_fd=staging_fd)
         root_fd = os.open(transaction_id, _directory_flags(), dir_fd=staging_fd)
         os.fchmod(root_fd, 0o700)
         root_stat = os.fstat(root_fd)
         actual_root = candidate / transaction_id
-        if _identity(root_stat) != _identity(
+        if _identity(root_stat)[:2] != _identity(
             os.stat(actual_root, follow_symlinks=False)
-        ):
+        )[:2]:
             _reject("staging_root", "transaction identity changed", retryable=True)
         return _StagingTransaction(
             release_root=release_root,
@@ -1026,6 +1026,8 @@ def write_staging(plan: PublishPlan, staging_root: Path) -> StagedRelease:
             manifest=manifest,
             manifest_sha256=manifest_sha,
             checksums_sha256=checksums_sha,
+            root_device=os.fstat(transaction.root_fd).st_dev,
+            root_inode=os.fstat(transaction.root_fd).st_ino,
         )
     except BaseException:
         transaction.cleanup()

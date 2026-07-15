@@ -372,6 +372,18 @@ symlink 时必须失败，且不得写入外部路径。ffmpeg timeout 按片段
 
 验证最后必须使用固定版本的官方 `lerobot.datasets.LeRobotDataset` 再回读一次。只有本仓库 `annotation.LeRobotV3Dataset` 可读而官方 reader 不可读时，发布必须失败，不能标记为 Curated LeRobot v3。
 
+官方 reader 门禁运行在离线独立子进程中，冻结 LeRobot、datasets、Torch、视频解码
+依赖以及 Python/数值栈/平台/backend 身份，并把版本集合及 fingerprint 写入验证报告。
+子进程必须实际读取第 0 帧和末帧，返回并由父进程复核 length、index、frame_index、
+timestamp_ns 和视频 tensor shape；timeout、signal、错误退出或不完整响应均失败。
+
+原子提交持有 release_root、`.staging`、`releases` 的 nofollow directory fd 和发布锁。
+所有文件/子目录 fsync 后必须再做一次完整独立验证和 plan revalidation，随后立即执行
+dirfd no-replace rename；rename 后 fsync staging/releases/root，最后用 O_EXCL 临时文件、
+fsync、`os.replace` 更新 CURRENT。已有同 ID 只有独立验证完全相同时才幂等；无效或
+不同内容为 commit_conflict。rename 后 CURRENT 前中断留下的是完整孤儿 release，重试
+必须验证、补齐 durability 和 CURRENT 后返回 already_published。
+
 ## 10. 错误模型
 
 ```python

@@ -263,13 +263,21 @@ def validate_staged_release(staged: StagedRelease, expected: CanonicalQcEpisode)
 def publish(request: PublishRequest) -> PublishResult: ...
 ```
 
-- [ ] Step 1: 写独立 reopen 的 row count/index/timestamp_ns/float timestamp/arrays/subtask/video PTS/checksum 测试。
-- [ ] Step 2: 运行测试并确认 validator/publish 缺失失败。
-- [ ] Step 3: 实现不共享 writer 内存状态的 reader/validator。
-- [ ] Step 4: 冻结官方 `lerobot` 版本，使用官方 `LeRobotDataset` 回读 staging；本地 reader 成功但官方 reader 失败时门禁必须失败。
-- [ ] Step 5: 实现 `.staging`、fsync、不可变 release rename、最后原子更新 `CURRENT.json` 和同请求幂等返回。
-- [ ] Step 6: 在 writer、validator、rename、CURRENT replace 各故障点注入异常，断言旧 CURRENT 和旧 release 字节不变，partial release 不可见。
-- [ ] Step 7: 运行官方 reader 与 annotation reader 回归，提交 `feat(publisher): validate and atomically commit LeRobot v3 releases`。
+- [x] Step 1: 写独立 reopen 的 row count/index/timestamp_ns/float timestamp/arrays/subtask/video PTS/checksum 测试。
+- [x] Step 2: 运行测试并确认 validator/publish 缺失失败。
+- [x] Step 3: 实现不共享 writer 内存状态的 reader/validator。
+- [x] Step 4: 冻结官方 `lerobot` 版本，使用官方 `LeRobotDataset` 回读 staging；本地 reader 成功但官方 reader 失败时门禁必须失败。
+- [x] Step 5: 实现 `.staging`、fsync、不可变 release rename、最后原子更新 `CURRENT.json` 和同请求幂等返回。
+- [x] Step 6: 在 writer、validator、rename、CURRENT replace 各故障点注入异常，断言旧 CURRENT 和旧 release 字节不变，partial release 不可见。
+- [x] Step 7: 运行官方 reader 与 annotation reader 回归，提交 `feat(publisher): validate and atomically commit LeRobot v3 releases`。
+
+实施收口：validator 从 held nofollow dirfd 独立枚举并逐文件 reopen，不信任 writer
+内存 inventory；完整对账 manifest/checksum、Arrow schema、Core/Evidence、metadata、
+stats、语义、视频和工具链。官方 `LeRobotDataset==0.6.0` 在冻结环境中以离线独立
+subprocess 读取首末帧，timeout/signal/环境漂移均 fail closed。提交端持有
+release_root/.staging/releases dirfd 和进程锁，fsync 后再次完整验证并最终 revalidate，
+使用 no-replace rename，最后原子更新 CURRENT；孤儿 release 可验证恢复，同/不同 ID
+真实并发发布均有回归。
 
 ## Task 10: CLI、版本化配置与端到端验收
 

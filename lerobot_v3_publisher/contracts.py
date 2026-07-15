@@ -139,6 +139,8 @@ class StagedRelease:
     manifest: ReleaseManifest
     manifest_sha256: str
     checksums_sha256: str
+    root_device: int = 0
+    root_inode: int = 0
 
     def __post_init__(self) -> None:
         if type(self.plan) is not PublishPlan:
@@ -146,6 +148,26 @@ class StagedRelease:
         if type(self.manifest) is not ReleaseManifest:
             raise TypeError("manifest must be an exact ReleaseManifest")
         object.__setattr__(self, "root", Path(self.root))
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationReport:
+    schema_version: Literal["curated_lerobot_v3_validation.v1"]
+    release_id: str
+    file_count: int
+    frame_count: int
+    manifest_sha256: str
+    official_reader_version: str
+    official_reader_versions: tuple[tuple[str, str], ...]
+    official_reader_fingerprint: str
+    manifest: ReleaseManifest
+
+    def __post_init__(self) -> None:
+        if type(self.manifest) is not ReleaseManifest:
+            raise TypeError("manifest must be an exact ReleaseManifest")
+        object.__setattr__(
+            self, "official_reader_versions", tuple(self.official_reader_versions)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +194,7 @@ __all__ = [
     "ReleaseManifest",
     "SourceSnapshot",
     "StagedRelease",
+    "ValidationReport",
     "VideoMaterialization",
     "WriterToolchain",
 ]

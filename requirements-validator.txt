@@ -1,0 +1,2 @@
+-c constraints/lerobot-validator-v0.6.0.txt
+lerobot[dataset]==0.6.0
