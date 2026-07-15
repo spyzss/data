@@ -126,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--candidate-windows", type=Path, required=True)
-    parser.add_argument("--supplier", choices=("jdt",), required=True)
+    parser.add_argument("--supplier", choices=("jdt", "canonical"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--batch-root", type=Path, required=True)
     parser.add_argument("--profile", default="acceptance")
@@ -651,7 +651,7 @@ def run_manifest_sam3_containment(
     batch_root: Path | None = None,
     profile: str = "acceptance",
 ) -> dict[str, Any]:
-    if supplier != "jdt":
+    if supplier not in {"jdt", "canonical"}:
         raise ValueError(f"unsupported supplier: {supplier}")
     if frames_per_window < 1:
         raise ValueError("--frames-per-window must be >= 1")

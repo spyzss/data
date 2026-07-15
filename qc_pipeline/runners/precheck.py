@@ -87,6 +87,18 @@ def _slice_clip(clip: Any, source_range: tuple[int, int]) -> Any:
 
 
 def _load_clip(context: AssetContext, module: str) -> Any:
+    canonical_episode = context.metadata.get("canonical_episode")
+    if canonical_episode is not None:
+        source_root = context.metadata.get("canonical_source_root")
+        if not isinstance(source_root, str) or not source_root:
+            raise ModulePrerequisiteError(module, "metadata.canonical_source_root")
+        from canonical_qc.bridge import CanonicalQcBridge
+
+        return CanonicalQcBridge(
+            canonical_episode,
+            source_root=Path(source_root),
+        ).clip_inputs(context.source_range)
+
     declared_clip = context.metadata.get("clip_inputs")
     if declared_clip is not None:
         return declared_clip

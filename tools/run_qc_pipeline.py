@@ -214,6 +214,61 @@ def contexts_from_manifest(
             inclusive_end = _integer(row.get("end_frame"), "end_frame")
             source_range = (start, inclusive_end + 1)
 
+        canonical_format = _text(row.get("canonical_format")).lower()
+        canonical_source = _text(row.get("canonical_source_path"))
+        if canonical_format or canonical_source:
+            if canonical_format not in {"hdf5", "lerobot"}:
+                raise ValueError(
+                    f"manifest row {row_index} canonical_format must be hdf5 or lerobot"
+                )
+            if not canonical_source:
+                raise ValueError(
+                    f"manifest row {row_index} missing canonical_source_path"
+                )
+            _relative, absolute = _path_inside_batch(
+                canonical_source,
+                batch_root=batch_root,
+                manifest_dir=manifest.parent,
+                field="canonical_source_path",
+            )
+            from canonical_qc import StandardHdf5Adapter, StandardLeRobotAdapter
+            from canonical_qc.bridge import CanonicalQcBridge
+
+            if canonical_format == "hdf5":
+                episode = StandardHdf5Adapter().load(Path(absolute))
+            else:
+                episode_index = row.get("episode_index")
+                selected = (
+                    None
+                    if episode_index is None or not _text(episode_index)
+                    else _integer(episode_index, "episode_index")
+                )
+                episode = StandardLeRobotAdapter().load(
+                    Path(absolute), episode_index=selected
+                )
+            if episode.identity.asset_id != asset_id:
+                raise ValueError(
+                    f"manifest asset_id {asset_id!r} does not match canonical episode "
+                    f"{episode.identity.asset_id!r}"
+                )
+            contexts.append(
+                CanonicalQcBridge(
+                    episode,
+                    source_root=Path(absolute)
+                    if Path(absolute).is_dir()
+                    else Path(absolute).parent,
+                ).asset_context(
+                    batch_root=batch_root,
+                    report_path=batch_root
+                    / "quality_archive"
+                    / f"{asset_id}.json",
+                    source_range=source_range,
+                    metadata={**row, "manifest_row": row},
+                    supplemental_source_files=source_files,
+                )
+            )
+            continue
+
         contexts.append(
             AssetContext(
                 asset_id=asset_id,

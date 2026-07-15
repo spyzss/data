@@ -101,8 +101,15 @@ class VideoStream:
     fps_den: int
     codec: str
     pixel_format: str
+    source_frame_range: tuple[int, int] | None = None
     camera_id: Literal["main"] = "main"
     camera_role: Literal["ego"] = "ego"
+
+    def __post_init__(self) -> None:
+        source_range = self.source_frame_range
+        if source_range is None:
+            source_range = (0, self.frame_count)
+        object.__setattr__(self, "source_frame_range", source_range)
 
 
 @dataclass(frozen=True, slots=True)

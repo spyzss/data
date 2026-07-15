@@ -40,6 +40,16 @@ class _FrozenMapping(Mapping[str, Any]):
 
 
 def _freeze(value: Any) -> Any:
+    # CanonicalQcEpisode is already a deeply immutable, validated contract.
+    # Copying it would recreate its NumPy arrays as writable and silently break
+    # that contract, so preserve the exact object when it is attached to runner
+    # metadata by CanonicalQcBridge.
+    try:
+        from canonical_qc.contracts import CanonicalQcEpisode
+    except ImportError:  # pragma: no cover - canonical_qc ships with this package
+        CanonicalQcEpisode = ()  # type: ignore[assignment]
+    if isinstance(value, CanonicalQcEpisode):
+        return value
     if isinstance(value, _FrozenMapping):
         return value
     if isinstance(value, Mapping):

@@ -540,6 +540,7 @@ class StandardLeRobotAdapter:
                     frame_count=sliced.frame_count, width_px=sliced.width_px,
                     height_px=sliced.height_px, fps_num=sliced.fps_num, fps_den=sliced.fps_den,
                     codec=sliced.codec, pixel_format=sliced.pixel_format,
+                    source_frame_range=(start, stop),
                 ), observation=episode.observation, calibration=episode.calibration,
                 semantics=episode.semantics, supplier_evidence=episode.supplier_evidence,
             )
@@ -725,7 +726,7 @@ class StandardLeRobotAdapter:
             schema_version="canonical_qc_episode.v1", profile="human_ego_hand_pose.v1",
             identity=identity, provenance=provenance,
             time_axis=TimeAxis(frame_count=inspection.frame_count, timestamps_ns=timestamps, fps_num=fps_num, fps_den=fps_den),
-            main_video=VideoStream(path=video_source.relative_path, sha256=video_source.sha256, frame_count=inspection.frame_count, width_px=calibration.image_width_px, height_px=calibration.image_height_px, fps_num=fps_num, fps_den=fps_den, codec="pending_probe", pixel_format="pending_probe"),
+            main_video=VideoStream(path=video_source.relative_path, sha256=video_source.sha256, frame_count=inspection.frame_count, width_px=calibration.image_width_px, height_px=calibration.image_height_px, fps_num=fps_num, fps_den=fps_den, codec="pending_probe", pixel_format="pending_probe", source_frame_range=(inspection.video_frame_offset, inspection.video_frame_stop)),
             observation=observation, calibration=calibration,
             semantics=EpisodeSemantics(
                 scene_id=_text(_required(semantic, "scene_id", prefix="semantics"), field="semantics.scene_id"),

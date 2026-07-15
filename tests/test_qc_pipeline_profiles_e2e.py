@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import Issue, ModuleResult
 from qc_common.module_registry import ModulePrerequisiteError, ModuleRegistry
 from qc_pipeline.context import AssetContext
+from qc_pipeline.default_registry import build_default_registry
+from qc_pipeline.orchestrator import run_asset
 from qc_reporting.aggregate import aggregate_projection
 from qc_reporting.projection import project_quality_archive
 from tools.run_qc_pipeline import run_batch
+from canonical_qc import StandardHdf5Adapter, StandardLeRobotAdapter
+from canonical_qc.bridge import CanonicalQcBridge
+from tests.fixtures import write_standard_hdf5_episode, write_standard_lerobot_dataset
 
 
 _CONFIG_HASH = "sha256:" + "1" * 64
@@ -321,3 +329,135 @@ def test_fixture_batch_reports_have_independent_revision_cursors(tmp_path: Path)
 
     assert revisions["pass"] == revisions["warn"] == revisions["hard-fail"] == 5
     assert revisions["runtime-error"] == 2
+
+
+def test_equivalent_standard_sources_have_same_machine_gate_and_revision(
+    tmp_path: Path,
+) -> None:
+    from qc_common.config import load_qc_acceptance_config
+
+    hdf5_batch = tmp_path / "hdf5"
+    lerobot_batch = tmp_path / "lerobot"
+    hdf5_root = hdf5_batch / "asset-001"
+    _, video = write_standard_hdf5_episode(hdf5_root)
+    lerobot_root = write_standard_lerobot_dataset(
+        lerobot_batch / "dataset",
+        main_video_source=video,
+    )
+    hdf5_episode = StandardHdf5Adapter().load(hdf5_root)
+    lerobot_episode = StandardLeRobotAdapter().load(lerobot_root)
+    loaded = load_qc_acceptance_config()
+    raw = json.loads(json.dumps(loaded.raw))
+    automatic_modules = (
+        "hdf5_text_info",
+        "quality_hand",
+        "keypoint_presence",
+        "keypoint_morphology",
+        "keypoint_temporal",
+        "video_quality",
+        "sam3_containment",
+    )
+    raw["pipeline"]["modules"] = list(automatic_modules)
+    config = LoadedQcConfig(path=loaded.path, raw=raw, sha256=loaded.sha256)
+
+    class Segmenter:
+        def segment_frame(self, frame, queries, detector_config):
+            return [
+                SimpleNamespace(
+                    mask=np.ones(frame.shape[:2], dtype=bool),
+                    category="hand",
+                )
+            ]
+
+    def hashes(root: Path) -> dict[str, str]:
+        return {
+            path.relative_to(root).as_posix(): hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    reports = []
+    for name, episode, source_root, batch_root in (
+        ("hdf5", hdf5_episode, hdf5_root, hdf5_batch),
+        ("lerobot", lerobot_episode, lerobot_root, lerobot_batch),
+    ):
+        candidates = batch_root / "candidate-windows.json"
+        candidates.write_text(
+            json.dumps(
+                [
+                    {
+                        "asset_id": "asset-001",
+                        "start_frame": 0,
+                        "end_frame": 0,
+                        "hand_side": "both",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        before = hashes(source_root)
+        context = CanonicalQcBridge(episode, source_root=source_root).asset_context(
+            batch_root=batch_root,
+            report_path=batch_root / "quality_archive" / "asset-001.json",
+            supplemental_source_files={
+                "candidate_windows": {"path": "candidate-windows.json"}
+            },
+        )
+        outcome = run_asset(
+            context,
+            config=config,
+            profile="supplier_evaluation",
+            registry=build_default_registry(
+                context, config, segmenter_factory=lambda: Segmenter()
+            ),
+            now=lambda: "2026-07-15T00:00:00Z",
+        )
+        reports.append(outcome.report)
+        assert hashes(source_root) == before
+
+    left, right = reports
+    for module in automatic_modules:
+        left_evaluation = {
+            key: value
+            for key, value in left[module]["evaluation"].items()
+            if key != "issue_ids"
+        }
+        right_evaluation = {
+            key: value
+            for key, value in right[module]["evaluation"].items()
+            if key != "issue_ids"
+        }
+        assert left_evaluation == right_evaluation
+        assert left[module]["metrics"] == right[module]["metrics"]
+        assert left[module]["flow"]["result_gate"] == right[module]["flow"]["result_gate"]
+        normalized_left = [
+            {
+                key: issue.get(key)
+                for key in ("code", "severity", "metric", "value", "comparison")
+            }
+            for issue in left.get("issues", [])
+            if issue.get("module") == module
+        ]
+        normalized_right = [
+            {
+                key: issue.get(key)
+                for key in ("code", "severity", "metric", "value", "comparison")
+            }
+            for issue in right.get("issues", [])
+            if issue.get("module") == module
+        ]
+        assert normalized_left == normalized_right
+    assert left["overall_decision"] == right["overall_decision"] == "fail"
+    assert left["report_revision"] == right["report_revision"] == len(
+        automatic_modules
+    )
+    assert left["pipeline_state"] == right["pipeline_state"]
+    assert left["pipeline_state"]["status"] == "completed"
+    assert left["execution"]["module_states"] == right["execution"]["module_states"]
+    assert all(
+        state["state"] in {"completed", "skipped"}
+        for state in left["execution"]["module_states"].values()
+    )
+    assert set(left["execution"]["module_states"]) == set(automatic_modules)

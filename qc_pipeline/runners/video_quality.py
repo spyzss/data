@@ -48,20 +48,58 @@ def run(context: AssetContext, config: LoadedQcConfig) -> ModuleResult:
     )
     from qc_pipeline.adapters.video_quality import adapt_video_quality_result
 
-    video = _source_path(context, "video")
-    hdf5 = _source_path(context, "hdf5", required=False)
+    canonical_episode = context.metadata.get("canonical_episode")
+    canonical = canonical_episode is not None
+    if canonical:
+        source_root = context.metadata.get("canonical_source_root")
+        if not isinstance(source_root, str) or not source_root:
+            raise ModulePrerequisiteError(
+                "video_quality", "metadata.canonical_source_root"
+            )
+        from canonical_qc.bridge import CanonicalQcBridge
+
+        bridge = CanonicalQcBridge(
+            canonical_episode,
+            source_root=Path(source_root),
+        )
+        video = bridge.video_path()
+        hdf5 = None
+    else:
+        video = _source_path(context, "video")
+        hdf5 = _source_path(context, "hdf5", required=False)
     assert video is not None
     detector_config = load_video_quality_config(config.path)
-    if context.source_range is None:
+    physical_range = (
+        bridge.physical_video_range(context.source_range)
+        if canonical
+        else context.source_range
+    )
+    canonical_full_unshifted = canonical and physical_range == (
+        0,
+        canonical_episode.time_axis.frame_count,
+    )
+    if context.source_range is None and (not canonical or canonical_full_unshifted):
         metrics = analyze_video(video, detector_config, hdf5_path=hdf5)
-        alignment = check_hdf5_alignment(
-            video,
-            context.batch_root,
-            metrics,
-            detector_config,
-        )
+        if canonical:
+            alignment = Hdf5Alignment(
+                status="matched",
+                hdf5_path=None,
+                hdf5_frame_count=canonical_episode.time_axis.frame_count,
+                frame_count_match=True,
+                frame_count_delta=0,
+                frame_count_delta_ratio=0.0,
+                reason="validated by CanonicalQcEpisode input boundary",
+            )
+        else:
+            alignment = check_hdf5_alignment(
+                video,
+                context.batch_root,
+                metrics,
+                detector_config,
+            )
     else:
-        start, end = context.source_range
+        assert physical_range is not None
+        start, end = physical_range
         analysis = analyze_video_frame_range(
             video,
             detector_config,
@@ -70,13 +108,28 @@ def run(context: AssetContext, config: LoadedQcConfig) -> ModuleResult:
             hdf5_path=hdf5,
         )
         metrics = analysis.metrics
-        alignment = Hdf5Alignment(
-            status="range_not_evaluated",
-            hdf5_path=hdf5,
-            hdf5_frame_count=None,
-            frame_count_match=None,
-            reason="logical range alignment validated by AssetContext bounds",
-        )
+        if canonical:
+            logical_start, logical_end = context.source_range or (
+                0,
+                canonical_episode.time_axis.frame_count,
+            )
+            alignment = Hdf5Alignment(
+                status="matched",
+                hdf5_path=None,
+                hdf5_frame_count=logical_end - logical_start,
+                frame_count_match=True,
+                frame_count_delta=0,
+                frame_count_delta_ratio=0.0,
+                reason="validated by CanonicalQcEpisode input boundary",
+            )
+        else:
+            alignment = Hdf5Alignment(
+                status="range_not_evaluated",
+                hdf5_path=hdf5,
+                hdf5_frame_count=None,
+                frame_count_match=None,
+                reason="logical range alignment validated by AssetContext bounds",
+            )
     metrics = replace(metrics, asset_id=context.asset_id)
     evaluation = evaluate_video_quality(metrics, detector_config, alignment)
     return adapt_video_quality_result(

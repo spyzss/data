@@ -17,6 +17,7 @@ from .contracts import (
     VideoStream,
 )
 from .errors import CanonicalInputError
+from .bridge import CanonicalQcBridge
 from .provenance import semantic_fingerprint, source_fingerprint
 from .validation import validate_episode, validate_video_alignment
 from .video_probe import probe_video
@@ -24,6 +25,7 @@ from .video_probe import probe_video
 __all__ = [
     "CameraCalibration",
     "CanonicalInputError",
+    "CanonicalQcBridge",
     "CanonicalQcEpisode",
     "EpisodeIdentity",
     "EpisodeSemantics",

@@ -320,6 +320,30 @@ def _validate_video(episode: CanonicalQcEpisode) -> None:
             "main_video.frame_count",
             f"expected {episode.time_axis.frame_count}, got {video.frame_count}",
         )
+    source_range = video.source_frame_range
+    if (
+        type(source_range) is not tuple
+        or len(source_range) != 2
+        or any(type(value) is not int for value in source_range)
+    ):
+        _fail(
+            "invalid_video_source_range",
+            "main_video.source_frame_range",
+            "must be an exact integer half-open tuple",
+        )
+    source_start, source_end = source_range
+    if source_start < 0 or source_end <= source_start:
+        _fail(
+            "invalid_video_source_range",
+            "main_video.source_frame_range",
+            "must be non-negative and non-empty",
+        )
+    if source_end - source_start != video.frame_count:
+        _fail(
+            "video_source_range_mismatch",
+            "main_video.source_frame_range",
+            f"must contain exactly {video.frame_count} logical frames",
+        )
     _nonempty_string(video.codec, "main_video.codec")
     _nonempty_string(video.pixel_format, "main_video.pixel_format")
 

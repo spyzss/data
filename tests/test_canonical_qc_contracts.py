@@ -70,6 +70,7 @@ def make_episode(*, frame_count: int = 3) -> CanonicalQcEpisode:
     keypoints_3d = np.arange(frame_count * 2 * 21 * 3, dtype=np.float32).reshape(
         frame_count, 2, 21, 3
     )
+
     keypoints_2d = np.arange(frame_count * 2 * 21 * 2, dtype=np.float32).reshape(
         frame_count, 2, 21, 2
     )
@@ -148,6 +149,23 @@ def make_episode(*, frame_count: int = 3) -> CanonicalQcEpisode:
         ),
         supplier_evidence=SupplierEvidence(),
     )
+
+
+@pytest.mark.parametrize(
+    "source_range",
+    [(-1, 2), (0, 0), (0, 2), (1, 5), [0, 3]],
+)
+def test_video_source_range_is_strict_half_open_physical_placement(
+    source_range: object,
+) -> None:
+    episode = make_episode()
+    malformed = replace(
+        episode,
+        main_video=replace(episode.main_video, source_frame_range=source_range),
+    )
+
+    with pytest.raises(CanonicalInputError, match="main_video.source_frame_range"):
+        validate_episode(malformed)
 
 
 def _assert_error(

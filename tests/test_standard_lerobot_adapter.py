@@ -10,6 +10,7 @@ import pytest
 import numpy as np
 
 from canonical_qc import CanonicalInputError, StandardLeRobotAdapter
+from canonical_qc.bridge import CanonicalQcBridge
 from annotation.lerobot_v3_dataset import LeRobotV3Dataset
 from tests.fixtures import solid_frame, write_standard_lerobot_dataset, write_test_video
 
@@ -40,6 +41,7 @@ def test_load_reads_registered_lerobot_layout_without_mutation(
     assert episode.identity.source_format == "lerobot"
     assert episode.identity.source_schema_version == "egodata_lerobot_qc_input.v1"
     assert episode.time_axis.timestamps_ns.tolist() == [0, 100_000_000, 200_000_000]
+    assert episode.main_video.source_frame_range == (0, 3)
     assert episode.observation.hand_keypoints_3d.shape == (3, 2, 21, 3)
     assert episode.main_video.path.endswith(".mp4")
     assert {item.role for item in episode.provenance.source_files} == {
@@ -179,6 +181,10 @@ def test_v3_shared_shards_use_metadata_row_and_video_offsets(tmp_path: Path) -> 
 
     assert np.all(episode.observation.hand_keypoints_3d == 7.0)
     assert episode.time_axis.timestamps_ns.tolist() == [0, 100_000_000, 200_000_000]
+    assert episode.main_video.source_frame_range == (3, 6)
+    bridge = CanonicalQcBridge(episode, source_root=root)
+    assert bridge.physical_video_range() == (3, 6)
+    assert bridge.physical_video_range((1, 3)) == (4, 6)
 
 
 def test_v3_fixture_remains_readable_by_legacy_annotation_reader(tmp_path: Path) -> None:
