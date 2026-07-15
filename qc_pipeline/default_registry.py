@@ -20,8 +20,9 @@ def build_default_registry(
 ) -> ModuleRegistry:
     """Build a fresh automatic-runner registry for one asset worker."""
     registry = ModuleRegistry()
+    precheck_session = precheck.PrecheckSession(context, config)
     runners: dict[str, ModuleRunner] = {
-        **{name: precheck.runner_for(name) for name in precheck.MODULES},
+        **{name: precheck_session.runner_for(name) for name in precheck.MODULES},
         "video_quality": video_quality.run,
         "sam3_containment": sam3_containment.runner(segmenter_factory),
     }

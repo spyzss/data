@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import Counter
+from dataclasses import replace
 import json
 import math
 import sys
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 if __package__ in {None, ""}:
@@ -32,7 +35,6 @@ _SOURCE_COLUMNS = {
     "video": ("primary_video_path", "video_path"),
     "hdf5": ("hdf5_path",),
     "parquet": ("parquet_path",),
-    "candidate_windows": ("candidate_windows_path", "candidate_windows"),
     "sam3_model": ("sam3_model", "sam3_model_path"),
 }
 
@@ -174,15 +176,25 @@ def run_batch(
     )
 
     def run_one(context: AssetContext) -> RunOutcome:
-        registry = factory(context)
+        started = perf_counter()
+        runtime_context = replace(
+            context,
+            metadata={
+                **dict(context.metadata),
+                "reuse_artifacts": resume,
+                "profile": profile,
+            },
+        )
+        registry = factory(runtime_context)
         if not isinstance(registry, ModuleRegistry):
             raise TypeError("registry_factory must return ModuleRegistry")
-        return run_asset(
-            context,
+        outcome = run_asset(
+            runtime_context,
             config=config,
             profile=profile,
             registry=registry,
         )
+        return replace(outcome, elapsed_seconds=perf_counter() - started)
 
     outcomes: dict[str, RunOutcome] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -194,6 +206,64 @@ def run_batch(
             asset_id = future_to_asset[future]
             outcomes[asset_id] = future.result()
     return outcomes
+
+
+def _module_artifact_state(report: dict[str, Any], module: str) -> str | None:
+    block = report.get(module)
+    runtime = block.get("runtime") if isinstance(block, dict) else None
+    state = runtime.get("artifact_state") if isinstance(runtime, dict) else None
+    if isinstance(state, str):
+        return "skipped" if state == "no_candidates" else state
+    execution = report.get("execution")
+    module_states = execution.get("module_states") if isinstance(execution, dict) else None
+    recorded = module_states.get(module) if isinstance(module_states, dict) else None
+    execution_state = recorded.get("state") if isinstance(recorded, dict) else None
+    if execution_state in {"blocked", "adapter_missing", "input_missing"}:
+        return "blocked"
+    if execution_state in {"runtime_error", "input_invalid", "not_implemented"}:
+        return "failed"
+    if execution_state == "not_run":
+        return "not_run"
+    return None
+
+
+def summarize_outcome(outcome: RunOutcome) -> dict[str, Any]:
+    report = outcome.report
+    precheck_states = [
+        state
+        for module in (
+            "hdf5_text_info",
+            "quality_hand",
+            "keypoint_presence",
+            "keypoint_morphology",
+            "keypoint_temporal",
+        )
+        if (state := _module_artifact_state(report, module)) is not None
+    ]
+    producers: dict[str, str] = {}
+    if precheck_states:
+        producers["precheck"] = (
+            "computed"
+            if "computed" in precheck_states
+            else (
+                "reused"
+                if all(state == "reused" for state in precheck_states)
+                else precheck_states[-1]
+            )
+        )
+    for producer in ("video_quality", "sam3_containment"):
+        state = _module_artifact_state(report, producer)
+        if state is not None:
+            producers[producer] = state
+    counts = Counter(producers.values())
+    return {
+        "status": outcome.status,
+        "report_revision": report.get("report_revision"),
+        "executed_modules": list(outcome.executed_modules),
+        "producers": producers,
+        "producer_counts": dict(sorted(counts.items())),
+        "elapsed_seconds": float(outcome.elapsed_seconds),
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -229,11 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         json.dumps(
             {
-                asset_id: {
-                    "status": outcome.status,
-                    "report_revision": outcome.report["report_revision"],
-                    "executed_modules": list(outcome.executed_modules),
-                }
+                asset_id: summarize_outcome(outcome)
                 for asset_id, outcome in sorted(outcomes.items())
             },
             ensure_ascii=False,

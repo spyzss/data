@@ -385,6 +385,33 @@ def _has_machine_fail(
     return False
 
 
+_INCOMPLETE_MODULE_STATES = frozenset(
+    {
+        "not_implemented",
+        "runtime_error",
+        "not_run",
+        "input_missing",
+        "input_invalid",
+        "adapter_missing",
+        "blocked",
+    }
+)
+
+
+def has_required_incomplete_module(report: Mapping[str, Any]) -> bool:
+    execution = report.get("execution")
+    if not isinstance(execution, Mapping):
+        return False
+    module_states = execution.get("module_states")
+    if not isinstance(module_states, Mapping):
+        return False
+    return any(
+        isinstance(value, Mapping)
+        and value.get("state") in _INCOMPLETE_MODULE_STATES
+        for value in module_states.values()
+    )
+
+
 def mark_remaining_skipped_due_to_fail(
     report: dict[str, Any],
     modules: Sequence[str],
@@ -407,7 +434,10 @@ def mark_remaining_skipped_due_to_fail(
     if not isinstance(module_states, dict):
         raise ValueError("execution.module_states must be an object")
     for module in modules[failed_index + 1 :]:
-        module_states[module] = {"state": "skipped_due_to_fail"}
+        module_states[module] = {
+            "state": "not_run",
+            "reason": f"blocked_by_quality_fail:{failed_module}",
+        }
 
     manual_review = marked.get("manual_review")
     if not isinstance(manual_review, dict):
@@ -518,9 +548,13 @@ def apply_module_result(
         pipeline_next = None
         stop_reason = f"quality_fail:{result.module}"
     elif next_module is None:
-        pipeline_status = "completed"
+        pipeline_status = (
+            "incomplete" if has_required_incomplete_module(report) else "completed"
+        )
         pipeline_next = None
-        stop_reason = None
+        stop_reason = (
+            "required_module_incomplete" if pipeline_status == "incomplete" else None
+        )
     else:
         pipeline_status = "running"
         pipeline_next = next_module
@@ -532,7 +566,7 @@ def apply_module_result(
         "next_module": pipeline_next,
         "stop_reason": stop_reason,
     }
-    if pipeline_status in {"stopped", "completed"}:
+    if pipeline_status in {"stopped", "completed", "incomplete"}:
         report["pipeline_state"].pop("external_resume", None)
     execution = report.get("execution")
     if not isinstance(execution, dict):
@@ -686,17 +720,20 @@ def record_disabled_transition(
     execution["updated_at"] = now
 
     completed = next_module is None
+    incomplete = completed and has_required_incomplete_module(report)
     pipeline_state.update(
         {
-            "status": "completed" if completed else "running",
+            "status": (
+                "incomplete" if incomplete else ("completed" if completed else "running")
+            ),
             "last_completed_module": module,
             "next_module": next_module,
-            "stop_reason": None,
+            "stop_reason": "required_module_incomplete" if incomplete else None,
         }
     )
     if completed:
         pipeline_state.pop("external_resume", None)
-    report["overall_decision"] = overall_decision
+    report["overall_decision"] = None if incomplete else overall_decision
     report["report_revision"] = expected_revision + 1
     write_asset_qc_report(
         path,
@@ -718,6 +755,8 @@ def record_runtime_error(
     config: LoadedQcConfig,
     profile: str,
     now: str,
+    continue_pipeline: bool = False,
+    next_module: str | None = None,
 ) -> dict[str, Any]:
     """Persist an incomplete runtime outcome without fabricating quality data."""
     if module not in config.pipeline_modules:
@@ -763,20 +802,36 @@ def record_runtime_error(
     module_states = execution.setdefault("module_states", {})
     if not isinstance(module_states, dict):
         raise ValueError("execution.module_states must be an object")
+    state_by_error = {
+        "module_unavailable": "not_implemented",
+        "input_missing": "input_missing",
+        "input_invalid": "input_invalid",
+        "adapter_missing": "adapter_missing",
+        "blocked": "blocked",
+    }
     module_states[module] = {
-        "state": (
-            "not_implemented" if error_type == "module_unavailable" else "runtime_error"
-        ),
+        "state": state_by_error.get(error_type, "runtime_error"),
         "reason": error_type,
     }
     execution["updated_at"] = now
-    pipeline_state.update(
-        {
-            "status": "error",
-            "next_module": module,
-            "stop_reason": error_type,
-        }
-    )
+    if continue_pipeline:
+        pipeline_state.update(
+            {
+                "status": "running" if next_module is not None else "incomplete",
+                "next_module": next_module,
+                "stop_reason": (
+                    None if next_module is not None else "required_module_incomplete"
+                ),
+            }
+        )
+    else:
+        pipeline_state.update(
+            {
+                "status": "error",
+                "next_module": module,
+                "stop_reason": error_type,
+            }
+        )
     pipeline_state.pop("external_resume", None)
     report["overall_decision"] = None
     report["report_revision"] = expected_revision + 1

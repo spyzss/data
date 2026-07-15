@@ -25,6 +25,7 @@ from qc_pipeline.context import AssetContext
 from qc_pipeline.orchestrator import (
     ModulePrerequisiteError,
     build_default_registry,
+    resume_after_external,
     run_asset,
 )
 
@@ -75,7 +76,7 @@ def _config(
                 },
                 "supplier_evaluation": {
                     "fail_action": "record_and_continue",
-                    "runtime_error_action": "stop_incomplete",
+                    "runtime_error_action": "record_and_continue",
                 },
             },
             "pipeline": {
@@ -352,9 +353,18 @@ def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
     assert acceptance["execution"]["module_states"] == {
         "hdf5_text_info": {"state": "completed"},
         "video_quality": {"state": "completed"},
-        "sam3_containment": {"state": "skipped_due_to_fail"},
-        "semantic_consistency": {"state": "skipped_due_to_fail"},
-        "manual_review": {"state": "skipped_due_to_fail"},
+        "sam3_containment": {
+            "state": "not_run",
+            "reason": "blocked_by_quality_fail:video_quality",
+        },
+        "semantic_consistency": {
+            "state": "not_run",
+            "reason": "blocked_by_quality_fail:video_quality",
+        },
+        "manual_review": {
+            "state": "not_run",
+            "reason": "blocked_by_quality_fail:video_quality",
+        },
     }
     assert "continued_after_fail" not in acceptance["video_quality"]["runtime"]
     assert supplier["video_quality"]["flow"]["exit_gate"]["state"] == "continue"
@@ -388,8 +398,14 @@ def test_fail_skip_marking_is_copy_on_write_and_config_ordered() -> None:
 
     assert original == before
     assert marked["execution"]["module_states"] == {
-        "video_quality": {"state": "skipped_due_to_fail"},
-        "semantic_consistency": {"state": "skipped_due_to_fail"},
+        "video_quality": {
+            "state": "not_run",
+            "reason": "blocked_by_quality_fail:hdf5_text_info",
+        },
+        "semantic_consistency": {
+            "state": "not_run",
+            "reason": "blocked_by_quality_fail:hdf5_text_info",
+        },
     }
     assert marked["manual_review"]["state"] == "skipped_due_to_fail"
     assert marked["semantic_calibration"] == {
@@ -417,6 +433,76 @@ def test_supplier_profile_preserves_prior_fail_at_automatic_completion(
     assert calls == ["hdf5_text_info", "sam3_containment"]
     assert report["pipeline_state"]["status"] == "completed"
     assert report["overall_decision"] == "fail"
+
+
+def test_supplier_profile_records_runtime_error_and_continues(
+    tmp_path: Path,
+) -> None:
+    modules = ["hdf5_text_info", "video_quality"]
+    config = _config(tmp_path, modules)
+    calls: list[str] = []
+    registry = _registry(
+        calls,
+        config,
+        {"hdf5_text_info": "pass", "video_quality": "pass"},
+        errors={"hdf5_text_info"},
+    )
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="supplier_evaluation",
+        registry=registry,
+        now=lambda: "2026-07-15T00:00:00Z",
+    )
+
+    assert calls == ["hdf5_text_info", "video_quality"]
+    assert outcome.executed_modules == ("video_quality",)
+    assert outcome.status == "incomplete"
+    assert outcome.report["overall_decision"] is None
+    assert outcome.report["execution"]["module_states"] == {
+        "hdf5_text_info": {"state": "runtime_error", "reason": "process_error"},
+        "video_quality": {"state": "completed"},
+    }
+    assert outcome.report["video_quality"]["flow"]["result_gate"]["verdict"] == "pass"
+    assert outcome.report["runtime_errors"][0]["module"] == "hdf5_text_info"
+
+
+def test_external_completion_preserves_incomplete_without_final_verdict(
+    tmp_path: Path,
+) -> None:
+    modules = ["hdf5_text_info", "semantic_consistency"]
+    config = _config(tmp_path, modules)
+    context = _context(tmp_path)
+    first = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=_registry(
+            [],
+            config,
+            {"hdf5_text_info": "pass"},
+            errors={"hdf5_text_info"},
+        ),
+        now=lambda: "2026-07-15T00:00:00Z",
+    )
+
+    assert first.status == "awaiting_external"
+    assert first.report["overall_decision"] is None
+
+    completed = resume_after_external(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        completed_module="semantic_consistency",
+        expected_revision=first.report["report_revision"],
+        now=lambda: "2026-07-15T00:01:00Z",
+    )
+
+    assert completed.status == "incomplete"
+    assert completed.report["overall_decision"] is None
+    assert completed.report["pipeline_state"]["stop_reason"] == "required_module_incomplete"
+    assert "external_resume" not in completed.report["pipeline_state"]
 
 
 def test_unknown_profile_is_rejected_before_runner_work(tmp_path: Path) -> None:
@@ -458,11 +544,10 @@ def test_fresh_asset_starts_at_first_configured_module(tmp_path: Path) -> None:
     assert outcome.report["report_revision"] == 2
 
 
-@pytest.mark.parametrize("profile", ["acceptance", "supplier_evaluation"])
-def test_runner_error_stops_incomplete_and_terminal_rerun_is_idempotent(
+def test_acceptance_runner_error_stops_incomplete_and_terminal_rerun_is_idempotent(
     tmp_path: Path,
-    profile: str,
 ) -> None:
+    profile = "acceptance"
     modules = ["hdf5_text_info", "quality_hand", "keypoint_presence"]
     config = _config(tmp_path, modules)
     first_calls: list[str] = []
@@ -1201,7 +1286,7 @@ def test_batch_keeps_other_assets_running_when_one_runner_errors(
 
     assert outcomes["good"].status == "completed"
     assert outcomes["good"].report["overall_decision"] == "pass"
-    assert outcomes["bad"].status == "error"
+    assert outcomes["bad"].status == "incomplete"
     assert outcomes["bad"].report["overall_decision"] is None
     assert outcomes["bad"].report["runtime_errors"][0]["error_type"] == (
         "process_error"

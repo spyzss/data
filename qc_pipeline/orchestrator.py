@@ -9,6 +9,9 @@ from typing import Any, Callable, Mapping
 
 from qc_common.config import LoadedQcConfig
 from qc_common.module_registry import (
+    ModuleAdapterMissingError,
+    ModuleBlockedError,
+    ModuleInputError,
     ModulePrerequisiteError,
     ModuleRegistry,
     ModuleUnavailableError,
@@ -21,6 +24,7 @@ from qc_common.report import (
 from qc_common.report_mutation import (
     _has_machine_fail,
     apply_module_result,
+    has_required_incomplete_module,
     initialize_v2_report,
     record_awaiting_external,
     record_disabled_transition,
@@ -31,7 +35,7 @@ from qc_pipeline.context import AssetContext
 from qc_pipeline.default_registry import build_default_registry
 
 
-_TERMINAL_STATUSES = frozenset({"stopped", "completed", "error"})
+_TERMINAL_STATUSES = frozenset({"stopped", "completed", "incomplete", "error"})
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,7 @@ class RunOutcome:
     executed_modules: tuple[str, ...]
     status: str
     config: LoadedQcConfig
+    elapsed_seconds: float = 0.0
 
 
 def utc_now() -> str:
@@ -52,7 +57,7 @@ def _successor(modules: tuple[str, ...], module: str) -> str | None:
 
 
 def _disabled_overall_decision(report: Mapping[str, Any], completed: bool) -> str | None:
-    if not completed:
+    if not completed or has_required_incomplete_module(report):
         return None
     issues = report.get("issues")
     has_fail = isinstance(issues, list) and any(
@@ -122,19 +127,24 @@ def _record_empty_manual_review(
     pipeline = candidate.get("pipeline_state")
     if not isinstance(pipeline, dict):
         raise ValueError("pipeline_state must be an object")
+    incomplete = next_module is None and has_required_incomplete_module(candidate)
     pipeline.update(
         {
-            "status": "running" if next_module is not None else "completed",
+            "status": (
+                "running"
+                if next_module is not None
+                else ("incomplete" if incomplete else "completed")
+            ),
             "last_completed_module": "manual_review",
             "next_module": next_module,
-            "stop_reason": None,
+            "stop_reason": "required_module_incomplete" if incomplete else None,
         }
     )
     if next_module is None:
         pipeline.pop("external_resume", None)
     candidate["overall_decision"] = (
         None
-        if next_module is not None
+        if next_module is not None or incomplete
         else (
             "fail"
             if _has_machine_fail(candidate, config.pipeline_modules)
@@ -226,13 +236,18 @@ def run_asset(
     start = config.pipeline_modules.index(current)
     executed: list[str] = []
 
-    def stop_incomplete(
+    profile_config = config.execution_profile(profile)
+
+    def record_incomplete(
         module: str,
         error_type: str,
         message: str,
         expected_revision: int,
         timestamp: str,
-    ) -> RunOutcome:
+    ) -> tuple[dict[str, Any], bool]:
+        should_continue = (
+            profile_config["runtime_error_action"] == "record_and_continue"
+        )
         error_report = record_runtime_error(
             context.report_path,
             module=module,
@@ -243,8 +258,14 @@ def run_asset(
             config=config,
             profile=profile,
             now=timestamp,
+            continue_pipeline=should_continue,
+            next_module=(
+                _successor(config.pipeline_modules, module)
+                if should_continue
+                else None
+            ),
         )
-        return RunOutcome(error_report, tuple(executed), "error", config)
+        return error_report, should_continue
 
     for module_name in config.pipeline_modules[start:]:
         module_config = config.module_config(module_name)
@@ -293,19 +314,49 @@ def run_asset(
         try:
             runner = registry.resolve(implementation)
         except ModuleUnavailableError as exc:
-            return stop_incomplete(
+            report, should_continue = record_incomplete(
                 module_name, "module_unavailable", str(exc), expected_revision, timestamp
             )
+            if should_continue:
+                continue
+            return RunOutcome(report, tuple(executed), "error", config)
         try:
             result = runner(context, config)
+        except ModuleInputError as exc:
+            report, should_continue = record_incomplete(
+                module_name, "input_invalid", str(exc), expected_revision, timestamp
+            )
+            if should_continue:
+                continue
+            return RunOutcome(report, tuple(executed), "error", config)
+        except ModuleAdapterMissingError as exc:
+            report, should_continue = record_incomplete(
+                module_name, "adapter_missing", str(exc), expected_revision, timestamp
+            )
+            if should_continue:
+                continue
+            return RunOutcome(report, tuple(executed), "error", config)
+        except ModuleBlockedError as exc:
+            report, should_continue = record_incomplete(
+                module_name, "blocked", str(exc), expected_revision, timestamp
+            )
+            if should_continue:
+                continue
+            return RunOutcome(report, tuple(executed), "error", config)
         except ModulePrerequisiteError as exc:
-            return stop_incomplete(
+            report, should_continue = record_incomplete(
                 module_name, "input_missing", str(exc), expected_revision, timestamp
             )
+            if should_continue:
+                continue
+            return RunOutcome(report, tuple(executed), "error", config)
         except ValueError as exc:
-            return stop_incomplete(
+            report, should_continue = record_incomplete(
                 module_name, "detector_error", str(exc), expected_revision, timestamp
             )
+            if should_continue:
+                continue
+            return RunOutcome(report, tuple(executed), "error", config)
         except StaleReportRevisionError as exc:
             report = _record_stale_revision_if_current(
                 context,
@@ -322,9 +373,12 @@ def run_asset(
                 config,
             )
         except Exception as exc:
-            return stop_incomplete(
+            report, should_continue = record_incomplete(
                 module_name, "process_error", str(exc), expected_revision, timestamp
             )
+            if should_continue:
+                continue
+            return RunOutcome(report, tuple(executed), "error", config)
         try:
             report = apply_module_result(
                 context.report_path,
@@ -353,13 +407,16 @@ def run_asset(
                 config,
             )
         except Exception as exc:
-            return stop_incomplete(
+            report, should_continue = record_incomplete(
                 module_name,
                 "evidence_integrity_error",
                 str(exc),
                 expected_revision,
                 timestamp,
             )
+            if should_continue:
+                continue
+            return RunOutcome(report, tuple(executed), "error", config)
         executed.append(module_name)
         if report["pipeline_state"]["status"] in _TERMINAL_STATUSES:
             break
@@ -442,13 +499,18 @@ def resume_after_external(
     execution["updated_at"] = timestamp
 
     next_module = _successor(config.pipeline_modules, completed_module)
+    incomplete = next_module is None and has_required_incomplete_module(candidate)
     pipeline_state = dict(pipeline)
     pipeline_state.update(
         {
-            "status": "running" if next_module is not None else "completed",
+            "status": (
+                "running"
+                if next_module is not None
+                else ("incomplete" if incomplete else "completed")
+            ),
             "last_completed_module": completed_module,
             "next_module": next_module,
-            "stop_reason": None,
+            "stop_reason": "required_module_incomplete" if incomplete else None,
         }
     )
     if next_module is None:
@@ -459,7 +521,9 @@ def resume_after_external(
             "transition_revision": expected_revision + 1,
         }
     candidate["pipeline_state"] = pipeline_state
-    if next_module is None:
+    if incomplete:
+        candidate["overall_decision"] = None
+    elif next_module is None:
         manual = candidate.get("manual_review")
         manual_state = manual.get("state") if isinstance(manual, Mapping) else None
         reviews = manual.get("issue_reviews", {}) if isinstance(manual, Mapping) else {}

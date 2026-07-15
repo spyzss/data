@@ -68,7 +68,7 @@
           "enum": ["stop", "record_and_continue"]
         },
         "runtime_error_action": {
-          "enum": ["stop_incomplete"]
+          "enum": ["stop_incomplete", "record_and_continue"]
         }
       }
     },

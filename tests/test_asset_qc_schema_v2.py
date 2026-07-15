@@ -12,7 +12,9 @@ from qc_common.schema import validate_asset_qc_report
 from tests.qc_report_fixtures import make_v1_video_report, make_v2_report
 
 
-@pytest.mark.parametrize("status", ["pending", "running", "awaiting_external", "error"])
+@pytest.mark.parametrize(
+    "status", ["pending", "running", "awaiting_external", "incomplete", "error"]
+)
 def test_unfinished_v2_report_requires_null_decision(status: str) -> None:
     report = make_v2_report(status=status, overall_decision=None)
     validate_asset_qc_report(report)
@@ -45,10 +47,23 @@ def test_runtime_error_v2_report_uses_error_state_and_null_decision() -> None:
     validate_asset_qc_report(report)
 
 
+def test_supplier_runtime_error_can_finish_as_incomplete() -> None:
+    report = make_v2_report(status="incomplete", overall_decision=None)
+    report["execution"]["profile"] = "supplier_evaluation"
+    report["runtime_errors"] = [
+        {"module": "video_quality", "message": "decoder crashed"}
+    ]
+    report["execution"]["module_states"] = {
+        "video_quality": {"state": "runtime_error", "reason": "process_error"},
+        "sam3_containment": {"state": "completed"},
+    }
+
+    validate_asset_qc_report(report)
+
+
 @pytest.mark.parametrize(
     ("status", "decision", "error_path"),
     [
-        ("running", None, "pipeline_state.status"),
         ("completed", "pass", "overall_decision"),
     ],
 )
@@ -62,6 +77,16 @@ def test_runtime_errors_reject_non_error_pipeline_outcomes(
 
     with pytest.raises(ValueError, match=error_path):
         validate_asset_qc_report(report)
+
+
+def test_supplier_runtime_error_can_remain_running_until_other_modules_finish() -> None:
+    report = make_v2_report(status="running", overall_decision=None)
+    report["execution"]["profile"] = "supplier_evaluation"
+    report["runtime_errors"] = [
+        {"module": "hdf5_text_info", "message": "source parse failed"}
+    ]
+
+    validate_asset_qc_report(report)
 
 
 @pytest.mark.parametrize("decision", ["pass", "fail"])

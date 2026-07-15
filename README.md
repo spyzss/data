@@ -3,12 +3,19 @@
 本仓库现在不是单一 annotation pipeline，而是面向机器人/VLA 数据的多模块验收与标注系统：
 
 ```text
-precheck -> optional SAM3 containment sidecar -> annotation -> annotation_verify
+supplier adapter / canonical manifest
+  -> precheck and video_quality (independent producers)
+  -> candidate windows
+  -> optional SAM3 containment sidecar
+  -> ledger and manual review
+
+annotation discovery -> SAM3 segmentation -> DA3 depth -> annotation QC
+annotation outputs -> annotation_verify
 ```
 
 这个顺序属于外部 workflow。代码层面四个 root modules 保持独立；测试可以临时串联多个模块，但只能通过配置/文件/JSON 输出连接，不能把模块互相 import 成隐式 workflow。
 
-- `precheck/`：数据可信度、HDF5 文本字段、`quality_hand`、骨骼点连续性、基础画质、mask containment 消费端。
+- `precheck/`：数据可信度、HDF5 文本字段、`quality_hand`、骨骼点 existence/morphology/temporal 与 candidate-window 生成；不加载视觉模型。
 - `annotation/`：视觉标注，包含 discovery、SAM3 segmentation、DA3 depth、storage、annotation QC。
 - `annotation_verify/`：语义一致性验证契约，目前 VLM 仍是 stub。
 - `qc_common/`：共享契约、schema、keypoint topology、registry 和纯工具。
@@ -48,7 +55,33 @@ python tools/sam3_keypoint_containment.py \
 clip_keypoint_inside_ratio = inside_keypoints / total_expected_keypoints
 ```
 
-### 3. Annotation
+### 3. Manifest 统一 QC 入口（云端）
+
+当前需要尽可能跑完整检查并保留供应商诊断时，使用 `supplier_evaluation`：
+
+```bash
+python tools/run_qc_pipeline.py \
+  --batch-root /path/to/qc_run \
+  --manifest /path/to/qc_run/manifest.jsonl \
+  --profile supplier_evaluation \
+  --max-workers 1 \
+  --resume
+```
+
+同一个 asset 的五项 precheck 共用一次源数据加载，但仍分别写入五个 module result。Producer sidecar 位于：
+
+```text
+<batch-root>/module_outputs/<asset_id>/precheck/
+<batch-root>/module_outputs/<asset_id>/video_quality/
+<batch-root>/module_outputs/<asset_id>/sam3_containment/
+<batch-root>/quality_archive/<asset_id>.json
+```
+
+`--resume` 只复用输入、范围、配置和实现指纹完全匹配的 sidecar。CLI JSON 摘要会报告每个 asset 的 `computed/reused/skipped/blocked/failed` producer 状态和总耗时。要强制 producer 重算可使用 `--no-resume`；若已有 QC report，建议使用新的 `batch-root` 保留旧运行，而不是删除或覆盖旧 report。
+
+统一入口的 SAM3 只读取本轮 precheck 写出的 `module_outputs/<asset_id>/precheck/candidate_windows.json`，不要求 manifest 预填 `candidate_windows_path`。空候选不会加载 SAM3。JDT 继续直接读取 Parquet 2D keypoints；DeepReach head calibration/projection adapter 尚未完成时会明确标记 `adapter_missing/blocked`。
+
+### 4. Annotation
 
 ```bash
 python run_annotate.py configs/anygrasp_full.yaml
@@ -65,7 +98,7 @@ sampling_manifest.parquet
 qc/*.png
 ```
 
-### 4. Annotation verification
+### 5. Annotation verification
 
 ```bash
 python run_annotation_verify.py configs/annotation_verify_example.yaml

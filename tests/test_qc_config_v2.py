@@ -10,6 +10,7 @@ from qc_common.schema import validate_qc_config
 
 
 V1_SHA256 = "0ef58453f381651711ec84490975a1af5e274a179647f6ea2cc83e42404ea41d"
+V20_SHA256 = "747dc605a066eb992d89346611b1421f4225dbeeb37431d85e532e39fd94c37b"
 
 
 def _write_config(tmp_path: Path, raw: dict[str, object]) -> Path:
@@ -21,10 +22,15 @@ def _write_config(tmp_path: Path, raw: dict[str, object]) -> Path:
 def test_default_config_is_v2_snapshot_with_two_profiles() -> None:
     loaded = load_qc_acceptance_config()
     assert loaded.schema_version == "qc_acceptance_config_schema.v2"
-    assert loaded.config_version == "qc_acceptance_v2.0.0"
+    assert loaded.config_version == "qc_acceptance_v2.1.0"
     assert loaded.default_profile == "acceptance"
     assert loaded.execution_profile("acceptance")["fail_action"] == "stop"
     assert loaded.execution_profile("supplier_evaluation")["fail_action"] == "record_and_continue"
+    assert loaded.execution_profile("acceptance")["runtime_error_action"] == "stop_incomplete"
+    assert (
+        loaded.execution_profile("supplier_evaluation")["runtime_error_action"]
+        == "record_and_continue"
+    )
     assert loaded.pipeline_modules == (
         "hdf5_text_info",
         "quality_hand",
@@ -50,11 +56,17 @@ def test_default_config_is_v2_snapshot_with_two_profiles() -> None:
 
 def test_active_config_matches_immutable_v2_snapshot() -> None:
     assert Path("configs/qc_acceptance.yaml").read_bytes() == Path(
-        "configs/qc_acceptance/qc_acceptance_v2.0.0.yaml"
+        "configs/qc_acceptance/qc_acceptance_v2.1.0.yaml"
     ).read_bytes()
     assert (
         hashlib.sha256(Path("configs/qc_acceptance/qc_acceptance_v1.1.0.yaml").read_bytes()).hexdigest()
         == V1_SHA256
+    )
+    assert (
+        hashlib.sha256(
+            Path("configs/qc_acceptance/qc_acceptance_v2.0.0.yaml").read_bytes()
+        ).hexdigest()
+        == V20_SHA256
     )
 
 

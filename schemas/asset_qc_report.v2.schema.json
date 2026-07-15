@@ -54,7 +54,13 @@
           "pipeline_state": {
             "properties": {
               "status": {
-                "enum": ["pending", "running", "awaiting_external", "error"]
+                "enum": [
+                  "pending",
+                  "running",
+                  "awaiting_external",
+                  "incomplete",
+                  "error"
+                ]
               }
             }
           }
@@ -87,7 +93,9 @@
         "properties": {
           "pipeline_state": {
             "properties": {
-              "status": {"const": "error"}
+              "status": {
+                "enum": ["running", "awaiting_external", "incomplete", "error"]
+              }
             }
           }
         }
@@ -124,7 +132,9 @@
         "properties": {
           "pipeline_state": {
             "properties": {
-              "status": {"const": "error"}
+              "status": {
+                "enum": ["running", "awaiting_external", "incomplete", "error"]
+              }
             }
           },
           "overall_decision": {"type": "null"}
@@ -169,7 +179,35 @@
       "properties": {
         "profile": {"type": "string", "minLength": 1},
         "started_at": {"type": ["string", "null"]},
-        "updated_at": {"type": ["string", "null"]}
+        "updated_at": {"type": ["string", "null"]},
+        "module_states": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/moduleState"}
+        }
+      }
+    },
+    "moduleState": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "enum": [
+            "completed",
+            "disabled",
+            "skipped",
+            "not_implemented",
+            "runtime_error",
+            "awaiting_external",
+            "skipped_due_to_fail",
+            "not_run",
+            "input_missing",
+            "input_invalid",
+            "adapter_missing",
+            "blocked"
+          ]
+        },
+        "reason": {"type": "string"}
       }
     },
     "pipelineState": {
@@ -189,6 +227,7 @@
             "awaiting_external",
             "stopped",
             "completed",
+            "incomplete",
             "error"
           ]
         },

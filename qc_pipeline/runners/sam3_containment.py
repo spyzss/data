@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 import json
 from pathlib import Path
+import shutil
+from time import perf_counter
 from typing import Any
 
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import ModuleResult
-from qc_common.module_registry import ModulePrerequisiteError, ModuleRunner
+from qc_common.module_registry import (
+    ModuleAdapterMissingError,
+    ModuleInputError,
+    ModulePrerequisiteError,
+    ModuleRunner,
+)
 from qc_pipeline.context import AssetContext
+from qc_pipeline.artifacts import artifact_for
+
+
+_IMPLEMENTATION_VERSION = "sam3-containment-producer-v1"
 
 
 def _source_entry(context: AssetContext, name: str) -> Mapping[str, Any] | None:
@@ -48,16 +60,275 @@ def _records_for_asset(path: Path, asset_id: str) -> list[dict[str, Any]]:
     return [row for row in read_records(path) if str(row.get("asset_id")) == asset_id]
 
 
+def _validated_candidates(
+    context: AssetContext,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    validated: list[dict[str, Any]] = []
+    clip_start: int | None = None
+    clip_end: int | None = None
+    if context.source_range is not None:
+        clip_start, exclusive_end = context.source_range
+        clip_end = exclusive_end - 1
+    for index, row in enumerate(rows):
+        if str(row.get("asset_id") or "") != context.asset_id:
+            raise ModuleInputError(
+                "sam3_containment",
+                f"candidate {index} asset_id does not match {context.asset_id}",
+            )
+        start = row.get("start_frame")
+        end = row.get("end_frame")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+        ):
+            raise ModuleInputError(
+                "sam3_containment",
+                f"candidate {index} source bounds must be integers",
+            )
+        if start > end:
+            raise ModuleInputError(
+                "sam3_containment",
+                f"candidate {index} start_frame exceeds end_frame",
+            )
+        coordinate_space = str(row.get("coordinate_space") or "source").lower()
+        frame_coordinates = str(
+            row.get("frame_coordinate_system") or "source_inclusive"
+        ).lower()
+        if coordinate_space != "source" or frame_coordinates != "source_inclusive":
+            raise ModuleInputError(
+                "sam3_containment",
+                f"candidate {index} must use source_inclusive coordinates",
+            )
+        if (
+            clip_start is not None
+            and clip_end is not None
+            and not (clip_start <= start <= end <= clip_end)
+        ):
+            raise ModuleInputError(
+                "sam3_containment",
+                f"candidate {index} bounds {start}..{end} outside clip "
+                f"{clip_start}..{clip_end}",
+            )
+        if "source_start_frame" in row and row["source_start_frame"] != start:
+            raise ModuleInputError(
+                "sam3_containment",
+                f"candidate {index} source_start_frame disagrees with start_frame",
+            )
+        if "source_end_frame" in row and row["source_end_frame"] != end:
+            raise ModuleInputError(
+                "sam3_containment",
+                f"candidate {index} source_end_frame disagrees with end_frame",
+            )
+        validated.append(dict(row))
+    return validated
+
+
+def _with_artifact_runtime(
+    result: ModuleResult,
+    *,
+    state: str,
+    elapsed_seconds: float,
+    fingerprint_sha256: str,
+) -> ModuleResult:
+    return replace(
+        result,
+        runtime={
+            **dict(result.runtime),
+            "artifact_state": state,
+            "elapsed_seconds": float(elapsed_seconds),
+            "fingerprint_sha256": fingerprint_sha256,
+        },
+    )
+
+
+def _publish_sam3_artifact(
+    *,
+    context: AssetContext,
+    frame_results: list[dict[str, Any]],
+    window_summaries: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
+    evidence_rows: list[dict[str, Any]],
+    producer_run_config: Mapping[str, Any],
+    producer_root: Path,
+    fingerprint: Mapping[str, Any],
+    elapsed_seconds: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from qc_common.io import write_json_records
+    from qc_pipeline.artifacts import (
+        promote_artifact,
+        staged_artifact,
+        write_run_config,
+    )
+
+    artifact = artifact_for(context, "sam3_containment")
+    rewritten: list[dict[str, Any]] = []
+    with staged_artifact(artifact) as staging:
+        evidence_dir = staging / "evidence"
+        for index, source_row in enumerate(evidence_rows):
+            row = dict(source_row)
+            value = row.get("source_path")
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("SAM3 evidence row has no source_path")
+            source = Path(value)
+            if not source.is_absolute():
+                source = producer_root / source
+            if not source.is_file():
+                raise ValueError(f"SAM3 evidence file does not exist: {source}")
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            destination = evidence_dir / f"{index:04d}-{source.name}"
+            shutil.copy2(source, destination)
+            final_path = artifact.directory / "evidence" / destination.name
+            row["source_path"] = final_path.relative_to(context.batch_root).as_posix()
+            rewritten.append(row)
+        write_json_records(frame_results, staging / "frame_results.json")
+        write_json_records(window_summaries, staging / "window_results.json")
+        write_json_records(failures, staging / "failures.json")
+        write_json_records(rewritten, staging / "evidence_manifest.json")
+        (staging / "producer_run_config.json").write_text(
+            json.dumps(
+                dict(producer_run_config),
+                ensure_ascii=False,
+                allow_nan=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        write_run_config(
+            staging,
+            producer="sam3_containment",
+            outcome="completed",
+            fingerprint=fingerprint,
+            elapsed_seconds=elapsed_seconds,
+        )
+        promote_artifact(staging, artifact)
+    return window_summaries, rewritten
+
+
 def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
     def run(context: AssetContext, config: LoadedQcConfig) -> ModuleResult:
         from qc_pipeline.adapters.sam3_containment import adapt_sam3_containment
         from tools.run_manifest_sam3_containment import (
+            DEFAULT_QUERIES,
+            SAM3_CONFIG,
             read_records,
             run_manifest_sam3_containment,
         )
+        from qc_pipeline.artifacts import (
+            build_run_fingerprint,
+            canonical_sha256,
+            file_sha256,
+            reusable_artifact,
+        )
 
-        candidate_path = _source_path(context, "candidate_windows")
-        assert candidate_path is not None
+        started = perf_counter()
+
+        candidate_path = artifact_for(context, "precheck").directory / "candidate_windows.json"
+        if not candidate_path.is_file():
+            raise ModulePrerequisiteError(
+                "sam3_containment",
+                "current precheck candidate_windows.json",
+            )
+        precheck_run_config = candidate_path.parent / "run_config.json"
+        if not precheck_run_config.is_file():
+            raise ModulePrerequisiteError(
+                "sam3_containment",
+                "current precheck run_config.json",
+            )
+        try:
+            precheck_run = json.loads(
+                precheck_run_config.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ModuleInputError(
+                "sam3_containment",
+                f"current precheck run_config is unreadable: {exc}",
+            ) from exc
+        from qc_pipeline.runners.precheck import precheck_fingerprint
+
+        expected_precheck = precheck_fingerprint(context, config)
+        completed_precheck_modules = precheck_run.get("completed_modules")
+        if (
+            precheck_run.get("producer") != "precheck"
+            or precheck_run.get("outcome") not in {"completed", "partial"}
+            or precheck_run.get("fingerprint") != expected_precheck
+            or not isinstance(completed_precheck_modules, list)
+            or "keypoint_temporal" not in completed_precheck_modules
+        ):
+            raise ModuleInputError(
+                "sam3_containment",
+                "current precheck run does not match this asset/config or lacks temporal output",
+            )
+        try:
+            all_candidate_rows = read_records(candidate_path)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ModuleInputError(
+                "sam3_containment",
+                f"candidate artifact is unreadable: {exc}",
+            ) from exc
+        candidate_rows = _validated_candidates(context, all_candidate_rows)
+        if not candidate_rows:
+            return ModuleResult(
+                module="sam3_containment",
+                verdict="skipped",
+                evaluation={"decision": "skipped", "reason": "no_candidates"},
+                metrics={"window_count": 0},
+                runtime={"artifact_state": "no_candidates"},
+            )
+
+        supplier = str(context.metadata.get("supplier") or "jdt").lower()
+        if supplier == "deepreach":
+            raise ModuleAdapterMissingError(
+                "sam3_containment",
+                "DeepReach head calibration/projection adapter is not validated",
+            )
+        if supplier != "jdt":
+            raise ModuleAdapterMissingError(
+                "sam3_containment",
+                f"supplier adapter is not implemented: {supplier}",
+            )
+        source_names = tuple(
+            name
+            for name in ("video", "parquet", "sam3_model")
+            if name in context.source_files
+        )
+        fingerprint = build_run_fingerprint(
+            context=context,
+            producer="sam3_containment",
+            config=config,
+            module_names=("sam3_containment",),
+            source_names=source_names,
+            implementation_version=_IMPLEMENTATION_VERSION,
+            extra={
+                "candidate_sha256": file_sha256(candidate_path),
+                "queries": DEFAULT_QUERIES,
+                "sam3_runtime": SAM3_CONFIG,
+            },
+        )
+        fingerprint_sha256 = canonical_sha256(fingerprint)
+        artifact = artifact_for(context, "sam3_containment")
+        if bool(context.metadata.get("reuse_artifacts", True)) and reusable_artifact(
+            artifact, fingerprint
+        ):
+            window_summaries = read_records(artifact.directory / "window_results.json")
+            evidence_rows = read_records(artifact.directory / "evidence_manifest.json")
+            result = adapt_sam3_containment(
+                asset_id=context.asset_id,
+                batch_root=context.batch_root,
+                window_summaries=window_summaries,
+                evidence_rows=evidence_rows,
+                config=config,
+            )
+            return _with_artifact_runtime(
+                result,
+                state="reused",
+                elapsed_seconds=perf_counter() - started,
+                fingerprint_sha256=fingerprint_sha256,
+            )
         manifest_path = _source_path(context, "manifest", required=False)
         if manifest_path is not None:
             manifest_rows = _records_for_asset(manifest_path, context.asset_id)
@@ -89,8 +360,6 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
                 manifest_row[field] = str(
                     value if value.is_absolute() else manifest_dir / value
                 )
-        candidate_rows = _records_for_asset(candidate_path, context.asset_id)
-
         staging_root = context.batch_root / ".qc_pipeline" / context.asset_id / "sam3"
         staging_root.mkdir(parents=True, exist_ok=True)
         single_manifest = staging_root / "manifest.jsonl"
@@ -116,7 +385,7 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
         summary = run_manifest_sam3_containment(
             manifest=single_manifest,
             candidate_windows=single_candidates,
-            supplier=str(context.metadata.get("supplier") or "jdt"),
+            supplier=supplier,
             output_dir=output_dir,
             max_clips=1,
             sam3_model=model,
@@ -132,12 +401,40 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
             output_dir / "window_keypoint_containment_summary.json"
         )
         evidence_rows = read_records(output_dir / "review_evidence_manifest.csv")
-        return adapt_sam3_containment(
+        frame_path = output_dir / "frame_keypoint_containment.json"
+        failures_path = output_dir / "failures.json"
+        producer_config_path = output_dir / "run_config.json"
+        frame_results = read_records(frame_path) if frame_path.is_file() else []
+        failures = read_records(failures_path) if failures_path.is_file() else []
+        producer_run_config = (
+            json.loads(producer_config_path.read_text(encoding="utf-8"))
+            if producer_config_path.is_file()
+            else {}
+        )
+        elapsed = perf_counter() - started
+        window_summaries, evidence_rows = _publish_sam3_artifact(
+            context=context,
+            frame_results=frame_results,
+            window_summaries=window_summaries,
+            failures=failures,
+            evidence_rows=evidence_rows,
+            producer_run_config=producer_run_config,
+            producer_root=staging_root,
+            fingerprint=fingerprint,
+            elapsed_seconds=elapsed,
+        )
+        result = adapt_sam3_containment(
             asset_id=context.asset_id,
             batch_root=context.batch_root,
             window_summaries=window_summaries,
             evidence_rows=evidence_rows,
             config=config,
+        )
+        return _with_artifact_runtime(
+            result,
+            state="computed",
+            elapsed_seconds=elapsed,
+            fingerprint_sha256=fingerprint_sha256,
         )
 
     return run

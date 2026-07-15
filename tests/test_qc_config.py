@@ -8,7 +8,7 @@ from qc_common.config import load_qc_acceptance_config
 def test_default_qc_config_loads_and_hashes() -> None:
     loaded = load_qc_acceptance_config()
 
-    assert loaded.config_version == "qc_acceptance_v2.0.0"
+    assert loaded.config_version == "qc_acceptance_v2.1.0"
     assert loaded.module_rules("video_quality")["fps_below_min"]["verdict"] == "fail"
     assert loaded.json_reference()["config_hash"].startswith("sha256:")
 

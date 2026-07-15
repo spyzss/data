@@ -36,6 +36,33 @@ class ModulePrerequisiteError(RuntimeError):
         super().__init__(f"{module} prerequisite unavailable: {prerequisite}")
 
 
+class _ModuleStatusError(RuntimeError):
+    status = "blocked"
+
+    def __init__(self, module: str, reason: str) -> None:
+        self.module = module
+        self.reason = reason
+        super().__init__(f"{module} {self.status}: {reason}")
+
+
+class ModuleInputError(_ModuleStatusError):
+    """A producer input exists but violates its explicit contract."""
+
+    status = "input_invalid"
+
+
+class ModuleAdapterMissingError(_ModuleStatusError):
+    """The supplier has no validated adapter for this producer."""
+
+    status = "adapter_missing"
+
+
+class ModuleBlockedError(_ModuleStatusError):
+    """The producer is valid but cannot run in the current environment."""
+
+    status = "blocked"
+
+
 class ModuleRegistry:
     """Mutable registry owned by one asset worker."""
 
@@ -62,6 +89,9 @@ class ModuleRegistry:
 
 
 __all__ = [
+    "ModuleAdapterMissingError",
+    "ModuleBlockedError",
+    "ModuleInputError",
     "ModulePrerequisiteError",
     "ModuleRegistry",
     "ModuleRunner",

@@ -21,6 +21,11 @@ ModuleExecutionState = Literal[
     "runtime_error",
     "awaiting_external",
     "skipped_due_to_fail",
+    "not_run",
+    "input_missing",
+    "input_invalid",
+    "adapter_missing",
+    "blocked",
 ]
 _VERDICTS = ("pass", "warn", "fail", "skipped")
 _ISSUE_SEVERITIES = ("warn", "fail")
