@@ -22,6 +22,12 @@ from urllib.parse import urlsplit
 
 
 LOGGER = logging.getLogger("serve_manual_review")
+LEGACY_SOURCE_OF_TRUTH_WARNING = (
+    "DEPRECATED: legacy manual-review CSV/progress output is not the authoritative "
+    "source of truth. Import completed legacy decisions with "
+    "tools/import_legacy_manual_review.py; the human QC workbench reads "
+    "quality_archive JSON."
+)
 SAVE_ENDPOINT_SUFFIX = "/__manual_review_save__"
 LEGACY_SAVE_ENDPOINT = "/api/manual-review/save"
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
@@ -75,6 +81,7 @@ def main() -> int:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    LOGGER.warning(LEGACY_SOURCE_OF_TRUTH_WARNING)
     server = create_server(
         host=args.host,
         port=args.port,
