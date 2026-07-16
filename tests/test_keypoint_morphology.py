@@ -231,6 +231,79 @@ def test_existence_invalid_hand_is_not_applicable_not_morphology_fail(
     assert frame.flag is False
 
 
+@pytest.mark.parametrize("sentinel", ["zero", "identical_nonzero"])
+def test_existence_sentinel_hand_is_gated_from_morphology(sentinel: str) -> None:
+    clip = _clip()
+    assert clip.keypoints is not None
+    point = np.zeros(3) if sentinel == "zero" else np.asarray([1.0, 2.0, 3.0])
+    for name, values in clip.keypoints.items():
+        if name.startswith("left"):
+            values[0] = point
+
+    frame, _summary = _run(clip)
+
+    assert frame.metrics["left_morphology_verdict"] == "not_applicable"
+    assert frame.metrics["right_morphology_verdict"] == "pass"
+    assert frame.metrics["left_valid_keypoint_count"] == 0
+    assert frame.metrics["left_finite_keypoint_count"] == 21
+    assert frame.metrics["left_all_zero"] is (sentinel == "zero")
+    assert frame.metrics["left_all_identical"] is True
+    assert frame.metrics["left_existence_invalid_reasons"] == [
+        "all_zero_keypoints" if sentinel == "zero" else "all_identical_keypoints"
+    ]
+    assert not any(
+        token.startswith("left:")
+        for token in frame.metrics["which_thresholds_exceeded"]
+    )
+    assert "left:palm_scale_too_small" not in frame.reason
+
+
+def test_local_duplicate_remains_a_morphology_review() -> None:
+    clip = _clip()
+    assert clip.keypoints is not None
+    clip.keypoints["leftIndexFingerTip"][0] = clip.keypoints[
+        "leftIndexFingerIntermediateTip"
+    ][0]
+
+    frame, _summary = _run(clip)
+
+    assert frame.metrics["left_morphology_verdict"] == "review"
+    assert frame.metrics["left_valid_keypoint_count"] == 21
+    assert frame.metrics["left_existence_invalid_reasons"] == []
+    assert "left:duplicate_joint_pair_count_review" in frame.reason
+
+
+def test_both_zero_hands_make_morphology_not_applicable_without_fail_reasons() -> None:
+    clip = _clip()
+    assert clip.keypoints is not None
+    for values in clip.keypoints.values():
+        values[0] = 0.0
+
+    frame, summary = _run(clip)
+
+    assert frame.metrics["left_morphology_verdict"] == "not_applicable"
+    assert frame.metrics["right_morphology_verdict"] == "not_applicable"
+    assert frame.metrics["morphology_verdict"] == "not_applicable"
+    assert summary.metrics["morphology_verdict"] == "not_applicable"
+    assert frame.metrics["which_thresholds_exceeded"] == []
+
+
+def test_one_not_applicable_hand_does_not_hide_other_hand_morphology_fail() -> None:
+    clip = _clip()
+    assert clip.keypoints is not None
+    clip.keypoints["leftThumbTip"][0, 0] = np.nan
+    knuckle = clip.keypoints["rightIndexFingerKnuckle"][0].copy()
+    for base_name in ACCEPTANCE_FINGER_CHAINS["Index"][1:]:
+        _set_joint(clip, f"right{base_name}", knuckle)
+
+    frame, summary = _run(clip)
+
+    assert frame.metrics["left_morphology_verdict"] == "not_applicable"
+    assert frame.metrics["right_morphology_verdict"] == "fail"
+    assert frame.metrics["morphology_verdict"] == "fail"
+    assert summary.metrics["morphology_verdict"] == "fail"
+
+
 def test_left_fail_and_right_pass_produces_overall_fail() -> None:
     clip = _clip()
     assert clip.keypoints is not None

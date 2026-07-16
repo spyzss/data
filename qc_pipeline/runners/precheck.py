@@ -22,7 +22,7 @@ MODULES = (
     "keypoint_morphology",
     "keypoint_temporal",
 )
-_IMPLEMENTATION_VERSION = "precheck-session-v1"
+_IMPLEMENTATION_VERSION = "precheck-session-v2"
 
 
 @dataclass(frozen=True)

@@ -590,6 +590,88 @@ def test_presence_does_not_infer_missing_keypoints_from_absent_quality_hand() ->
     assert result.issues == ()
 
 
+def test_presence_explicit_existence_invalid_preserves_side_ranges_and_reasons() -> None:
+    rows = []
+    for frame, reason, all_zero, all_identical in (
+        (10, "all_zero_keypoints", True, True),
+        (11, "all_zero_keypoints", True, True),
+        (14, "all_identical_keypoints", False, True),
+    ):
+        rows.append(
+            CheckResult(
+                "keypoint_missing",
+                0,
+                frame,
+                {
+                    "keypoint_presence_invalid": True,
+                    "keypoint_existence_invalid_left": True,
+                    "keypoint_existence_invalid_right": False,
+                    "valid_keypoint_count_left": 0.0,
+                    "finite_keypoint_count_left": 21.0,
+                    "missing_keypoint_count_left": 21.0,
+                    "all_zero_left": all_zero,
+                    "all_identical_left": all_identical,
+                    "invalid_reasons_left": [reason],
+                    "valid_keypoint_count_right": 21.0,
+                    "finite_keypoint_count_right": 21.0,
+                    "missing_keypoint_count_right": 0.0,
+                    "all_zero_right": False,
+                    "all_identical_right": False,
+                    "invalid_reasons_right": [],
+                },
+                True,
+                "explicit existence invalid",
+            )
+        )
+
+    result = adapt_keypoint_presence(
+        asset_id="a",
+        source_relative_path="parquet/a.parquet",
+        results=rows,
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "fail"
+    assert result.evaluation["affected_frame_count"] == 3
+    assert result.evaluation["affected_frame_ranges"] == ((10, 11), (14, 14))
+    assert result.metrics["affected_frame_count"] == 3
+    assert result.metrics["affected_frame_ranges"] == ((10, 11), (14, 14))
+    assert result.metrics["invalid_frame_ranges_by_hand"] == {
+        "left": ((10, 11), (14, 14)),
+        "right": (),
+    }
+    assert result.metrics["invalid_frame_details"] == [
+        {
+            "side": "left",
+            "frame_idx": 10,
+            "invalid_reasons": ["all_zero_keypoints"],
+            "valid_point_count": 0,
+            "finite_point_count": 21,
+            "all_zero": True,
+            "all_identical": True,
+        },
+        {
+            "side": "left",
+            "frame_idx": 11,
+            "invalid_reasons": ["all_zero_keypoints"],
+            "valid_point_count": 0,
+            "finite_point_count": 21,
+            "all_zero": True,
+            "all_identical": True,
+        },
+        {
+            "side": "left",
+            "frame_idx": 14,
+            "invalid_reasons": ["all_identical_keypoints"],
+            "valid_point_count": 0,
+            "finite_point_count": 21,
+            "all_zero": False,
+            "all_identical": True,
+        },
+    ]
+    assert all(issue.context["hand_side"] == "left" for issue in result.issues)
+
+
 def test_temporal_candidate_is_one_warn_issue_with_source_range() -> None:
     result = adapt_keypoint_temporal(
         asset_id="a",
@@ -1040,6 +1122,14 @@ def test_morphology_fail_uses_configured_threshold_and_actual_metric_name() -> N
     assert result.issues[0].rule_id == (
         "keypoint_morphology.max_normalized_bone_length"
     )
+    assert result.evaluation["fail_frame_count"] == 1
+    assert result.evaluation["fail_frame_ranges"] == ((8, 8),)
+    assert result.evaluation["affected_frame_count"] == 1
+    assert result.evaluation["affected_frame_ranges"] == ((8, 8),)
+    assert result.metrics["fail_frame_count"] == 1
+    assert result.metrics["fail_frame_ranges"] == ((8, 8),)
+    assert result.metrics["review_frame_count"] == 0
+    assert result.metrics["review_frame_ranges"] == ()
     assert result.issues[0].metric == "normalized_bone_length_max"
     assert result.issues[0].observed_value == 6.5
     assert result.issues[0].operator == ">="
@@ -1225,7 +1315,12 @@ def test_morphology_not_applicable_is_skipped_not_pass() -> None:
 
     assert result.verdict == "skipped"
     assert result.evaluation["reason"] == "skipped_due_to_existence_invalid"
-    assert result.metrics == rows[0].metrics
+    assert result.metrics["morphology_verdict"] == "not_applicable"
+    assert result.metrics["num_frames"] == 2
+    assert result.metrics["fail_frame_count"] == 0
+    assert result.metrics["fail_frame_ranges"] == ()
+    assert result.metrics["review_frame_count"] == 0
+    assert result.metrics["review_frame_ranges"] == ()
     assert result.issues == ()
     assert result.evidence == ()
 

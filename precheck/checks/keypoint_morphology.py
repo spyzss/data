@@ -10,6 +10,7 @@ import numpy as np
 
 from precheck.base import BaseCheck
 from precheck.registry import register
+from qc_common.keypoint_validity import inspect_hand_keypoints
 from qc_common.keypoints import (
     ACCEPTANCE_FINGER_CHAINS,
     acceptance_joint_names,
@@ -146,21 +147,30 @@ class KeypointMorphologyCheck(BaseCheck):
         side: str,
     ) -> tuple[dict[str, Any], str, list[str]]:
         expected = acceptance_joint_names([side])
-        points_by_name: dict[str, np.ndarray] = {}
-        for name in expected:
-            values = clip.keypoints.get(name) if clip.keypoints else None
-            if values is None or values.shape[0] <= frame_offset:
-                continue
-            point = np.asarray(values[frame_offset], dtype=np.float64)
-            if point.shape[0] < 3 or not np.all(np.isfinite(point[:3])):
-                continue
-            points_by_name[name] = point[:3]
-
+        validity = inspect_hand_keypoints(
+            clip.keypoints,
+            side=side,
+            frame_offset=frame_offset,
+            source_value_count=self._source_value_count(
+                clip,
+                side,
+                frame_offset,
+            ),
+        )
         metrics = empty_hand_metrics()
-        metrics["valid_keypoint_count"] = len(points_by_name)
-        if len(points_by_name) != len(expected):
+        metrics.update(
+            {
+                "valid_keypoint_count": validity.valid_point_count,
+                "finite_keypoint_count": validity.finite_point_count,
+                "all_zero": validity.all_zero,
+                "all_identical": validity.all_identical,
+                "existence_invalid_reasons": list(validity.invalid_reasons),
+            }
+        )
+        if not validity.is_valid:
             return metrics, "not_applicable", ["skipped_due_to_existence_invalid"]
 
+        points_by_name = validity.points_by_name
         points = np.stack([points_by_name[name] for name in expected])
         palm_scale = self._palm_scale(points_by_name, side)
         metrics["palm_scale_m"] = palm_scale
@@ -213,6 +223,20 @@ class KeypointMorphologyCheck(BaseCheck):
         reasons = self._threshold_reasons(metrics)
         verdict = verdict_from_reasons(reasons)
         return metrics, verdict, reasons
+
+    @staticmethod
+    def _source_value_count(
+        clip: ClipInputs,
+        side: str,
+        frame_offset: int,
+    ) -> int | None:
+        counts_by_side = getattr(clip, "keypoint_source_value_counts", None)
+        if not isinstance(counts_by_side, dict):
+            return None
+        counts = counts_by_side.get(side)
+        if counts is None or len(counts) <= frame_offset:
+            return None
+        return int(counts[frame_offset])
 
     def _palm_scale(
         self,
@@ -395,6 +419,10 @@ class KeypointMorphologyCheck(BaseCheck):
 def empty_hand_metrics() -> dict[str, Any]:
     return {
         "valid_keypoint_count": 0,
+        "finite_keypoint_count": 0,
+        "all_zero": False,
+        "all_identical": False,
+        "existence_invalid_reasons": [],
         "palm_scale_m": None,
         "bone_length_m_min": None,
         "bone_length_m_max": None,

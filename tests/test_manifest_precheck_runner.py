@@ -138,12 +138,134 @@ def test_jdt_adapter_reshapes_3d_and_preserves_cam_left_2d(tmp_path: Path) -> No
     assert clip.num_frames == 3
     assert clip.keypoints is not None
     assert clip.keypoints["leftHand"].shape == (3, 3)
+    source_points = np.asarray(_jdt_frame(3)["left_kp3d"]).reshape(21, 3)
+    assert np.array_equal(clip.keypoints["leftHand"][0], source_points[0])
+    assert np.array_equal(
+        clip.keypoints["leftThumbKnuckle"][0],
+        source_points[13],
+    )
+    assert np.array_equal(
+        clip.keypoints["leftIndexFingerTip"][0],
+        source_points[17],
+    )
     assert getattr(clip, "leftcam_left_kp2d").shape == (3, 21, 2)
     assert getattr(clip, "leftcam_right_kp2d").shape == (3, 21, 2)
     assert clip.text_label is not None
     assert clip.text_label["language_instruction"] == "instruction-3"
     assert getattr(clip, "primary_camera") == "observation.images.cam_left"
     assert getattr(clip, "morphology_status") == "not_ready_topology"
+
+
+def test_jdt_unified_presence_uses_3d_keypoints_without_quality_hand(
+    tmp_path: Path,
+) -> None:
+    from qc_common.config import load_qc_acceptance_config
+    from qc_pipeline.context import AssetContext
+    from qc_pipeline.runners.precheck import PrecheckSession
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    parquet_path = source_dir / "jdt.parquet"
+    pd.DataFrame([_jdt_frame(index) for index in range(8)]).to_parquet(
+        parquet_path,
+        index=False,
+    )
+    context = AssetContext(
+        asset_id="jdt-clip",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "jdt-clip.json",
+        source_files={"parquet": {"path": "source/jdt.parquet"}},
+        source_range=(3, 6),
+        metadata={"supplier": "jdt"},
+    )
+
+    result = PrecheckSession(context, load_qc_acceptance_config()).run_module(
+        "keypoint_presence"
+    )
+
+    assert result.verdict == "pass"
+    assert result.evaluation["decision"] == "pass"
+    assert result.evaluation["checked_frame_count"] == 3
+    assert result.evaluation["invalid_frame_count"] == 0
+    assert result.evaluation.get("reason") != "source_signal_not_provided"
+    assert result.metrics["min_valid_keypoint_count_left"] == 21.0
+    assert result.metrics["min_valid_keypoint_count_right"] == 21.0
+
+
+def test_jdt_short_3d_cell_becomes_presence_invalid_instead_of_load_failure(
+    tmp_path: Path,
+) -> None:
+    from qc_common.config import load_qc_acceptance_config
+    from qc_pipeline.context import AssetContext
+    from qc_pipeline.runners.precheck import PrecheckSession
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    rows = [_jdt_frame(index) for index in range(8)]
+    rows[4]["left_kp3d"] = rows[4]["left_kp3d"][:60]
+    pd.DataFrame(rows).to_parquet(source_dir / "jdt.parquet", index=False)
+    context = AssetContext(
+        asset_id="jdt-short-cell",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "jdt-short-cell.json",
+        source_files={"parquet": {"path": "source/jdt.parquet"}},
+        source_range=(3, 6),
+        metadata={"supplier": "jdt"},
+    )
+
+    result = PrecheckSession(context, load_qc_acceptance_config()).run_module(
+        "keypoint_presence"
+    )
+
+    assert result.verdict == "fail"
+    assert result.evaluation["affected_frame_count"] == 1
+    assert result.evaluation["affected_frame_ranges"] == ((4, 4),)
+    detail = result.evaluation["invalid_frame_details"][0]
+    assert detail["side"] == "left"
+    assert detail["frame_idx"] == 4
+    assert detail["valid_point_count"] == 20
+    assert "invalid_coordinate_shape" in detail["invalid_reasons"]
+    assert "insufficient_valid_keypoint_count" in detail["invalid_reasons"]
+
+
+def test_jdt_missing_hand_3d_column_isolated_as_presence_invalid(
+    tmp_path: Path,
+) -> None:
+    from qc_common.config import load_qc_acceptance_config
+    from qc_pipeline.context import AssetContext
+    from qc_pipeline.runners.precheck import PrecheckSession
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    rows = [_jdt_frame(index) for index in range(8)]
+    pd.DataFrame(rows).drop(columns=["left_kp3d"]).to_parquet(
+        source_dir / "jdt.parquet",
+        index=False,
+    )
+    context = AssetContext(
+        asset_id="jdt-missing-left",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "jdt-missing-left.json",
+        source_files={"parquet": {"path": "source/jdt.parquet"}},
+        source_range=(3, 6),
+        metadata={"supplier": "jdt"},
+    )
+
+    result = PrecheckSession(context, load_qc_acceptance_config()).run_module(
+        "keypoint_presence"
+    )
+
+    assert result.verdict == "fail"
+    assert result.evaluation["affected_frame_count"] == 3
+    assert result.evaluation["affected_frame_ranges"] == ((3, 5),)
+    assert {
+        (detail["side"], detail["frame_idx"])
+        for detail in result.evaluation["invalid_frame_details"]
+    } == {("left", 3), ("left", 4), ("left", 5)}
+    assert all(
+        "invalid_coordinate_shape" in detail["invalid_reasons"]
+        for detail in result.evaluation["invalid_frame_details"]
+    )
 
 
 def test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows(

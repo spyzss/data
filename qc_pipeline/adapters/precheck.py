@@ -632,11 +632,24 @@ def adapt_keypoint_presence(
         for side in ("left", "right"):
             observed = observations.setdefault(
                 (side, row.frame_idx),
-                {"counts": [], "ratios": [], "missing": False, "quality_low": False},
+                {
+                    "counts": [],
+                    "finite_counts": [],
+                    "ratios": [],
+                    "missing": False,
+                    "quality_low": False,
+                    "explicit_invalid": False,
+                    "invalid_reasons": [],
+                    "all_zero": False,
+                    "all_identical": False,
+                },
             )
             count = row.metrics.get(f"valid_keypoint_count_{side}")
             if isinstance(count, Real):
                 observed["counts"].append(float(count))
+            finite_count = row.metrics.get(f"finite_keypoint_count_{side}")
+            if isinstance(finite_count, Real):
+                observed["finite_counts"].append(float(finite_count))
             ratio = row.metrics.get(f"missing_fraction_in_10s_window_{side}")
             if isinstance(ratio, Real):
                 observed["ratios"].append(float(ratio))
@@ -644,6 +657,20 @@ def adapt_keypoint_presence(
             observed["missing"] |= isinstance(missing, Real) and float(missing) > 0
             observed["quality_low"] |= bool(
                 row.metrics.get(f"quality_low_{side}", 0.0)
+            )
+            observed["explicit_invalid"] |= bool(
+                row.metrics.get(f"keypoint_existence_invalid_{side}", False)
+            )
+            reasons = row.metrics.get(f"invalid_reasons_{side}", ())
+            if isinstance(reasons, (list, tuple)):
+                observed["invalid_reasons"].extend(
+                    str(reason) for reason in reasons if str(reason)
+                )
+            observed["all_zero"] |= bool(
+                row.metrics.get(f"all_zero_{side}", False)
+            )
+            observed["all_identical"] |= bool(
+                row.metrics.get(f"all_identical_{side}", False)
             )
 
     selected: dict[tuple[str, int], _NormalizedFailure] = {}
@@ -671,7 +698,8 @@ def adapt_keypoint_presence(
         side_detector_invalid_frames = {
             frame
             for frame, observed in side_observations.items()
-            if observed["missing"]
+            if observed["explicit_invalid"]
+            or observed["missing"]
             or any(
                 not math.isfinite(value) or value < expected_count
                 for value in observed["counts"]
@@ -705,7 +733,31 @@ def adapt_keypoint_presence(
             )
             ratio = max(explicit_ratio, aggregate_ratio)
             failure: _NormalizedFailure | None = None
-            if (
+            if observed["explicit_invalid"]:
+                invalid_reasons = tuple(sorted(set(observed["invalid_reasons"])))
+                if "nonfinite_keypoints" in invalid_reasons:
+                    failure = _NormalizedFailure(
+                        side,
+                        frame,
+                        "fail",
+                        str(nonfinite_rule["rule_id"]),
+                        f"invalid_reasons_{side}",
+                        list(invalid_reasons),
+                        "==",
+                        [],
+                    )
+                else:
+                    failure = _NormalizedFailure(
+                        side,
+                        frame,
+                        "fail",
+                        str(count_rule["rule_id"]),
+                        count_metric,
+                        count,
+                        "<",
+                        expected_count,
+                    )
+            elif (
                 nonfinite_counts or nonfinite_ratios
             ) and parameters["nan_or_inf_fail"]:
                 metric = count_metric if nonfinite_counts else ratio_metric
@@ -742,12 +794,8 @@ def adapt_keypoint_presence(
                 )
             if failure is not None:
                 selected[(side, frame)] = failure
-            if (
-                observed["quality_low"]
-                or nonfinite_ratios
-                or explicit_ratio >= ratio_warn_boundary
-            ):
-                invalid_frames_by_hand[side].add(frame)
+            # Rolling ratios can affect the module verdict, but they do not make
+            # the current source frame itself existence-invalid.
         invalid_frames_by_hand[side].update(side_detector_invalid_frames)
 
     checked_frames = {row.frame_idx for row in rows}
@@ -761,6 +809,22 @@ def adapt_keypoint_presence(
         )
         or (row.check == "keypoint_missing" and row.flag is True)
     )
+    affected_frame_ranges = _contiguous_ranges(tuple(invalid_frames))
+    invalid_frame_details = [
+        {
+            "side": side,
+            "frame_idx": frame,
+            "invalid_reasons": sorted(set(observed["invalid_reasons"])),
+            "valid_point_count": int(min(observed["counts"], default=0.0)),
+            "finite_point_count": int(
+                min(observed["finite_counts"], default=0.0)
+            ),
+            "all_zero": bool(observed["all_zero"]),
+            "all_identical": bool(observed["all_identical"]),
+        }
+        for (side, frame), observed in sorted(observations.items())
+        if observed["explicit_invalid"]
+    ]
 
     issues = tuple(
         _issue_from_row(
@@ -789,17 +853,23 @@ def adapt_keypoint_presence(
             "checked_frame_count": len(checked_frames),
             "invalid_frame_count": len(invalid_frames),
             "invalid_frame_ratio": len(invalid_frames) / len(checked_frames),
+            "affected_frame_count": len(invalid_frames),
+            "affected_frame_ranges": affected_frame_ranges,
+            "invalid_frame_details": invalid_frame_details,
         },
         metrics={
             **{
                 f"min_valid_keypoint_count_{side}": value
                 for side, value in minimum_counts.items()
             },
-            "invalid_frame_ranges": _contiguous_ranges(tuple(invalid_frames)),
+            "invalid_frame_ranges": affected_frame_ranges,
             "invalid_frame_ranges_by_hand": {
                 side: _contiguous_ranges(tuple(side_frames))
                 for side, side_frames in invalid_frames_by_hand.items()
             },
+            "affected_frame_count": len(invalid_frames),
+            "affected_frame_ranges": affected_frame_ranges,
+            "invalid_frame_details": invalid_frame_details,
         },
         issues=issues,
     )
@@ -1160,12 +1230,40 @@ def adapt_keypoint_morphology(
             f"invalid keypoint_morphology summary verdict: {detector_verdict!r}"
         )
     verdict = cast(Verdict, verdict_by_detector[detector_verdict])
+    frame_rows = [
+        row
+        for row in results
+        if row.check == "keypoint_morphology" and row.frame_idx >= 0
+    ]
+    fail_frames = {
+        row.frame_idx
+        for row in frame_rows
+        if row.metrics.get("morphology_verdict") == "fail"
+    }
+    review_frames = {
+        row.frame_idx
+        for row in frame_rows
+        if row.metrics.get("morphology_verdict") == "review"
+    }
+    affected_frames = fail_frames | review_frames
+    frame_metrics = {
+        "fail_frame_count": len(fail_frames),
+        "fail_frame_ranges": _contiguous_ranges(tuple(fail_frames)),
+        "review_frame_count": len(review_frames),
+        "review_frame_ranges": _contiguous_ranges(tuple(review_frames)),
+        "affected_frame_count": len(affected_frames),
+        "affected_frame_ranges": _contiguous_ranges(tuple(affected_frames)),
+    }
     if verdict == "skipped":
         return ModuleResult(
             module="keypoint_morphology",
             verdict="skipped",
-            evaluation={"decision": "skipped", "reason": summary.reason},
-            metrics=dict(summary.metrics),
+            evaluation={
+                "decision": "skipped",
+                "reason": summary.reason,
+                **frame_metrics,
+            },
+            metrics={**dict(summary.metrics), **frame_metrics},
         )
 
     parameters = config.module_parameters("keypoint_morphology")
@@ -1206,8 +1304,8 @@ def adapt_keypoint_morphology(
     return ModuleResult(
         module="keypoint_morphology",
         verdict=verdict,
-        evaluation={"decision": verdict, "reason": summary.reason},
-        metrics=dict(summary.metrics),
+        evaluation={"decision": verdict, "reason": summary.reason, **frame_metrics},
+        metrics={**dict(summary.metrics), **frame_metrics},
         issues=tuple(issue for issue, _evidence in issue_evidence),
         evidence=tuple(evidence for _issue, evidence in issue_evidence),
     )

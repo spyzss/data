@@ -330,16 +330,17 @@ def test_qc_runners_smoke(tmp_path: Path) -> None:
         result for result in precheck_results if result.check == "keypoint_missing"
     ]
     assert missing_results
-    assert any(result.flag is True for result in missing_results)
-    assert any(
-        result.metrics["missing_frames_in_10s_window_left"] > 1.0
+    assert all(result.flag is False for result in missing_results)
+    assert any(result.metrics["quality_low_left"] > 0.0 for result in missing_results)
+    assert all(
+        result.metrics["missing_frames_in_10s_window_left"] == 0.0
         for result in missing_results
     )
     assert any(
         result.metrics["acceptance_joint_count"] == 42.0
         for result in missing_results
     )
-    assert (
+    assert not (
         tmp_path / "precheck" / "keypoint_missing_repair_candidates.json"
     ).exists()
     assert (tmp_path / "precheck" / "check_results.parquet").exists() or (

@@ -239,6 +239,33 @@ def _reshape_cells(
     return np.stack(values, axis=0)
 
 
+def _reshape_keypoint_cells(
+    frame: pd.DataFrame,
+    column: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Canonicalize up to 21x3 values while preserving short-cell invalidity."""
+    if column not in frame.columns:
+        return (
+            np.full((len(frame), 21, 3), np.nan, dtype=np.float32),
+            np.zeros(len(frame), dtype=np.int64),
+        )
+    expected = 21 * 3
+    values: list[np.ndarray] = []
+    source_value_counts: list[int] = []
+    for row_offset, value in enumerate(frame[column].tolist()):
+        array = np.asarray(value, dtype=np.float32).reshape(-1)
+        if array.size > expected:
+            raise ValueError(
+                f"{column} row {row_offset} has {array.size} values; "
+                f"expected at most {expected}"
+            )
+        padded = np.full(expected, np.nan, dtype=np.float32)
+        padded[: array.size] = array
+        values.append(padded.reshape(21, 3))
+        source_value_counts.append(int(array.size))
+    return np.stack(values, axis=0), np.asarray(source_value_counts, dtype=np.int64)
+
+
 def load_jdt_clip(
     row: dict[str, Any],
     *,
@@ -264,8 +291,8 @@ def load_jdt_clip(
             f"end_frame {end_frame} outside source frame count {len(full_frame)}"
         )
     sliced = full_frame.iloc[start_frame : end_frame + 1]
-    left_3d = _reshape_cells(sliced, "left_kp3d", (21, 3))
-    right_3d = _reshape_cells(sliced, "right_kp3d", (21, 3))
+    left_3d, left_3d_counts = _reshape_keypoint_cells(sliced, "left_kp3d")
+    right_3d, right_3d_counts = _reshape_keypoint_cells(sliced, "right_kp3d")
     left_2d = _reshape_cells(sliced, "leftcam_left_kp2d", (21, 2))
     right_2d = _reshape_cells(sliced, "leftcam_right_kp2d", (21, 2))
     first = sliced.iloc[0]
@@ -285,6 +312,11 @@ def load_jdt_clip(
     )
     setattr(clip, "leftcam_left_kp2d", left_2d)
     setattr(clip, "leftcam_right_kp2d", right_2d)
+    setattr(
+        clip,
+        "keypoint_source_value_counts",
+        {"left": left_3d_counts, "right": right_3d_counts},
+    )
     setattr(clip, "primary_camera", "observation.images.cam_left")
     setattr(clip, "source_frame_count", len(full_frame))
     return _attach_common_metadata(

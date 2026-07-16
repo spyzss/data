@@ -103,6 +103,89 @@ def test_failed_video_recompute_preserves_previous_valid_artifact(
     } == before
 
 
+def test_precheck_v1_artifact_is_not_reused_by_current_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_common.types import CheckResult
+    from qc_pipeline.runners import precheck
+    from tests.test_qc_pipeline_precheck_session import _config, _context
+
+    context = _context(tmp_path)
+    config = _config(tmp_path)
+    loads: list[str] = []
+    executions: list[str] = []
+
+    monkeypatch.setattr(
+        precheck,
+        "_load_clip",
+        lambda context, module: loads.append(module) or object(),
+    )
+
+    def execute(
+        context: AssetContext,
+        config: object,
+        module: str,
+        clip: object,
+    ) -> precheck.PrecheckModuleExecution:
+        executions.append(module)
+        return precheck.PrecheckModuleExecution(
+            result=ModuleResult(module, "pass", {}, {}),
+            check_results=(CheckResult(module, 0, -1, {}, False, "ok"),),
+            candidate_windows=(),
+        )
+
+    monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
+    with monkeypatch.context() as legacy:
+        legacy.setattr(precheck, "_IMPLEMENTATION_VERSION", "precheck-session-v1")
+        old_session = precheck.PrecheckSession(context, config)
+        for module in precheck.MODULES:
+            old_session.run_module(module)
+
+    old_run_config = json.loads(
+        (
+            tmp_path
+            / "module_outputs"
+            / "asset-a"
+            / "precheck"
+            / "run_config.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert old_run_config["fingerprint"]["implementation_version"] == (
+        "precheck-session-v1"
+    )
+
+    loads.clear()
+    executions.clear()
+    reused_modules: list[str] = []
+
+    def adapt_cached(
+        context: AssetContext,
+        config: object,
+        module: str,
+        results: object,
+        candidates: object,
+        *,
+        artifact_state: str,
+    ) -> ModuleResult:
+        reused_modules.append(module)
+        return ModuleResult(
+            module,
+            "pass",
+            {},
+            {},
+            runtime={"artifact_state": artifact_state},
+        )
+
+    monkeypatch.setattr(precheck, "_adapt_module", adapt_cached)
+    current_session = precheck.PrecheckSession(context, config)
+    current_session.run_module("hdf5_text_info")
+
+    assert loads == ["hdf5_text_info"]
+    assert executions == ["hdf5_text_info"]
+    assert reused_modules == []
+
+
 def test_sam3_cache_uses_candidate_sha_and_skips_segmenter_on_hit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

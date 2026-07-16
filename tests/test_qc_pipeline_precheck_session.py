@@ -274,6 +274,9 @@ def test_completed_session_publishes_canonical_precheck_artifact(
         }
     ]
     assert run_config["outcome"] == "completed"
+    assert run_config["fingerprint"]["implementation_version"] == (
+        "precheck-session-v2"
+    )
 
 
 def test_temporal_success_publishes_empty_candidate_list(
