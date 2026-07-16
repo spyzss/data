@@ -27,7 +27,7 @@ outputs/
 *.mp4
 
 # === Debug archive (one-off diagnostic scripts/images) ===
-archive/
+/archive/
 inspect_rig.py
 
 # === Agent / tooling logs ===

@@ -2,6 +2,7 @@
 change: unify-qc-dataflow
 design-doc: docs/superpowers/specs/2026-07-14-unify-qc-dataflow-design.md
 base-ref: 44ee01f5221a00343e48046bfb477889a82a68cc
+archived-with: 2026-07-16-unify-qc-dataflow
 ---
 
 # 统一 QC 数据流实施计划
@@ -31,6 +32,7 @@ base-ref: 44ee01f5221a00343e48046bfb477889a82a68cc
 - 正式批次决策与统计只遍历 `quality_archive/*.json`；sidecar 仅用于算法回归、证据展示和迁移对账。
 - 每项任务遵循 TDD：先添加精确失败测试，确认失败原因，再写最小实现、运行相关回归并单独提交。
 
+archived-with: 2026-07-16-unify-qc-dataflow
 ---
 
 ## 文件结构与职责

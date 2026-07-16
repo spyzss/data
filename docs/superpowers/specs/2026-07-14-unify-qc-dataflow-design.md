@@ -2,6 +2,8 @@
 comet_change: unify-qc-dataflow
 role: technical-design
 canonical_spec: openspec
+archived-with: 2026-07-16-unify-qc-dataflow
+status: final
 ---
 
 # 统一 QC 数据流技术设计
