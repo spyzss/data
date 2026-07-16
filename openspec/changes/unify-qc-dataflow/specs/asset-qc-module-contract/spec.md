@@ -56,7 +56,17 @@
 - **THEN** revision N+1 的报告保持完整
 
 ### Requirement: 未实现模块不得伪装为通过
-统一编排器 MUST 区分 disabled、skipped、not_implemented 和执行错误。配置为 enabled 但没有注册实现的模块 MUST 使本次运行保持未完成或显式失败，MUST NOT 自动写成 pass。
+统一编排器 MUST 区分 disabled、skipped、not_implemented 和执行错误。配置为 disabled 的模块 MUST 在 `execution.module_states` 写入 `state=disabled`；只有模块已启用、实现可用且经入口条件判断为明确不适用时，才可写入 `state=skipped`。配置为 enabled 但没有注册实现的模块 MUST 使本次运行保持未完成或显式失败，MUST NOT 自动写成 pass。
+
+#### Scenario: 配置禁用模块
+- **WHEN** 当前活跃配置将 `effective_duration` 设置为 `enabled: false`
+- **THEN** 编排器写入 `execution.module_states.effective_duration.state=disabled` 和禁用原因
+- **THEN** 编排器不得将该模块写成 `skipped` 或 pass
+
+#### Scenario: 已启用模块明确不适用
+- **WHEN** 已启用且有注册实现的模块通过入口条件确定当前资产不适用，并且该判断没有输入错误或运行错误
+- **THEN** 编排器可写入 `state=skipped`
+- **THEN** 该状态不得被用于表示配置禁用或实现缺失
 
 #### Scenario: 配置启用尚未实现的 duplicate_check
 - **WHEN** 当前代码没有 `duplicate_check` 实现但运行配置将其启用

@@ -45,7 +45,9 @@
 
 新增资产级 orchestrator，读取版本化 config 的模块顺序，通过 registry 找到实现并传入 manifest/source_files。每完成一个模块立即提交一次报告 revision，使中断后可以从 `pipeline_state.next_module` 恢复。
 
-配置为 disabled 的模块写 skipped；配置为 enabled 但 registry 无实现的模块写运行错误并保持 final decision 为 null。当前只接入仓库已有实现；未来模块通过同一 registry 扩展。
+配置为 disabled 的模块写 `execution.module_states.<module>.state=disabled`；只有 enabled、实现可用且入口条件明确判定不适用于当前资产的模块才写 `state=skipped`。配置为 enabled 但 registry 无实现的模块写运行错误并保持 final decision 为 null。当前只接入仓库已有实现；未来模块通过同一 registry 扩展。
+
+活跃配置入口不绑定到某个历史版本号。新运行读取 `configs/qc_acceptance.yaml` 当前声明的 `config_version`，并要求活跃入口与对应不可变快照字节一致；`qc_acceptance_v2.0.0.yaml` 仅作为已经发布的历史快照保留，不再作为新运行的固定默认版本。
 
 ### 5. Sidecar 是引用证据，不是第二份结论
 

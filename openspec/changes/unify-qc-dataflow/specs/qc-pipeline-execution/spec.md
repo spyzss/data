@@ -1,17 +1,22 @@
 ## ADDED Requirements
 
 ### Requirement: 流程顺序来自不可变版本化配置
-统一编排器 SHALL 按单资产报告顶层 `qc_config` 指向的版本化配置执行模块。本 change MUST 发布 `qc_acceptance_config_schema.v2` 和 `qc_acceptance_v2.0.0`，并保持历史 v1.1.0 文件不可变。一个资产从初始化到最终完成 MUST 使用同一 config version 和 hash；运行中不得切换阈值或模块顺序。
+统一编排器 SHALL 按单资产报告顶层 `qc_config` 指向的版本化配置执行模块。本 change MUST 发布 `qc_acceptance_config_schema.v2` 和不可变版本快照，并保持已经发布的历史快照不可变。新运行 MUST 使用活跃入口当前声明的 `config_version`，且活跃入口 MUST 与该 `config_version` 对应的不可变快照字节一致。一个资产从初始化到最终完成 MUST 使用同一 config version 和 hash；运行中不得切换阈值或模块顺序。
 
 #### Scenario: 配置文件在运行中被修改
 - **WHEN** 资产报告已记录配置 hash 后磁盘配置内容发生变化
 - **THEN** 后续模块拒绝以新 hash 继续更新该资产
 - **THEN** 报告保留原配置引用和未完成状态
 
+#### Scenario: 活跃入口选择当前快照
+- **WHEN** 新资产开始运行且 `configs/qc_acceptance.yaml` 声明 `config_version: qc_acceptance_v2.1.0`
+- **THEN** 新运行使用 `qc_acceptance_v2.1.0`
+- **THEN** 活跃入口与 `configs/qc_acceptance/qc_acceptance_v2.1.0.yaml` 字节一致
+
 #### Scenario: 历史配置保留
-- **WHEN** v2 配置发布
-- **THEN** `qc_acceptance_v1.1.0.yaml` 的内容和 hash 保持不变
-- **THEN** 新运行默认使用 `qc_acceptance_v2.0.0`
+- **WHEN** 新配置版本发布并成为活跃版本
+- **THEN** `qc_acceptance_v1.1.0.yaml` 和 `qc_acceptance_v2.0.0.yaml` 等已发布快照的内容和 hash 保持不变
+- **THEN** 新运行不得因历史文档示例而回退到 `qc_acceptance_v2.0.0`
 
 ### Requirement: 并发边界按资产隔离
 统一编排器 MUST 保证同一资产内的模块按配置顺序串行写回，同时 SHALL 允许不同资产并行执行。任何跨资产并行不得共享可变报告状态或绕过每个资产的 revision 校验。
