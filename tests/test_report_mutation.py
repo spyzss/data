@@ -587,3 +587,52 @@ def test_error_transition_keeps_null_quality_decision(tmp_path: Path) -> None:
     assert report["pipeline_state"]["status"] == "error"
     assert report["overall_decision"] is None
     validate_asset_qc_report(report)
+
+
+def test_evidence_path_allows_opted_in_internal_symlink(
+    tmp_path: Path,
+) -> None:
+    from qc_common.contracts import EvidenceRef
+    from qc_common.report_mutation import _assert_evidence_path
+    from qc_pipeline.context import AssetContext
+
+    outside = tmp_path.parent / f"{tmp_path.name}-external-evidence"
+    outside.mkdir()
+    target = outside / "video.mp4"
+    target.write_bytes(b"video")
+
+    link = tmp_path / "source" / "video.mp4"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+
+    evidence = EvidenceRef(
+        evidence_id="evidence-a",
+        kind="source_video",
+        path="source/video.mp4",
+        coordinate_system="source_video_inclusive",
+        start_frame=0,
+        end_frame=9,
+    )
+
+    strict_context = AssetContext(
+        asset_id="asset-strict",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "strict.json",
+        source_files={},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="evidence path is outside batch_root",
+    ):
+        _assert_evidence_path(strict_context, evidence)
+
+    linked_context = AssetContext(
+        asset_id="asset-linked",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "linked.json",
+        source_files={},
+        allow_symlinked_sources=True,
+    )
+
+    _assert_evidence_path(linked_context, evidence)

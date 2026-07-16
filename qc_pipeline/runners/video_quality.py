@@ -94,6 +94,7 @@ def _compute_video_quality(
         config=config,
         batch_root=context.batch_root,
         source_range=context.source_range,
+        allow_symlinked_sources=context.allow_symlinked_sources,
     )
     return adapted, _to_plain(raw_result)
 

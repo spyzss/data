@@ -192,3 +192,57 @@ def test_promote_artifact_replaces_complete_directory(tmp_path: Path) -> None:
         {"version": 2}
     ]
     assert list(directory.parent.glob(".precheck.backup-*")) == []
+
+
+
+def test_file_identity_allows_opted_in_symlinked_source(
+    tmp_path: Path,
+) -> None:
+    from qc_pipeline.artifacts import file_identity
+
+    outside_dir = (
+        tmp_path.parent
+        / f"{tmp_path.name}-outside-source"
+    )
+    outside_dir.mkdir()
+    target = outside_dir / "clip.bin"
+    target.write_bytes(b"external-source-v1")
+
+    link = tmp_path / "source" / "clip.bin"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+
+    # Strict/default behavior still rejects a symlink whose
+    # resolved target leaves batch_root.
+    with pytest.raises(
+        ValueError,
+        match="source path must stay inside batch_root",
+    ):
+        file_identity(
+            link,
+            batch_root=tmp_path,
+        )
+
+    identity = file_identity(
+        link,
+        batch_root=tmp_path,
+        allow_symlinked_sources=True,
+    )
+
+    assert identity == {
+        "path": "source/clip.bin",
+        "size": len(b"external-source-v1"),
+        "mtime_ns": target.stat().st_mtime_ns,
+    }
+
+    # Opt-in allows only links lexically staged under batch_root;
+    # it must not allow direct external paths.
+    with pytest.raises(
+        ValueError,
+        match="source path must stay inside batch_root",
+    ):
+        file_identity(
+            target,
+            batch_root=tmp_path,
+            allow_symlinked_sources=True,
+        )

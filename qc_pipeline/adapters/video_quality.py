@@ -285,8 +285,13 @@ def _source_evidence(
     start_frame: int | None,
     end_frame: int | None,
     generator_version: str,
+    allow_symlinked_sources: bool = False,
 ) -> EvidenceRef:
-    path = relative_evidence_path(result.metrics.path, batch_root)
+    path = relative_evidence_path(
+        result.metrics.path,
+        batch_root,
+        allow_symlinked_sources=allow_symlinked_sources,
+    )
     evidence_id = build_issue_id(
         asset_id=result.metrics.asset_id,
         module="video_quality",
@@ -362,6 +367,7 @@ def adapt_video_quality_result(
     config: LoadedQcConfig,
     batch_root: Path,
     source_range: tuple[int, int] | None = None,
+    allow_symlinked_sources: bool = False,
 ) -> ModuleResult:
     """Translate one batch or range result without reevaluating its metrics."""
     video_config = load_video_quality_config(config.path)
@@ -374,6 +380,7 @@ def adapt_video_quality_result(
         start_frame=start_frame,
         end_frame=end_frame,
         generator_version=str(payload["module_version"]),
+        allow_symlinked_sources=allow_symlinked_sources,
     )
     details = (
         *result.evaluation.reason_details,

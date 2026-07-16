@@ -9,6 +9,7 @@ from collections import Counter
 from dataclasses import replace
 import json
 import math
+import os
 import sys
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -61,27 +62,47 @@ def _path_inside_batch(
     batch_root: Path,
     manifest_dir: Path,
     field: str,
+    allow_symlinked_sources: bool = False,
 ) -> tuple[str, str]:
     text = _text(value)
     if not text:
         raise ValueError(f"{field} must be a non-empty path")
+
     candidate = Path(text).expanduser()
-    absolute = (
-        candidate.resolve()
+    candidate_path = (
+        candidate
         if candidate.is_absolute()
-        else (manifest_dir / candidate).resolve()
+        else manifest_dir / candidate
     )
+
+    # lexical_absolute preserves a symlink located inside batch_root.
+    # resolved_absolute records the real supplier/model source path.
+    lexical_absolute = Path(
+        os.path.abspath(os.fspath(candidate_path))
+    )
+    resolved_absolute = lexical_absolute.resolve()
+
+    containment_path = (
+        lexical_absolute
+        if allow_symlinked_sources
+        else resolved_absolute
+    )
+
     try:
-        relative = absolute.relative_to(batch_root)
+        relative = containment_path.relative_to(batch_root)
     except ValueError:
-        raise ValueError(f"{field} is outside batch_root: {absolute}") from None
-    return relative.as_posix(), str(absolute)
+        raise ValueError(
+            f"{field} is outside batch_root: {resolved_absolute}"
+        ) from None
+
+    return relative.as_posix(), str(resolved_absolute)
 
 
 def contexts_from_manifest(
     manifest: Path,
     *,
     batch_root: Path,
+    allow_symlinked_sources: bool = False,
 ) -> list[AssetContext]:
     """Build source-faithful, independent contexts from manifest rows."""
     manifest = manifest.resolve()
@@ -110,6 +131,7 @@ def contexts_from_manifest(
                 batch_root=batch_root,
                 manifest_dir=manifest.parent,
                 field=column,
+                allow_symlinked_sources=allow_symlinked_sources,
             )
             source_files[source_name] = {"path": relative}
             row[column] = absolute
@@ -132,6 +154,7 @@ def contexts_from_manifest(
                 batch_root=batch_root,
                 report_path=batch_root / "quality_archive" / f"{asset_id}.json",
                 source_files=source_files,
+                allow_symlinked_sources=allow_symlinked_sources,
                 source_range=source_range,
                 metadata={
                     **row,
@@ -271,6 +294,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-root", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument(
+        "--allow-symlinked-sources",
+        action="store_true",
+        help=(
+            "Allow manifest source paths to be symlinks located inside "
+            "batch_root whose real targets are on external data/model mounts."
+        ),
+    )
+    parser.add_argument(
         "--profile",
         required=True,
         choices=("acceptance", "supplier_evaluation"),
@@ -288,7 +319,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = load_qc_acceptance_config(args.config)
-    contexts = contexts_from_manifest(args.manifest, batch_root=args.batch_root)
+    contexts = contexts_from_manifest(
+        args.manifest,
+        batch_root=args.batch_root,
+        allow_symlinked_sources=args.allow_symlinked_sources,
+    )
     outcomes = run_batch(
         contexts,
         config=config,

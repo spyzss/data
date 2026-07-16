@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Mapping
@@ -234,14 +235,35 @@ def _assert_module_order(
 def _assert_evidence_path(context: AssetContext, evidence: EvidenceRef) -> None:
     relative_path = Path(evidence.path)
     if relative_path.is_absolute():
-        raise ValueError(f"evidence path must be relative to batch_root: {evidence.path}")
-    resolved = (context.batch_root.resolve() / relative_path).resolve()
+        raise ValueError(
+            f"evidence path must be relative to batch_root: {evidence.path}"
+        )
+
+    lexical_root = Path(
+        os.path.abspath(os.fspath(context.batch_root))
+    )
+    lexical_path = Path(
+        os.path.abspath(
+            os.fspath(lexical_root / relative_path)
+        )
+    )
+
     try:
-        resolved.relative_to(context.batch_root.resolve())
+        lexical_path.relative_to(lexical_root)
     except ValueError:
         raise ValueError(
             f"evidence path is outside batch_root: {evidence.path}"
         ) from None
+
+    if not context.allow_symlinked_sources:
+        try:
+            lexical_path.resolve().relative_to(
+                context.batch_root.resolve()
+            )
+        except ValueError:
+            raise ValueError(
+                f"evidence path is outside batch_root: {evidence.path}"
+            ) from None
 
 
 def _module_block(

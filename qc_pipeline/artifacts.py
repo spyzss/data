@@ -79,11 +79,43 @@ def file_identity(
     *,
     batch_root: Path,
     declared: Mapping[str, Any] | None = None,
+    allow_symlinked_sources: bool = False,
 ) -> dict[str, Any]:
-    resolved = _inside(path, batch_root, label="source path")
-    stat = resolved.stat()
+    # Keep the declared/staged path relative to batch_root in the
+    # fingerprint, while reading size/mtime from the resolved source.
+    lexical_root = Path(
+        os.path.abspath(os.fspath(batch_root))
+    )
+    candidate = (
+        path
+        if path.is_absolute()
+        else lexical_root / path
+    )
+    lexical_path = Path(
+        os.path.abspath(os.fspath(candidate))
+    )
+
+    try:
+        relative_path = lexical_path.relative_to(lexical_root)
+    except ValueError:
+        raise ValueError(
+            f"source path must stay inside batch_root: {path}"
+        ) from None
+
+    resolved_root = batch_root.resolve()
+    resolved_path = lexical_path.resolve()
+
+    if not allow_symlinked_sources:
+        try:
+            resolved_path.relative_to(resolved_root)
+        except ValueError:
+            raise ValueError(
+                f"source path must stay inside batch_root: {path}"
+            ) from None
+
+    stat = resolved_path.stat()
     identity: dict[str, Any] = {
-        "path": resolved.relative_to(batch_root.resolve()).as_posix(),
+        "path": relative_path.as_posix(),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
@@ -198,6 +230,7 @@ def build_run_fingerprint(
             path,
             batch_root=context.batch_root,
             declared=declared,
+            allow_symlinked_sources=context.allow_symlinked_sources,
         )
     fingerprint: dict[str, Any] = {
         "producer": producer,

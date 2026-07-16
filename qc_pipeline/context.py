@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -13,6 +14,7 @@ class AssetContext:
     batch_root: Path
     report_path: Path
     source_files: Mapping[str, Any]
+    allow_symlinked_sources: bool = False
     source_range: tuple[int, int] | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -41,12 +43,25 @@ class AssetContext:
                 raise ValueError(
                     f"source_files.{source_name}.path must be relative to batch_root"
                 )
+            lexical_path = Path(
+                os.path.abspath(
+                    os.fspath(batch_root / relative_path)
+                )
+            )
             try:
-                (batch_root / relative_path).resolve().relative_to(batch_root)
+                lexical_path.relative_to(batch_root)
             except ValueError:
                 raise ValueError(
                     f"source_files.{source_name}.path must stay inside batch_root"
                 ) from None
+
+            if not self.allow_symlinked_sources:
+                try:
+                    lexical_path.resolve().relative_to(batch_root)
+                except ValueError:
+                    raise ValueError(
+                        f"source_files.{source_name}.path must stay inside batch_root"
+                    ) from None
 
         if self.source_range is not None:
             start, end = self.source_range

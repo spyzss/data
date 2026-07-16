@@ -8,6 +8,7 @@ from enum import Enum
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -184,13 +185,39 @@ def build_issue_id(
     return f"{module}:{rule_name}:{digest}"
 
 
-def relative_evidence_path(path: Path, batch_root: Path) -> str:
-    resolved_path = path.resolve()
-    resolved_root = batch_root.resolve()
+def relative_evidence_path(
+    path: Path,
+    batch_root: Path,
+    *,
+    allow_symlinked_sources: bool = False,
+) -> str:
+    lexical_root = Path(
+        os.path.abspath(os.fspath(batch_root))
+    )
+    candidate = (
+        path
+        if path.is_absolute()
+        else lexical_root / path
+    )
+    lexical_path = Path(
+        os.path.abspath(os.fspath(candidate))
+    )
+
     try:
-        relative_path = resolved_path.relative_to(resolved_root)
+        relative_path = lexical_path.relative_to(lexical_root)
     except ValueError:
         raise ValueError(
             f"evidence path {path} is outside batch root {batch_root}"
         ) from None
+
+    if not allow_symlinked_sources:
+        resolved_path = lexical_path.resolve()
+        resolved_root = batch_root.resolve()
+        try:
+            resolved_path.relative_to(resolved_root)
+        except ValueError:
+            raise ValueError(
+                f"evidence path {path} is outside batch root {batch_root}"
+            ) from None
+
     return relative_path.as_posix()
