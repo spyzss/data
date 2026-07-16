@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from qc_common.config import LoadedQcConfig
+from qc_common.manifest_metadata import manifest_metadata
 from qc_common.contracts import EvidenceRef, ModuleResult, RuntimeErrorRecord
 from qc_common.report import (
     StaleReportRevisionError,
@@ -53,6 +54,7 @@ def initialize_v2_report(
         },
         "overall_decision": None,
         "source_files": copy.deepcopy(dict(context.source_files)),
+        "manifest_metadata": manifest_metadata(context.metadata),
         "issues": [],
         "runtime_errors": [],
         "manual_review": {
@@ -104,6 +106,8 @@ def _assert_report_identity(
         )
     if report.get("source_files") != dict(context.source_files):
         raise ValueError("source_files mismatch between report and AssetContext")
+    if report.get("manifest_metadata") != manifest_metadata(context.metadata):
+        raise ValueError("manifest_metadata mismatch between report and AssetContext")
     _assert_config_reference(report, config, profile)
 
 

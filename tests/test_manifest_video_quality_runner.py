@@ -39,6 +39,7 @@ def _advance_report_to_video(
     video_path: Path,
     source_range: tuple[int, int],
     profile: str = "acceptance",
+    manifest_metadata: dict[str, object] | None = None,
 ) -> None:
     config = load_qc_acceptance_config()
     context = AssetContext(
@@ -49,6 +50,7 @@ def _advance_report_to_video(
             "video": {"path": video_path.relative_to(batch_root).as_posix()}
         },
         source_range=source_range,
+        metadata=manifest_metadata or {},
     )
     revision = 0
     modules = config.pipeline_modules
@@ -329,6 +331,95 @@ def test_manifest_video_quality_supplier_profile_keeps_machine_verdict(
     assert report["pipeline_state"]["status"] == "running"
 
 
+def test_manifest_video_quality_reuses_report_manifest_metadata(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_video_quality import run_manifest_video_quality
+
+    video = tmp_path / "source.mp4"
+    write_test_video(video, [solid_frame(90) for _ in range(4)], fps=10.0)
+    manifest = _write_manifest(
+        tmp_path / "manifest.csv",
+        [
+            {
+                "asset_id": "logical-a",
+                "primary_video_path": str(video),
+                "start_frame": 0,
+                "end_frame": 3,
+            }
+        ],
+    )
+    manifest_metadata = {
+        "scene": "manifest scene",
+        "task": "manifest task",
+        "task_name": "pick_cup",
+        "text_en": "Pick the cup.",
+        "text_label": "display label",
+    }
+    _advance_report_to_video(
+        tmp_path,
+        asset_id="logical-a",
+        video_path=video,
+        source_range=(0, 4),
+        manifest_metadata=manifest_metadata,
+    )
+
+    summary = run_manifest_video_quality(
+        manifest,
+        tmp_path / "quality",
+        batch_root=tmp_path,
+    )
+
+    assert summary["qc_report_write_count"] == 1
+    report = json.loads(
+        (tmp_path / "quality_archive" / "logical-a.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["manifest_metadata"] == manifest_metadata
+
+
+def test_manifest_video_quality_rejects_legacy_report_without_manifest_metadata(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_video_quality import run_manifest_video_quality
+
+    video = tmp_path / "source.mp4"
+    write_test_video(video, [solid_frame(90) for _ in range(4)], fps=10.0)
+    manifest = _write_manifest(
+        tmp_path / "manifest.csv",
+        [
+            {
+                "asset_id": "logical-a",
+                "primary_video_path": str(video),
+                "start_frame": 0,
+                "end_frame": 3,
+            }
+        ],
+    )
+    _advance_report_to_video(
+        tmp_path,
+        asset_id="logical-a",
+        video_path=video,
+        source_range=(0, 4),
+    )
+    report_path = tmp_path / "quality_archive" / "logical-a.json"
+    legacy = json.loads(report_path.read_text(encoding="utf-8"))
+    legacy.pop("manifest_metadata")
+    report_path.write_text(json.dumps(legacy), encoding="utf-8")
+    before = report_path.read_bytes()
+
+    summary = run_manifest_video_quality(
+        manifest,
+        tmp_path / "quality",
+        batch_root=tmp_path,
+    )
+
+    assert summary["qc_report_write_count"] == 0
+    assert summary["failed_clip_count"] == 1
+    assert report_path.read_bytes() == before
+
+
 def test_manifest_video_quality_handles_repeated_source_ranges_independently(
     tmp_path: Path,
 ) -> None:
@@ -552,7 +643,7 @@ def test_manifest_video_rejects_inconsistent_completed_flow(
     ("profile", "exit_state", "pipeline_status", "exit_next"),
     [
         ("supplier_evaluation", "continue", "running", "sam3_containment"),
-        ("acceptance", "stop_qc", "stopped", None),
+        ("acceptance", "continue", "running", "sam3_containment"),
     ],
 )
 def test_manifest_video_skips_consistent_completed_outcomes(

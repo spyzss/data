@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,7 @@ from qc_common.contracts import ModuleResult
 from qc_common.frame_survival import FrameExclusion
 from qc_common.module_registry import ModuleRegistry
 from qc_common.module_registry import ModulePrerequisiteError
-from qc_common.types import CheckResult
+from qc_common.types import CheckResult, ClipInputs
 from qc_pipeline.context import AssetContext
 from qc_pipeline.orchestrator import run_asset
 from qc_pipeline.runners import precheck
@@ -86,7 +87,7 @@ def _registry(session: object, config: LoadedQcConfig) -> ModuleRegistry:
 def _enable_frame_survival(config: LoadedQcConfig) -> None:
     config.raw["acceptance_policy"] = {
         "frame_survival": {
-            "version": "frame_survival_v1",
+            "version": "frame_survival_v2",
             "enabled": True,
             "min_remaining_frame_ratio": 0.90,
             "stop_when_below": True,
@@ -261,6 +262,102 @@ def test_manifest_inclusive_range_counts_nonzero_start_and_last_frame(
     assert result.evaluation["frame_survival"]["original_frame_count"] == 5
     assert result.evaluation["frame_survival"]["remaining_frame_count"] == 4
     assert result.evaluation["frame_survival"]["eligible_frame_ranges"] == [[37, 40]]
+
+
+def test_manifest_metadata_survives_clip_slice_and_frame_survival_preparation(
+    tmp_path: Path,
+) -> None:
+    metadata = {
+        "scene": "kitchen",
+        "task": "pick cup",
+        "task_name": "pick_cup",
+        "text_en": "Pick the cup.",
+        "text_label": "display label",
+        "display_only": "preserve me",
+    }
+    clip = ClipInputs(
+        episode_idx=1,
+        frame_indices=[10, 11, 12],
+        quality_hand=None,
+        manifest_metadata=metadata,
+    )
+
+    sliced = precheck._slice_clip(clip, (1, 3))
+
+    assert sliced.frame_indices == [1, 2]
+    assert sliced.manifest_metadata == metadata
+    config = _config(tmp_path)
+    _enable_frame_survival(config)
+    session = precheck.PrecheckSession(
+        replace(
+            _context(tmp_path, source_range=(1, 3)),
+            metadata=metadata,
+        ),
+        config,
+    )
+    session._clip = sliced
+
+    prepared = session._prepare_clip_for_module("keypoint_presence")
+
+    assert prepared.manifest_metadata == metadata
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("scene", "living room"),
+        ("task", "place cup"),
+        ("task_name", "place_cup"),
+        ("text_en", "Place the cup."),
+        ("text_label", "updated label"),
+    ],
+)
+def test_precheck_fingerprint_uses_only_normalized_text_decision_metadata(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+) -> None:
+    context = replace(
+        _context(tmp_path),
+        metadata={
+            "supplier": "jdt",
+            "scene": " kitchen ",
+            "task": None,
+            "task_name": " pick_cup ",
+            "text_en": " Pick the cup. ",
+            "text_label": " label ",
+            "source_supplier_video_path": "video/one.mp4",
+            "sam3_model": "models/one.pt",
+            "supplier_display_name": "Supplier One",
+        },
+    )
+    config = _config(tmp_path)
+
+    fingerprint = precheck.precheck_fingerprint(context, config)
+
+    assert fingerprint["manifest_text_metadata"] == {
+        "scene": "kitchen",
+        "task": None,
+        "task_name": "pick_cup",
+        "text_en": "Pick the cup.",
+        "text_label": "label",
+    }
+    changed_relevant = replace(
+        context,
+        metadata={**dict(context.metadata), field: replacement},
+    )
+    changed_unrelated = replace(
+        context,
+        metadata={
+            **dict(context.metadata),
+            "source_supplier_video_path": "video/two.mp4",
+            "sam3_model": "models/two.pt",
+            "supplier_display_name": "Supplier Two",
+        },
+    )
+
+    assert precheck.precheck_fingerprint(changed_relevant, config) != fingerprint
+    assert precheck.precheck_fingerprint(changed_unrelated, config) == fingerprint
 
 
 def test_acceptance_e2e_one_morphology_fail_keeps_independent_modules_running(
@@ -654,7 +751,7 @@ def test_completed_session_publishes_canonical_precheck_artifact(
     ]
     assert run_config["outcome"] == "completed"
     assert run_config["fingerprint"]["implementation_version"] == (
-        "precheck-session-v4-frame-survival-lineage"
+        "precheck-session-v5-frame-survival-metadata"
     )
 
 
@@ -737,6 +834,93 @@ def test_matching_precheck_artifact_reuses_without_source_load_or_check_run(
 
     assert adapted == list(precheck.MODULES)
     assert all(result.runtime["artifact_state"] == "reused" for result in results)
+
+
+def test_precheck_artifact_and_cache_reuse_retain_manifest_text_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_metadata = {
+        "supplier": "jdt",
+        "scene": "kitchen",
+        "task": "pick cup",
+        "task_name": "pick_cup",
+        "text_en": "Pick the cup.",
+        "text_label": "display label",
+    }
+    context = replace(_context(tmp_path), metadata=manifest_metadata)
+    config = _config(tmp_path)
+    seen_metadata: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        precheck,
+        "_load_clip",
+        lambda context, module: ClipInputs(episode_idx=1),
+    )
+
+    def execute(
+        context: AssetContext,
+        config: LoadedQcConfig,
+        module: str,
+        clip: ClipInputs,
+    ) -> precheck.PrecheckModuleExecution:
+        seen_metadata.append(dict(clip.manifest_metadata))
+        return precheck.PrecheckModuleExecution(
+            result=ModuleResult(module, "pass", {"decision": "pass"}, {}),
+            check_results=(CheckResult(module, 0, -1, {}, False, "ok"),),
+            candidate_windows=(),
+        )
+
+    monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
+    first = precheck.PrecheckSession(context, config)
+    for module in precheck.MODULES:
+        first.run_module(module)
+
+    artifact = tmp_path / "module_outputs" / "asset-a" / "precheck"
+    run_config = json.loads((artifact / "run_config.json").read_text())
+    assert seen_metadata == [manifest_metadata] * len(precheck.MODULES)
+    assert run_config["manifest_metadata"] == manifest_metadata
+    assert run_config["manifest_text_metadata"] == {
+        "scene": "kitchen",
+        "task": "pick cup",
+        "task_name": "pick_cup",
+        "text_en": "Pick the cup.",
+        "text_label": "display label",
+    }
+
+    monkeypatch.setattr(
+        precheck,
+        "_load_clip",
+        lambda context, module: pytest.fail("cache hit must not reload source"),
+    )
+    monkeypatch.setattr(
+        precheck,
+        "_run_module_on_clip",
+        lambda context, config, module, clip: pytest.fail("cache hit must not rerun"),
+    )
+    reused: list[str] = []
+
+    def adapt(
+        context: AssetContext,
+        config: LoadedQcConfig,
+        module: str,
+        results: object,
+        candidates: object,
+        *,
+        artifact_state: str,
+    ) -> ModuleResult:
+        assert artifact_state == "reused"
+        reused.append(module)
+        return ModuleResult(module, "pass", {"decision": "pass"}, {})
+
+    monkeypatch.setattr(precheck, "_adapt_module", adapt)
+    second = precheck.PrecheckSession(context, config)
+    second.run_module("hdf5_text_info")
+
+    assert reused == ["hdf5_text_info"]
+    assert second._fingerprint()["manifest_text_metadata"] == run_config[
+        "manifest_text_metadata"
+    ]
 
 
 def test_source_identity_change_invalidates_precheck_artifact(

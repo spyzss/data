@@ -57,6 +57,7 @@ def advance_batch_report_to_video(
     asset_id: str,
     *,
     config_path: Path | None = None,
+    manifest_metadata: dict[str, object] | None = None,
 ) -> None:
     config = load_qc_acceptance_config(config_path)
     video_path = batch / "video" / f"{asset_id}_video.mp4"
@@ -73,6 +74,7 @@ def advance_batch_report_to_video(
         batch_root=batch,
         report_path=batch / "quality_archive" / f"{asset_id}.json",
         source_files=source_files,
+        metadata=manifest_metadata or {},
     )
     revision = 0
     modules = config.pipeline_modules
@@ -1250,20 +1252,32 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     video_dir = batch / "video"
     video_dir.mkdir()
     (video_dir / "bad_video.mp4").write_bytes(b"not a video")
-    advance_batch_report_to_video(batch, "bad")
+    manifest_metadata = {
+        "scene": "manifest scene",
+        "task": "manifest task",
+        "task_name": "pick_cup",
+        "text_en": "Pick the cup.",
+        "text_label": "display label",
+    }
+    advance_batch_report_to_video(
+        batch,
+        "bad",
+        manifest_metadata=manifest_metadata,
+    )
 
     exit_code = run_video_quality_check(batch)
 
     assert exit_code == 2
     assert not (batch / "reports").exists()
     report = json.loads((batch / "quality_archive" / "bad.json").read_text(encoding="utf-8"))
+    assert report["manifest_metadata"] == manifest_metadata
     assert report["pipeline_state"] == {
-        "status": "stopped",
+        "status": "running",
         "last_completed_module": "video_quality",
-        "next_module": None,
-        "stop_reason": "quality_fail:video_quality",
+        "next_module": "sam3_containment",
+        "stop_reason": None,
     }
-    assert report["overall_decision"] == "fail"
+    assert report["overall_decision"] is None
     assert report["manual_review"]["state"] == "not_evaluated"
     assert "cannot_open_video" in report["video_quality"]["evaluation"]["reasons"]
     detail = next(
@@ -1276,9 +1290,9 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     assert detail["needs_manual_review"] is False
     assert "config_version" not in detail
     assert report["video_quality"]["flow"]["exit_gate"] == {
-        "state": "stop_qc",
-        "continue_to_next_module": False,
-        "next_module": None,
+        "state": "continue",
+        "continue_to_next_module": True,
+        "next_module": "sam3_containment",
     }
     before = (batch / "quality_archive" / "bad.json").read_bytes()
     assert run_video_quality_check(batch) == 2

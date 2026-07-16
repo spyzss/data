@@ -3,7 +3,7 @@ config_version: qc_acceptance_v2.1.0
 config_name: acceptance_gate
 acceptance_policy:
   frame_survival:
-    version: frame_survival_v1
+    version: frame_survival_v2
     enabled: true
     min_remaining_frame_ratio: 0.90
     stop_when_below: true
@@ -14,10 +14,7 @@ acceptance_policy:
     - keypoint_temporal
     - sam3_containment
     - manual_review
-    terminal_asset_fail_modules:
-    - hdf5_text_info
-    - quality_hand
-    - video_quality
+    terminal_asset_fail_modules: []
 execution_profiles:
   acceptance:
     fail_action: stop

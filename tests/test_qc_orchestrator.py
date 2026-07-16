@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from qc_common.config import LoadedQcConfig
+from qc_common.config import LoadedQcConfig, load_qc_acceptance_config
 from qc_common.contracts import EvidenceRef, Issue, ModuleResult
 from qc_common.frame_survival import FrameExclusion
 from qc_common.module_registry import ModuleRegistry, ModuleUnavailableError
@@ -103,7 +103,7 @@ def _context(tmp_path: Path, asset_id: str = "asset-a") -> AssetContext:
 def _enable_frame_survival(config: LoadedQcConfig) -> None:
     config.raw["acceptance_policy"] = {
         "frame_survival": {
-            "version": "frame_survival_v1",
+            "version": "frame_survival_v2",
             "enabled": True,
             "min_remaining_frame_ratio": 0.90,
             "stop_when_below": True,
@@ -117,6 +117,61 @@ def _enable_frame_survival(config: LoadedQcConfig) -> None:
             "terminal_asset_fail_modules": [],
         }
     }
+
+
+def _active_acceptance_config_for(
+    modules: list[str],
+) -> LoadedQcConfig:
+    loaded = load_qc_acceptance_config()
+    raw = copy.deepcopy(loaded.raw)
+    raw["pipeline"]["modules"] = modules
+    raw["pipeline"]["terminal_module"] = modules[-1]
+    return LoadedQcConfig(path=loaded.path, raw=raw, sha256=loaded.sha256)
+
+
+def _failure_issue(module: str) -> Issue:
+    return Issue(
+        f"{module}:failure:11111111111111111111",
+        "failure",
+        "fail",
+        module,
+        "test_failure",
+        "failure_metric",
+        1,
+        ">",
+        0,
+        f"{module}.failure",
+        False,
+    )
+
+
+def _registry_with_raw_failures(
+    config: LoadedQcConfig,
+    calls: list[str],
+    failed_modules: set[str],
+) -> ModuleRegistry:
+    registry = ModuleRegistry()
+    for module in config.pipeline_modules:
+        implementation = str(config.module_config(module)["implementation"])
+
+        def run(
+            context: AssetContext,
+            loaded: LoadedQcConfig,
+            *,
+            module: str = module,
+        ) -> ModuleResult:
+            calls.append(module)
+            verdict = "fail" if module in failed_modules else "pass"
+            return ModuleResult(
+                module,
+                verdict,
+                {"decision": verdict},
+                {},
+                issues=(_failure_issue(module),) if verdict == "fail" else (),
+            )
+
+        registry.register(implementation, run)
+    return registry
 
 
 def _frame_survival_result(
@@ -281,6 +336,46 @@ def test_acceptance_frame_budget_stops_only_skeleton_branch_below_ninety_percent
     )
     assert outcome.report["acceptance_frame_survival"]["stop_reason"] == (
         "insufficient_remaining_frames"
+    )
+
+
+@pytest.mark.parametrize(
+    "failed_module",
+    ["hdf5_text_info", "quality_hand", "video_quality"],
+)
+def test_acceptance_raw_fail_keeps_independent_modules_running(
+    tmp_path: Path,
+    failed_module: str,
+) -> None:
+    modules = [
+        "hdf5_text_info",
+        "quality_hand",
+        "keypoint_presence",
+        "keypoint_morphology",
+        "keypoint_temporal",
+        "video_quality",
+        "sam3_containment",
+    ]
+    config = _active_acceptance_config_for(modules)
+    calls: list[str] = []
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="acceptance",
+        registry=_registry_with_raw_failures(config, calls, {failed_module}),
+        now=lambda: "2026-07-17T00:00:00Z",
+    )
+
+    assert calls == modules
+    assert outcome.report[failed_module]["flow"]["result_gate"]["verdict"] == "fail"
+    assert outcome.report[failed_module]["flow"]["exit_gate"]["state"] == "continue"
+    assert outcome.report["pipeline_state"]["status"] == "completed"
+    assert outcome.report["overall_decision"] == "fail"
+    assert all(
+        state.get("reason") != f"blocked_by_quality_fail:{failed_module}"
+        for state in outcome.report["execution"]["module_states"].values()
+        if isinstance(state, dict)
     )
 
 

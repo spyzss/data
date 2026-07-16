@@ -81,7 +81,7 @@
         "terminal_asset_fail_modules"
       ],
       "properties": {
-        "version": {"const": "frame_survival_v1"},
+        "version": {"const": "frame_survival_v2"},
         "enabled": {"type": "boolean"},
         "min_remaining_frame_ratio": {"type": "number", "minimum": 0, "maximum": 1},
         "stop_when_below": {"type": "boolean"},

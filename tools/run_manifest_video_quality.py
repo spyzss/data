@@ -28,6 +28,7 @@ from acceptance_pull.video_quality import (  # noqa: E402
     load_video_quality_config,
 )
 from qc_common.config import load_qc_acceptance_config  # noqa: E402
+from qc_common.manifest_metadata import context_metadata_from_report  # noqa: E402
 from qc_common.report import load_asset_qc_report  # noqa: E402
 from qc_pipeline.adapters.video_quality import (  # noqa: E402
     VideoQualityReportReadiness,
@@ -427,6 +428,7 @@ def run_manifest_video_quality(
                 report_path=report_path,
                 source_files=source_files,
                 source_range=(start_frame, end_frame + 1),
+                metadata=context_metadata_from_report(report),
             )
             write_video_quality_result(
                 context=context,

@@ -14,6 +14,7 @@ import cv2
 import h5py
 import numpy as np
 from qc_common.config import LoadedQcConfig, load_qc_acceptance_config
+from qc_common.manifest_metadata import context_metadata_from_report
 from qc_common.report import load_asset_qc_report
 from qc_pipeline.context import AssetContext
 
@@ -2421,6 +2422,7 @@ def write_per_asset_qc_json_reports(
             batch_root=batch_dir,
             report_path=path,
             source_files=source_files,
+            metadata=context_metadata_from_report(existing),
         )
         write_video_quality_result(
             context=context,

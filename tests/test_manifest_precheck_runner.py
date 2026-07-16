@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from qc_common.types import ClipInputs
+
 
 def _hand_points(frame_count: int, jump: bool = False) -> np.ndarray:
     base = np.stack(
@@ -156,6 +158,74 @@ def test_jdt_adapter_reshapes_3d_and_preserves_cam_left_2d(tmp_path: Path) -> No
     assert getattr(clip, "morphology_status") == "not_ready_topology"
 
 
+def test_text_integrity_prefers_nonempty_manifest_scene_and_task() -> None:
+    from precheck.checks.text_integrity import TextIntegrityCheck
+
+    clip = ClipInputs(
+        episode_idx=1,
+        text_label={
+            "scene": "canonical scene",
+            "task": "canonical task",
+            "language_instruction": "do not rewrite",
+        },
+        manifest_metadata={
+            "scene": "manifest scene",
+            "task": "manifest task",
+            "task_name": "must not substitute",
+            "text_en": "do not substitute",
+            "text_label": "do not substitute",
+        },
+    )
+
+    text_label, parse_error, absent = TextIntegrityCheck(
+        {"required_fields": ["scene", "task"]}
+    )._text_label(clip)
+
+    assert parse_error is None
+    assert absent is False
+    assert text_label == {
+        "scene": "manifest scene",
+        "task": "manifest task",
+        "language_instruction": "do not rewrite",
+    }
+
+
+def test_text_integrity_empty_manifest_values_preserve_canonical_scene_and_task() -> None:
+    from precheck.checks.text_integrity import TextIntegrityCheck
+
+    clip = ClipInputs(
+        episode_idx=1,
+        text_label={"scene": "canonical scene", "task": "canonical task"},
+        manifest_metadata={"scene": "  ", "task": ""},
+    )
+
+    text_label, _parse_error, _absent = TextIntegrityCheck(
+        {"required_fields": ["scene", "task"]}
+    )._text_label(clip)
+
+    assert text_label == {"scene": "canonical scene", "task": "canonical task"}
+
+
+def test_text_integrity_does_not_promote_task_name_or_text_fields_to_task() -> None:
+    from precheck.checks.text_integrity import TextIntegrityCheck
+
+    clip = ClipInputs(
+        episode_idx=1,
+        text_label={"language_instruction": "existing canonical text"},
+        manifest_metadata={
+            "task_name": "not a task fallback",
+            "text_en": "not a task fallback",
+            "text_label": "not a task fallback",
+        },
+    )
+
+    result = TextIntegrityCheck({"required_fields": ["task"]}).run(clip)[0]
+
+    assert result.flag is True
+    assert result.metrics["field_present_task"] == 0.0
+    assert '"task"' in result.reason
+
+
 def test_jdt_unified_presence_uses_3d_keypoints_without_quality_hand(
     tmp_path: Path,
 ) -> None:
@@ -190,6 +260,49 @@ def test_jdt_unified_presence_uses_3d_keypoints_without_quality_hand(
     assert result.evaluation.get("reason") != "source_signal_not_provided"
     assert result.metrics["min_valid_keypoint_count_left"] == 21.0
     assert result.metrics["min_valid_keypoint_count_right"] == 21.0
+
+
+def test_unified_jdt_text_integrity_receives_manifest_metadata(
+    tmp_path: Path,
+) -> None:
+    from qc_common.config import load_qc_acceptance_config
+    from qc_pipeline.context import AssetContext
+    from qc_pipeline.runners.precheck import PrecheckSession
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    pd.DataFrame([_jdt_frame(index) for index in range(8)]).to_parquet(
+        source_dir / "jdt.parquet",
+        index=False,
+    )
+    manifest_metadata = {
+        "supplier": "jdt",
+        "scene": "manifest kitchen",
+        "task": "manifest pick",
+        "task_name": "pick_task_name",
+        "text_en": "Pick the cup.",
+        "text_label": "display-only label",
+    }
+    context = AssetContext(
+        asset_id="jdt-text-metadata",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "jdt-text-metadata.json",
+        source_files={"parquet": {"path": "source/jdt.parquet"}},
+        source_range=(3, 6),
+        metadata=manifest_metadata,
+    )
+    session = PrecheckSession(context, load_qc_acceptance_config())
+
+    result = session.run_module("hdf5_text_info")
+
+    assert result.verdict == "pass"
+    assert result.metrics["field_present_scene"] == 1.0
+    assert result.metrics["field_present_task"] == 1.0
+    assert session._clip is not None
+    assert session._clip.manifest_metadata == manifest_metadata
+    assert session._clip.manifest_metadata["task_name"] == "pick_task_name"
+    assert session._clip.manifest_metadata["text_en"] == "Pick the cup."
+    assert session._clip.manifest_metadata["text_label"] == "display-only label"
 
 
 def test_jdt_short_3d_cell_becomes_presence_invalid_instead_of_load_failure(

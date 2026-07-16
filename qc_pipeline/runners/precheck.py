@@ -12,7 +12,12 @@ from typing import Any
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import ModuleResult
 from qc_common.frame_survival import FrameSurvivalState
+from qc_common.manifest_metadata import (
+    manifest_metadata,
+    normalized_manifest_text_metadata,
+)
 from qc_common.module_registry import ModulePrerequisiteError, ModuleRunner
+from qc_common.types import ClipInputs
 from qc_pipeline.context import AssetContext
 
 
@@ -23,7 +28,7 @@ MODULES = (
     "keypoint_morphology",
     "keypoint_temporal",
 )
-_IMPLEMENTATION_VERSION = "precheck-session-v4-frame-survival-lineage"
+_IMPLEMENTATION_VERSION = "precheck-session-v5-frame-survival-metadata"
 _FRAME_SURVIVAL_MODULES = frozenset(
     {"keypoint_presence", "keypoint_morphology", "keypoint_temporal"}
 )
@@ -45,7 +50,7 @@ def precheck_fingerprint(
     source_names = tuple(
         name for name in ("hdf5", "parquet") if name in context.source_files
     )
-    return build_run_fingerprint(
+    fingerprint = build_run_fingerprint(
         context=context,
         producer="precheck",
         config=config,
@@ -53,6 +58,10 @@ def precheck_fingerprint(
         source_names=source_names,
         implementation_version=_IMPLEMENTATION_VERSION,
     )
+    fingerprint["manifest_text_metadata"] = normalized_manifest_text_metadata(
+        context.metadata
+    )
+    return fingerprint
 
 
 def _source_entry(context: AssetContext, name: str) -> Mapping[str, Any] | None:
@@ -101,6 +110,7 @@ def _slice_clip(clip: Any, source_range: tuple[int, int]) -> Any:
         masks=sliced(clip.masks),
         instruction=clip.instruction,
         text_label=clip.text_label,
+        manifest_metadata=clip.manifest_metadata,
         text_label_raw=clip.text_label_raw,
         text_label_parse_error=clip.text_label_parse_error,
         intrinsics=clip.intrinsics,
@@ -333,6 +343,8 @@ class PrecheckSession:
             )
         if self._clip is None:
             self._clip = _load_clip(self.context, module)
+        if isinstance(self._clip, ClipInputs):
+            self._clip.manifest_metadata = manifest_metadata(self.context.metadata)
         source_indices = getattr(self._clip, "source_frame_indices", None)
         if source_indices is None:
             frame_indices = getattr(self._clip, "frame_indices", None)
@@ -397,6 +409,10 @@ class PrecheckSession:
         if not reusable_artifact(artifact, fingerprint):
             return
         run_config = json.loads(artifact.run_config_path.read_text(encoding="utf-8"))
+        if run_config.get("manifest_text_metadata") != normalized_manifest_text_metadata(
+            self.context.metadata
+        ):
+            return
         if tuple(run_config.get("completed_modules", ())) != MODULES:
             return
         rows = json.loads(
@@ -468,6 +484,10 @@ class PrecheckSession:
                         name for name in MODULES if name in self._raw_results
                     ],
                     "frame_survival": self._frame_survival_metadata(),
+                    "manifest_metadata": manifest_metadata(self.context.metadata),
+                    "manifest_text_metadata": normalized_manifest_text_metadata(
+                        self.context.metadata
+                    ),
                 },
             )
             promote_artifact(staging, artifact)

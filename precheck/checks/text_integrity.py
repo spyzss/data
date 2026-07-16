@@ -82,14 +82,25 @@ class TextIntegrityCheck(BaseCheck):
         self,
         clip: ClipInputs,
     ) -> tuple[dict[str, Any] | None, str | None, bool]:
-        if clip.text_label is not None:
-            return clip.text_label, None, False
         if clip.text_label_parse_error is not None:
             return None, clip.text_label_parse_error, False
-        if clip.text_label_raw is not None:
+        canonical = clip.text_label
+        if canonical is None and clip.text_label_raw is not None:
             parsed, _raw, error = read_scalar_json(clip.text_label_raw)
-            return parsed, error, False
-        return None, None, True
+            if error is not None:
+                return None, error, False
+            canonical = parsed
+
+        manifest = clip.manifest_metadata
+        effective = dict(canonical or {})
+        for field in ("scene", "task"):
+            value = manifest.get(field)
+            if self._nonempty(value):
+                effective[field] = value
+
+        if canonical is None and not effective:
+            return None, None, True
+        return effective, None, False
 
     def _empty_metrics(self) -> dict[str, float]:
         metrics = {}

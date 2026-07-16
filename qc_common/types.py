@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,6 +58,7 @@ class ClipInputs:
         masks: dict[int, np.ndarray] | list[np.ndarray] | np.ndarray | None = None,
         instruction: str | None = None,
         text_label: dict[str, Any] | None = None,
+        manifest_metadata: Mapping[str, Any] | None = None,
         text_label_raw: str | None = None,
         text_label_parse_error: str | None = None,
         intrinsics: np.ndarray | None = None,
@@ -85,6 +86,7 @@ class ClipInputs:
         self._masks = masks
         self._instruction = instruction
         self._text_label = text_label
+        self.manifest_metadata = dict(manifest_metadata or {})
         self._text_label_raw = text_label_raw
         self._text_label_parse_error = text_label_parse_error
         self._intrinsics = intrinsics
