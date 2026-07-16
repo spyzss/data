@@ -303,6 +303,9 @@ def _module_block(
         "evaluation": copy.deepcopy(dict(result.evaluation)),
         "metrics": copy.deepcopy(dict(result.metrics)),
         "evidence": evidence,
+        "frame_exclusions": [
+            exclusion.to_dict() for exclusion in result.frame_exclusions
+        ],
         "runtime": runtime,
     }
 
@@ -388,9 +391,26 @@ def _has_machine_fail(
     report: Mapping[str, Any],
     modules: tuple[str, ...],
 ) -> bool:
+    frame_survival = report.get("acceptance_frame_survival")
+    if isinstance(frame_survival, Mapping) and bool(
+        frame_survival.get("stop_triggered", False)
+    ):
+        return True
+
+    def is_frame_survival_handled(module: str) -> bool:
+        block = report.get(module)
+        if not isinstance(block, Mapping):
+            return False
+        runtime = block.get("runtime")
+        return isinstance(runtime, Mapping) and bool(
+            runtime.get("acceptance_frame_survival_handled", False)
+        )
+
     issues = report.get("issues", [])
     if isinstance(issues, list) and any(
-        isinstance(issue, Mapping) and issue.get("severity") == "fail"
+        isinstance(issue, Mapping)
+        and issue.get("severity") == "fail"
+        and not is_frame_survival_handled(str(issue.get("module", "")))
         for issue in issues
     ):
         return True
@@ -402,7 +422,11 @@ def _has_machine_fail(
         if not isinstance(flow, Mapping):
             continue
         result_gate = flow.get("result_gate")
-        if isinstance(result_gate, Mapping) and result_gate.get("verdict") == "fail":
+        if (
+            isinstance(result_gate, Mapping)
+            and result_gate.get("verdict") == "fail"
+            and not is_frame_survival_handled(module)
+        ):
             return True
     return False
 
@@ -488,6 +512,77 @@ def mark_remaining_skipped_due_to_fail(
     return marked
 
 
+def record_not_run_due_to_acceptance_frame_budget(
+    path: Path,
+    *,
+    context: AssetContext,
+    config: LoadedQcConfig,
+    profile: str,
+    expected_revision: int,
+    module: str,
+    now: str,
+) -> dict[str, Any]:
+    """Advance one non-runnable skeleton stage without stopping the asset."""
+    report = _load_or_initialize_report(
+        path,
+        context=context,
+        config=config,
+        profile=profile,
+        expected_revision=expected_revision,
+        now=now,
+    )
+    pipeline_state = report.get("pipeline_state")
+    if not isinstance(pipeline_state, dict):
+        raise ValueError("pipeline_state must be an object")
+    if pipeline_state.get("next_module") != module:
+        raise ModuleOrderError(
+            f"expected current module {pipeline_state.get('next_module')}, got {module}"
+        )
+    next_module = _expected_next_module(config.pipeline_modules, module)
+    execution = report.get("execution")
+    if not isinstance(execution, dict):
+        raise ValueError("execution must be an object")
+    module_states = execution.setdefault("module_states", {})
+    if not isinstance(module_states, dict):
+        raise ValueError("execution.module_states must be an object")
+    module_states[module] = {
+        "state": "not_run_due_to_acceptance_frame_budget",
+        "reason": "insufficient_remaining_frames",
+    }
+    execution["updated_at"] = now
+
+    completed = next_module is None
+    pipeline_state.update(
+        {
+            "status": (
+                "incomplete"
+                if completed and has_required_incomplete_module(report)
+                else "completed"
+                if completed
+                else "running"
+            ),
+            "next_module": next_module,
+            "stop_reason": None,
+        }
+    )
+    if pipeline_state["status"] in {"completed", "incomplete"}:
+        pipeline_state.pop("external_resume", None)
+    if pipeline_state["status"] == "completed":
+        report["overall_decision"] = (
+            "fail" if _has_machine_fail(report, config.pipeline_modules) else "pass"
+        )
+    else:
+        report["overall_decision"] = None
+    report["report_revision"] = expected_revision + 1
+    write_asset_qc_report(
+        path,
+        report,
+        expected_revision=expected_revision,
+        profile=profile,
+    )
+    return report
+
+
 def apply_module_result(
     path: Path,
     *,
@@ -536,7 +631,22 @@ def apply_module_result(
     )
     owned_issues = _preflight_owned_issues(result)
     evidence = _preflight_evidence(context, result)
-    hard_stop = result.verdict == "fail" and profile_config["fail_action"] == "stop"
+    frame_survival_policy = config.frame_survival_policy(profile)
+    survival_enabled = bool(frame_survival_policy.get("enabled", False))
+    survival_handled = bool(
+        result.runtime.get("acceptance_frame_survival_handled", False)
+    )
+    terminal_asset_fail_modules = {
+        str(name)
+        for name in frame_survival_policy.get("terminal_asset_fail_modules", [])
+    }
+    hard_stop = result.verdict == "fail" and profile_config["fail_action"] == "stop" and (
+        not survival_enabled
+        or (
+            not survival_handled
+            and result.module in terminal_asset_fail_modules
+        )
+    )
     continued_after_fail = result.verdict == "fail" and not hard_stop
     continue_to_next = not hard_stop
     exit_state = "continue" if continue_to_next else "stop_qc"
@@ -562,6 +672,9 @@ def apply_module_result(
         owned=owned_issues,
     )
     report[result.module] = module_block
+    frame_survival = result.evaluation.get("frame_survival")
+    if isinstance(frame_survival, Mapping):
+        report["acceptance_frame_survival"] = copy.deepcopy(dict(frame_survival))
 
     _rebuild_issue_collections(report)
 

@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import EvidenceRef, Issue, ModuleResult
+from qc_common.frame_survival import FrameExclusion
 from qc_pipeline.context import AssetContext
 
 
@@ -183,6 +184,23 @@ def module_result_from_dict(payload: Mapping[str, Any]) -> ModuleResult:
         )
         for item in payload.get("evidence", ())
     )
+    frame_exclusions = tuple(
+        FrameExclusion(
+            start_frame=int(item["start_frame"]),
+            end_frame=int(item["end_frame"]),
+            module=str(item["module"]),
+            reason=str(item["reason"]),
+            raw_severity=item["raw_severity"],
+            hand_side=item.get("hand_side"),
+            first_introduced_stage=str(item["first_introduced_stage"]),
+            temporal_pair_start_frame=item.get("temporal_pair_start_frame"),
+            temporal_pair_end_frame=item.get("temporal_pair_end_frame"),
+            temporal_transition_attribution=item.get(
+                "temporal_transition_attribution"
+            ),
+        )
+        for item in payload.get("frame_exclusions", ())
+    )
     return ModuleResult(
         module=str(payload["module"]),
         verdict=payload["verdict"],
@@ -190,6 +208,7 @@ def module_result_from_dict(payload: Mapping[str, Any]) -> ModuleResult:
         metrics=dict(payload.get("metrics") or {}),
         issues=issues,
         evidence=evidence,
+        frame_exclusions=frame_exclusions,
         runtime=dict(payload.get("runtime") or {}),
     )
 

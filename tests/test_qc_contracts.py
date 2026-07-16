@@ -167,7 +167,7 @@ def test_contracts_are_frozen_and_serialize_to_json_native_values() -> None:
                 "evidence_ids": ["evidence-1", "evidence-2"],
             }
         ],
-        "evidence": [
+            "evidence": [
             {
                 "evidence_id": "evidence-1",
                 "kind": "clip",
@@ -179,10 +179,11 @@ def test_contracts_are_frozen_and_serialize_to_json_native_values() -> None:
                 "checksum": "sha256:abc",
                 "mime_type": "video/mp4",
                 "generator_version": "keypoint-qc/1",
-            }
-        ],
-        "runtime": {"versions": ["1", "2"]},
-    }
+                }
+            ],
+            "frame_exclusions": [],
+            "runtime": {"versions": ["1", "2"]},
+        }
     assert json.loads(json.dumps(payload, allow_nan=False)) == payload
     with pytest.raises(FrozenInstanceError):
         evidence.path = "evidence/changed.mp4"

@@ -11,6 +11,7 @@ import pytest
 
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import EvidenceRef, Issue, ModuleResult
+from qc_common.frame_survival import FrameExclusion
 from qc_common.module_registry import ModuleRegistry, ModuleUnavailableError
 from qc_common.report import StaleReportRevisionError, write_asset_qc_report
 from qc_common.report_mutation import (
@@ -96,6 +97,190 @@ def _context(tmp_path: Path, asset_id: str = "asset-a") -> AssetContext:
         batch_root=tmp_path,
         report_path=tmp_path / "quality_archive" / f"{asset_id}.json",
         source_files={"video": {"path": "video/clip.mp4"}},
+    )
+
+
+def _enable_frame_survival(config: LoadedQcConfig) -> None:
+    config.raw["acceptance_policy"] = {
+        "frame_survival": {
+            "version": "frame_survival_v1",
+            "enabled": True,
+            "min_remaining_frame_ratio": 0.90,
+            "stop_when_below": True,
+            "exclude_severities": ["fail"],
+            "skeleton_dependent_modules": [
+                "keypoint_morphology",
+                "keypoint_temporal",
+                "sam3_containment",
+                "manual_review",
+            ],
+            "terminal_asset_fail_modules": [],
+        }
+    }
+
+
+def _frame_survival_result(
+    module: str,
+    *,
+    remaining_frame_count: int,
+    remaining_frame_ratio: float,
+    stop_triggered: bool,
+) -> ModuleResult:
+    return ModuleResult(
+        module,
+        "fail",
+        {
+            "decision": "fail",
+            "frame_survival": {
+                "original_frame_count": 10_000,
+                "eligible_frame_count_before_module": 10_000,
+                "newly_excluded_frame_count": 10_000 - remaining_frame_count,
+                "cumulative_excluded_frame_count": 10_000 - remaining_frame_count,
+                "remaining_frame_count": remaining_frame_count,
+                "remaining_frame_ratio": remaining_frame_ratio,
+                "cumulative_excluded_frame_ranges": [[0, 9_999 - remaining_frame_count]],
+                "eligible_frame_ranges": [[10_000 - remaining_frame_count, 9_999]],
+                "stop_threshold": 0.90,
+                "stop_triggered": stop_triggered,
+                "stop_trigger_module": module if stop_triggered else None,
+                "stop_reason": (
+                    "insufficient_remaining_frames" if stop_triggered else None
+                ),
+            },
+        },
+        {},
+        frame_exclusions=(
+            FrameExclusion(
+                start_frame=0,
+                end_frame=10_000 - remaining_frame_count - 1,
+                module=module,
+                reason=f"{module}.hard_fail",
+                raw_severity="fail",
+                hand_side="both",
+                first_introduced_stage=module,
+            ),
+        ),
+        runtime={"acceptance_frame_survival_handled": True},
+    )
+
+
+def test_acceptance_frame_budget_keeps_running_at_exact_ninety_percent(
+    tmp_path: Path,
+) -> None:
+    modules = [
+        "hdf5_text_info",
+        "quality_hand",
+        "keypoint_presence",
+        "keypoint_morphology",
+        "keypoint_temporal",
+        "video_quality",
+        "sam3_containment",
+    ]
+    config = _config(tmp_path, modules)
+    _enable_frame_survival(config)
+    calls: list[str] = []
+    registry = ModuleRegistry()
+    for module in modules:
+        implementation = str(config.module_config(module)["implementation"])
+
+        def run(
+            context: AssetContext,
+            loaded: LoadedQcConfig,
+            *,
+            module: str = module,
+        ) -> ModuleResult:
+            calls.append(module)
+            if module == "keypoint_morphology":
+                return _frame_survival_result(
+                    module,
+                    remaining_frame_count=9_000,
+                    remaining_frame_ratio=0.90,
+                    stop_triggered=False,
+                )
+            return ModuleResult(module, "pass", {"decision": "pass"}, {})
+
+        registry.register(implementation, run)
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="acceptance",
+        registry=registry,
+        now=lambda: "2026-07-16T00:00:00Z",
+    )
+
+    assert calls == modules
+    assert outcome.status == "completed"
+    assert outcome.report["keypoint_morphology"]["flow"]["exit_gate"][
+        "continue_to_next_module"
+    ] is True
+    assert outcome.report["overall_decision"] == "pass"
+
+
+def test_acceptance_frame_budget_stops_only_skeleton_branch_below_ninety_percent(
+    tmp_path: Path,
+) -> None:
+    modules = [
+        "hdf5_text_info",
+        "quality_hand",
+        "keypoint_presence",
+        "keypoint_morphology",
+        "keypoint_temporal",
+        "video_quality",
+        "sam3_containment",
+    ]
+    config = _config(tmp_path, modules)
+    _enable_frame_survival(config)
+    calls: list[str] = []
+    registry = ModuleRegistry()
+    for module in modules:
+        implementation = str(config.module_config(module)["implementation"])
+
+        def run(
+            context: AssetContext,
+            loaded: LoadedQcConfig,
+            *,
+            module: str = module,
+        ) -> ModuleResult:
+            calls.append(module)
+            if module == "keypoint_morphology":
+                return _frame_survival_result(
+                    module,
+                    remaining_frame_count=8_999,
+                    remaining_frame_ratio=0.8999,
+                    stop_triggered=True,
+                )
+            return ModuleResult(module, "pass", {"decision": "pass"}, {})
+
+        registry.register(implementation, run)
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="acceptance",
+        registry=registry,
+        now=lambda: "2026-07-16T00:00:00Z",
+    )
+
+    assert calls == [
+        "hdf5_text_info",
+        "quality_hand",
+        "keypoint_presence",
+        "keypoint_morphology",
+        "video_quality",
+    ]
+    assert outcome.status == "completed"
+    assert outcome.report["overall_decision"] == "fail"
+    for module in ("keypoint_temporal", "sam3_containment"):
+        assert outcome.report["execution"]["module_states"][module] == {
+            "state": "not_run_due_to_acceptance_frame_budget",
+            "reason": "insufficient_remaining_frames",
+        }
+    assert outcome.report["acceptance_frame_survival"]["stop_trigger_module"] == (
+        "keypoint_morphology"
+    )
+    assert outcome.report["acceptance_frame_survival"]["stop_reason"] == (
+        "insufficient_remaining_frames"
     )
 
 
@@ -1160,6 +1345,69 @@ def test_resume_rejects_source_identity_drift_before_runner_work(
     with pytest.raises(ValueError, match="source_files mismatch"):
         run_asset(
             changed,
+            config=config,
+            profile="acceptance",
+            registry=ModuleRegistry(),
+        )
+
+
+def test_resume_rejects_frame_survival_policy_drift_before_runner_work(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, ["hdf5_text_info"])
+    _enable_frame_survival(config)
+    context = _context(tmp_path)
+    report = initialize_v2_report(
+        context,
+        config,
+        "acceptance",
+        "2026-07-16T00:00:00Z",
+    )
+    report["report_revision"] = 1
+    write_asset_qc_report(
+        context.report_path,
+        report,
+        expected_revision=0,
+        profile="acceptance",
+    )
+    config.raw["acceptance_policy"]["frame_survival"][
+        "min_remaining_frame_ratio"
+    ] = 0.85
+
+    with pytest.raises(ConfigDriftError, match="acceptance_policy_hash"):
+        run_asset(
+            context,
+            config=config,
+            profile="acceptance",
+            registry=ModuleRegistry(),
+        )
+
+
+def test_resume_rejects_legacy_report_without_frame_survival_identity(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, ["hdf5_text_info"])
+    _enable_frame_survival(config)
+    context = _context(tmp_path)
+    report = initialize_v2_report(
+        context,
+        config,
+        "acceptance",
+        "2026-07-16T00:00:00Z",
+    )
+    report["qc_config"].pop("acceptance_policy_version")
+    report["qc_config"].pop("acceptance_policy_hash")
+    report["report_revision"] = 1
+    write_asset_qc_report(
+        context.report_path,
+        report,
+        expected_revision=0,
+        profile="acceptance",
+    )
+
+    with pytest.raises(ConfigDriftError, match="acceptance_policy_version"):
+        run_asset(
+            context,
             config=config,
             profile="acceptance",
             registry=ModuleRegistry(),

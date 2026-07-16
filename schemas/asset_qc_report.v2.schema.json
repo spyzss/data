@@ -169,6 +169,14 @@
         "config_hash": {
           "type": "string",
           "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "acceptance_policy_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "acceptance_policy_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
         }
       }
     },
@@ -200,6 +208,7 @@
             "runtime_error",
             "awaiting_external",
             "skipped_due_to_fail",
+            "not_run_due_to_acceptance_frame_budget",
             "not_run",
             "input_missing",
             "input_invalid",

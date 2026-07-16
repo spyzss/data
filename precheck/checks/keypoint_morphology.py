@@ -11,6 +11,7 @@ import numpy as np
 from precheck.base import BaseCheck
 from precheck.registry import register
 from qc_common.keypoint_validity import inspect_hand_keypoints
+from qc_common.frame_survival import is_source_frame_eligible, source_frame_at
 from qc_common.keypoints import (
     ACCEPTANCE_FINGER_CHAINS,
     acceptance_joint_names,
@@ -97,7 +98,17 @@ class KeypointMorphologyCheck(BaseCheck):
             return []
 
         frame_results: list[CheckResult] = []
+        source_indices = getattr(clip, "source_frame_indices", clip.frame_indices)
+        eligible_ranges = getattr(clip, "eligible_frame_ranges", None)
+        fallback_start = int(getattr(clip, "clip_start_frame", 0))
         for frame_offset in range(clip.num_frames):
+            source_frame = source_frame_at(
+                source_indices,
+                frame_offset,
+                fallback_start_frame=fallback_start,
+            )
+            if not is_source_frame_eligible(source_frame, eligible_ranges):
+                continue
             metrics: dict[str, Any] = {}
             reasons: list[str] = []
             exceeded: list[str] = []

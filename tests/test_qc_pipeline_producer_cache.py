@@ -103,7 +103,7 @@ def test_failed_video_recompute_preserves_previous_valid_artifact(
     } == before
 
 
-def test_precheck_v1_artifact_is_not_reused_by_current_session(
+def test_precheck_v3_artifact_is_not_reused_by_current_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -137,7 +137,11 @@ def test_precheck_v1_artifact_is_not_reused_by_current_session(
 
     monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
     with monkeypatch.context() as legacy:
-        legacy.setattr(precheck, "_IMPLEMENTATION_VERSION", "precheck-session-v1")
+        legacy.setattr(
+            precheck,
+            "_IMPLEMENTATION_VERSION",
+            "precheck-session-v3-frame-survival",
+        )
         old_session = precheck.PrecheckSession(context, config)
         for module in precheck.MODULES:
             old_session.run_module(module)
@@ -152,7 +156,7 @@ def test_precheck_v1_artifact_is_not_reused_by_current_session(
         ).read_text(encoding="utf-8")
     )
     assert old_run_config["fingerprint"]["implementation_version"] == (
-        "precheck-session-v1"
+        "precheck-session-v3-frame-survival"
     )
 
     loads.clear()

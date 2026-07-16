@@ -22,6 +22,7 @@ from precheck.config import (
 )
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import EvidenceRef, Issue, ModuleResult, Verdict, build_issue_id
+from qc_common.frame_survival import FrameExclusion, temporal_transition_lineage
 from qc_common.types import CheckResult
 
 
@@ -123,6 +124,9 @@ class _NormalizedFailure(NamedTuple):
     observed: Any
     operator: str
     boundary: Any
+    temporal_pair_start_frame: int | None = None
+    temporal_pair_end_frame: int | None = None
+    temporal_transition_attribution: str | None = None
 
 
 _CompactedFailure = tuple[_NormalizedFailure, tuple[int, int]]
@@ -504,6 +508,7 @@ def _compact_failures(
         compatibility = (
             failure.side, failure.severity, failure.rule_id,
             failure.metric, failure.operator, canonical(failure.boundary),
+            failure.temporal_transition_attribution,
         )
         grouped.setdefault(compatibility, []).append(failure)
 
@@ -516,6 +521,18 @@ def _compact_failures(
                 item.observed for item in compatible
                 if start_frame <= item.frame <= end_frame
             ]
+            temporal_pair_starts = [
+                item.temporal_pair_start_frame
+                for item in compatible
+                if start_frame <= item.frame <= end_frame
+                and item.temporal_pair_start_frame is not None
+            ]
+            temporal_pair_ends = [
+                item.temporal_pair_end_frame
+                for item in compatible
+                if start_frame <= item.frame <= end_frame
+                and item.temporal_pair_end_frame is not None
+            ]
             if example.operator in {"<", "<="}:
                 extreme: Any = min(observed)
             elif example.operator in {">", ">="}:
@@ -525,7 +542,19 @@ def _compact_failures(
                 ordered = [unique[key] for key in sorted(unique)]
                 extreme = ordered[0] if len(ordered) == 1 else ordered
             compacted.append(
-                (example._replace(frame=start_frame, observed=extreme), (start_frame, end_frame))
+                (
+                    example._replace(
+                        frame=start_frame,
+                        observed=extreme,
+                        temporal_pair_start_frame=(
+                            min(temporal_pair_starts) if temporal_pair_starts else None
+                        ),
+                        temporal_pair_end_frame=(
+                            max(temporal_pair_ends) if temporal_pair_ends else None
+                        ),
+                    ),
+                    (start_frame, end_frame),
+                )
             )
 
     return tuple(
@@ -845,6 +874,29 @@ def adapt_keypoint_presence(
         for failure, frame_range in _compact_failures(tuple(selected.values()))
     )
     verdict = _worst("pass", *(issue.severity for issue in issues))
+    frame_exclusions = tuple(
+        FrameExclusion(
+            start_frame=row.frame_idx,
+            end_frame=row.frame_idx,
+            module="keypoint_presence",
+            reason=reason,
+            raw_severity="fail",
+            hand_side=side,
+            first_introduced_stage="keypoint_presence",
+        )
+        for row in rows
+        if row.check == "keypoint_missing" and row.frame_idx >= 0
+        for side in ("left", "right")
+        if bool(row.metrics.get(f"keypoint_existence_invalid_{side}", False))
+        for reason in (
+            tuple(
+                str(value)
+                for value in row.metrics.get(f"invalid_reasons_{side}", ())
+                if str(value)
+            )
+            or ("keypoint_existence_invalid",)
+        )
+    )
     return ModuleResult(
         module="keypoint_presence",
         verdict=verdict,
@@ -872,6 +924,7 @@ def adapt_keypoint_presence(
             "invalid_frame_details": invalid_frame_details,
         },
         issues=issues,
+        frame_exclusions=frame_exclusions,
     )
 
 
@@ -918,9 +971,18 @@ def _temporal_row_failures(
         boundary: Any,
     ) -> _NormalizedFailure:
         rule = _temporal_rule(config, alias)
+        lineage = temporal_transition_lineage(
+            target_frame=row.frame_idx,
+            pair_start_frame=row.metrics.get("temporal_pair_start_frame"),
+            pair_end_frame=row.metrics.get("temporal_pair_end_frame"),
+            attribution=row.metrics.get("temporal_transition_attribution"),
+        )
         return _NormalizedFailure(
             side, row.frame_idx, _rule_verdict(rule), str(rule["rule_id"]),
             metric, observed, operator, boundary,
+            lineage.pair_start_frame,
+            lineage.pair_end_frame,
+            lineage.attribution,
         )
 
     hard_count = int(parameters["hard_exceeded_metric_count"])
@@ -1060,10 +1122,11 @@ def adapt_keypoint_temporal(
             parameters=parameters,
         )
     )
+    compacted_failures = _compact_failures(failures)
     issue_evidence: list[tuple[Issue, EvidenceRef]] = []
     row_for_issue = rows[0] if rows else None
     if row_for_issue is not None:
-        for failure, frame_range in _compact_failures(failures):
+        for failure, frame_range in compacted_failures:
             issue = _issue_from_row(
                 asset_id=asset_id,
                 module="keypoint_temporal",
@@ -1079,6 +1142,15 @@ def adapt_keypoint_temporal(
                 hand_side=failure.side,
                 frame_range=frame_range,
                 evidence_kind="frame_metrics",
+            )
+            issue = replace(
+                issue,
+                context={
+                    **dict(issue.context),
+                    "temporal_pair_start_frame": failure.temporal_pair_start_frame,
+                    "temporal_pair_end_frame": failure.temporal_pair_end_frame,
+                    "temporal_transition_attribution": failure.temporal_transition_attribution,
+                },
             )
             issue_evidence.append(
                 _link_issue_evidence(
@@ -1148,6 +1220,22 @@ def adapt_keypoint_temporal(
         },
         issues=issues,
         evidence=tuple(evidence for _issue, evidence in issue_evidence),
+        frame_exclusions=tuple(
+            FrameExclusion(
+                start_frame=frame_range[0],
+                end_frame=frame_range[1],
+                module="keypoint_temporal",
+                reason=failure.rule_id,
+                raw_severity="fail",
+                hand_side=failure.side,
+                first_introduced_stage="keypoint_temporal",
+                temporal_pair_start_frame=failure.temporal_pair_start_frame,
+                temporal_pair_end_frame=failure.temporal_pair_end_frame,
+                temporal_transition_attribution=failure.temporal_transition_attribution,
+            )
+            for failure, frame_range in compacted_failures
+            if failure.severity == "fail"
+        ),
     )
 
 
@@ -1274,8 +1362,9 @@ def adapt_keypoint_morphology(
         for token in row.metrics.get("which_thresholds_exceeded", ())
         if (failure := _morphology_failure(row, token, parameters)) is not None
     ]
+    compacted_failures = _compact_failures(failures)
     issue_evidence: list[tuple[Issue, EvidenceRef]] = []
-    for failure, frame_range in _compact_failures(failures):
+    for failure, frame_range in compacted_failures:
         issue = _issue_from_row(
             asset_id=asset_id,
             module="keypoint_morphology",
@@ -1308,6 +1397,19 @@ def adapt_keypoint_morphology(
         metrics={**dict(summary.metrics), **frame_metrics},
         issues=tuple(issue for issue, _evidence in issue_evidence),
         evidence=tuple(evidence for _issue, evidence in issue_evidence),
+        frame_exclusions=tuple(
+            FrameExclusion(
+                start_frame=frame_range[0],
+                end_frame=frame_range[1],
+                module="keypoint_morphology",
+                reason=failure.rule_id,
+                raw_severity="fail",
+                hand_side=failure.side,
+                first_introduced_stage="keypoint_morphology",
+            )
+            for failure, frame_range in compacted_failures
+            if failure.severity == "fail"
+        ),
     )
 
 

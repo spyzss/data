@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import ModuleResult
+from qc_common.frame_survival import FrameExclusion
 from qc_common.module_registry import ModuleRegistry
 from qc_common.module_registry import ModulePrerequisiteError
 from qc_common.types import CheckResult
@@ -15,7 +17,13 @@ from qc_pipeline.orchestrator import run_asset
 from qc_pipeline.runners import precheck
 
 
-def _context(tmp_path: Path, asset_id: str = "asset-a") -> AssetContext:
+def _context(
+    tmp_path: Path,
+    asset_id: str = "asset-a",
+    *,
+    source_range: tuple[int, int] | None = None,
+    profile: str | None = None,
+) -> AssetContext:
     source = tmp_path / "source" / "clip.hdf5"
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(b"synthetic-source-identity")
@@ -24,7 +32,11 @@ def _context(tmp_path: Path, asset_id: str = "asset-a") -> AssetContext:
         batch_root=tmp_path,
         report_path=tmp_path / "quality_archive" / f"{asset_id}.json",
         source_files={"hdf5": {"path": "source/clip.hdf5"}},
-        metadata={"supplier": "xjgt"},
+        source_range=source_range,
+        metadata={
+            "supplier": "xjgt",
+            **({"profile": profile} if profile is not None else {}),
+        },
     )
 
 
@@ -71,6 +83,267 @@ def _registry(session: object, config: LoadedQcConfig) -> ModuleRegistry:
     return registry
 
 
+def _enable_frame_survival(config: LoadedQcConfig) -> None:
+    config.raw["acceptance_policy"] = {
+        "frame_survival": {
+            "version": "frame_survival_v1",
+            "enabled": True,
+            "min_remaining_frame_ratio": 0.90,
+            "stop_when_below": True,
+            "exclude_severities": ["fail"],
+            "skeleton_dependent_modules": [
+                "keypoint_morphology",
+                "keypoint_temporal",
+                "sam3_containment",
+                "manual_review",
+            ],
+            "terminal_asset_fail_modules": [],
+        }
+    }
+
+
+def test_acceptance_session_applies_presence_then_morphology_exclusions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_eligibility: dict[str, tuple[tuple[int, int], ...]] = {}
+
+    def execute(
+        context: AssetContext,
+        config: LoadedQcConfig,
+        module: str,
+        clip: object,
+    ) -> precheck.PrecheckModuleExecution:
+        seen_eligibility[module] = tuple(
+            getattr(clip, "eligible_frame_ranges", ())
+        )
+        exclusions = {
+            "keypoint_presence": (
+                FrameExclusion(
+                    start_frame=20,
+                    end_frame=29,
+                    module="keypoint_presence",
+                    reason="nonfinite_keypoints",
+                    raw_severity="fail",
+                    hand_side="left",
+                    first_introduced_stage="keypoint_presence",
+                ),
+            ),
+            "keypoint_morphology": (
+                FrameExclusion(
+                    start_frame=100,
+                    end_frame=299,
+                    module="keypoint_morphology",
+                    reason="keypoint_morphology.joint_angle_min_deg",
+                    raw_severity="fail",
+                    hand_side="right",
+                    first_introduced_stage="keypoint_morphology",
+                ),
+            ),
+        }.get(module, ())
+        verdict = "fail" if module == "keypoint_morphology" else "pass"
+        return precheck.PrecheckModuleExecution(
+            result=ModuleResult(
+                module,
+                verdict,
+                {"decision": verdict},
+                {},
+                frame_exclusions=exclusions,
+            ),
+            check_results=(CheckResult(module, 0, -1, {}, False, "ok"),),
+        )
+
+    monkeypatch.setattr(
+        precheck,
+        "_load_clip",
+        lambda context, module: SimpleNamespace(num_frames=10_000),
+    )
+    monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
+    config = _config(tmp_path)
+    _enable_frame_survival(config)
+    context = _context(tmp_path, source_range=(0, 10_000))
+    session = precheck.PrecheckSession(context, config)
+
+    presence = session.run_module("keypoint_presence")
+    morphology = session.run_module("keypoint_morphology")
+    temporal = session.run_module("keypoint_temporal")
+
+    assert seen_eligibility["keypoint_presence"] == ((0, 9_999),)
+    assert seen_eligibility["keypoint_morphology"] == ((0, 19), (30, 9_999))
+    assert seen_eligibility["keypoint_temporal"] == ((0, 19), (30, 99), (300, 9_999))
+    assert morphology.verdict == "fail"
+    assert presence.evaluation["frame_survival"] == {
+        "original_frame_count": 10_000,
+        "eligible_frame_count_before_module": 10_000,
+        "newly_excluded_frame_count": 10,
+        "cumulative_excluded_frame_count": 10,
+        "remaining_frame_count": 9_990,
+        "remaining_frame_ratio": 0.999,
+        "raw_exclusions": [
+            {
+                "start_frame": 20,
+                "end_frame": 29,
+                "module": "keypoint_presence",
+                "reason": "nonfinite_keypoints",
+                "raw_severity": "fail",
+                "hand_side": "left",
+                "first_introduced_stage": "keypoint_presence",
+            }
+        ],
+        "cumulative_excluded_frame_ranges": [[20, 29]],
+        "eligible_frame_ranges": [[0, 19], [30, 9_999]],
+        "stop_threshold": 0.90,
+        "stop_triggered": False,
+        "stop_trigger_module": None,
+        "stop_reason": None,
+    }
+    assert morphology.evaluation["frame_survival"]["remaining_frame_count"] == 9_790
+    assert morphology.evaluation["frame_survival"]["remaining_frame_ratio"] == pytest.approx(
+        0.979
+    )
+
+
+def test_manifest_inclusive_range_counts_nonzero_start_and_last_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.run_qc_pipeline import contexts_from_manifest
+
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {"asset_id": "asset-a", "start_frame": 37, "end_frame": 41}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+    config = _config(tmp_path)
+    _enable_frame_survival(config)
+    monkeypatch.setattr(
+        precheck,
+        "_load_clip",
+        lambda context, module: SimpleNamespace(
+            num_frames=5,
+            frame_indices=[37, 38, 39, 40, 41],
+            clip_start_frame=37,
+        ),
+    )
+    monkeypatch.setattr(
+        precheck,
+        "_run_module_on_clip",
+        lambda context, config, module, clip: ModuleResult(
+            module,
+            "fail" if module == "keypoint_presence" else "pass",
+            {},
+            {},
+            frame_exclusions=(
+                FrameExclusion(
+                    start_frame=41,
+                    end_frame=41,
+                    module="keypoint_presence",
+                    reason="nonfinite_keypoints",
+                    raw_severity="fail",
+                    hand_side="left",
+                    first_introduced_stage="keypoint_presence",
+                ),
+            )
+            if module == "keypoint_presence"
+            else (),
+        ),
+    )
+
+    result = precheck.PrecheckSession(context, config).run_module(
+        "keypoint_presence"
+    )
+
+    assert context.source_range == (37, 42)
+    assert result.evaluation["frame_survival"]["original_frame_count"] == 5
+    assert result.evaluation["frame_survival"]["remaining_frame_count"] == 4
+    assert result.evaluation["frame_survival"]["eligible_frame_ranges"] == [[37, 40]]
+
+
+def test_acceptance_e2e_one_morphology_fail_keeps_independent_modules_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    eligibility: dict[str, tuple[tuple[int, int], ...]] = {}
+    context = _context(tmp_path, source_range=(1_000, 11_000))
+    config = _config(tmp_path)
+    config.raw["pipeline"]["modules"].append("video_quality")
+    config.raw["modules"]["video_quality"] = {
+        "enabled": True,
+        "implementation": "video_quality.test",
+        "parameters": {},
+        "rules": {},
+    }
+    _enable_frame_survival(config)
+
+    monkeypatch.setattr(
+        precheck,
+        "_load_clip",
+        lambda context, module: SimpleNamespace(
+            num_frames=10_000,
+            frame_indices=list(range(1_000, 11_000)),
+            clip_start_frame=1_000,
+        ),
+    )
+
+    def execute(
+        context: AssetContext,
+        config: LoadedQcConfig,
+        module: str,
+        clip: object,
+    ) -> ModuleResult:
+        calls.append(module)
+        eligibility[module] = tuple(getattr(clip, "eligible_frame_ranges", ()))
+        return ModuleResult(
+            module,
+            "fail" if module == "keypoint_morphology" else "pass",
+            {"decision": "fail" if module == "keypoint_morphology" else "pass"},
+            {},
+            frame_exclusions=(
+                FrameExclusion(
+                    start_frame=1_042,
+                    end_frame=1_042,
+                    module="keypoint_morphology",
+                    reason="keypoint_morphology.joint_angle_min_deg",
+                    raw_severity="fail",
+                    hand_side="left",
+                    first_introduced_stage="keypoint_morphology",
+                ),
+            )
+            if module == "keypoint_morphology"
+            else (),
+        )
+
+    monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
+    session = precheck.PrecheckSession(context, config)
+    registry = _registry(session, config)
+    registry.register(
+        "video_quality.test",
+        lambda context, config: calls.append("video_quality")
+        or ModuleResult("video_quality", "pass", {"decision": "pass"}, {}),
+    )
+
+    outcome = run_asset(
+        context,
+        config=config,
+        profile="acceptance",
+        registry=registry,
+        now=lambda: "2026-07-16T00:00:00Z",
+    )
+
+    assert calls == [*precheck.MODULES, "video_quality"]
+    assert outcome.report["keypoint_morphology"]["flow"]["result_gate"]["verdict"] == "fail"
+    assert outcome.report["keypoint_morphology"]["flow"]["exit_gate"]["continue_to_next_module"] is True
+    assert outcome.report["overall_decision"] == "pass"
+    assert outcome.report["acceptance_frame_survival"]["remaining_frame_count"] == 9_999
+    assert outcome.report["acceptance_frame_survival"]["remaining_frame_ratio"] == pytest.approx(0.9999)
+    assert eligibility["keypoint_temporal"] == ((1_000, 1_041), (1_043, 10_999))
+
+
 def test_supplier_evaluation_loads_source_once_for_five_modules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -113,6 +386,112 @@ def test_supplier_evaluation_loads_source_once_for_five_modules(
     assert outcome.status == "completed"
     for module in precheck.MODULES:
         assert outcome.report[module]["flow"]["result_gate"]["verdict"] == "pass"
+
+
+def test_supplier_evaluation_keeps_all_frames_eligible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_eligibility: dict[str, object] = {}
+
+    def execute(
+        context: AssetContext,
+        config: LoadedQcConfig,
+        module: str,
+        clip: object,
+    ) -> precheck.PrecheckModuleExecution:
+        seen_eligibility[module] = getattr(clip, "eligible_frame_ranges", None)
+        return precheck.PrecheckModuleExecution(
+            result=ModuleResult(
+                module,
+                "fail" if module == "keypoint_presence" else "pass",
+                {},
+                {},
+                frame_exclusions=(
+                    FrameExclusion(
+                        start_frame=10,
+                        end_frame=20,
+                        module="keypoint_presence",
+                        reason="nonfinite_keypoints",
+                        raw_severity="fail",
+                        hand_side="left",
+                        first_introduced_stage="keypoint_presence",
+                    ),
+                )
+                if module == "keypoint_presence"
+                else (),
+            ),
+            check_results=(CheckResult(module, 0, -1, {}, False, "ok"),),
+        )
+
+    monkeypatch.setattr(
+        precheck,
+        "_load_clip",
+        lambda context, module: SimpleNamespace(num_frames=100),
+    )
+    monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
+    config = _config(tmp_path)
+    _enable_frame_survival(config)
+    session = precheck.PrecheckSession(
+        _context(
+            tmp_path,
+            source_range=(0, 100),
+            profile="supplier_evaluation",
+        ),
+        config,
+    )
+
+    presence = session.run_module("keypoint_presence")
+    session.run_module("keypoint_morphology")
+
+    assert seen_eligibility == {
+        "keypoint_presence": None,
+        "keypoint_morphology": None,
+    }
+    assert "frame_survival" not in presence.evaluation
+
+
+def test_supplier_evaluation_keeps_source_indices_for_temporal_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_source_indices: tuple[int, ...] | None = None
+
+    def execute(
+        context: AssetContext,
+        config: LoadedQcConfig,
+        module: str,
+        clip: object,
+    ) -> ModuleResult:
+        nonlocal seen_source_indices
+        if module == "keypoint_temporal":
+            seen_source_indices = tuple(clip.source_frame_indices)
+        return ModuleResult(module, "pass", {}, {})
+
+    monkeypatch.setattr(
+        precheck,
+        "_load_clip",
+        lambda context, module: SimpleNamespace(
+            num_frames=3,
+            frame_indices=[50, 51, 52],
+            clip_start_frame=50,
+        ),
+    )
+    monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
+    config = _config(tmp_path)
+    _enable_frame_survival(config)
+    session = precheck.PrecheckSession(
+        _context(
+            tmp_path,
+            source_range=(50, 53),
+            profile="supplier_evaluation",
+        ),
+        config,
+    )
+
+    session.run_module("keypoint_temporal")
+
+    assert seen_source_indices == (50, 51, 52)
 
 
 def test_acceptance_fail_does_not_preexecute_later_prechecks(
@@ -275,7 +654,7 @@ def test_completed_session_publishes_canonical_precheck_artifact(
     ]
     assert run_config["outcome"] == "completed"
     assert run_config["fingerprint"]["implementation_version"] == (
-        "precheck-session-v2"
+        "precheck-session-v4-frame-survival-lineage"
     )
 
 

@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from qc_common.config import LoadedQcConfig
+from qc_common.contracts import ModuleResult
+from qc_common.frame_survival import FrameExclusion
 from qc_pipeline.context import AssetContext
 
 
@@ -106,6 +108,35 @@ def test_run_fingerprint_is_canonical_and_changes_with_inputs(tmp_path: Path) ->
         implementation_version="producer-v2",
     )
     assert canonical_sha256(first) != canonical_sha256(changed)
+
+
+def test_module_result_round_trip_preserves_temporal_exclusion_lineage() -> None:
+    from qc_pipeline.artifacts import module_result_from_dict
+
+    original = ModuleResult(
+        "keypoint_temporal",
+        "fail",
+        {"decision": "fail"},
+        {},
+        frame_exclusions=(
+            FrameExclusion(
+                start_frame=42,
+                end_frame=42,
+                module="keypoint_temporal",
+                reason="keypoint_temporal.strong_temporal_failure",
+                raw_severity="fail",
+                hand_side="both",
+                first_introduced_stage="keypoint_temporal",
+                temporal_pair_start_frame=41,
+                temporal_pair_end_frame=42,
+                temporal_transition_attribution="target_frame",
+            ),
+        ),
+    )
+
+    restored = module_result_from_dict(original.to_dict())
+
+    assert restored.frame_exclusions == original.frame_exclusions
 
 
 def test_reusable_artifact_requires_exact_fingerprint_and_valid_files(

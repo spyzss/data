@@ -670,6 +670,14 @@ def test_presence_explicit_existence_invalid_preserves_side_ranges_and_reasons()
         },
     ]
     assert all(issue.context["hand_side"] == "left" for issue in result.issues)
+    assert [
+        (item.start_frame, item.end_frame, item.reason, item.hand_side)
+        for item in result.frame_exclusions
+    ] == [
+        (10, 10, "all_zero_keypoints", "left"),
+        (11, 11, "all_zero_keypoints", "left"),
+        (14, 14, "all_identical_keypoints", "left"),
+    ]
 
 
 def test_temporal_candidate_is_one_warn_issue_with_source_range() -> None:
@@ -722,6 +730,9 @@ def test_strong_temporal_failure_remains_hard_fail() -> None:
             9,
             {
                 "skeleton_verdict": "suspect",
+                "temporal_pair_start_frame": 8,
+                "temporal_pair_end_frame": 9,
+                "temporal_transition_attribution": "target_frame",
                 "which_thresholds_exceeded": [
                     "joint_acceleration_m_s2_max",
                     "joint_displacement_m_max",
@@ -754,6 +765,19 @@ def test_strong_temporal_failure_remains_hard_fail() -> None:
     assert issue.boundary_value == 3
     assert issue.needs_manual_review is False
     assert result.evidence[0].path == "check_results.json"
+    assert [
+        (item.start_frame, item.end_frame, item.reason, item.hand_side)
+        for item in result.frame_exclusions
+    ] == [
+        (9, 9, "keypoint_temporal.strong_temporal_failure", "both")
+    ]
+    exclusion = result.frame_exclusions[0]
+    assert exclusion.temporal_pair_start_frame == 8
+    assert exclusion.temporal_pair_end_frame == 9
+    assert exclusion.temporal_transition_attribution == "target_frame"
+    assert issue.context["temporal_pair_start_frame"] == 8
+    assert issue.context["temporal_pair_end_frame"] == 9
+    assert issue.context["temporal_transition_attribution"] == "target_frame"
 
 
 def test_temporal_projection_review_is_warn_without_candidate_window() -> None:
@@ -1136,6 +1160,13 @@ def test_morphology_fail_uses_configured_threshold_and_actual_metric_name() -> N
     assert result.issues[0].boundary_value == 6.0
     assert result.issues[0].needs_manual_review is False
     assert result.issues[0].context["hand_side"] == "right"
+    assert len(result.frame_exclusions) == 1
+    exclusion = result.frame_exclusions[0]
+    assert (exclusion.start_frame, exclusion.end_frame) == (8, 8)
+    assert exclusion.module == "keypoint_morphology"
+    assert exclusion.reason == "keypoint_morphology.max_normalized_bone_length"
+    assert exclusion.hand_side == "right"
+    assert exclusion.raw_severity == "fail"
 
 
 def test_morphology_merges_only_contiguous_same_rule_and_side_frames() -> None:

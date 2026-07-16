@@ -249,6 +249,15 @@ class SkeletonQualityScoreCheck(BaseCheck):
                         "skeleton_decision_source": source,
                         "sustained_review_promoted": 0.0,
                         "skeleton_decision_mode": self.decision_mode,
+                        **{
+                            key: temporal_result.metrics[key]
+                            for key in (
+                                "temporal_pair_start_frame",
+                                "temporal_pair_end_frame",
+                                "temporal_transition_attribution",
+                            )
+                            if key in temporal_result.metrics
+                        },
                         **presence_metrics,
                         **palm_orientation_metrics,
                         **projection_metrics,

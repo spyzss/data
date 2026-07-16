@@ -18,6 +18,7 @@
       "pattern": "^qc_acceptance_v[0-9]+\\.[0-9]+\\.[0-9]+$"
     },
     "config_name": {"const": "acceptance_gate"},
+    "acceptance_policy": {"$ref": "#/$defs/acceptancePolicy"},
     "execution_profiles": {
       "type": "object",
       "minProperties": 1,
@@ -59,6 +60,48 @@
     }
   },
   "$defs": {
+    "acceptancePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["frame_survival"],
+      "properties": {
+        "frame_survival": {"$ref": "#/$defs/frameSurvival"}
+      }
+    },
+    "frameSurvival": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "enabled",
+        "min_remaining_frame_ratio",
+        "stop_when_below",
+        "exclude_severities",
+        "skeleton_dependent_modules",
+        "terminal_asset_fail_modules"
+      ],
+      "properties": {
+        "version": {"const": "frame_survival_v1"},
+        "enabled": {"type": "boolean"},
+        "min_remaining_frame_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        "stop_when_below": {"type": "boolean"},
+        "exclude_severities": {
+          "type": "array",
+          "items": {"const": "fail"},
+          "uniqueItems": true
+        },
+        "skeleton_dependent_modules": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "terminal_asset_fail_modules": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      }
+    },
     "executionProfile": {
       "type": "object",
       "additionalProperties": false,

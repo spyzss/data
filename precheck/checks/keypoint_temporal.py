@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 from precheck.base import BaseCheck
@@ -12,6 +14,11 @@ from qc_common.keypoints import (
     finite_stats,
     project_points,
     select_hand_joints,
+)
+from qc_common.frame_survival import (
+    is_source_frame_eligible,
+    source_frame_at,
+    temporal_transition_lineage,
 )
 from qc_common.types import CheckResult, ClipInputs
 
@@ -60,12 +67,60 @@ class KeypointTemporalCheck(BaseCheck):
         previous_velocity: dict[str, np.ndarray] = {}
         previous_bone_lengths: dict[tuple[str, str], float] = {}
         previous_angles: dict[tuple[str, str, str], float] = {}
+        source_indices = getattr(clip, "source_frame_indices", clip.frame_indices)
+        eligible_ranges = getattr(clip, "eligible_frame_ranges", None)
+        fallback_start = int(getattr(clip, "clip_start_frame", 0))
+
+        def source_frame(frame_offset: int) -> int:
+            return source_frame_at(
+                source_indices,
+                frame_offset,
+                fallback_start_frame=fallback_start,
+            )
+
+        def is_eligible(frame_offset: int) -> bool:
+            return is_source_frame_eligible(source_frame(frame_offset), eligible_ranges)
 
         for frame_offset in range(num_frames):
-            metrics: dict[str, float] = {
+            current_eligible = is_eligible(frame_offset)
+            if not current_eligible:
+                results.append(
+                    CheckResult(
+                        check=self.name,
+                        episode_idx=clip.episode_idx,
+                        frame_idx=clip.frame_idx_at(frame_offset),
+                        metrics={
+                            "joint_count": float(len(joint_names)),
+                            "bone_count": float(len(bones)),
+                            "temporal_pair_eligible": False,
+                            "skipped_pair_count": float(frame_offset > 0),
+                            "temporal_pair_skip_reason": "current_frame_excluded",
+                        },
+                        flag=None,
+                        reason="raw temporal pair skipped: current_frame_excluded",
+                    )
+                )
+                previous_velocity = {}
+                previous_bone_lengths = {}
+                previous_angles = {}
+                continue
+            metrics: dict[str, Any] = {
                 "joint_count": float(len(joint_names)),
                 "bone_count": float(len(bones)),
             }
+            pair_eligible = frame_offset > 0 and is_eligible(frame_offset - 1)
+            metrics["temporal_pair_eligible"] = pair_eligible
+            metrics["skipped_pair_count"] = float(frame_offset > 0 and not pair_eligible)
+            if pair_eligible:
+                metrics.update(
+                    temporal_transition_lineage(
+                        target_frame=source_frame(frame_offset),
+                        pair_start_frame=source_frame(frame_offset - 1),
+                        pair_end_frame=source_frame(frame_offset),
+                    ).to_metrics()
+                )
+            if frame_offset > 0 and not pair_eligible:
+                metrics["temporal_pair_skip_reason"] = "previous_frame_excluded"
 
             # Rigid-rig data has near-zero bone-length variance; keep these
             # only as a rig sanity check, not as a drift signal.
@@ -78,7 +133,7 @@ class KeypointTemporalCheck(BaseCheck):
             metrics.update(self._quality_metrics(quality_hand, frame_offset))
 
             velocities: dict[str, np.ndarray] = {}
-            if frame_offset > 0:
+            if pair_eligible:
                 angle_changes = [
                     abs(angle - previous_angles[triple])
                     for triple, angle in frame_angles.items()
@@ -113,7 +168,7 @@ class KeypointTemporalCheck(BaseCheck):
                     ]
                     metrics.update(finite_stats(pixel_displacements, "displacement_2d_px"))
 
-            if frame_offset > 1 and previous_velocity:
+            if pair_eligible and frame_offset > 1 and previous_velocity:
                 accelerations = [
                     np.linalg.norm(velocities[name] - previous_velocity[name]) * fps
                     for name in joint_names

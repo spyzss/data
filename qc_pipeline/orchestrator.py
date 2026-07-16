@@ -28,6 +28,7 @@ from qc_common.report_mutation import (
     initialize_v2_report,
     record_awaiting_external,
     record_disabled_transition,
+    record_not_run_due_to_acceptance_frame_budget,
     record_runtime_error,
     validate_report_identity,
 )
@@ -77,6 +78,14 @@ def _manual_selected_issue_ids(report: Mapping[str, Any]) -> tuple[str, ...]:
     if any(not isinstance(item, str) or not item for item in value):
         raise ValueError("manual_review.selected_issue_ids must contain strings")
     return tuple(value)
+
+
+def _acceptance_frame_budget_stop_module(report: Mapping[str, Any]) -> str | None:
+    state = report.get("acceptance_frame_survival")
+    if not isinstance(state, Mapping) or not bool(state.get("stop_triggered", False)):
+        return None
+    module = state.get("stop_trigger_module")
+    return module if isinstance(module, str) and module else None
 
 
 def _record_empty_manual_review(
@@ -237,6 +246,11 @@ def run_asset(
     executed: list[str] = []
 
     profile_config = config.execution_profile(profile)
+    frame_survival_policy = config.frame_survival_policy(profile)
+    skeleton_dependent_modules = {
+        str(module)
+        for module in frame_survival_policy.get("skeleton_dependent_modules", [])
+    }
 
     def record_incomplete(
         module: str,
@@ -271,6 +285,22 @@ def run_asset(
         module_config = config.module_config(module_name)
         expected_revision = int(report.get("report_revision", 0))
         timestamp = initial_now if expected_revision == 0 and initial_now else now()
+        budget_stop_module = _acceptance_frame_budget_stop_module(report)
+        if (
+            budget_stop_module is not None
+            and module_name in skeleton_dependent_modules
+            and module_name != budget_stop_module
+        ):
+            report = record_not_run_due_to_acceptance_frame_budget(
+                context.report_path,
+                context=context,
+                config=config,
+                profile=profile,
+                expected_revision=expected_revision,
+                module=module_name,
+                now=timestamp,
+            )
+            continue
         if not module_config.get("enabled"):
             next_module = _successor(config.pipeline_modules, module_name)
             completed = next_module is None

@@ -11,6 +11,7 @@ from typing import Any
 
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import ModuleResult
+from qc_common.frame_survival import FrameSurvivalState
 from qc_common.module_registry import ModulePrerequisiteError, ModuleRunner
 from qc_pipeline.context import AssetContext
 
@@ -22,7 +23,10 @@ MODULES = (
     "keypoint_morphology",
     "keypoint_temporal",
 )
-_IMPLEMENTATION_VERSION = "precheck-session-v2"
+_IMPLEMENTATION_VERSION = "precheck-session-v4-frame-survival-lineage"
+_FRAME_SURVIVAL_MODULES = frozenset(
+    {"keypoint_presence", "keypoint_morphology", "keypoint_temporal"}
+)
 
 
 @dataclass(frozen=True)
@@ -292,6 +296,83 @@ class PrecheckSession:
         self._candidate_windows: tuple[Mapping[str, Any], ...] = ()
         self._cache_checked = False
         self._started_at = perf_counter()
+        self._frame_survival_state = self._initial_frame_survival_state()
+
+    def _initial_frame_survival_state(self) -> FrameSurvivalState | None:
+        profile = str(
+            self.context.metadata.get("profile") or self.config.default_profile
+        )
+        policy = self.config.frame_survival_policy(profile)
+        if (
+            profile != "acceptance"
+            or not bool(policy.get("enabled", False))
+        ):
+            return None
+        source_range = self.context.source_range
+        if source_range is None:
+            return None
+        start_frame, end_frame_exclusive = source_range
+        return FrameSurvivalState.from_manifest_range(
+            start_frame=start_frame,
+            end_frame=end_frame_exclusive - 1,
+            min_remaining_frame_ratio=float(policy["min_remaining_frame_ratio"]),
+            stop_when_below=bool(policy.get("stop_when_below", True)),
+        )
+
+    def _prepare_clip_for_module(self, module: str) -> Any:
+        if (
+            self._frame_survival_state is None
+            and module in _FRAME_SURVIVAL_MODULES
+            and bool(self.config.frame_survival_policy(
+                str(self.context.metadata.get("profile") or self.config.default_profile)
+            ).get("enabled", False))
+        ):
+            raise ModulePrerequisiteError(
+                module,
+                "manifest source_range for acceptance frame survival",
+            )
+        if self._clip is None:
+            self._clip = _load_clip(self.context, module)
+        source_indices = getattr(self._clip, "source_frame_indices", None)
+        if source_indices is None:
+            frame_indices = getattr(self._clip, "frame_indices", None)
+            if frame_indices is None:
+                num_frames = getattr(self._clip, "num_frames", None)
+                if isinstance(num_frames, int):
+                    start = int(getattr(self._clip, "clip_start_frame", 0))
+                    frame_indices = list(range(start, start + num_frames))
+            if frame_indices is not None:
+                setattr(self._clip, "source_frame_indices", tuple(frame_indices))
+        if self._frame_survival_state is not None:
+            setattr(
+                self._clip,
+                "eligible_frame_ranges",
+                self._frame_survival_state.eligible_ranges,
+            )
+        return self._clip
+
+    def _apply_frame_survival(
+        self,
+        module: str,
+        result: ModuleResult,
+    ) -> ModuleResult:
+        if self._frame_survival_state is None or module not in _FRAME_SURVIVAL_MODULES:
+            return result
+        self._frame_survival_state, update = self._frame_survival_state.apply(
+            module=module,
+            exclusions=result.frame_exclusions,
+        )
+        return replace(
+            result,
+            evaluation={
+                **dict(result.evaluation),
+                "frame_survival": update.to_dict(),
+            },
+            runtime={
+                **dict(result.runtime),
+                "acceptance_frame_survival_handled": True,
+            },
+        )
 
     def _fingerprint(self) -> dict[str, Any]:
         return precheck_fingerprint(self.context, self.config)
@@ -385,10 +466,27 @@ class PrecheckSession:
                 metadata={
                     "completed_modules": [
                         name for name in MODULES if name in self._raw_results
-                    ]
+                    ],
+                    "frame_survival": self._frame_survival_metadata(),
                 },
             )
             promote_artifact(staging, artifact)
+
+    def _frame_survival_metadata(self) -> dict[str, Any] | None:
+        state = self._frame_survival_state
+        if state is None:
+            return None
+        return {
+            "original_frame_count": state.original_frame_count,
+            "raw_exclusions": [item.to_dict() for item in state.raw_exclusions],
+            "cumulative_excluded_frame_ranges": [
+                list(item) for item in state.cumulative_excluded_frame_ranges
+            ],
+            "eligible_frame_ranges": [list(item) for item in state.eligible_ranges],
+            "remaining_frame_count": state.remaining_frame_count,
+            "remaining_frame_ratio": state.remaining_frame_ratio,
+            "stop_threshold": state.min_remaining_frame_ratio,
+        }
 
     def run_module(self, module: str) -> ModuleResult:
         if module not in MODULES:
@@ -407,20 +505,19 @@ class PrecheckSession:
                 candidates,
                 artifact_state="reused",
             )
+            result = self._apply_frame_survival(module, result)
             self._results[module] = result
             return result
-        if self._clip is None:
-            self._clip = _load_clip(self.context, module)
         execution = _run_module_on_clip(
             self.context,
             self.config,
             module,
-            self._clip,
+            self._prepare_clip_for_module(module),
         )
         if isinstance(execution, ModuleResult):
-            result = execution
+            result = self._apply_frame_survival(module, execution)
         else:
-            result = execution.result
+            result = self._apply_frame_survival(module, execution.result)
             self._raw_results[module] = execution.check_results
             if module == "keypoint_temporal":
                 self._candidate_windows = execution.candidate_windows

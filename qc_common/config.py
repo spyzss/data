@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -47,6 +48,18 @@ class LoadedQcConfig:
         except KeyError as exc:
             raise ValueError(f"unknown execution profile: {name}") from exc
 
+    def frame_survival_policy(self, profile: str) -> dict[str, Any]:
+        """Return the versioned acceptance-only frame-survival policy."""
+        if profile != "acceptance":
+            return {"enabled": False}
+        acceptance_policy = self.raw.get("acceptance_policy")
+        if not isinstance(acceptance_policy, Mapping):
+            return {"enabled": False}
+        policy = acceptance_policy.get("frame_survival")
+        if not isinstance(policy, Mapping):
+            return {"enabled": False}
+        return copy.deepcopy(dict(policy))
+
     def module_config(self, name: str) -> dict[str, Any]:
         try:
             return copy.deepcopy(self.raw["modules"][name])
@@ -71,17 +84,33 @@ class LoadedQcConfig:
             config_path = str(self.path.relative_to(_repo_root()))
         except ValueError:
             config_path = str(self.path)
+        policy = self.frame_survival_policy("acceptance")
+        policy_payload = json.dumps(
+            policy,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
         return {
             "schema_version": self.schema_version,
             "config_version": self.config_version,
             "config_name": self.config_name,
             "config_path": config_path,
             "config_hash": self.sha256,
+            "acceptance_policy_version": str(policy.get("version", "disabled")),
+            "acceptance_policy_hash": "sha256:"
+            + hashlib.sha256(policy_payload).hexdigest(),
         }
 
     def assert_same_reference(self, reference: Mapping[str, str]) -> None:
         expected = self.json_reference()
-        for key in ("schema_version", "config_version", "config_hash"):
+        for key in (
+            "schema_version",
+            "config_version",
+            "config_hash",
+            "acceptance_policy_version",
+            "acceptance_policy_hash",
+        ):
             if reference.get(key) != expected[key]:
                 raise ValueError(
                     f"QC config drift at {key}: {reference.get(key)} != {expected[key]}"

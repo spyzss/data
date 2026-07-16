@@ -258,6 +258,22 @@ def test_existence_sentinel_hand_is_gated_from_morphology(sentinel: str) -> None
     assert "left:palm_scale_too_small" not in frame.reason
 
 
+def test_acceptance_eligibility_skips_excluded_source_frame() -> None:
+    clip = _clip()
+    assert clip.keypoints is not None
+    clip.frame_indices = [42, 43]
+    for values in clip.keypoints.values():
+        values.resize((2, 3), refcheck=False)
+        values[1] = values[0]
+    clip.eligible_frame_ranges = ((43, 43),)
+
+    results = create_check("keypoint_morphology", DEFAULT_CONFIG).run(clip)
+
+    assert [row.frame_idx for row in results if row.frame_idx >= 0] == [43]
+    summary = next(row for row in results if row.frame_idx == -1)
+    assert summary.metrics["num_frames"] == 1
+
+
 def test_local_duplicate_remains_a_morphology_review() -> None:
     clip = _clip()
     assert clip.keypoints is not None

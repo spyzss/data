@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 from typing import Any, Literal
 
+from qc_common.frame_survival import FrameExclusion
+
 
 Verdict = Literal["pass", "warn", "fail", "skipped"]
 ModuleExecutionState = Literal[
@@ -22,6 +24,7 @@ ModuleExecutionState = Literal[
     "runtime_error",
     "awaiting_external",
     "skipped_due_to_fail",
+    "not_run_due_to_acceptance_frame_budget",
     "not_run",
     "input_missing",
     "input_invalid",
@@ -116,6 +119,7 @@ class ModuleResult:
     metrics: Mapping[str, Any]
     issues: tuple[Issue, ...] = ()
     evidence: tuple[EvidenceRef, ...] = ()
+    frame_exclusions: tuple[FrameExclusion, ...] = ()
     runtime: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
