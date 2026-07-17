@@ -344,3 +344,95 @@ def test_sam3_cache_uses_candidate_sha_and_skips_segmenter_on_hit(
 
     assert producer_calls == 2
     assert factory_calls == 2
+
+
+def test_sam3_model_directory_key_file_change_invalidates_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_pipeline.runners.sam3_containment import runner
+    from tests.test_qc_pipeline_sam3_runner import (
+        _candidate,
+        _model_context,
+        _write_candidates,
+        _write_current_run_config,
+        _write_successful_sam3_outputs,
+    )
+
+    context, model = _model_context(tmp_path)
+    _write_candidates(tmp_path, [_candidate()])
+    _write_current_run_config(context)
+    producer_calls = 0
+
+    def fake_run(**kwargs: object) -> dict[str, object]:
+        nonlocal producer_calls
+        producer_calls += 1
+        _write_successful_sam3_outputs(Path(str(kwargs["output_dir"])))
+        return {"failed_asset_count": 0}
+
+    monkeypatch.setattr(
+        "tools.run_manifest_sam3_containment.run_manifest_sam3_containment",
+        fake_run,
+    )
+
+    first = runner(None)(context, load_qc_acceptance_config())
+    second = runner(None)(context, load_qc_acceptance_config())
+    (model / "config.json").write_text(
+        '{"model":"sam3","revision":2}\n',
+        encoding="utf-8",
+    )
+    third = runner(None)(context, load_qc_acceptance_config())
+
+    assert producer_calls == 2
+    assert first.runtime["artifact_state"] == "computed"
+    assert second.runtime["artifact_state"] == "reused"
+    assert third.runtime["artifact_state"] == "computed"
+
+
+def test_sam3_v1_artifact_is_not_reused_by_v2_producer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_pipeline.runners import sam3_containment
+    from tests.test_qc_pipeline_sam3_runner import (
+        _candidate,
+        _context,
+        _write_candidates,
+        _write_current_run_config,
+        _write_successful_sam3_outputs,
+    )
+
+    context = _context(tmp_path)
+    _write_candidates(tmp_path, [_candidate()])
+    _write_current_run_config(context)
+    producer_calls = 0
+
+    def fake_run(**kwargs: object) -> dict[str, object]:
+        nonlocal producer_calls
+        producer_calls += 1
+        _write_successful_sam3_outputs(Path(str(kwargs["output_dir"])))
+        return {"failed_asset_count": 0}
+
+    monkeypatch.setattr(
+        "tools.run_manifest_sam3_containment.run_manifest_sam3_containment",
+        fake_run,
+    )
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            sam3_containment,
+            "_IMPLEMENTATION_VERSION",
+            "sam3-containment-producer-v1",
+        )
+        sam3_containment.runner(lambda: object())(
+            context,
+            load_qc_acceptance_config(),
+        )
+
+    current = sam3_containment.runner(lambda: object())(
+        context,
+        load_qc_acceptance_config(),
+    )
+
+    assert producer_calls == 2
+    assert current.runtime["artifact_state"] == "computed"

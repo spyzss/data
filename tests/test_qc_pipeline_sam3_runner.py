@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
 import pytest
 
 from qc_common.config import load_qc_acceptance_config
-from qc_common.module_registry import ModuleBlockedError, ModuleInputError
+from qc_common.module_registry import (
+    ModuleBlockedError,
+    ModuleInputError,
+    ModulePrerequisiteError,
+)
 from qc_pipeline.context import AssetContext
-from qc_pipeline.runners.sam3_containment import runner
+from qc_pipeline.runners.sam3_containment import _source_path, runner
 
 
 def _write_candidates(tmp_path: Path, rows: list[dict[str, object]]) -> Path:
@@ -75,6 +80,47 @@ def _candidate(start: int = 10, end: int = 12) -> dict[str, object]:
     }
 
 
+def _model_context(tmp_path: Path) -> tuple[AssetContext, Path]:
+    base = _context(tmp_path)
+    model = tmp_path / "source" / "sam3-model"
+    model.mkdir()
+    (model / "config.json").write_text('{"model":"sam3"}\n', encoding="utf-8")
+    (model / "model.safetensors").write_bytes(b"safetensors-metadata")
+    (model / "sam3.pt").write_bytes(b"checkpoint-metadata")
+    return (
+        replace(
+            base,
+            source_files={
+                **dict(base.source_files),
+                "sam3_model": {"path": "source/sam3-model"},
+            },
+        ),
+        model,
+    )
+
+
+def _write_successful_sam3_outputs(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "window_keypoint_containment_summary.json").write_text(
+        json.dumps(
+            [
+                {
+                    "asset_id": "asset-a",
+                    "window_start_frame": 10,
+                    "window_end_frame": 12,
+                    "hand_side": "left",
+                    "window_containment_verdict": "pass",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "review_evidence_manifest.csv").write_text(
+        "asset_id,evidence_type,source_path,window_start_frame,window_end_frame,hand_side\n",
+        encoding="utf-8",
+    )
+
+
 def _write_current_run_config(
     context: AssetContext,
     *,
@@ -110,6 +156,173 @@ def _write_current_run_config(
             },
         },
     )
+
+
+def test_source_path_accepts_model_directory(tmp_path: Path) -> None:
+    context, model = _model_context(tmp_path)
+
+    assert _source_path(
+        context,
+        "sam3_model",
+        expected_type="directory",
+    ) == model
+
+
+def test_source_path_accepts_symlink_to_model_directory(tmp_path: Path) -> None:
+    context, model = _model_context(tmp_path)
+    link = tmp_path / "source" / "sam3-model-link"
+    link.symlink_to(model, target_is_directory=True)
+    linked_context = replace(
+        context,
+        source_files={
+            **dict(context.source_files),
+            "sam3_model": {"path": "source/sam3-model-link"},
+        },
+    )
+
+    assert _source_path(
+        linked_context,
+        "sam3_model",
+        expected_type="directory",
+    ) == link
+
+
+def test_source_path_rejects_file_as_model_directory(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    model_file = tmp_path / "source" / "sam3-model"
+    model_file.write_bytes(b"not-a-directory")
+    invalid = replace(
+        context,
+        source_files={
+            **dict(context.source_files),
+            "sam3_model": {"path": "source/sam3-model"},
+        },
+    )
+
+    with pytest.raises(
+        ModulePrerequisiteError,
+        match=r"existing directory source_files\.sam3_model\.path",
+    ):
+        _source_path(invalid, "sam3_model", expected_type="directory")
+
+
+def test_source_path_rejects_missing_model_directory(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    missing = replace(
+        context,
+        source_files={
+            **dict(context.source_files),
+            "sam3_model": {"path": "source/missing-model"},
+        },
+    )
+
+    with pytest.raises(
+        ModulePrerequisiteError,
+        match=r"existing directory source_files\.sam3_model\.path",
+    ):
+        _source_path(missing, "sam3_model", expected_type="directory")
+
+
+@pytest.mark.parametrize("source_name", ["video", "parquet", "manifest"])
+def test_source_path_keeps_file_contract_for_jdt_inputs(
+    tmp_path: Path,
+    source_name: str,
+) -> None:
+    context = _context(tmp_path)
+    source_path = tmp_path / "source" / source_name
+    source_path.mkdir()
+    invalid = replace(
+        context,
+        source_files={
+            **dict(context.source_files),
+            source_name: {"path": f"source/{source_name}"},
+        },
+    )
+
+    with pytest.raises(
+        ModulePrerequisiteError,
+        match=rf"existing file source_files\.{source_name}\.path",
+    ):
+        _source_path(invalid, source_name)
+
+
+@pytest.mark.parametrize("source_name", ["video", "parquet"])
+def test_jdt_runner_rejects_directory_for_file_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+) -> None:
+    base = _context(tmp_path)
+    source_dir = tmp_path / "source" / f"{source_name}-directory"
+    source_dir.mkdir()
+    context = replace(
+        base,
+        source_files={
+            **dict(base.source_files),
+            source_name: {"path": f"source/{source_name}-directory"},
+        },
+    )
+    _write_candidates(tmp_path, [_candidate()])
+    _write_current_run_config(context)
+    monkeypatch.setattr(
+        "tools.run_manifest_sam3_containment.run_manifest_sam3_containment",
+        lambda **kwargs: pytest.fail("invalid file source must fail preflight"),
+    )
+
+    with pytest.raises(
+        ModulePrerequisiteError,
+        match=rf"existing file source_files\.{source_name}\.path",
+    ):
+        runner(lambda: object())(context, load_qc_acceptance_config())
+
+
+def test_jdt_model_directory_reaches_manifest_sam3_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_pipeline.artifacts import file_sha256
+
+    context, model = _model_context(tmp_path)
+    _write_candidates(tmp_path, [_candidate()])
+    _write_current_run_config(context)
+    captured: dict[str, object] = {}
+
+    def fake_run(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        _write_successful_sam3_outputs(Path(str(kwargs["output_dir"])))
+        return {"failed_asset_count": 0}
+
+    monkeypatch.setattr(
+        "tools.run_manifest_sam3_containment.run_manifest_sam3_containment",
+        fake_run,
+    )
+
+    result = runner(None)(context, load_qc_acceptance_config())
+
+    assert result.verdict == "pass"
+    assert captured["sam3_model"] == model
+    assert captured["segmenter"] is None
+    run_config = json.loads(
+        (
+            tmp_path
+            / "module_outputs"
+            / "asset-a"
+            / "sam3_containment"
+            / "run_config.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert run_config["fingerprint"]["implementation_version"] == (
+        "sam3-containment-producer-v2"
+    )
+    model_identity = run_config["fingerprint"]["sources"]["sam3_model"]
+    assert model_identity["kind"] == "directory"
+    assert model_identity["path"] == "source/sam3-model"
+    assert model_identity["resolved_path"] == "source/sam3-model"
+    assert model_identity["files"]["config.json"]["sha256"] == file_sha256(
+        model / "config.json"
+    )
+    assert "sha256" not in model_identity["files"]["model.safetensors"]
+    assert "sha256" not in model_identity["files"]["sam3.pt"]
 
 
 def test_full_pipeline_uses_current_precheck_artifact_not_legacy_manifest_path(

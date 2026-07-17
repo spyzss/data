@@ -154,6 +154,81 @@ def file_sha256(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def directory_identity(
+    path: Path,
+    *,
+    batch_root: Path,
+    key_files: Sequence[str],
+    hash_files: Sequence[str] = (),
+    declared: Mapping[str, Any] | None = None,
+    allow_symlinked_sources: bool = False,
+) -> dict[str, Any]:
+    """Build a bounded identity without walking or hashing a whole directory."""
+    lexical_root = Path(os.path.abspath(os.fspath(batch_root)))
+    candidate = path if path.is_absolute() else lexical_root / path
+    lexical_path = Path(os.path.abspath(os.fspath(candidate)))
+    try:
+        relative_path = lexical_path.relative_to(lexical_root)
+    except ValueError:
+        raise ValueError(
+            f"source path must stay inside batch_root: {path}"
+        ) from None
+
+    resolved_root = batch_root.resolve()
+    resolved_path = lexical_path.resolve()
+    if not allow_symlinked_sources:
+        try:
+            resolved_path.relative_to(resolved_root)
+        except ValueError:
+            raise ValueError(
+                f"source path must stay inside batch_root: {path}"
+            ) from None
+    if not resolved_path.is_dir():
+        raise ValueError(f"source path must be a directory: {path}")
+
+    try:
+        resolved_identity = resolved_path.relative_to(resolved_root).as_posix()
+    except ValueError:
+        resolved_identity = resolved_path.as_posix()
+    identity: dict[str, Any] = {
+        "kind": "directory",
+        "path": relative_path.as_posix(),
+        "resolved_path": resolved_identity,
+        "files": {},
+    }
+    if declared is not None:
+        for key in ("checksum", "etag", "version_id"):
+            value = declared.get(key)
+            if value is not None and str(value).strip():
+                identity[key] = str(value)
+
+    hashed = set(hash_files)
+    unknown_hash_files = hashed.difference(key_files)
+    if unknown_hash_files:
+        raise ValueError(
+            "hash_files must be included in key_files: "
+            + ", ".join(sorted(unknown_hash_files))
+        )
+    files: dict[str, Any] = identity["files"]
+    for name in key_files:
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"directory identity key must be relative: {name}")
+        key_path = resolved_path / relative
+        if not key_path.is_file():
+            files[name] = {"missing": True}
+            continue
+        stat = key_path.stat()
+        file_value: dict[str, Any] = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        if name in hashed:
+            file_value["sha256"] = file_sha256(key_path)
+        files[name] = file_value
+    return identity
+
+
 def module_result_from_dict(payload: Mapping[str, Any]) -> ModuleResult:
     issues = tuple(
         Issue(
@@ -390,6 +465,7 @@ __all__ = [
     "canonical_json",
     "canonical_sha256",
     "config_fingerprint",
+    "directory_identity",
     "file_identity",
     "file_sha256",
     "module_result_from_dict",

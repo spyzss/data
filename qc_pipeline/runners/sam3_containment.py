@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import shutil
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import ModuleResult
@@ -23,7 +23,9 @@ from qc_pipeline.context import AssetContext
 from qc_pipeline.artifacts import artifact_for
 
 
-_IMPLEMENTATION_VERSION = "sam3-containment-producer-v1"
+_IMPLEMENTATION_VERSION = "sam3-containment-producer-v2"
+_MODEL_IDENTITY_FILES = ("config.json", "model.safetensors", "sam3.pt")
+_MODEL_HASH_FILES = ("config.json",)
 
 
 def _source_entry(context: AssetContext, name: str) -> Mapping[str, Any] | None:
@@ -36,6 +38,7 @@ def _source_path(
     name: str,
     *,
     required: bool = True,
+    expected_type: Literal["file", "directory"] = "file",
 ) -> Path | None:
     entry = _source_entry(context, name)
     value = entry.get("path") if entry is not None else None
@@ -47,10 +50,16 @@ def _source_path(
             )
         return None
     path = context.batch_root / str(value)
-    if not path.is_file():
+    if expected_type == "file":
+        valid = path.is_file()
+    elif expected_type == "directory":
+        valid = path.is_dir()
+    else:
+        raise ValueError(f"unsupported source path type: {expected_type}")
+    if not valid:
         raise ModulePrerequisiteError(
             "sam3_containment",
-            f"existing source_files.{name}.path",
+            f"existing {expected_type} source_files.{name}.path",
         )
     return path
 
@@ -224,6 +233,7 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
         from qc_pipeline.artifacts import (
             build_run_fingerprint,
             canonical_sha256,
+            directory_identity,
             file_sha256,
             reusable_artifact,
         )
@@ -319,9 +329,18 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
                 "sam3_containment",
                 f"supplier adapter is not implemented: {supplier}",
             )
+        for source_name in ("video", "parquet"):
+            _source_path(context, source_name, required=False)
+        manifest_path = _source_path(context, "manifest", required=False)
+        model = _source_path(
+            context,
+            "sam3_model",
+            required=segmenter_factory is None,
+            expected_type="directory",
+        )
         source_names = tuple(
             name
-            for name in ("video", "parquet", "sam3_model")
+            for name in ("video", "parquet")
             if name in context.source_files
         )
         fingerprint = build_run_fingerprint(
@@ -337,6 +356,15 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
                 "sam3_runtime": SAM3_CONFIG,
             },
         )
+        if model is not None:
+            fingerprint["sources"]["sam3_model"] = directory_identity(
+                model,
+                batch_root=context.batch_root,
+                key_files=_MODEL_IDENTITY_FILES,
+                hash_files=_MODEL_HASH_FILES,
+                declared=_source_entry(context, "sam3_model"),
+                allow_symlinked_sources=context.allow_symlinked_sources,
+            )
         fingerprint_sha256 = canonical_sha256(fingerprint)
         artifact = artifact_for(context, "sam3_containment")
         if bool(context.metadata.get("reuse_artifacts", True)) and reusable_artifact(
@@ -357,7 +385,6 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
                 elapsed_seconds=perf_counter() - started,
                 fingerprint_sha256=fingerprint_sha256,
             )
-        manifest_path = _source_path(context, "manifest", required=False)
         if manifest_path is not None:
             manifest_rows = _records_for_asset(manifest_path, context.asset_id)
             manifest_dir = manifest_path.parent
@@ -405,11 +432,6 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
         )
         output_dir = staging_root / "output"
         segmenter = segmenter_factory() if segmenter_factory is not None else None
-        model = _source_path(
-            context,
-            "sam3_model",
-            required=segmenter is None,
-        )
         summary = run_manifest_sam3_containment(
             manifest=single_manifest,
             candidate_windows=single_candidates,
