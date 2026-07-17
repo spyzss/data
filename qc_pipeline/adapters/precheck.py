@@ -374,10 +374,32 @@ def adapt_quality_hand(
             metrics=metrics,
         )
 
+    supplier_enum_rows = [
+        row
+        for row in frame_rows
+        if "supplier_status_left" in row.metrics
+        or "supplier_status_right" in row.metrics
+    ]
+    if supplier_enum_rows:
+        if len(supplier_enum_rows) != len(frame_rows):
+            raise ValueError("mixed numeric and enum supplier hand quality rows")
+        return ModuleResult(
+            module="quality_hand",
+            verdict="pass",
+            evaluation={
+                "decision": "pass",
+                "reason": "optional_supplier_evidence_validated",
+            },
+            metrics=metrics,
+        )
+
     parameters = config.module_parameters("quality_hand")
-    expected_shape = list(parameters["expected_shape"])
-    valid_values = list(parameters["valid_values"])
-    low_value = parameters["low_quality_hand_value"]
+    legacy = parameters.get("legacy_numeric_contract", parameters)
+    if not isinstance(legacy, Mapping):
+        raise ValueError("quality_hand legacy_numeric_contract must be a mapping")
+    expected_shape = list(legacy["expected_shape"])
+    valid_values = list(legacy["valid_values"])
+    low_value = legacy["low_quality_hand_value"]
     issues: list[Issue] = []
     verdicts: list[Verdict] = ["pass"]
 

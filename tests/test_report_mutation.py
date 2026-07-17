@@ -570,7 +570,9 @@ def test_terminal_supplier_fail_remains_machine_fail(tmp_path: Path) -> None:
     assert report["effective_duration"]["flow"]["result_gate"]["verdict"] == "fail"
 
 
-def test_error_transition_keeps_null_quality_decision(tmp_path: Path) -> None:
+def test_generic_pipeline_transition_rejects_error_without_mutating_report(
+    tmp_path: Path,
+) -> None:
     context = make_asset_context(tmp_path, "a")
     apply_module_result(
         context.report_path,
@@ -583,21 +585,19 @@ def test_error_transition_keeps_null_quality_decision(tmp_path: Path) -> None:
         now="2026-07-14T00:00:00Z",
     )
 
-    report = write_pipeline_transition(
-        context.report_path,
-        expected_revision=1,
-        module="quality_hand",
-        state="error",
-        next_module=None,
-        stop_reason="decoder crashed",
-        overall_decision=None,
-        now="2026-07-14T00:00:01Z",
-    )
-
-    assert report["report_revision"] == 2
-    assert report["pipeline_state"]["status"] == "error"
-    assert report["overall_decision"] is None
-    validate_asset_qc_report(report)
+    before = context.report_path.read_bytes()
+    with pytest.raises(ValueError, match="record_runtime_error"):
+        write_pipeline_transition(
+            context.report_path,
+            expected_revision=1,
+            module="quality_hand",
+            state="error",
+            next_module=None,
+            stop_reason="decoder crashed",
+            overall_decision=None,
+            now="2026-07-14T00:00:01Z",
+        )
+    assert context.report_path.read_bytes() == before
 
 
 def test_evidence_path_allows_opted_in_internal_symlink(

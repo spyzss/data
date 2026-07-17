@@ -7,6 +7,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import shutil
+import tempfile
 from time import perf_counter
 from typing import Any, Literal
 
@@ -221,8 +222,129 @@ def _publish_sam3_artifact(
     return window_summaries, rewritten
 
 
+def _run_canonical(
+    context: AssetContext,
+    config: LoadedQcConfig,
+    segmenter_factory: Callable[..., Any] | None,
+) -> ModuleResult:
+    """Run SAM3 from CanonicalEpisode without exposing supplier source layouts."""
+    import pandas as pd
+
+    from canonical_qc.bridge import CanonicalQcBridge
+    from qc_pipeline.adapters.sam3_containment import adapt_sam3_containment
+    from tools.run_manifest_sam3_containment import (
+        ManifestSourceCache,
+        read_records,
+        run_manifest_sam3_containment,
+    )
+
+    episode = context.metadata.get("canonical_episode")
+    source_root = context.metadata.get("canonical_source_root")
+    if not isinstance(source_root, str) or not source_root:
+        raise ModulePrerequisiteError(
+            "sam3_containment", "metadata.canonical_source_root"
+        )
+    bridge = CanonicalQcBridge(episode, source_root=Path(source_root))
+    candidate_path = _source_path(context, "candidate_windows")
+    assert candidate_path is not None
+    candidate_rows = _records_for_asset(candidate_path, context.asset_id)
+
+    staging_parent = context.batch_root / ".qc_pipeline" / context.asset_id / "sam3"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(tempfile.mkdtemp(prefix="run-", dir=staging_parent))
+    start, end = context.source_range or (0, episode.time_axis.frame_count)
+    points = episode.observation.hand_keypoints_2d
+    projection = staging_root / "canonical_keypoints_2d.parquet"
+    pd.DataFrame(
+        {
+            "canonical_left_hand_2d": [row.reshape(-1) for row in points[:, 0]],
+            "canonical_right_hand_2d": [row.reshape(-1) for row in points[:, 1]],
+        }
+    ).to_parquet(projection, index=False)
+    manifest_row = {
+        "asset_id": context.asset_id,
+        "episode_index": 0,
+        "start_frame": start,
+        "end_frame": end - 1,
+        "primary_video_path": str(bridge.video_path()),
+        "parquet_path": str(projection),
+        "left_hand_2d_field": "canonical_left_hand_2d",
+        "right_hand_2d_field": "canonical_right_hand_2d",
+    }
+    single_manifest = staging_root / "manifest.jsonl"
+    single_candidates = staging_root / "candidate_windows.jsonl"
+    single_manifest.write_text(
+        json.dumps(manifest_row, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    single_candidates.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in candidate_rows),
+        encoding="utf-8",
+    )
+    segmenter = segmenter_factory() if segmenter_factory is not None else None
+    model = _source_path(
+        context,
+        "sam3_model",
+        required=segmenter is None,
+        expected_type="directory",
+    )
+
+    class CanonicalSourceCache(ManifestSourceCache):
+        def read_frame(self, path: Path, frame_idx: int):  # type: ignore[no-untyped-def]
+            physical_start, _ = episode.main_video.source_frame_range
+            return super().read_frame(path, physical_start + frame_idx)
+
+    source_cache = CanonicalSourceCache()
+    bridge.verify_sources()
+    try:
+        summary = run_manifest_sam3_containment(
+            manifest=single_manifest,
+            candidate_windows=single_candidates,
+            supplier="canonical",
+            output_dir=staging_root / "output",
+            max_clips=1,
+            sam3_model=model,
+            overwrite=True,
+            segmenter=segmenter,
+            source_cache=source_cache,
+            config_path=config.path,
+            batch_root=staging_root,
+            profile=str(context.metadata.get("profile") or "acceptance"),
+        )
+    finally:
+        source_cache.close()
+    bridge.verify_sources()
+    if int(summary.get("failed_asset_count", 0)):
+        raise RuntimeError(f"sam3_containment producer failed: {summary}")
+    output_dir = staging_root / "output"
+    window_rows = read_records(
+        output_dir / "window_keypoint_containment_summary.json"
+    )
+    frame_rows = [
+        {**row, "camera_id": "main"}
+        for row in read_records(output_dir / "frame_keypoint_containment.json")
+    ]
+    evidence_rows = read_records(output_dir / "review_evidence_manifest.csv")
+    hand_quality = episode.supplier_evidence.hand_quality
+    return adapt_sam3_containment(
+        asset_id=context.asset_id,
+        batch_root=context.batch_root,
+        window_summaries=window_rows,
+        evidence_rows=evidence_rows,
+        config=config,
+        frame_rows=frame_rows,
+        supplier_hand_quality_status=(
+            hand_quality.status
+            if hand_quality is not None and hand_quality.provided
+            else None
+        ),
+    )
+
+
 def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
     def run(context: AssetContext, config: LoadedQcConfig) -> ModuleResult:
+        if context.metadata.get("canonical_episode") is not None:
+            return _run_canonical(context, config, segmenter_factory)
+
         from qc_pipeline.adapters.sam3_containment import adapt_sam3_containment
         from tools.run_manifest_sam3_containment import (
             DEFAULT_QUERIES,

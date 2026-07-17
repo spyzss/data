@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "canonical_qc_config.v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "config_version", "config_name", "source", "qc", "publisher", "runtime_contract", "cli"],
+  "properties": {
+    "schema_version": {"const": "canonical_qc_config_schema.v1"},
+    "config_version": {"type": "string", "pattern": "^canonical_qc_v[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "config_name": {"const": "canonical_qc_ingest_publish"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported_formats", "require_explicit_format", "require_explicit_source_root", "timestamp_tolerance_ns"],
+      "properties": {
+        "supported_formats": {"const": ["hdf5", "lerobot"]},
+        "require_explicit_format": {"const": true},
+        "require_explicit_source_root": {"const": true},
+        "timestamp_tolerance_ns": {"type": "integer", "minimum": 0}
+      }
+    },
+    "source_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_registry_version", "rules"],
+      "properties": {
+        "rule_registry_version": {"const": "canonical_source_gate_rules.v1"},
+        "rules": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contract_failure"],
+          "properties": {
+            "contract_failure": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["rule_id", "severity"],
+              "properties": {
+                "rule_id": {"const": "canonical.source_gate.contract_failure"},
+                "severity": {"const": "fail"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "qc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["config_path", "config_version", "config_sha256", "profiles"],
+      "properties": {
+        "config_path": {"type": "string", "minLength": 1},
+        "config_version": {"pattern": "^qc_acceptance_v[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "config_sha256": {"pattern": "^sha256:[0-9a-f]{64}$"},
+        "profiles": {"const": ["acceptance", "supplier_evaluation"]}
+      }
+    },
+    "publisher": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["output_format", "publisher_version_prefix", "manifest_schema_version", "toolchain_schema_version", "official_reader_version"],
+      "properties": {
+        "output_format": {"const": "lerobot_v3"},
+        "publisher_version_prefix": {"const": "lerobot_v3_curated.v1+toolchain."},
+        "manifest_schema_version": {"const": "curated_lerobot_v3_release_manifest.v1"},
+        "toolchain_schema_version": {"const": "curated_lerobot_v3_toolchain.v1"},
+        "official_reader_version": {"const": "0.6.0"}
+      }
+    },
+    "runtime_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["standard_hdf5_adapter_version", "standard_lerobot_adapter_version"],
+      "properties": {
+        "standard_hdf5_adapter_version": {"const": "1.0.0"},
+        "standard_lerobot_adapter_version": {"const": "1.1.0"}
+      }
+    },
+    "cli": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exit_codes"],
+      "properties": {
+        "exit_codes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["success", "input_or_quality_fail", "qc_runtime", "publish_prerequisite", "publish_validation", "commit_conflict"],
+          "properties": {
+            "success": {"const": 0},
+            "input_or_quality_fail": {"const": 2},
+            "qc_runtime": {"const": 3},
+            "publish_prerequisite": {"const": 4},
+            "publish_validation": {"const": 5},
+            "commit_conflict": {"const": 6}
+          }
+        }
+      }
+    }
+  }
+}

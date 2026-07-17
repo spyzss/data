@@ -1,0 +1,36 @@
+schema_version: canonical_qc_config_schema.v1
+config_version: canonical_qc_v1.1.0
+config_name: canonical_qc_ingest_publish
+source:
+  supported_formats: [hdf5, lerobot]
+  require_explicit_format: true
+  require_explicit_source_root: true
+  timestamp_tolerance_ns: 1000000
+source_gate:
+  rule_registry_version: canonical_source_gate_rules.v1
+  rules:
+    contract_failure:
+      rule_id: canonical.source_gate.contract_failure
+      severity: fail
+qc:
+  config_path: configs/qc_acceptance.yaml
+  config_version: qc_acceptance_v2.1.0
+  config_sha256: sha256:92f0fe6e31b4a512fc0e812c72fe9b68e0915d51e4e20fae62bd9bdcb049fc10
+  profiles: [acceptance, supplier_evaluation]
+publisher:
+  output_format: lerobot_v3
+  publisher_version_prefix: lerobot_v3_curated.v1+toolchain.
+  manifest_schema_version: curated_lerobot_v3_release_manifest.v1
+  toolchain_schema_version: curated_lerobot_v3_toolchain.v1
+  official_reader_version: 0.6.0
+runtime_contract:
+  standard_hdf5_adapter_version: 1.0.0
+  standard_lerobot_adapter_version: 1.1.0
+cli:
+  exit_codes:
+    success: 0
+    input_or_quality_fail: 2
+    qc_runtime: 3
+    publish_prerequisite: 4
+    publish_validation: 5
+    commit_conflict: 6

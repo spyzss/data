@@ -2,6 +2,8 @@
 comet_change: unify-qc-dataflow
 role: technical-design
 canonical_spec: openspec
+archived-with: 2026-07-16-unify-qc-dataflow
+status: final
 ---
 
 # 统一 QC 数据流技术设计
@@ -59,18 +61,18 @@ flowchart TD
 ### 5.1 文件与版本策略
 
 - 活跃入口：`configs/qc_acceptance.yaml`
-- 不可变快照：`configs/qc_acceptance/qc_acceptance_v2.0.0.yaml`
+- 不可变快照：`configs/qc_acceptance/qc_acceptance_<config_version>.yaml`
 - Schema：`schemas/qc_acceptance_config.v2.schema.json`
 - `schema_version`：`qc_acceptance_config_schema.v2`
-- `config_version`：`qc_acceptance_v2.0.0`
+- 当前活跃 `config_version`：`qc_acceptance_v2.1.0`
 
-历史 `qc_acceptance_v1.1.0.yaml` 保持字节和 hash 不变。活跃入口必须与 v2.0.0 快照字节一致；后续任何规则、顺序、profile 或路由变化都发布新版本，禁止修改已有快照。
+`qc_acceptance_v1.1.0.yaml`、`qc_acceptance_v2.0.0.yaml` 等已发布快照保持字节和 hash 不变。新运行读取活跃入口当前声明的 `config_version`，且活跃入口必须与该版本对应的不可变快照字节一致。`qc_acceptance_v2.0.0` 仅是历史已发布版本，不是固定的新运行默认值；后续任何规则、顺序、profile 或路由变化都发布新版本，禁止修改已有快照。
 
 ### 5.2 核心结构
 
 ```yaml
 schema_version: qc_acceptance_config_schema.v2
-config_version: qc_acceptance_v2.0.0
+config_version: qc_acceptance_v2.1.0
 config_name: acceptance_gate
 
 execution_profiles:
@@ -118,6 +120,8 @@ Config loader 除 Schema 校验外还必须检查：
 
 `duplicate_check`、`content_validity` 和 `effective_duration` 当前没有可调用实现。v2 默认配置将它们保留在声明顺序中，但设置 `enabled: false` 和结构化 `disabled_reason: no_registered_implementation`。它们不会被写成 Pass；后续实现完成时必须发布新的 Config 版本后才能启用。
 
+配置禁用与运行时不适用是不同状态：`enabled: false` 必须写入 `execution.module_states.<module>.state=disabled` 和原因；只有 enabled、实现可用且入口条件无错误地判断当前资产不适用时，才写 `state=skipped`。实现缺失或输入/运行错误均不得借用 `skipped`。
+
 `semantic_consistency` 和 `manual_review` 是外部人工阶段，v2 将其声明为 `execution_kind: external`。本 change 的自动 orchestrator 到达它们时写入 awaiting 状态并暂停；依赖 change 完成后由同一流程继续。
 
 现有 `annotation_verify.instruction_consistency` 仍是未实现模型判断的 stub，不得注册为已完成的语义模块。
@@ -140,9 +144,9 @@ Config loader 除 Schema 校验外还必须检查：
   "report_revision": 7,
   "qc_config": {
     "schema_version": "qc_acceptance_config_schema.v2",
-    "config_version": "qc_acceptance_v2.0.0",
+    "config_version": "qc_acceptance_v2.1.0",
     "config_name": "acceptance_gate",
-    "config_path": "configs/qc_acceptance/qc_acceptance_v2.0.0.yaml",
+    "config_path": "configs/qc_acceptance/qc_acceptance_v2.1.0.yaml",
     "config_hash": "sha256:..."
   },
   "execution": {

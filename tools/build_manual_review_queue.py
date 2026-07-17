@@ -28,6 +28,7 @@ from tools.build_batch_qc_ledger import (  # noqa: E402
     read_records,
     scalar,
 )
+from qc_reporting.projection import project_quality_archive_review_rows  # noqa: E402
 
 
 LOGGER = logging.getLogger("build_manual_review_queue")
@@ -69,6 +70,7 @@ CONFIDENCE_ENUM = ["low", "medium", "high"]
 
 REVIEW_QUEUE_COLUMNS = [
     "review_id",
+    "issue_id",
     "supplier_id",
     "asset_id",
     "window_start_frame",
@@ -76,6 +78,8 @@ REVIEW_QUEUE_COLUMNS = [
     "representative_frame",
     "source_level",
     "module",
+    "rule_id",
+    "hand_side",
     "auto_verdict",
     "suggested_issue_type",
     "severity_suggestion",
@@ -125,12 +129,53 @@ def parse_args() -> argparse.Namespace:
             "review_index.html for supplier acceptance manual review."
         )
     )
-    parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--candidate-windows", required=True, type=Path)
-    parser.add_argument("--sam3-window-summary", type=Path)
-    parser.add_argument("--issue-events", type=Path)
-    parser.add_argument("--video-quality", type=Path)
-    parser.add_argument("--overlay-dir", type=Path)
+    parser.add_argument(
+        "--quality-archive",
+        type=Path,
+        help="Canonical quality_archive directory (formal queue input).",
+    )
+    parser.add_argument(
+        "--legacy-manifest",
+        "--manifest",
+        dest="legacy_manifest",
+        type=Path,
+        help="Legacy sidecar manifest input (only when --quality-archive is absent).",
+    )
+    parser.add_argument(
+        "--legacy-candidate-windows",
+        "--candidate-windows",
+        dest="legacy_candidate_windows",
+        type=Path,
+        help="Legacy candidate-window sidecar input.",
+    )
+    parser.add_argument(
+        "--legacy-sam3-window-summary",
+        "--sam3-window-summary",
+        dest="legacy_sam3_window_summary",
+        type=Path,
+        help="Legacy SAM3 sidecar input.",
+    )
+    parser.add_argument(
+        "--legacy-issue-events",
+        "--issue-events",
+        dest="legacy_issue_events",
+        type=Path,
+        help="Legacy issue-event sidecar input.",
+    )
+    parser.add_argument(
+        "--legacy-video-quality",
+        "--video-quality",
+        dest="legacy_video_quality",
+        type=Path,
+        help="Legacy video-quality sidecar input.",
+    )
+    parser.add_argument(
+        "--legacy-overlay-dir",
+        "--overlay-dir",
+        dest="legacy_overlay_dir",
+        type=Path,
+        help="Legacy overlay directory.",
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--max-items-per-supplier", type=int, default=60)
     parser.add_argument("--max-side-view-per-supplier", type=int, default=10)
@@ -147,46 +192,93 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    assets, episode_to_asset = load_manifest(args.manifest)
+
+    if args.quality_archive is not None:
+        if any(
+            value is not None
+            for value in (
+                args.legacy_manifest,
+                args.legacy_candidate_windows,
+                args.legacy_sam3_window_summary,
+                args.legacy_issue_events,
+                args.legacy_video_quality,
+                args.legacy_overlay_dir,
+            )
+        ):
+            raise SystemExit(
+                "--quality-archive cannot be combined with legacy sidecar inputs"
+            )
+        # The canonical path is intentionally not passed through the old
+        # sampling selector: every explicit warn candidate is queued and
+        # all-pass assets are not sampled here.
+        selected_rows = project_quality_archive_review_rows(args.quality_archive)
+        selected_rows = sorted(
+            selected_rows,
+            key=lambda row: (
+                str(row.get("supplier_id", "")),
+                str(row.get("asset_id", "")),
+                str(row.get("module", "")),
+                frame_sort_value(row.get("window_start_frame")),
+                str(row.get("review_id", "")),
+            ),
+        )
+        selected_rows = assign_review_ids(selected_rows)
+        copy_selected_overlays(
+            selected_rows,
+            args.output_dir,
+            source_root=args.quality_archive.parent,
+        )
+        _write_review_outputs(
+            selected_rows,
+            args.output_dir,
+            default_reviewer=args.default_reviewer,
+        )
+        return 0
+
+    if args.legacy_manifest is None or args.legacy_candidate_windows is None:
+        raise SystemExit(
+            "legacy mode requires --legacy-manifest and --legacy-candidate-windows"
+        )
+    assets, episode_to_asset = load_manifest(args.legacy_manifest)
 
     rows: list[dict[str, Any]] = []
     rows.extend(
         rows_from_candidate_windows(
-            read_records(args.candidate_windows),
-            args.candidate_windows,
+            read_records(args.legacy_candidate_windows),
+            args.legacy_candidate_windows,
             assets,
             episode_to_asset,
-            args.overlay_dir,
+            args.legacy_overlay_dir,
         )
     )
-    if args.sam3_window_summary:
+    if args.legacy_sam3_window_summary:
         rows.extend(
             rows_from_sam3_summary(
-                read_records(args.sam3_window_summary),
-                args.sam3_window_summary,
+                read_records(args.legacy_sam3_window_summary),
+                args.legacy_sam3_window_summary,
                 assets,
                 episode_to_asset,
-                args.overlay_dir,
+                args.legacy_overlay_dir,
             )
         )
-    if args.issue_events:
+    if args.legacy_issue_events:
         rows.extend(
             rows_from_issue_events(
-                read_records(args.issue_events),
-                args.issue_events,
+                read_records(args.legacy_issue_events),
+                args.legacy_issue_events,
                 assets,
                 episode_to_asset,
-                args.overlay_dir,
+                args.legacy_overlay_dir,
             )
         )
-    if args.video_quality:
+    if args.legacy_video_quality:
         rows.extend(
             rows_from_video_quality(
-                read_records(args.video_quality),
-                args.video_quality,
+                read_records(args.legacy_video_quality),
+                args.legacy_video_quality,
                 assets,
                 episode_to_asset,
-                args.overlay_dir,
+                args.legacy_overlay_dir,
             )
         )
 
@@ -196,31 +288,41 @@ def main() -> int:
         max_items_per_supplier=args.max_items_per_supplier,
         max_side_view_per_supplier=args.max_side_view_per_supplier,
         max_pass_samples_per_supplier=args.max_pass_samples_per_supplier,
-        overlay_dir=args.overlay_dir,
+        overlay_dir=args.legacy_overlay_dir,
     )
     selected_rows = assign_review_ids(selected_rows)
     copy_selected_overlays(selected_rows, args.output_dir)
+    _write_review_outputs(
+        selected_rows,
+        args.output_dir,
+        default_reviewer=args.default_reviewer,
+    )
+    return 0
 
+
+def _write_review_outputs(
+    selected_rows: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    default_reviewer: str = "",
+) -> None:
     queue_df = pd.DataFrame(selected_rows, columns=REVIEW_QUEUE_COLUMNS)
     template_df = pd.DataFrame(
-        [manual_template_row(row, default_reviewer=args.default_reviewer) for row in selected_rows],
+        [manual_template_row(row, default_reviewer=default_reviewer) for row in selected_rows],
         columns=MANUAL_TEMPLATE_COLUMNS,
     )
-
-    review_queue_path = args.output_dir / "review_queue.csv"
-    template_path = args.output_dir / "manual_labels_template.csv"
-    html_path = args.output_dir / "review_index.html"
+    review_queue_path = output_dir / "review_queue.csv"
+    template_path = output_dir / "manual_labels_template.csv"
+    html_path = output_dir / "review_index.html"
     queue_df.to_csv(review_queue_path, index=False)
     template_df.to_csv(template_path, index=False)
     html_path.write_text(
-        build_review_index_html(selected_rows, default_reviewer=args.default_reviewer),
+        build_review_index_html(selected_rows, default_reviewer=default_reviewer),
         encoding="utf-8",
     )
-
     LOGGER.info("Wrote %s", review_queue_path)
     LOGGER.info("Wrote %s", template_path)
     LOGGER.info("Wrote %s", html_path)
-    return 0
 
 
 def rows_from_candidate_windows(
@@ -598,17 +700,26 @@ def assign_review_ids(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         supplier_id = str(row["supplier_id"])
         counters[supplier_id] += 1
-        start = empty_if_none(row.get("window_start_frame")) or "na"
-        end = empty_if_none(row.get("window_end_frame")) or "na"
         new_row = dict(row)
-        new_row["review_id"] = (
-            f"{supplier_id}_{row['asset_id']}_{start}_{end}_{counters[supplier_id]:04d}"
-        )
+        # Canonical QC issue IDs are stable join keys and must survive the
+        # legacy output writer.  Sidecar rows leave this field empty and keep
+        # the historical synthetic ID format.
+        if not str(new_row.get("review_id") or "").strip():
+            start = empty_if_none(row.get("window_start_frame")) or "na"
+            end = empty_if_none(row.get("window_end_frame")) or "na"
+            new_row["review_id"] = (
+                f"{supplier_id}_{row['asset_id']}_{start}_{end}_{counters[supplier_id]:04d}"
+            )
         output.append(new_row)
     return output
 
 
-def copy_selected_overlays(rows: list[dict[str, Any]], output_dir: Path) -> None:
+def copy_selected_overlays(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    source_root: Path | None = None,
+) -> None:
     overlay_output_dir = output_dir / "assets" / "overlays"
     used_names: Counter[str] = Counter()
     for row in rows:
@@ -617,6 +728,8 @@ def copy_selected_overlays(rows: list[dict[str, Any]], output_dir: Path) -> None
         if not overlay_path:
             continue
         source = Path(str(overlay_path))
+        if source_root is not None and not source.is_absolute():
+            source = source_root / source
         if not source.exists() or not source.is_file():
             continue
         overlay_output_dir.mkdir(parents=True, exist_ok=True)

@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import re
+import shutil
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -69,13 +70,31 @@ def parse_args() -> argparse.Namespace:
             "and optional manual-review outputs."
         )
     )
-    parser.add_argument("--supplier-sample-manifest", required=True, type=Path)
-    parser.add_argument("--precheck-clip-aggregates", type=Path)
-    parser.add_argument("--precheck-candidate-windows", type=Path)
-    parser.add_argument("--sam3-window-summary", type=Path)
-    parser.add_argument("--video-quality-results", type=Path)
-    parser.add_argument("--manual-review-labels", type=Path)
+    parser.add_argument("--quality-archive", required=True, type=Path)
+    parser.add_argument(
+        "--supplier-sample-manifest",
+        "--legacy-reconciliation-manifest",
+        dest="supplier_sample_manifest",
+        type=Path,
+    )
+    parser.add_argument(
+        "--legacy-reconciliation-precheck-check-results",
+        "--precheck-check-results",
+        dest="legacy_reconciliation_precheck_check_results",
+        type=Path,
+    )
+    parser.add_argument("--legacy-reconciliation-precheck-clip-aggregates", "--precheck-clip-aggregates", dest="legacy_reconciliation_precheck_clip_aggregates", type=Path)
+    parser.add_argument("--legacy-reconciliation-candidate-windows", "--precheck-candidate-windows", dest="legacy_reconciliation_candidate_windows", type=Path)
+    parser.add_argument("--legacy-reconciliation-sam3-window-summary", "--sam3-window-summary", dest="legacy_reconciliation_sam3_window_summary", type=Path)
+    parser.add_argument("--legacy-reconciliation-video-quality-results", "--video-quality-results", dest="legacy_reconciliation_video_quality_results", type=Path)
+    parser.add_argument("--legacy-reconciliation-manual-review-labels", "--manual-review-labels", dest="legacy_reconciliation_manual_review_labels", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--formats",
+        nargs="+",
+        choices=("csv", "parquet", "xlsx", "markdown"),
+        default=["csv", "parquet", "xlsx", "markdown"],
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -88,82 +107,35 @@ def main() -> int:
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    assets, episode_to_asset = load_manifest(args.supplier_sample_manifest)
-    events: list[dict[str, Any]] = []
-    module_status: dict[str, dict[str, str]] = {
-        asset_id: default_module_statuses() for asset_id in assets
-    }
+    # Formal batch outputs are projections of the canonical QC JSON reports.
+    # Legacy detector artifacts are accepted only as reconciliation evidence;
+    # they are never fed into the verdict reducer below.
+    from tools.build_qc_json_projection import run_projection_cli
 
-    if args.precheck_clip_aggregates:
-        add_precheck_aggregates(
-            read_records(args.precheck_clip_aggregates),
-            args.precheck_clip_aggregates,
-            assets,
-            episode_to_asset,
-            module_status,
-            events,
-        )
-    if args.precheck_candidate_windows:
-        add_candidate_windows(
-            read_records(args.precheck_candidate_windows),
-            args.precheck_candidate_windows,
-            assets,
-            episode_to_asset,
-            module_status,
-            events,
-        )
-    if args.sam3_window_summary:
-        add_sam3_window_summaries(
-            read_records(args.sam3_window_summary),
-            args.sam3_window_summary,
-            assets,
-            episode_to_asset,
-            module_status,
-            events,
-        )
-    if args.video_quality_results:
-        add_video_quality(
-            read_records(args.video_quality_results),
-            args.video_quality_results,
-            assets,
-            episode_to_asset,
-            module_status,
-            events,
-        )
-    if args.manual_review_labels:
-        add_manual_review(
-            load_manual_review_records(args.manual_review_labels),
-            args.manual_review_labels,
-            assets,
-            episode_to_asset,
-            module_status,
-            events,
-        )
-
-    ledger_rows = build_ledger_rows(assets, module_status, events)
-    issue_frequency_rows = build_supplier_issue_frequency(assets, events)
-
-    ledger_df = pd.DataFrame(ledger_rows, columns=LEDGER_COLUMNS)
-    frequency_df = pd.DataFrame(issue_frequency_rows)
-    events_df = pd.DataFrame(events, columns=EVENT_COLUMNS)
-
-    ledger_csv = args.output_dir / "batch_qc_ledger.csv"
-    frequency_csv = args.output_dir / "supplier_issue_frequency.csv"
-    events_csv = args.output_dir / "issue_events.csv"
-    ledger_df.to_csv(ledger_csv, index=False)
-    frequency_df.to_csv(frequency_csv, index=False)
-    events_df.to_csv(events_csv, index=False)
-    ledger_parquet = write_dataframe(ledger_df, args.output_dir / "batch_qc_ledger.parquet")
-
-    report_path = args.output_dir / "batch_report.md"
-    report_path.write_text(
-        build_markdown_report(ledger_rows, issue_frequency_rows, events),
-        encoding="utf-8",
+    paths = run_projection_cli(
+        args.quality_archive,
+        args.output_dir,
+        formats=args.formats,
+        legacy_sidecars={
+            "manifest": args.supplier_sample_manifest,
+            "precheck_check_results": args.legacy_reconciliation_precheck_check_results,
+            "precheck_clip_aggregates": args.legacy_reconciliation_precheck_clip_aggregates,
+            "precheck_candidate_windows": args.legacy_reconciliation_candidate_windows,
+            "sam3_window_summary": args.legacy_reconciliation_sam3_window_summary,
+            "video_quality_results": args.legacy_reconciliation_video_quality_results,
+            "manual_review_labels": args.legacy_reconciliation_manual_review_labels,
+        },
     )
-    LOGGER.info("Wrote %s", ledger_csv)
-    LOGGER.info("Wrote %s", ledger_parquet)
-    LOGGER.info("Wrote %s", frequency_csv)
-    LOGGER.info("Wrote %s", report_path)
+    aliases = {
+        "asset_csv": "batch_qc_ledger.csv",
+        "asset_parquet": "batch_qc_ledger.parquet",
+        "issue_csv": "issue_events.csv",
+        "markdown": "batch_report.md",
+    }
+    for key, filename in aliases.items():
+        source = paths.get(key)
+        if source is not None and source.exists():
+            shutil.copyfile(source, args.output_dir / filename)
     return 0
 
 

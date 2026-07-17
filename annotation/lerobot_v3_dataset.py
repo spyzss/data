@@ -184,7 +184,9 @@ class LeRobotV3Dataset:
             keep_boundaries,
         )
         for subtask_index, start, end, frames in segment_samples:
-            subtask_text = self.subtask_info.get(subtask_index, {}).get("subtask", "")
+            subtask_text = self.subtask_info.get(
+                (actual_episode_idx, subtask_index), {}
+            ).get("description_en", "")
             label = f" ({subtask_text})" if subtask_text else ""
             logger.info(
                 "Episode %d: subtask %s%s frames [%d, %d] -> sampled %s",
@@ -289,8 +291,9 @@ class LeRobotV3Dataset:
                 "subtask_index": subtask_index,
                 "timestamp": timestamp,
             }
-            if subtask_index is not None and subtask_index in self.subtask_info:
-                metadata[frame_idx].update(self.subtask_info[subtask_index])
+            subtask_key = (actual_episode_idx, subtask_index)
+            if subtask_index is not None and subtask_key in self.subtask_info:
+                metadata[frame_idx].update(self.subtask_info[subtask_key])
 
         return metadata
 
@@ -319,7 +322,7 @@ class LeRobotV3Dataset:
             logger.warning("Could not read dataset fps from %s: %s", info_path, e)
             return None
 
-    def _load_subtask_info(self) -> dict[int, dict[str, Any]]:
+    def _load_subtask_info(self) -> dict[tuple[int, int], dict[str, Any]]:
         subtask_path = self.dataset_path / "meta" / "subtask.parquet"
         if not subtask_path.exists():
             return {}
@@ -328,13 +331,28 @@ class LeRobotV3Dataset:
         except Exception as e:
             logger.warning("Could not read subtask metadata from %s: %s", subtask_path, e)
             return {}
-        info: dict[int, dict[str, Any]] = {}
+        required = {
+            "episode_index",
+            "subtask_index",
+            "subtask_id",
+            "start_frame",
+            "end_frame_exclusive",
+            "description_cn",
+            "description_en",
+        }
+        if not required.issubset(df.columns):
+            logger.warning("Subtask metadata is missing official project fields")
+            return {}
+        info: dict[tuple[int, int], dict[str, Any]] = {}
         for _, row in df.iterrows():
+            episode_index = int(row["episode_index"])
             subtask_index = int(row["subtask_index"])
-            info[subtask_index] = {
-                "atomic_skill": str(row.get("atomic_skill", "")),
-                "subtask": str(row.get("subtask", "")),
-                "has_regrasp": bool(row.get("has_regrasp", False)),
+            info[(episode_index, subtask_index)] = {
+                "subtask_id": str(row["subtask_id"]),
+                "start_frame": int(row["start_frame"]),
+                "end_frame_exclusive": int(row["end_frame_exclusive"]),
+                "description_cn": str(row["description_cn"]),
+                "description_en": str(row["description_en"]),
             }
         return info
 
@@ -353,6 +371,11 @@ class LeRobotV3Dataset:
         field = self.instruction_config.get("instruction_field", "expand_task")
         if field in row.index and isinstance(row[field], str) and row[field].strip():
             return row[field].strip()
+        tasks = row.get("tasks")
+        if isinstance(tasks, (list, np.ndarray)) and len(tasks) == 1:
+            task = str(tasks[0]).strip()
+            if task:
+                return task
 
         default = self._fallback_instruction()
         logger.warning(
@@ -406,7 +429,10 @@ class LeRobotV3Dataset:
     ) -> dict[int, np.ndarray]:
         chunk_index = int(row[f"videos/{camera_name}/chunk_index"])
         file_index = int(row[f"videos/{camera_name}/file_index"])
-        start_index = int(row["dataset_from_index"])
+        from_timestamp_key = f"videos/{camera_name}/from_timestamp"
+        if from_timestamp_key not in row.index:
+            raise ValueError(f"Missing official video span field {from_timestamp_key}")
+        start_index = int(round(float(row[from_timestamp_key]) * float(self.dataset_fps)))
         video_path = (
             self.dataset_path
             / "videos"

@@ -1,0 +1,68 @@
+# Subagent Progress — unify-qc-dataflow
+
+- Execution mode: current branch, subagent-driven development, TDD, Thorough review
+- Plan: `docs/superpowers/plans/2026-07-14-unify-qc-dataflow.md`
+- Task 1: complete (`1041654`), TDD evidence in `.superpowers/sdd/task-1-report.md`
+- Task 2: complete (`65e568f`, fix `0124ca2`), focused `86 passed`, full suite `353 passed, 1 skipped`; TDD/fix evidence in `.superpowers/sdd/task-2-report.md`
+- OpenSpec checkoff: 1.1 complete
+- Review: Thorough combined Task 1–2 approved after fix round 1; no open findings
+- Task 3: complete (`e011b8f`, fix `7d70307`), focused `30 passed`, full suite `395 passed, 1 skipped`
+- Task 4: complete (`9000f12`, fix `122499d`), focused `15 passed`, targeted `42 passed`, full suite `398 passed, 1 skipped`
+- OpenSpec checkoff: 1.1, 1.2, 1.3 complete
+- Current phase: checkoff
+- Review: Thorough combined Task 3–4 approved after fix round 1; no open findings
+- Task 5: implemented (`8865f82`), focused/regression green, full suite `413 passed, 1 skipped`; awaiting Task 5–7 combined review
+- Task 6: implemented with concern (`5721967`), focused `26 passed`, smoke `20 passed`, full suite `423 passed, 1 skipped`; production delta ~320 lines, maintainability review required
+- Task 7: implemented (`7170bc9`), focused `18 passed`, relevant `105 passed`, full suite `429 passed, 1 skipped`; combined review requires fixes
+- Fix round 1: committed `359fd59`, focused `33 passed`, relevant `34 passed`, full suite `432 passed, 1 skipped`; production file net -4 lines
+- Task 5: complete (`8865f82`)
+- Task 6: complete (`5721967`, fix `359fd59`)
+- Task 7: complete (`7170bc9`)
+- OpenSpec checkoff: 1.1–1.3 and 2.1–2.3 complete
+- Current phase: checkoff
+- Review: Thorough combined Task 5–7 approved after fix round 1; no open findings
+- Task 8: implemented with concern (`8972b79`), focused `9 passed`, relevant `78 passed`, full suite `441 passed, 1 skipped`; production net +299 lines, maintainability review required
+- Task 9: implemented with concern (`53b22be`), focused `71 passed`, full suite `448 passed, 1 skipped`; production +539/-91, single write path, maintainability review required
+- Task 10: implemented with concern (`901fd1f`), focused `62 passed`, full suite `468 passed, 1 skipped`; combined review requires fixes
+- Review round 1 fixes: temporal `f3b9808`, SAM3 `18dfe77`, video readiness `60e5079`
+- Task 8 fix round 1 committed (`f3b9808`), focused `10 passed`, relevant `79 passed`, full suite `469 passed, 1 skipped`
+- Task 10 fix round 1 committed (`18dfe77`), focused `83 passed`, full suite `479 passed, 1 skipped`; adapter now 388 lines, maintainability re-review required
+- Task 9 fix round 2 committed (`6f3d25c`), focused `90 passed`, full suite `498 passed, 1 skipped`
+- Task 8: complete (`8972b79`, fix `f3b9808`)
+- Task 9: complete (`53b22be`, fixes `60e5079`, `6f3d25c`)
+- Task 10: complete (`901fd1f`, fix `18dfe77`)
+- OpenSpec checkoff: 1.1–1.3 and 2.1–2.6 complete
+- Current phase: checkoff
+- Review: Thorough combined Task 8–10 approved after final round 2; no open findings
+- Task 11: implemented with concern (`2415890`), focused `118 passed`, full suite `517 passed, 1 skipped`; disabled-leading custom config deferred to Task 13
+- Task 12: implemented (`3b137f6`), full suite `521 passed, 1 skipped`
+- Task 13: implemented with concern (`df7d777`), focused `60 passed`, full suite `532 passed, 1 skipped`; combined review requires fixes
+- Current phase: implementing fixes
+- Review round 1A: Task 13 CAS/error-schema fixes committed (`0bc30cf`), focused `87 passed`, full suite `543 passed, 1 skipped`; Task 11 context/report/batch isolation and Task 12 trailing-disabled reducer remain
+- Review round 1B: Task 11 isolation fixes committed (`375d39e`), focused `39 passed`, full suite `548 passed, 1 skipped`; malformed-report bytes preserved with in-memory structured error outcome
+- Review round 1C: Task 12 supplier reducer fix committed (`401d9ce`), focused `56 passed`, full suite `549 passed, 1 skipped`; module result gates now participate in final reduction
+- Review round: Task 11–13 round 1 — `review-11-13-round1-final.md` found one Important nested source_files JSON identity/serialization mismatch
+- Review round 2 fix: Task 11 JSON identity normalization committed (`f0a2ea2`), focused `58 passed`, full suite `550 passed, 1 skipped`; nested non-JSON source values rejected explicitly
+- Review round 2: final Thorough approval in `.superpowers/sdd/review-11-13-round2-final.md`; focused `95 passed`, full suite `551 passed, 1 skipped`, no Critical/Important findings; one out-of-contract nested non-string-key Minor noted
+- OpenSpec checkoff: 3.1–3.4 complete; plan Task 11–13 implementation steps checked
+- Task 14: complete (`ad2b500`, path hardening `164c0d9`, fix `e775638`), final Thorough review Ready in `.superpowers/sdd/review-task14-after-fix.md`; focused `20 passed`, full suite `561 passed, 1 skipped`, no findings
+- OpenSpec checkoff: 3.1–3.4 and 4.1 complete; plan Task 11–14 checked
+- Task 15: implemented (`4256d38`, compatibility aliases `6c459b7`), focused `7 passed`, Task14/Schema `54 passed`, full suite `568 passed, 1 skipped`; awaiting Thorough review
+- Task 15: complete; final Thorough review Ready in `.superpowers/sdd/review-task15-final-v2.md`, focused `54 passed`, full suite `568 passed, 1 skipped`, no findings
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.2 complete; plan Task 11–15 checked
+- Task 16: complete (`3ec76de`, `64a19bd`, `453de8a`, `e36f4ff`, `1309646`, `a2fac14`, `de0fbe7`, `facb92b`, `7365e8d`), focused `87 passed`, full suite `585 passed, 1 skipped`; formal weekly/XJGT aliases and direct CLI entrypoints verified
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.3 complete
+- Review: final Task16 Thorough verification complete; no Critical/Important findings after direct projection CLI fix
+- Task 17: complete (`8f2211f`, fixes `141b60c`, `7651e7d`), focused `21 passed`, full suite `594 passed, 1 skipped`; cache generation barriers, table hashes, manifest validation, corruption/stale rebuild and direct CLI verified
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.4 complete
+- Review: Task17 final Thorough approval Ready; no Critical/Important findings
+- Task 18: complete (`3a815f7`), docs contract `2 passed`, `openspec validate --strict` passed; PRD/Schema/reviewer/migration docs now match v2 profiles and canonical archive flow
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.4, 5.1 complete
+- Task 19: complete (`7c46e4d`), focused `4 passed`, report/orchestrator regression `62 passed`, full suite `600 passed, 1 skipped`; persisted revision golden covers pass/warn/hard-fail/runtime-error
+- Task 20: complete (`a6798cb`), focused `5 passed`, E2E/orchestrator/aggregate `51 passed`, full suite `605 passed, 1 skipped`; same-batch profile flow/coverage and sibling isolation verified
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.4, 5.1–5.3 complete
+- Review: combined Task19–20 Thorough approval Ready; no Critical/Important findings
+- Task 21: complete (`74e32f1`, review fixes `fae01be`, docs/CAS follow-up `4b9d9a6`), focused migration+entrypoints `11 passed`, full suite `607 passed, 1 skipped`; migration reconciliation is read-only, legacy rows identify `asset_qc_json` as authoritative, and docs include explicit v1 CAS promotion plus formal/compatibility validation split
+- OpenSpec checkoff: 3.1–3.4, 4.1–4.4, 5.1–5.4 complete
+- Review: final Task21 Thorough approval Ready; no Critical/Important findings; `openspec validate --strict` and `git diff --check` passed
+- Current phase: complete

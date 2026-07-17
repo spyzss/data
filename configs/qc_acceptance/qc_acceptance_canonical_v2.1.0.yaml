@@ -1,0 +1,632 @@
+schema_version: qc_acceptance_config_schema.v2
+config_version: qc_acceptance_v2.1.0
+config_name: acceptance_gate
+execution_profiles:
+  acceptance:
+    fail_action: stop
+    runtime_error_action: stop_incomplete
+  supplier_evaluation:
+    fail_action: record_and_continue
+    runtime_error_action: stop_incomplete
+pipeline:
+  default_profile: acceptance
+  terminal_module: batch_statistics
+  modules:
+  - hdf5_text_info
+  - quality_hand
+  - keypoint_presence
+  - keypoint_morphology
+  - keypoint_temporal
+  - video_quality
+  - sam3_containment
+  - semantic_consistency
+  - manual_review
+  - duplicate_check
+  - content_validity
+  - effective_duration
+modules:
+  hdf5_text_info:
+    enabled: true
+    implementation: precheck.hdf5_text_info
+    parameters:
+      source_check_alias: text_integrity
+      required_fields:
+      - scene
+      - task
+      required_any_text_field:
+      - text_label
+      - text_en
+      optional_fields:
+      - action
+      - subtask
+      fail_on_missing_required_field: true
+    rules:
+      missing_required_field:
+        rule_id: hdf5_text.missing_required_field
+        verdict: fail
+      missing_text_field:
+        rule_id: hdf5_text.missing_text_field
+        verdict: fail
+  quality_hand:
+    enabled: true
+    implementation: precheck.quality_hand
+    parameters:
+      source_check_alias:
+      - quality_score
+      - label.quality_hand
+      evidence_contract:
+        status_values:
+        - bad
+        - warning
+        - good
+        - unknown
+        numeric_inference: forbidden
+      legacy_numeric_contract:
+        expected_shape:
+        - 2
+        valid_values:
+        - 0
+        - 1
+        low_quality_hand_value: 0
+        mode: warn_unless_both_hands_low_quality
+      pass_threshold: 0.9
+    rules:
+      invalid_quality_hand_shape:
+        rule_id: quality_hand.invalid_shape
+        verdict: fail
+      invalid_quality_hand_value:
+        rule_id: quality_hand.invalid_value
+        verdict: fail
+      low_quality_single_hand:
+        rule_id: quality_hand.single_hand_low_quality
+        verdict: warn
+      low_quality_both_hands:
+        rule_id: quality_hand.both_hands_low_quality
+        verdict: fail
+  keypoint_presence:
+    enabled: true
+    implementation: precheck.keypoint_presence
+    parameters:
+      source_check_alias: keypoint_missing
+      sides:
+      - left
+      - right
+      joint_names: null
+      fps: null
+      expected_keypoints_per_hand: 21
+      min_valid_points_per_hand_warn: 18
+      min_valid_points_per_hand_fail: 8
+      missing_frame_ratio_warn: 0.05
+      missing_frame_ratio_fail: 0.2
+      window_seconds: 10.0
+      allowed_missing_seconds: 1.0
+      nan_or_inf_fail: true
+    rules:
+      missing_keypoint_field:
+        rule_id: keypoint_presence.missing_keypoint_field
+        verdict: fail
+      too_few_valid_points:
+        rule_id: keypoint_presence.too_few_valid_points
+        warn_metric: min_valid_points_per_hand_warn
+        fail_metric: min_valid_points_per_hand_fail
+      high_missing_frame_ratio:
+        rule_id: keypoint_presence.high_missing_frame_ratio
+        warn_metric: missing_frame_ratio_warn
+        fail_metric: missing_frame_ratio_fail
+      nan_or_inf:
+        rule_id: keypoint_presence.nan_or_inf
+        verdict: fail
+  keypoint_morphology:
+    enabled: true
+    implementation: precheck.keypoint_morphology
+    parameters:
+      source_check_alias: keypoint_morphology
+      method: static_per_frame_21_point_hand_geometry
+      sides:
+      - left
+      - right
+      duplicate_joint_distance_m: 1.0e-05
+      min_palm_scale_m: 0.0001
+      max_bone_length_ratio_spread_review: 3.0
+      max_bone_length_ratio_spread_fail: 8.0
+      max_normalized_bone_length_review: 3.0
+      max_normalized_bone_length_fail: 6.0
+      max_zero_length_bone_count_review: 1
+      max_zero_length_bone_count_fail: 2
+      max_duplicate_joint_pair_count_review: 1
+      max_duplicate_joint_pair_count_fail: 3
+      min_joint_angle_deg_review: 5.0
+      min_joint_angle_deg_fail: 1.0
+      max_joint_angle_violation_fraction_review: 0.15
+      max_joint_angle_violation_fraction_fail: 0.4
+      not_applicable_when_keypoints_incomplete: true
+      review_maps_to_json_warn: true
+    rules:
+      palm_scale_too_small:
+        rule_id: keypoint_morphology.palm_scale_too_small
+        verdict: fail
+      bone_length_ratio_spread:
+        rule_id: keypoint_morphology.bone_length_ratio_spread
+        review_metric: max_bone_length_ratio_spread_review
+        fail_metric: max_bone_length_ratio_spread_fail
+      max_normalized_bone_length:
+        rule_id: keypoint_morphology.max_normalized_bone_length
+        review_metric: max_normalized_bone_length_review
+        fail_metric: max_normalized_bone_length_fail
+      zero_length_bone_count:
+        rule_id: keypoint_morphology.zero_length_bone_count
+        review_metric: max_zero_length_bone_count_review
+        fail_metric: max_zero_length_bone_count_fail
+      duplicate_joint_pair_count:
+        rule_id: keypoint_morphology.duplicate_joint_pair_count
+        review_metric: max_duplicate_joint_pair_count_review
+        fail_metric: max_duplicate_joint_pair_count_fail
+      collapsed_finger_count:
+        rule_id: keypoint_morphology.collapsed_finger_count
+        review_verdict: warn
+        severe_verdict: fail
+      joint_angle_min_deg:
+        rule_id: keypoint_morphology.joint_angle_min_deg
+        review_metric: min_joint_angle_deg_review
+        fail_metric: min_joint_angle_deg_fail
+      joint_angle_violation_fraction:
+        rule_id: keypoint_morphology.joint_angle_violation_fraction
+        review_metric: max_joint_angle_violation_fraction_review
+        fail_metric: max_joint_angle_violation_fraction_fail
+  keypoint_temporal:
+    enabled: true
+    implementation: precheck.keypoint_temporal
+    parameters:
+      source_check_alias:
+      - keypoint_temporal
+      - skeleton_quality_score
+      - composite_frame_verdict
+      sides:
+      - left
+      - right
+      joint_names: null
+      fps: null
+      project_2d: true
+      min_angle_degrees: 5.0
+      max_angle_degrees: 175.0
+      decision_mode: any_threshold
+      joint_angle_change_deg_max_threshold: 10.0
+      rotation_delta_max_threshold: 0.45
+      joint_acceleration_m_s2_max_threshold: 15.0
+      joint_displacement_m_max_threshold: 0.05
+      hard_exceeded_metric_count: 3
+      strong_acceleration_ratio: 2.5
+      strong_displacement_ratio: 1.8
+      rotation_mask_review_ratio: 1.0
+      rotation_delta_extreme_review_threshold: null
+      palm_camera_angle_review_threshold_deg: null
+      palm_camera_axis:
+      - 0.0
+      - 0.0
+      - 1.0
+      palm_camera_angle_min_valid_hands: 1
+      promote_sustained_review: false
+      sustained_review_min_frames: 6
+      reject_missing_keypoints: true
+      reject_low_quality_hand: false
+      allowed_missing_keypoints_per_hand: 0
+      projection_enabled: true
+      projection_image_width: null
+      projection_image_height: null
+      projection_fx: null
+      projection_fy: null
+      projection_cx: null
+      projection_cy: null
+      projection_border_margin_px: 20.0
+      projection_near_border_count_threshold: 6
+      projection_outside_count_threshold: 1
+      projection_center_jump_px_threshold: 120.0
+      projection_bbox_area_change_ratio_threshold: 3.0
+      candidate_gap_close_frames: 2
+      candidate_min_seed_run_frames: 3
+      candidate_pre_context_frames: 10
+      candidate_post_context_frames: 10
+      candidate_merge_overlapping_only: true
+      pass_threshold: 0.9
+    rules:
+      composite_frame_verdict:
+        rule_id: keypoint_temporal.composite_frame_verdict
+        verdict: warn
+      skeleton_quality_score:
+        rule_id: keypoint_temporal.skeleton_quality_score
+        verdict: warn
+      projection_review:
+        rule_id: keypoint_temporal.projection_review
+        verdict: warn
+      strong_temporal_failure:
+        rule_id: keypoint_temporal.strong_temporal_failure
+        verdict: fail
+  video_quality:
+    enabled: true
+    implementation: video_quality.unified
+    source_check_alias: video_prefilter
+    module_version: video_prefilter_v0.3.2
+    decision_passthrough: true
+    hard_fail_blocks_next_qc: true
+    note: 'Video QC should stop writing per-module thresholds into asset JSON. It should write only metric
+      values, rule_id, and top-level qc_config version.
+
+      '
+    parameters:
+      pipeline:
+        stop_before_mask_if_fail: true
+        do_keypoint_quality_check: false
+        do_keypoint_mask_matching: false
+        do_keypoint_temporal_check: false
+      fps:
+        expected_fps: null
+        min_fps_pass: 24.0
+        min_fps_warn: 20.0
+        min_fps_fail: 20.0
+      resolution:
+        exact_resolution_required: false
+        use_display_size_after_rotation: true
+        min_short_side_fail: 720
+        min_long_side_fail: 1280
+        min_short_side_warn: 720
+        min_long_side_warn: 1280
+      timeline:
+        use_actual_fps: true
+        drop_interval_factor: 1.35
+        drop_interval_extra_ms: 10.0
+        drop_frame_ratio_pass: 0.05
+        drop_frame_ratio_warn: 0.1
+        max_gap_factor: 3.0
+        max_gap_floor_ms: 100.0
+        pts_monotonic_required: true
+      decode:
+        sample_decode_ratio_pass: 0.995
+        sample_decode_ratio_warn: 0.98
+        max_sample_frames: 300
+        sample_interval_sec: 0.5
+        include_head_tail_frames: 10
+      exposure:
+        black:
+          mean_y_max: 10.0
+          dark_pixel_ratio_min: 0.98
+          ratio_pass: 0.01
+          ratio_warn: 0.9
+          max_frame_count_fail: 10
+        over_dark:
+          mean_y_max: 35.0
+          dark_pixel_ratio_min: 0.75
+          ratio_pass: 0.05
+          ratio_warn: 0.9
+        over_exposed:
+          mean_y_min: 235.0
+          over_exposed_pixel_ratio_min: 0.35
+          ratio_pass: 0.05
+          ratio_warn: 0.9
+      sharpness_global:
+        normalize_before_compute: true
+        target_short_side: 720
+        no_upscale: true
+        laplacian_p10_pass: 15.0
+        laplacian_p10_warn: 0.0
+        laplacian_median_pass: 20.0
+        laplacian_median_warn: 0.0
+        laplacian_under_100_ratio_pass: 1.0
+        laplacian_under_100_ratio_warn: 1.0
+        tenengrad_p10_pass: 6.0
+        tenengrad_p10_warn: 4.0
+        tenengrad_median_pass: 7.0
+        tenengrad_median_warn: 4.0
+      freeze:
+        enabled: true
+        downscale_short_side: 360
+        frame_diff_mean_abs_max: 1.0
+        hist_diff_max: 0.01
+        ssim_min: 0.995
+        phash_hamming_max: 4
+        freeze_candidate_window_sec: 0.5
+        confirmed_freeze_window_sec: 1.0
+        adjacent_near_duplicate_ratio_warn: 0.9
+        frozen_frame_ratio_pass: 0.05
+        frozen_frame_ratio_warn: 0.1
+        min_interval_frames: 6
+        min_interval_duration_ms: 100.0
+        max_consecutive_frozen_sec_pass: 0.5
+        max_consecutive_frozen_sec_fail: 1.0
+        motion_conflict_enabled: true
+        motion_keypoint_delta_normalized_min: 0.02
+        motion_keypoint_delta_px_min: 12.0
+        motion_numeric_delta_min: 0.01
+        critical_window_enabled: true
+        critical_window_keywords:
+        - grasp
+        - place
+        - contact
+        - hand-object
+        - hand object
+        - interaction
+        - 抓取
+        - 放置
+        - 接触
+        - 交互
+        critical_window_interval_duration_ms_fail: 100.0
+        video_state_conflict_noncritical_duration_ms_fail: 1000.0
+        video_state_conflict_critical_duration_ms_fail: 500.0
+      defects:
+        max_duration_ratio_fail: 0.1
+        duration_ratio_warn: 0.05
+      hdf5_alignment:
+        enabled: true
+        mode: fail
+        max_delta_frames_pass: 2
+        max_delta_frames_warn: 5
+        max_delta_ratio_pass: 0.001
+        max_delta_ratio_warn: 0.005
+    rules:
+      video_not_opened:
+        rule_id: video_quality.video_not_opened
+        verdict: fail
+      cannot_open_video:
+        rule_id: video_quality.cannot_open_video
+        verdict: fail
+      video_stream_missing:
+        rule_id: video_quality.video_stream_missing
+        verdict: fail
+      codec_unreadable:
+        rule_id: video_quality.codec_unreadable
+        verdict: fail
+      metadata_unreadable:
+        rule_id: video_quality.metadata_unreadable
+        verdict: fail
+      fps_below_min:
+        rule_id: video_quality.fps_below_min
+        verdict: fail
+      fps_below_pass:
+        rule_id: video_quality.fps_below_pass
+        verdict: warn
+      fps_below_expected:
+        rule_id: video_quality.fps_below_expected
+        verdict: warn
+      short_side_below_min:
+        rule_id: video_quality.short_side_below_min
+        verdict: fail
+      long_side_below_min:
+        rule_id: video_quality.long_side_below_min
+        verdict: fail
+      pts_monotonic_invalid:
+        rule_id: video_quality.pts_monotonic_invalid
+        verdict: fail
+      drop_frame_ratio_above_max:
+        rule_id: video_quality.drop_frame_ratio_above_max
+        verdict: fail
+      drop_frame_ratio_warn:
+        rule_id: video_quality.drop_frame_ratio_warn
+        verdict: warn
+      frame_interval_p99_ms_above_max:
+        rule_id: video_quality.frame_interval_p99_ms_above_max
+        verdict: fail
+      frame_interval_p99_ms_warn:
+        rule_id: video_quality.frame_interval_p99_ms_warn
+        verdict: warn
+      max_frame_gap_ms_above_max:
+        rule_id: video_quality.max_frame_gap_ms_above_max
+        verdict: fail
+      sample_decode_ratio_below_min:
+        rule_id: video_quality.sample_decode_ratio_below_min
+        verdict: fail
+      sample_decode_ratio_warn:
+        rule_id: video_quality.sample_decode_ratio_warn
+        verdict: warn
+      black_frame_ratio_above_max:
+        rule_id: video_quality.black_frame_ratio_above_max
+        verdict: fail
+      black_frame_ratio_warn:
+        rule_id: video_quality.black_frame_ratio_warn
+        verdict: warn
+      black_frame_count_above_max:
+        rule_id: video_quality.black_frame_count_above_max
+        verdict: fail
+      defect_duration_ratio_above_max:
+        rule_id: video_quality.defect_duration_ratio_above_max
+        verdict: fail
+      defect_duration_ratio_warn:
+        rule_id: video_quality.defect_duration_ratio_warn
+        verdict: warn
+      mean_over_dark_ratio_above_max:
+        rule_id: video_quality.mean_over_dark_ratio_above_max
+        verdict: fail
+      mean_over_dark_ratio_warn:
+        rule_id: video_quality.mean_over_dark_ratio_warn
+        verdict: warn
+      mean_over_exposed_ratio_above_max:
+        rule_id: video_quality.mean_over_exposed_ratio_above_max
+        verdict: fail
+      mean_over_exposed_ratio_warn:
+        rule_id: video_quality.mean_over_exposed_ratio_warn
+        verdict: warn
+      laplacian_p10_below_min:
+        rule_id: video_quality.laplacian_p10_below_min
+        verdict: fail
+      laplacian_p10_warn:
+        rule_id: video_quality.laplacian_p10_warn
+        verdict: warn
+      laplacian_median_below_min:
+        rule_id: video_quality.laplacian_median_below_min
+        verdict: fail
+      laplacian_median_warn:
+        rule_id: video_quality.laplacian_median_warn
+        verdict: warn
+      laplacian_under_100_ratio_above_max:
+        rule_id: video_quality.laplacian_under_100_ratio_above_max
+        verdict: fail
+      laplacian_under_100_ratio_warn:
+        rule_id: video_quality.laplacian_under_100_ratio_warn
+        verdict: warn
+      tenengrad_p10_below_min:
+        rule_id: video_quality.tenengrad_p10_below_min
+        verdict: fail
+      tenengrad_p10_warn:
+        rule_id: video_quality.tenengrad_p10_warn
+        verdict: warn
+      tenengrad_median_below_min:
+        rule_id: video_quality.tenengrad_median_below_min
+        verdict: fail
+      tenengrad_median_warn:
+        rule_id: video_quality.tenengrad_median_warn
+        verdict: warn
+      adjacent_near_duplicate_ratio_warn:
+        rule_id: video_quality.adjacent_near_duplicate_ratio_warn
+        verdict: warn
+      frozen_frame_ratio_above_max:
+        rule_id: video_quality.frozen_frame_ratio_above_max
+        verdict: fail
+      frozen_frame_ratio_warn:
+        rule_id: video_quality.frozen_frame_ratio_warn
+        verdict: warn
+      max_consecutive_frozen_sec_above_max:
+        rule_id: video_quality.max_consecutive_frozen_sec_above_max
+        verdict: fail
+      max_consecutive_frozen_sec_warn:
+        rule_id: video_quality.max_consecutive_frozen_sec_warn
+        verdict: warn
+      video_state_conflict:
+        rule_id: video_quality.video_state_conflict
+        verdict: fail
+      video_state_conflict_warn:
+        rule_id: video_quality.video_state_conflict_warn
+        verdict: warn
+      hdf5_missing:
+        rule_id: video_quality.hdf5_missing
+        verdict: configured_by_hdf5_alignment_mode
+      hdf5_unreadable:
+        rule_id: video_quality.hdf5_unreadable
+        verdict: configured_by_hdf5_alignment_mode
+      hdf5_frame_count_mismatch:
+        rule_id: video_quality.hdf5_frame_count_mismatch
+        verdict: fail
+      hdf5_frame_count_mismatch_warn:
+        rule_id: video_quality.hdf5_frame_count_mismatch_warn
+        verdict: warn
+      no_sample_frames_decoded:
+        rule_id: video_quality.no_sample_frames_decoded
+        verdict: fail
+  sam3_containment:
+    enabled: true
+    implementation: sam3_containment.manifest
+    parameters:
+      source_check_alias:
+      - mask_containment
+      - sam3_containment
+      sides:
+      - left
+      - right
+      joint_names: null
+      inside_ratio_warn: 0.6
+      inside_ratio_fail: 0.2
+      abnormal_inside_ratio_threshold: 1.0
+      projected_in_image_ratio_threshold: 0.8
+      strong_inside_ratio_threshold: 0.2
+      acceptable_inside_ratio_threshold: 0.6
+      mask_tiny_area_ratio_threshold: 0.0
+      fail_min_strong_frames: 3
+      fail_strong_frame_ratio: 0.6
+      max_projection_error_px_warn: 5
+      max_projection_error_px_fail: 20
+      side_view_warn_only: true
+    rules:
+      strong_containment_mismatch:
+        rule_id: sam3_containment.strong_containment_mismatch
+        verdict: fail
+      side_view_manual_review:
+        rule_id: sam3_containment.side_view_manual_review
+        verdict: warn
+      projection_review:
+        rule_id: sam3_containment.projection_review
+        verdict: warn
+      supplier_mask_disagreement:
+        rule_id: sam3_containment.supplier_mask_disagreement
+        verdict: warn
+  semantic_consistency:
+    enabled: true
+    execution_kind: external
+    parameters:
+      object_match_score_warn: 0.6
+      object_match_score_fail: 0.3
+      action_match_score_warn: 0.6
+      action_match_score_fail: 0.3
+      model_name: configured_by_runtime
+      prompt_version: semantic_consistency_v1
+    rules:
+      object_mismatch:
+        rule_id: semantic_consistency.object_mismatch
+        warn_metric: object_match_score_warn
+        fail_metric: object_match_score_fail
+      action_mismatch:
+        rule_id: semantic_consistency.action_mismatch
+        warn_metric: action_match_score_warn
+        fail_metric: action_match_score_fail
+  manual_review:
+    enabled: true
+    execution_kind: external
+    parameters:
+      selection_policy: config_driven_from_warn_candidates
+      required_for_warn_issue_types:
+      - keypoint_static_morphology_abnormal
+      - keypoint_duplicate_or_collapsed
+      - keypoint_joint_angle_abnormal
+      - temporal_jump
+      - mask_projection_mismatch
+      - semantic_mismatch
+      pass_sample_enabled: true
+      max_pass_samples_per_supplier: 10
+      confirm_fail_labels:
+      - true_positive
+      - partial
+      - false_negative
+      acceptable_labels:
+      - false_positive
+      - acceptable_flagged
+    rules: {}
+  duplicate_check:
+    enabled: false
+    disabled_reason: no_registered_implementation
+    parameters:
+      video_similarity_warn: 0.92
+      video_similarity_fail: 0.98
+      time_overlap_ratio_fail: 0.9
+      exact_hash_duplicate_fail: true
+    rules:
+      exact_hash_duplicate:
+        rule_id: duplicate_check.exact_hash_duplicate
+        verdict: fail
+      high_similarity_duplicate:
+        rule_id: duplicate_check.high_similarity_duplicate
+        warn_metric: video_similarity_warn
+        fail_metric: video_similarity_fail
+  content_validity:
+    enabled: false
+    disabled_reason: no_registered_implementation
+    parameters:
+      invalid_content_duration_sec_warn: 1.0
+      invalid_content_ratio_fail: 0.9
+      no_action_duration_sec_warn: 1.0
+      no_hand_visible_duration_sec_warn: 1.0
+    rules:
+      invalid_content_segment:
+        rule_id: content_validity.invalid_content_segment
+        verdict: warn
+      mostly_invalid_content:
+        rule_id: content_validity.mostly_invalid_content
+        verdict: fail
+  effective_duration:
+    enabled: false
+    disabled_reason: no_registered_implementation
+    parameters:
+      effective_duration_sec_fail: 0.0
+      effective_ratio_warn: 0.8
+    rules:
+      no_effective_duration:
+        rule_id: effective_duration.no_effective_duration
+        verdict: fail
+      low_effective_ratio:
+        rule_id: effective_duration.low_effective_ratio
+        verdict: warn

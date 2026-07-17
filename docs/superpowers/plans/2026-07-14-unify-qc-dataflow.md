@@ -2,6 +2,7 @@
 change: unify-qc-dataflow
 design-doc: docs/superpowers/specs/2026-07-14-unify-qc-dataflow-design.md
 base-ref: 44ee01f5221a00343e48046bfb477889a82a68cc
+archived-with: 2026-07-16-unify-qc-dataflow
 ---
 
 # 统一 QC 数据流实施计划
@@ -31,6 +32,7 @@ base-ref: 44ee01f5221a00343e48046bfb477889a82a68cc
 - 正式批次决策与统计只遍历 `quality_archive/*.json`；sidecar 仅用于算法回归、证据展示和迁移对账。
 - 每项任务遵循 TDD：先添加精确失败测试，确认失败原因，再写最小实现、运行相关回归并单独提交。
 
+archived-with: 2026-07-16-unify-qc-dataflow
 ---
 
 ## 文件结构与职责
@@ -960,7 +962,7 @@ git commit -m "feat(qc): adapt sam3 containment evidence"
 - Produces: `build_default_registry(context: AssetContext, config: LoadedQcConfig, *, segmenter_factory: Callable | None = None) -> ModuleRegistry`，注册五个 precheck、统一 video 与 SAM3 runner；每个资产 worker 构建独立 registry。
 - Produces: `run_asset(context: AssetContext, *, config: LoadedQcConfig, profile: str, registry: ModuleRegistry, now: Callable[[], str] = utc_now) -> RunOutcome`。
 
-- [ ] **Step 1: 添加顺序、恢复、external pause 和 Config drift 测试**
+- [x] **Step 1: 添加顺序、恢复、external pause 和 Config drift 测试**
 
 ```python
 def test_orchestrator_resumes_from_next_module(tmp_path: Path) -> None:
@@ -980,13 +982,13 @@ def test_asset_context_rejects_report_outside_batch(tmp_path: Path) -> None:
         AssetContext("a", tmp_path / "batch", tmp_path / "outside.json", {}, None, {})
 ```
 
-- [ ] **Step 2: 运行测试并确认 orchestrator/registry 缺失**
+- [x] **Step 2: 运行测试并确认 orchestrator/registry 缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_pipeline.orchestrator'`。
 
-- [ ] **Step 3: 实现 registry 与恢复循环**
+- [x] **Step 3: 实现 registry 与恢复循环**
 
 ```python
 def run_asset(context, *, config, profile, registry, now=utc_now):
@@ -1016,13 +1018,13 @@ CLI 必须接受 `--batch-root`、`--manifest`、`--profile {acceptance,supplier
 
 `build_default_registry()` 的注册必须是实际 detector 调用，不是 sidecar reader：precheck runner 由 `precheck_config_from_unified()` 构造并将 CheckResult 交给 Tasks 5–8 adapter；video runner 调用 `analyze_video`/`analyze_video_frame_range` 后交给 Task 9 adapter；SAM3 runner 调用 manifest containment producer 后交给 Task 10 adapter。runner 只返回 `ModuleResult`，不得自行决定 next module 或 overall decision。
 
-- [ ] **Step 4: 运行 orchestrator、Config 与 mutation 测试**
+- [x] **Step 4: 运行 orchestrator、Config 与 mutation 测试**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py tests/test_qc_config_v2.py tests/test_report_mutation.py -q`
 
 Expected: PASS；恢复点来自 `next_module`，external 阶段不会被自动执行。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_common/module_registry.py qc_pipeline/context.py qc_pipeline/orchestrator.py tools/run_qc_pipeline.py tests/test_qc_orchestrator.py
@@ -1041,7 +1043,7 @@ git commit -m "feat(qc): add resumable asset orchestrator"
 - Produces: 相同 `ModuleResult.verdict="fail"` 在 acceptance 生成 `exit_gate.state="stop_qc"`，在 supplier evaluation 生成 `exit_gate.state="continue"` 与 `continued_after_fail=True`。
 - Produces: `mark_remaining_skipped_due_to_fail(report, modules, *, failed_module) -> dict[str, Any]`。
 
-- [ ] **Step 1: 添加同输入双 profile 状态轨迹测试**
+- [x] **Step 1: 添加同输入双 profile 状态轨迹测试**
 
 ```python
 def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
@@ -1059,13 +1061,13 @@ def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
     assert supplier["pipeline_state"]["status"] == "awaiting_external"
 ```
 
-- [ ] **Step 2: 运行双 profile 测试并确认 supplier 被错误截断**
+- [x] **Step 2: 运行双 profile 测试并确认 supplier 被错误截断**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py -k profiles -q`
 
 Expected: FAIL，supplier report 在 video fail 后没有执行 SAM3。
 
-- [ ] **Step 3: 将机器 verdict 与 exit action 分离**
+- [x] **Step 3: 将机器 verdict 与 exit action 分离**
 
 ```python
 profile_config = config.execution_profile(profile)
@@ -1076,13 +1078,13 @@ continued_after_fail = result.verdict == "fail" and not stop
 
 Acceptance 截断时 `pipeline_state={status: stopped, last_completed_module: failed_module, next_module: None, stop_reason: hard_fail}`、`overall_decision=fail`、`manual_review.state=skipped_due_to_fail`，并在 `execution.module_states` 给所有后续模块记录 `skipped_due_to_fail`。Supplier 模式保留 fail issue/candidate 统计引用，在每个相关 module runtime 写 `continued_after_fail: true`，到 external 阶段才暂停，最终依赖人工阶段完成后仍必须因自动 fail 得到 fail。
 
-- [ ] **Step 4: 验证双 profile 与稳定 issue 一致**
+- [x] **Step 4: 验证双 profile 与稳定 issue 一致**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py tests/test_report_mutation.py -q`
 
 Expected: PASS；两个 profile 的机器 issue ID、result verdict 相同，仅 exit/action/coverage 不同。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_pipeline/orchestrator.py qc_common/report_mutation.py tests/test_qc_orchestrator.py
@@ -1103,7 +1105,7 @@ git commit -m "feat(qc): apply dual execution profiles"
 - Produces: `record_runtime_error(path, *, module, error_type, message, expected_revision, context, config, profile, now) -> dict[str, Any]`。
 - Report `execution.module_states[module].state` 枚举：`completed|disabled|skipped|not_implemented|runtime_error|awaiting_external|skipped_due_to_fail`。
 
-- [ ] **Step 1: 添加四类状态与 runtime error 非质量结论测试**
+- [x] **Step 1: 添加四类状态与 runtime error 非质量结论测试**
 
 ```python
 def test_enabled_unregistered_module_is_error_not_pass(tmp_path: Path) -> None:
@@ -1119,13 +1121,13 @@ def test_disabled_module_is_recorded_without_module_pass_block(tmp_path: Path) -
     assert "effective_duration" not in report
 ```
 
-- [ ] **Step 2: 运行测试并确认状态混淆**
+- [x] **Step 2: 运行测试并确认状态混淆**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py -k "unregistered or disabled or runtime" -q`
 
 Expected: FAIL，缺少结构化 `module_states`/`runtime_errors`。
 
-- [ ] **Step 3: 实现结构化运行错误路径**
+- [x] **Step 3: 实现结构化运行错误路径**
 
 ```python
 runtime_error = {
@@ -1142,13 +1144,13 @@ report["overall_decision"] = None
 
 Disabled 模块只写 `module_states`；上游 skip 写 `skipped`；enabled 但 registry 缺失写 `not_implemented` + runtime error；runner exception、输入缺失、evidence/sidecar 写失败写 `runtime_error`。单资产异常由 batch worker 捕获并返回 error outcome，不取消其他 asset future。
 
-- [ ] **Step 4: 运行状态机、Schema 和批次隔离测试**
+- [x] **Step 4: 运行状态机、Schema 和批次隔离测试**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_orchestrator.py tests/test_asset_qc_schema_v2.py -q`
 
 Expected: PASS；所有 error report 的 decision 为 null，disabled/unavailable 不产生 module pass block。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_common/contracts.py qc_common/module_registry.py qc_common/report_mutation.py qc_pipeline/orchestrator.py tests/test_qc_orchestrator.py
@@ -1169,7 +1171,7 @@ git commit -m "feat(qc): separate runtime and quality states"
 - Produces: `project_warn_review_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]`。
 - Formal CLI: `python -m tools.build_manual_review_queue --quality-archive <dir> --output-dir <dir>`；旧 sidecar 参数保留为显式 `--legacy-*` 对账路径，不得成为默认。
 
-- [ ] **Step 1: 添加仅 warn 入队、all-pass/auto-fail 不入队测试**
+- [x] **Step 1: 添加仅 warn 入队、all-pass/auto-fail 不入队测试**
 
 ```python
 def test_review_queue_comes_only_from_candidate_issue_ids(tmp_path: Path) -> None:
@@ -1182,13 +1184,13 @@ def test_review_queue_comes_only_from_candidate_issue_ids(tmp_path: Path) -> Non
     assert rows[0]["window_end_frame"] == 20
 ```
 
-- [ ] **Step 2: 运行测试并确认投影模块缺失**
+- [x] **Step 2: 运行测试并确认投影模块缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_json_review_queue.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_reporting'`。
 
-- [ ] **Step 3: 实现候选 ID join 与正式 CLI**
+- [x] **Step 3: 实现候选 ID join 与正式 CLI**
 
 ```python
 def project_warn_review_rows(report):
@@ -1205,13 +1207,13 @@ def project_warn_review_rows(report):
 
 行必须包含 stable `review_id=issue_id`、supplier/asset、module/rule/reason、source-inclusive start/end、hand、machine verdict、metrics JSON、evidence/overlay 相对路径；禁止 pass-sample 抽样。候选引用不存在、重复或指向 fail 时整个资产投影失败并报 JSON path。
 
-- [ ] **Step 4: 运行新旧队列回归**
+- [x] **Step 4: 运行新旧队列回归**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_json_review_queue.py tests/test_manual_review_queue.py -q`
 
 Expected: PASS；新入口只读 QC JSON，旧 sidecar helper 仍可用于迁移对账测试。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_reporting/__init__.py qc_reporting/projection.py tools/build_manual_review_queue.py tests/test_qc_json_review_queue.py tests/test_manual_review_queue.py
@@ -1231,7 +1233,7 @@ git commit -m "feat(qc): project warn queue from asset reports"
 - Produces: `project_quality_archive(path: Path) -> BatchProjection`。
 - Produces: `aggregate_projection(projection: BatchProjection) -> dict[str, Any]`，顶层含 `overall` 与 `by_profile`。
 
-- [ ] **Step 1: 添加资产/issue 去重和 profile 隔离统计测试**
+- [x] **Step 1: 添加资产/issue 去重和 profile 隔离统计测试**
 
 ```python
 def test_aggregation_counts_assets_and_issues_separately(tmp_path: Path) -> None:
@@ -1247,13 +1249,13 @@ def test_aggregation_counts_assets_and_issues_separately(tmp_path: Path) -> None
     assert stats["by_profile"]["supplier_evaluation"]["module_coverage"]["sam3_containment"] == 1.0
 ```
 
-- [ ] **Step 2: 运行测试并确认聚合接口缺失**
+- [x] **Step 2: 运行测试并确认聚合接口缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_projection.py tests/test_qc_reporting_aggregate.py -q`
 
 Expected: FAIL，缺少 `BatchProjection` 或 `aggregate_projection`。
 
-- [ ] **Step 3: 实现规范化投影和精确指标**
+- [x] **Step 3: 实现规范化投影和精确指标**
 
 ```python
 def aggregate_projection(projection):
@@ -1272,13 +1274,13 @@ def aggregate_projection(projection):
 
 `asset_rows` 一资产一行，含 profile/status/decision/report_revision/config hash/模块覆盖率；`issue_rows` 一 issue 一行，含 machine severity、human/effective verdict（字段不存在时 null）、rule/module/window；`execution_rows` 一 module state 一行，含 duration、continued_after_fail、runtime error。统计必须输出 total/completed/incomplete、自动 fail 资产与 issue、machine warn 资产与 issue、人工消解/确认（当前可为 0）、最终 pass/fail、pass rate、每模块 coverage 与 stop position。
 
-- [ ] **Step 4: 运行投影、Schema 和双 profile 测试**
+- [x] **Step 4: 运行投影、Schema 和双 profile 测试**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_projection.py tests/test_qc_reporting_aggregate.py tests/test_asset_qc_schema_v2.py -q`
 
 Expected: PASS；同资产多个 issue 不重复资产计数，两种 profile 不混合 coverage。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_reporting/projection.py qc_reporting/aggregate.py tests/test_qc_reporting_projection.py tests/test_qc_reporting_aggregate.py
@@ -1304,7 +1306,7 @@ git commit -m "feat(qc): aggregate asset report projections"
 - Existing formal tools 新增并默认要求 `--quality-archive`；sidecar 参数移动到 `--legacy-reconciliation-*`，只能输出差异，不能改正式 verdict。
 - Produces: `write_projection_outputs(projection, statistics, output_dir, formats) -> dict[str, Path]`。
 
-- [ ] **Step 1: 添加 sidecar 冲突时 QC JSON 胜出的入口测试**
+- [x] **Step 1: 添加 sidecar 冲突时 QC JSON 胜出的入口测试**
 
 ```python
 def test_formal_ledger_ignores_conflicting_legacy_sidecar(tmp_path: Path) -> None:
@@ -1318,13 +1320,13 @@ def test_formal_ledger_ignores_conflicting_legacy_sidecar(tmp_path: Path) -> Non
     assert reconciliation.loc[0, "difference_type"] == "legacy_conflicts_with_qc_json"
 ```
 
-- [ ] **Step 2: 运行入口测试并确认现有工具仍解释 sidecar**
+- [x] **Step 2: 运行入口测试并确认现有工具仍解释 sidecar**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_entrypoints.py -q`
 
 Expected: FAIL，现有 `build_batch_qc_ledger` 将 sidecar fail 当作正式结论。
 
-- [ ] **Step 3: 让所有正式输出消费同一 projection**
+- [x] **Step 3: 让所有正式输出消费同一 projection**
 
 ```python
 projection = project_quality_archive(args.quality_archive)
@@ -1339,13 +1341,13 @@ if args.legacy_reconciliation_candidate_windows:
 
 CSV/Parquet 写 asset/issue/execution 三表；XLSX 固定 sheet 为 `Summary`、`Assets`、`Issues`、`Execution`、`Data_Dictionary`；Markdown 从同一 statistics 渲染。`build_acceptance_ledger` 与 weekly/XJGT 的正式结论列改为 projection 字段；遗留供应商特有 evidence 页可保留，但必须标注 `derived_evidence_only` 且不得回算 acceptance status。
 
-- [ ] **Step 4: 运行四类报表和遗留对账回归**
+- [x] **Step 4: 运行四类报表和遗留对账回归**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_entrypoints.py tests/test_batch_qc_ledger.py tests/test_acceptance_ledger.py tests/test_xjgt_acceptance_report.py tests/test_weekly_supplier_acceptance_report.py -q`
 
 Expected: PASS；正式 verdict 都来自 QC JSON，旧输入只影响 reconciliation/evidence 页。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add tools/build_qc_json_projection.py tools/build_batch_qc_ledger.py tools/build_acceptance_ledger.py tools/build_weekly_supplier_acceptance_report.py tools/build_xjgt_acceptance_report.py tests/test_qc_reporting_entrypoints.py tests/test_batch_qc_ledger.py tests/test_acceptance_ledger.py tests/test_weekly_supplier_acceptance_report.py tests/test_xjgt_acceptance_report.py
@@ -1364,7 +1366,7 @@ git commit -m "feat(qc): migrate reports to asset json projection"
 - Produces: `write_projection_cache(projection, cache_dir: Path) -> None`。
 - Produces: `load_projection_cache(cache_dir, expected_manifest) -> BatchProjection | None`；任何不一致返回 None。
 
-- [ ] **Step 1: 添加删除重建和 stale cache 无效测试**
+- [x] **Step 1: 添加删除重建和 stale cache 无效测试**
 
 ```python
 def test_cache_can_be_deleted_and_rebuilt_identically(tmp_path: Path) -> None:
@@ -1381,13 +1383,13 @@ def test_revision_change_invalidates_cache(tmp_path: Path) -> None:
     assert load_projection_cache(tmp_path / "cache", build_source_manifest(archive)) is None
 ```
 
-- [ ] **Step 2: 运行测试并确认缓存模块不存在**
+- [x] **Step 2: 运行测试并确认缓存模块不存在**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_cache.py -q`
 
 Expected: collection FAIL，包含 `No module named 'qc_reporting.cache'`。
 
-- [ ] **Step 3: 实现 manifest 驱动缓存**
+- [x] **Step 3: 实现 manifest 驱动缓存**
 
 ```python
 CACHE_FILES = {"assets": "assets.parquet", "issues": "issues.parquet", "execution": "execution.parquet"}
@@ -1403,13 +1405,13 @@ def load_projection_cache(cache_dir, expected_manifest):
 
 写缓存先写 `.tmp` 后逐文件 replace，最后写 manifest；CLI `--cache-dir` 只用于加速，cache missing/corrupt/stale 时自动从 QC JSON 重建。统计函数不得接受 cache 文件路径，只接受 `BatchProjection`。
 
-- [ ] **Step 4: 验证缓存、投影和 CLI**
+- [x] **Step 4: 验证缓存、投影和 CLI**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_reporting_cache.py tests/test_qc_reporting_projection.py tests/test_qc_reporting_entrypoints.py -q`
 
 Expected: PASS；删除、损坏或 revision 变化都能回源重建且统计一致。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add qc_reporting/cache.py tools/build_qc_json_projection.py tests/test_qc_reporting_cache.py
@@ -1431,7 +1433,7 @@ git commit -m "feat(qc): add rebuildable projection cache"
 - 文档必须使用与代码相同的版本、profile、pipeline status、module state、CLI 与目录名。
 - 迁移文档必须给出 v1 只读、首次 v2 写回、回滚到只读 sidecar 工具和禁止回退 master verdict 的操作步骤。
 
-- [ ] **Step 1: 添加文档契约测试**
+- [x] **Step 1: 添加文档契约测试**
 
 ```python
 def test_reviewer_docs_name_v2_profiles_and_single_source() -> None:
@@ -1445,13 +1447,13 @@ def test_docs_do_not_advertise_pass_sample_review() -> None:
     assert "仅累计 warn 进入人工质检" in text
 ```
 
-- [ ] **Step 2: 运行测试并确认旧文档缺少 v2/双 profile**
+- [x] **Step 2: 运行测试并确认旧文档缺少 v2/双 profile**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_docs_contract.py -q`
 
 Expected: FAIL，缺少 v2 版本或 `supplier_evaluation`。
 
-- [ ] **Step 3: 按已实现接口同步六份文档**
+- [x] **Step 3: 按已实现接口同步六份文档**
 
 每份文档必须写明以下精确流程：
 
@@ -1468,13 +1470,13 @@ Expected: FAIL，缺少 v2 版本或 `supplier_evaluation`。
 
 同时列出 Config 发布规则、v1 hash、evidence 相对路径、revision 冲突、runtime error 与质量 fail 的区别、新 CLI 完整示例和 sidecar 对账限制。
 
-- [ ] **Step 4: 运行文档契约与 OpenSpec 校验**
+- [x] **Step 4: 运行文档契约与 OpenSpec 校验**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_docs_contract.py -q && openspec validate unify-qc-dataflow --strict`
 
 Expected: PASS；OpenSpec 显示 change valid。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add docs/PRD-qc-gated-json.md docs/PRD-qc-unified-config.md docs/asset-qc-json-format.md ACCEPTANCE.md WORKFLOW_INTERFACE.md docs/qc-dataflow-migration.md tests/test_qc_docs_contract.py
@@ -1492,7 +1494,7 @@ git commit -m "docs(qc): document unified v2 dataflow"
 - Consumes: `run_asset()`、stub registry 和真实 report mutation；不依赖模型权重。
 - Produces: 固定 trace 行：`asset_id,module,revision,pipeline_status,result_verdict,exit_state,overall_decision,next_module`。
 
-- [ ] **Step 1: 添加四类 fixture 的精确轨迹测试**
+- [x] **Step 1: 添加四类 fixture 的精确轨迹测试**
 
 ```python
 def test_four_fixture_revision_trace_matches_golden(tmp_path: Path) -> None:
@@ -1506,13 +1508,13 @@ def test_four_fixture_revision_trace_matches_golden(tmp_path: Path) -> None:
     assert by_asset["runtime-error"][-1]["overall_decision"] is None
 ```
 
-- [ ] **Step 2: 运行测试并确认 golden/trace helper 缺失**
+- [x] **Step 2: 运行测试并确认 golden/trace helper 缺失**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_pipeline_revision_trace.py -q`
 
 Expected: FAIL，fixture 文件或 trace helper 不存在。
 
-- [ ] **Step 3: 写入四资产 fixture 和真实 revision 捕获器**
+- [x] **Step 3: 写入四资产 fixture 和真实 revision 捕获器**
 
 ```json
 {"asset_id":"pass","verdicts":{"hdf5_text_info":"pass","quality_hand":"pass"}}
@@ -1523,13 +1525,13 @@ Expected: FAIL，fixture 文件或 trace helper 不存在。
 
 每次 writer 返回后捕获实际报告，不手工推算 revision；assert revision 从 1 单调递增、warn candidate 全量重建、hard fail 不创建 external task、error 不产生 decision。
 
-- [ ] **Step 4: 运行 revision trace 与事务回归**
+- [x] **Step 4: 运行 revision trace 与事务回归**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_pipeline_revision_trace.py tests/test_report_mutation.py tests/test_qc_orchestrator.py -q`
 
 Expected: PASS，golden 与实际状态轨迹逐字段一致。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add tests/fixtures/qc_pipeline/manifest.jsonl tests/fixtures/qc_pipeline/expected_revision_trace.json tests/test_qc_pipeline_revision_trace.py
@@ -1546,7 +1548,7 @@ git commit -m "test(qc): cover complete revision trajectories"
 - Consumes: `tools.run_qc_pipeline.run_batch(...)` 与 `project_quality_archive()`。
 - 验证同一资产、同一 Config、同一 runner 输出，在两个 profile 下机器 issue 相同而模块覆盖/stop point 不同。
 
-- [ ] **Step 1: 添加双批次 E2E 测试**
+- [x] **Step 1: 添加双批次 E2E 测试**
 
 ```python
 def test_same_batch_has_profile_specific_flow_and_same_machine_findings(tmp_path: Path) -> None:
@@ -1563,13 +1565,13 @@ def test_same_batch_has_profile_specific_flow_and_same_machine_findings(tmp_path
     assert a_stats["overall"]["module_coverage"]["sam3_containment"] < s_stats["overall"]["module_coverage"]["sam3_containment"]
 ```
 
-- [ ] **Step 2: 运行 E2E 并确认 batch 入口或 coverage 不完整**
+- [x] **Step 2: 运行 E2E 并确认 batch 入口或 coverage 不完整**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_pipeline_profiles_e2e.py -q`
 
 Expected: FAIL，缺少可调用 batch helper 或 supplier fail 后未继续。
 
-- [ ] **Step 3: 补齐批次调用的可测试入口**
+- [x] **Step 3: 补齐批次调用的可测试入口**
 
 ```python
 def run_batch(contexts, *, config, profile, registry, max_workers):
@@ -1582,13 +1584,13 @@ def run_batch(contexts, *, config, profile, registry, max_workers):
 
 确保一个 asset error 不取消其他 future；每个资产 report revision 独立递增。测试 fixture 在 semantic external 暂停，因此 supplier report 尚不形成最终 pass，但已存在自动 fail 的资产在依赖人工 change 完成后 reducer 必须保持 fail。
 
-- [ ] **Step 4: 运行 E2E、并发和投影测试**
+- [x] **Step 4: 运行 E2E、并发和投影测试**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_pipeline_profiles_e2e.py tests/test_qc_orchestrator.py tests/test_qc_reporting_aggregate.py -q`
 
 Expected: PASS；同机器 findings、不同流转覆盖，分 profile 统计正确。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add tools/run_qc_pipeline.py tests/fixtures/qc_pipeline/manifest.jsonl tests/test_qc_pipeline_profiles_e2e.py
@@ -1606,7 +1608,7 @@ git commit -m "test(qc): verify execution profile differences"
 - Consumes: v1 fixture、遗留 sidecars、v2 projection 与全部正式 CLI。
 - Produces: `reconcile_legacy_outputs(*, quality_archive, legacy_inputs) -> list[dict[str, Any]]`，只输出差异，不修改主报告。
 
-- [ ] **Step 1: 添加 v1→v2、legacy 对账和只读回滚测试**
+- [x] **Step 1: 添加 v1→v2、legacy 对账和只读回滚测试**
 
 ```python
 def test_migration_reconciliation_never_rewrites_source_or_uses_legacy_verdict(tmp_path: Path) -> None:
@@ -1620,13 +1622,13 @@ def test_migration_reconciliation_never_rewrites_source_or_uses_legacy_verdict(t
     assert differences[0]["authoritative_source"] == "asset_qc_json"
 ```
 
-- [ ] **Step 2: 运行迁移测试和全量测试，记录首轮失败**
+- [x] **Step 2: 运行迁移测试和全量测试，记录首轮失败**
 
 Run: `.venv/bin/python -m pytest tests/test_qc_migration_reconciliation.py -q && .venv/bin/python -m pytest -q`
 
 Expected: 首条命令在 reconciliation helper 缺失处 FAIL；实现后第二条必须全量 PASS。
 
-- [ ] **Step 3: 实现只读对账并完成回滚说明**
+- [x] **Step 3: 实现只读对账并完成回滚说明**
 
 ```python
 def reconcile_legacy_outputs(*, quality_archive, legacy_inputs):
@@ -1640,7 +1642,7 @@ def reconcile_legacy_outputs(*, quality_archive, legacy_inputs):
 
 迁移文档写出三条可执行路径：正常升级（保留 sidecar、首次 module 写回迁为 v2）、只读验证（仅 projection/reconciliation）、回滚（停止 v2 writer，恢复旧 runner 只产 sidecar，但不得用旧报表覆盖已存在 v2 master JSON）。记录配置快照/hash、备份质量目录的操作和恢复验证命令。
 
-- [ ] **Step 4: 执行完整验证并勾选 21 项 OpenSpec 任务**
+- [x] **Step 4: 执行完整验证并勾选 21 项 OpenSpec 任务**
 
 Run:
 
@@ -1648,12 +1650,24 @@ Run:
 .venv/bin/python -m pytest -q
 openspec validate unify-qc-dataflow --strict
 git diff --check
-rg -n "precheck_clip_aggregates|candidate_windows|sam3_window_summary|video_quality_results|manual_review_labels" tools/build_batch_qc_ledger.py tools/build_acceptance_ledger.py tools/build_weekly_supplier_acceptance_report.py tools/build_xjgt_acceptance_report.py
+rg -n "def main|quality_archive|run_projection_cli|build_acceptance_outputs" \
+  tools/build_batch_qc_ledger.py tools/build_acceptance_ledger.py \
+  tools/build_weekly_supplier_acceptance_report.py tools/build_xjgt_acceptance_report.py
+rg -n "add_candidate_windows|legacy-reconciliation|load_xjgt_source_reads" \
+  tools/build_batch_qc_ledger.py tools/build_xjgt_acceptance_report.py \
+  tools/build_weekly_supplier_acceptance_report.py
 ```
 
-Expected: pytest 全量 PASS；OpenSpec valid；`git diff --check` 无输出；最后的 `rg` 命中只允许出现在命名为 `legacy_reconciliation` 的参数、帮助文本或对账函数中。逐项将 `openspec/changes/unify-qc-dataflow/tasks.md` 的 21 个 checkbox 标为完成。
+Expected: pytest 全量 PASS；OpenSpec valid；`git diff --check` 无输出。最后的 `rg` 结果必须证明正式
+`quality_archive`/canonical entrypoint 不再读取旧 sidecar 或执行旧 reducer。仓库仍保留的公开
+legacy compatibility helper（例如 `add_candidate_windows`、`load_xjgt_source_reads`，以及
+XJGT 的旧参数）只允许位于显式 legacy/reconciliation 适配路径。显式调用这些 helper
+可以产出旧格式兼容输出，但不能产出 canonical verdict 或写回 `quality_archive`；这些
+API 及其测试命中属于明确 allowlist；它们不得被正式 `main` 或 v2 writer 调用，旧
+helper 的结果在统一数据流中只能作为 sidecar evidence。逐项将
+`openspec/changes/unify-qc-dataflow/tasks.md` 的 21 个 checkbox 标为完成。
 
-- [ ] **Step 5: 提交最终验证与迁移说明**
+- [x] **Step 5: 提交最终验证与迁移说明**
 
 ```bash
 git add tests/test_qc_migration_reconciliation.py docs/qc-dataflow-migration.md openspec/changes/unify-qc-dataflow/tasks.md

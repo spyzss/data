@@ -123,6 +123,14 @@ def _slice_clip(clip: Any, source_range: tuple[int, int]) -> Any:
         text_label_raw=clip.text_label_raw,
         text_label_parse_error=clip.text_label_parse_error,
         intrinsics=clip.intrinsics,
+        supplier_hand_quality_status=sliced(
+            clip.supplier_hand_quality_status
+        ),
+        hand_keypoints_3d=sliced(clip.hand_keypoints_3d),
+        hand_joint_valid_3d=sliced(clip.hand_joint_valid_3d),
+        timestamps_ns=sliced(clip.timestamps_ns),
+        hand_keypoints_2d=sliced(clip.hand_keypoints_2d),
+        hand_joint_valid_2d=sliced(clip.hand_joint_valid_2d),
         fps=clip.fps,
     )
     for name in (
@@ -140,6 +148,18 @@ def _slice_clip(clip: Any, source_range: tuple[int, int]) -> Any:
 
 
 def _load_clip(context: AssetContext, module: str) -> Any:
+    canonical_episode = context.metadata.get("canonical_episode")
+    if canonical_episode is not None:
+        source_root = context.metadata.get("canonical_source_root")
+        if not isinstance(source_root, str) or not source_root:
+            raise ModulePrerequisiteError(module, "metadata.canonical_source_root")
+        from canonical_qc.bridge import CanonicalQcBridge
+
+        return CanonicalQcBridge(
+            canonical_episode,
+            source_root=Path(source_root),
+        ).clip_inputs(context.source_range)
+
     declared_clip = context.metadata.get("clip_inputs")
     if declared_clip is not None:
         return declared_clip
@@ -340,6 +360,10 @@ class PrecheckSession:
         ):
             return None
         source_range = self.context.source_range
+        if source_range is None:
+            canonical_episode = self.context.metadata.get("canonical_episode")
+            if canonical_episode is not None:
+                source_range = (0, canonical_episode.time_axis.frame_count)
         if source_range is None:
             return None
         start_frame, end_frame_exclusive = source_range

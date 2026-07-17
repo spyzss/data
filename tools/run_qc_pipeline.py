@@ -23,7 +23,7 @@ if __package__ in {None, ""}:
 from qc_common.config import LoadedQcConfig, load_qc_acceptance_config  # noqa: E402
 from qc_common.module_registry import ModuleRegistry  # noqa: E402
 from qc_common.suppliers import normalize_supplier  # noqa: E402
-from qc_pipeline.context import AssetContext  # noqa: E402
+from qc_pipeline.context import AssetContext, validate_asset_id  # noqa: E402
 from qc_pipeline.orchestrator import (  # noqa: E402
     RunOutcome,
     build_default_registry,
@@ -48,6 +48,7 @@ _SOURCE_COLUMNS = {
     "frames": ("frames_path",),
     "aligned": ("aligned_path",),
     "imu": ("imu_path",),
+    "candidate_windows": ("candidate_windows_path", "candidate_windows"),
     "sam3_model": ("sam3_model", "sam3_model_path"),
 }
 
@@ -125,6 +126,7 @@ def contexts_from_manifest(
         asset_id = _text(row.get("asset_id"))
         if not asset_id:
             raise ValueError(f"manifest row {row_index} missing asset_id")
+        validate_asset_id(asset_id)
         if asset_id in seen:
             raise ValueError(f"duplicate asset_id: {asset_id}")
         seen.add(asset_id)
@@ -146,6 +148,11 @@ def contexts_from_manifest(
         asset_id = _text(row.get("asset_id"))
         source_files: dict[str, Any] = {}
         for source_name, columns in _SOURCE_COLUMNS.items():
+            if source_name == "candidate_windows" and not (
+                _text(row.get("canonical_format"))
+                or _text(row.get("canonical_source_path"))
+            ):
+                continue
             column = next((name for name in columns if _text(row.get(name))), None)
             if column is None:
                 continue
@@ -159,17 +166,96 @@ def contexts_from_manifest(
             source_files[source_name] = {"path": relative}
             row[column] = absolute
 
+        canonical_format = _text(row.get("canonical_format")).lower()
+        canonical_source = _text(row.get("canonical_source_path"))
+        canonical = bool(canonical_format or canonical_source)
         start_text = _text(row.get("start_frame"))
-        end_text = _text(row.get("end_frame"))
+        inclusive_end_text = _text(row.get("end_frame"))
+        exclusive_end_text = _text(row.get("end_frame_exclusive"))
         source_range: tuple[int, int] | None = None
-        if start_text or end_text:
-            if not start_text or not end_text:
+        if canonical:
+            if inclusive_end_text:
                 raise ValueError(
-                    f"manifest row {row_index} must define both start_frame and end_frame"
+                    f"manifest row {row_index} canonical ranges require "
+                    "end_frame_exclusive; end_frame is not allowed"
                 )
-            start = _integer(row.get("start_frame"), "start_frame")
-            inclusive_end = _integer(row.get("end_frame"), "end_frame")
-            source_range = (start, inclusive_end + 1)
+            if start_text or exclusive_end_text:
+                if not start_text or not exclusive_end_text:
+                    raise ValueError(
+                        f"manifest row {row_index} must define both start_frame "
+                        "and end_frame_exclusive"
+                    )
+                source_range = (
+                    _integer(row.get("start_frame"), "start_frame"),
+                    _integer(row.get("end_frame_exclusive"), "end_frame_exclusive"),
+                )
+        else:
+            if exclusive_end_text:
+                raise ValueError(
+                    f"manifest row {row_index} legacy ranges use inclusive end_frame"
+                )
+            if start_text or inclusive_end_text:
+                if not start_text or not inclusive_end_text:
+                    raise ValueError(
+                        f"manifest row {row_index} must define both start_frame and end_frame"
+                    )
+                start = _integer(row.get("start_frame"), "start_frame")
+                inclusive_end = _integer(row.get("end_frame"), "end_frame")
+                source_range = (start, inclusive_end + 1)
+
+        if canonical:
+            if canonical_format not in {"hdf5", "lerobot"}:
+                raise ValueError(
+                    f"manifest row {row_index} canonical_format must be hdf5 or lerobot"
+                )
+            if not canonical_source:
+                raise ValueError(
+                    f"manifest row {row_index} missing canonical_source_path"
+                )
+            _relative, absolute = _path_inside_batch(
+                canonical_source,
+                batch_root=batch_root,
+                manifest_dir=manifest.parent,
+                field="canonical_source_path",
+                allow_symlinked_sources=allow_symlinked_sources,
+            )
+            from canonical_qc import StandardHdf5Adapter, StandardLeRobotAdapter
+            from canonical_qc.bridge import CanonicalQcBridge
+
+            if canonical_format == "hdf5":
+                episode = StandardHdf5Adapter().load(Path(absolute))
+            else:
+                episode_index = row.get("episode_index")
+                selected = (
+                    None
+                    if episode_index is None or not _text(episode_index)
+                    else _integer(episode_index, "episode_index")
+                )
+                episode = StandardLeRobotAdapter().load(
+                    Path(absolute), episode_index=selected
+                )
+            if episode.identity.asset_id != asset_id:
+                raise ValueError(
+                    f"manifest asset_id {asset_id!r} does not match canonical episode "
+                    f"{episode.identity.asset_id!r}"
+                )
+            contexts.append(
+                CanonicalQcBridge(
+                    episode,
+                    source_root=(
+                        Path(absolute)
+                        if Path(absolute).is_dir()
+                        else Path(absolute).parent
+                    ),
+                ).asset_context(
+                    batch_root=batch_root,
+                    report_path=batch_root / "quality_archive" / f"{asset_id}.json",
+                    source_range=source_range,
+                    metadata={**row, "manifest_row": raw_manifest_row},
+                    supplemental_source_files=source_files,
+                )
+            )
+            continue
 
         contexts.append(
             AssetContext(

@@ -74,7 +74,7 @@ def test_artifact_layout_and_file_identity_are_source_faithful(tmp_path: Path) -
 def test_artifact_paths_and_source_identity_reject_batch_escape(tmp_path: Path) -> None:
     from qc_pipeline.artifacts import artifact_for, file_identity
 
-    with pytest.raises(ValueError, match="artifact path must stay inside batch_root"):
+    with pytest.raises(ValueError, match="asset_id must be a safe filename component"):
         artifact_for(_context(tmp_path, "../escape"), "precheck")
 
     outside = tmp_path.parent / "outside.bin"

@@ -64,6 +64,12 @@ class ClipInputs:
         text_label_raw: str | None = None,
         text_label_parse_error: str | None = None,
         intrinsics: np.ndarray | None = None,
+        supplier_hand_quality_status: np.ndarray | None = None,
+        hand_keypoints_3d: np.ndarray | None = None,
+        hand_joint_valid_3d: np.ndarray | None = None,
+        timestamps_ns: np.ndarray | None = None,
+        hand_keypoints_2d: np.ndarray | None = None,
+        hand_joint_valid_2d: np.ndarray | None = None,
         fps: float | None = None,
         frames_loader: LazyLoader | None = None,
         keypoints_loader: LazyLoader | None = None,
@@ -92,6 +98,12 @@ class ClipInputs:
         self._text_label_raw = text_label_raw
         self._text_label_parse_error = text_label_parse_error
         self._intrinsics = intrinsics
+        self._supplier_hand_quality_status = supplier_hand_quality_status
+        self._hand_keypoints_3d = hand_keypoints_3d
+        self._hand_joint_valid_3d = hand_joint_valid_3d
+        self._timestamps_ns = timestamps_ns
+        self._hand_keypoints_2d = hand_keypoints_2d
+        self._hand_joint_valid_2d = hand_joint_valid_2d
         self._frames_loader = frames_loader
         self._keypoints_loader = keypoints_loader
         self._rotations_loader = rotations_loader
@@ -172,6 +184,33 @@ class ClipInputs:
         if self._intrinsics is None and self._intrinsics_loader is not None:
             self._intrinsics = self._intrinsics_loader()
         return self._intrinsics
+
+    @property
+    def supplier_hand_quality_status(self) -> np.ndarray | None:
+        """Optional supplier Evidence; never a legacy machine-validity signal."""
+        return self._supplier_hand_quality_status
+
+    @property
+    def hand_keypoints_3d(self) -> np.ndarray | None:
+        """Canonical raw 3D point tensor, kept separate from supplier Evidence."""
+        return self._hand_keypoints_3d
+
+    @property
+    def hand_joint_valid_3d(self) -> np.ndarray | None:
+        """Canonical per-joint validity, separate from supplier Evidence."""
+        return self._hand_joint_valid_3d
+
+    @property
+    def timestamps_ns(self) -> np.ndarray | None:
+        return self._timestamps_ns
+
+    @property
+    def hand_keypoints_2d(self) -> np.ndarray | None:
+        return self._hand_keypoints_2d
+
+    @property
+    def hand_joint_valid_2d(self) -> np.ndarray | None:
+        return self._hand_joint_valid_2d
 
     @property
     def num_frames(self) -> int:

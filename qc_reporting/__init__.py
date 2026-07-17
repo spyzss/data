@@ -19,6 +19,7 @@ from .export import (
     aggregate_metric_rows,
     write_aggregate_outputs,
 )
+from .migration import reconcile_legacy_outputs
 
 __all__ = [
     "BatchProjection",
@@ -30,5 +31,6 @@ __all__ = [
     "project_quality_archive",
     "project_quality_archive_review_rows",
     "project_warn_review_rows",
+    "reconcile_legacy_outputs",
     "write_aggregate_outputs",
 ]

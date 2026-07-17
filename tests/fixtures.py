@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import shutil
 
 import cv2
 import h5py
 import numpy as np
 from openpyxl import Workbook
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 def write_manifest(path: Path, rows: list[tuple[str, str, str]]) -> None:
@@ -42,6 +46,287 @@ def write_test_video(
 
 def solid_frame(value: int, width: int = 32, height: int = 24) -> np.ndarray:
     return np.full((height, width, 3), value, dtype=np.uint8)
+
+
+def write_standard_hdf5_episode(
+    episode_dir: Path,
+    *,
+    asset_id: str = "asset-001",
+    frame_count: int = 3,
+    fps_num: int = 10,
+    fps_den: int = 1,
+    hand_quality: str = "missing",
+) -> tuple[Path, Path]:
+    """Write a tiny real v1 Standard HDF5 episode and its external MP4."""
+
+    if hand_quality not in {"missing", "false", "provided"}:
+        raise ValueError(f"unsupported hand_quality fixture mode: {hand_quality}")
+    episode_dir.mkdir(parents=True, exist_ok=True)
+    hdf5_path = episode_dir / f"{asset_id}.h5"
+    video_path = episode_dir / "main.mp4"
+    write_test_video(
+        video_path,
+        [solid_frame(30 + index * 20) for index in range(frame_count)],
+        fps=fps_num / fps_den,
+    )
+
+    timestamps_ns = np.arange(frame_count, dtype=np.int64) * (
+        1_000_000_000 * fps_den // fps_num
+    )
+    keypoints_3d = np.ones((frame_count, 2, 21, 3), dtype=np.float32)
+    keypoints_2d = np.ones((frame_count, 2, 21, 2), dtype=np.float32)
+    valid = np.ones((frame_count, 2, 21), dtype=np.bool_)
+    annotation = {
+        "scene_id": "kitchen",
+        "task_id": "pick-object",
+        "task_category": "manipulation",
+        "task_cn": "拿起物体",
+        "task_en": "pick up object",
+        "description_cn": "拿起物体并放到桌面中央",
+        "description_en": "pick up the object and place it at the center",
+        "subtask_sequence": [
+            {
+                "subtask_id": "subtask_001",
+                "start_frame": 0,
+                "end_frame_exclusive": frame_count,
+                "description_cn": "拿起物体",
+                "description_en": "pick up the object",
+            }
+        ],
+    }
+
+    with h5py.File(hdf5_path, "w") as handle:
+        handle.attrs.update(
+            {
+                "schema_version": "egodata_hdf5_qc_input.v1",
+                "asset_id": asset_id,
+                "batch_id": "batch-001",
+                "supplier_id": "supplier-001",
+                "frame_count": np.int64(frame_count),
+                "fps_num": np.int64(fps_num),
+                "fps_den": np.int64(fps_den),
+                "joint_topology": "egodata_hand21.v1",
+                "coordinate_frame_3d": "camera:main",
+                "length_unit": "meter",
+                "coordinate_space_2d": "pixel",
+            }
+        )
+        handle.create_dataset("/time/timestamps_ns", data=timestamps_ns)
+        handle.create_dataset(
+            "/observation/hand_keypoints_3d", data=keypoints_3d
+        )
+        handle.create_dataset(
+            "/observation/hand_joint_valid_3d", data=valid
+        )
+        handle.create_dataset(
+            "/observation/hand_keypoints_2d", data=keypoints_2d
+        )
+        handle.create_dataset(
+            "/observation/hand_joint_valid_2d", data=valid.copy()
+        )
+        camera = handle.create_group("/camera/main")
+        camera.attrs.update(
+            {
+                "distortion_model": "none",
+                "image_width_px": np.int32(32),
+                "image_height_px": np.int32(24),
+                "camera_axes": "x_right_y_down_z_forward",
+                "pixel_origin": "top_left",
+            }
+        )
+        camera.create_dataset(
+            "intrinsic_matrix",
+            data=np.array(
+                [[20.0, 0.0, 16.0], [0.0, 20.0, 12.0], [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            ),
+        )
+        camera.create_dataset(
+            "distortion_coefficients", data=np.array([], dtype=np.float64)
+        )
+        string_dtype = h5py.string_dtype(encoding="utf-8")
+        handle.create_dataset(
+            "/semantics/annotation_json",
+            data=json.dumps(annotation, ensure_ascii=False),
+            dtype=string_dtype,
+        )
+        if hand_quality != "missing":
+            quality = handle.create_group("/supplier/hand_quality")
+            quality.attrs["provided"] = hand_quality == "provided"
+            if hand_quality == "provided":
+                quality.attrs["mapping_version"] = "supplier-001.hand-quality.v1"
+                quality.create_dataset(
+                    "raw_value",
+                    data=np.arange(frame_count * 2, dtype=np.int16).reshape(
+                        frame_count, 2
+                    ),
+                )
+                quality.create_dataset(
+                    "normalized_score",
+                    data=np.full((frame_count, 2), 0.75, dtype=np.float32),
+                )
+                status_pattern = np.array(
+                    [[0, 1], [2, 3], [3, 0]], dtype=np.uint8
+                )
+                status = status_pattern[
+                    np.arange(frame_count) % len(status_pattern)
+                ]
+                quality.create_dataset("status", data=status)
+    return hdf5_path, video_path
+
+
+def _fixed_list(array: np.ndarray) -> pa.Array:
+    value_type: pa.DataType = pa.from_numpy_dtype(array.dtype)
+    for size in reversed(array.shape[1:]):
+        value_type = pa.list_(value_type, int(size))
+    return pa.array(array.tolist(), type=value_type)
+
+
+def write_standard_lerobot_dataset(
+    root: Path,
+    *,
+    layout: str = "v3",
+    episodes: tuple[tuple[int, str], ...] = ((0, "asset-001"),),
+    frame_count: int = 3,
+    fps_num: int = 10,
+    fps_den: int = 1,
+    main_video_source: Path | None = None,
+) -> Path:
+    """Write a tiny strict LeRobot v3 or v2.1 dataset with real Parquet/MP4."""
+
+    if layout not in {"v3", "v2.1"}:
+        raise ValueError(layout)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "meta").mkdir(exist_ok=True)
+    data_template = (
+        "data/chunk-{episode_chunk:03d}/file-{episode_file:03d}.parquet"
+        if layout == "v3"
+        else "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+    )
+    video_template = (
+        "videos/{video_key}/chunk-{episode_chunk:03d}/file-{episode_file:03d}.mp4"
+        if layout == "v3"
+        else "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+    )
+    features = {
+        "episode_index": {"dtype": "int64", "shape": []},
+        "frame_index": {"dtype": "int64", "shape": []},
+        "timestamp": {"dtype": "float64", "shape": [], "unit": "second"},
+        "timestamp_ns": {"dtype": "int64", "shape": [], "unit": "nanosecond"},
+        "observation.hand_keypoints_3d": {
+            "dtype": "float32", "shape": [2, 21, 3], "hand_order": ["left", "right"],
+            "joint_topology": "egodata_hand21.v1", "coordinate_frame": "camera:main", "unit": "meter",
+        },
+        "observation.hand_joint_valid_3d": {"dtype": "bool", "shape": [2, 21]},
+        "observation.hand_keypoints_2d": {
+            "dtype": "float32", "shape": [2, 21, 2], "hand_order": ["left", "right"],
+            "joint_topology": "egodata_hand21.v1", "coordinate_space": "pixel", "unit": "pixel",
+        },
+        "observation.hand_joint_valid_2d": {"dtype": "bool", "shape": [2, 21]},
+        "observation.images.main": {
+            "dtype": "video", "shape": [24, 32, 3], "camera_id": "main", "camera_role": "ego",
+        },
+        "task_index": {"dtype": "int64", "shape": []},
+        "subtask_index": {"dtype": "int64", "shape": []},
+    }
+    info = {
+        "codebase_version": "v3.0" if layout == "v3" else "v2.1",
+        "schema_version": "egodata_lerobot_qc_input.v1",
+        "fps": fps_num / fps_den,
+        "fps_num": fps_num,
+        "fps_den": fps_den,
+        "data_path": data_template,
+        "video_path": video_template,
+        "features": features,
+    }
+    (root / "meta" / "info.json").write_text(
+        json.dumps(info, ensure_ascii=False), encoding="utf-8"
+    )
+
+    episode_rows: list[dict[str, object]] = []
+    semantic_rows: list[dict[str, object]] = []
+    for file_index, (episode_index, asset_id) in enumerate(episodes):
+        episode_row: dict[str, object] = {
+            "episode_index": np.int64(episode_index), "asset_id": asset_id,
+            "length": np.int64(frame_count), "dataset_from_index": np.int64(0),
+            "dataset_to_index": np.int64(frame_count),
+        }
+        if layout == "v3":
+            episode_row.update({
+                "data/chunk_index": np.int64(0),
+                "data/file_index": np.int64(file_index),
+                "videos/observation.images.main/chunk_index": np.int64(0),
+                "videos/observation.images.main/file_index": np.int64(file_index),
+                "videos/observation.images.main/from_index": np.int64(0),
+                "videos/observation.images.main/to_index": np.int64(frame_count),
+            })
+        else:
+            episode_row["episode_chunk"] = np.int64(0)
+        episode_rows.append(episode_row)
+        timestamps_ns = np.arange(frame_count, dtype=np.int64) * (
+            1_000_000_000 * fps_den // fps_num
+        )
+        points3d = np.ones((frame_count, 2, 21, 3), dtype=np.float32)
+        points2d = np.ones((frame_count, 2, 21, 2), dtype=np.float32)
+        valid = np.ones((frame_count, 2, 21), dtype=np.bool_)
+        table = pa.table({
+            "episode_index": pa.array([episode_index] * frame_count, type=pa.int64()),
+            "frame_index": pa.array(range(frame_count), type=pa.int64()),
+            "timestamp": pa.array((timestamps_ns - timestamps_ns[0]) / 1e9, type=pa.float64()),
+            "timestamp_ns": pa.array(timestamps_ns, type=pa.int64()),
+            "observation.hand_keypoints_3d": _fixed_list(points3d),
+            "observation.hand_joint_valid_3d": _fixed_list(valid),
+            "observation.hand_keypoints_2d": _fixed_list(points2d),
+            "observation.hand_joint_valid_2d": _fixed_list(valid.copy()),
+            "task_index": pa.array([0] * frame_count, type=pa.int64()),
+            "subtask_index": pa.array([0] * frame_count, type=pa.int64()),
+        })
+        values = {"episode_chunk": 0, "episode_file": file_index, "episode_index": episode_index}
+        data_path = root / data_template.format(**values)
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, data_path)
+        video_path = root / video_template.format(video_key="observation.images.main", **values)
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        if main_video_source is None:
+            write_test_video(video_path, [solid_frame(30 + i * 20) for i in range(frame_count)], fps=fps_num / fps_den)
+        else:
+            shutil.copyfile(main_video_source, video_path)
+        semantic_rows.append({
+            "episode_index": episode_index, "asset_id": asset_id, "batch_id": "batch-001",
+            "supplier_id": "supplier-001", "task_index": 0,
+            "joint_topology": "egodata_hand21.v1", "coordinate_frame_3d": "camera:main",
+            "length_unit": "meter", "coordinate_space_2d": "pixel",
+            "calibration": {
+                "intrinsic_matrix": [[20.0, 0.0, 16.0], [0.0, 20.0, 12.0], [0.0, 0.0, 1.0]],
+                "distortion_model": "none", "distortion_coefficients": [],
+                "image_width_px": 32, "image_height_px": 24,
+                "camera_axes": "x_right_y_down_z_forward", "pixel_origin": "top_left",
+            },
+            "scene_id": "kitchen", "task_id": "pick-object", "task_category": "manipulation",
+            "task_cn": "拿起物体", "task_en": "pick up object",
+            "description_cn": "拿起物体并放到桌面中央",
+            "description_en": "pick up the object and place it at the center",
+            "subtask_sequence": [{
+                "subtask_index": 0, "subtask_id": "subtask_001", "start_frame": 0,
+                "end_frame_exclusive": frame_count, "description_cn": "拿起物体",
+                "description_en": "pick up the object",
+            }],
+        })
+
+    if layout == "v3":
+        episode_path = root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+        episode_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.Table.from_pylist(episode_rows), episode_path)
+    else:
+        episode_path = root / "meta" / "episodes.jsonl"
+        episode_path.write_text(
+            "".join(json.dumps(row, default=int) + "\n" for row in episode_rows),
+            encoding="utf-8",
+        )
+    (root / "meta" / "episode_semantics.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in semantic_rows), encoding="utf-8"
+    )
+    return root
 
 
 def write_quality_hdf5(path: Path, frame_count: int) -> None:

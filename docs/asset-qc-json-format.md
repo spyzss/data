@@ -19,6 +19,13 @@ schemas/asset_qc_report.v2.schema.json
 ```
 
 旧 v1 报告必须先迁移到 v2；人工语义校准和 Warn 复核只写 v2 报告。
+`asset_qc_report.v1` 仅作为历史报告输入保留。v2 canonical report 在顶层持久化
+`supplier_id`：初始化时优先读取 `AssetContext.metadata.supplier_id`、其次读取
+`metadata.supplier`，两者都缺失时写入 `"unknown"`。旧报告没有该字段时仍可读取，
+review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
+
+当前代码已实现 `video_quality` 的写入合同；其余模块按
+`docs/PRD-qc-gated-json.md` 接入。
 
 ## 2. 顶层结构
 
@@ -29,12 +36,13 @@ schemas/asset_qc_report.v2.schema.json
   "schema_version": "asset_qc_report.v2",
   "qc_config": {
     "schema_version": "qc_acceptance_config_schema.v2",
-    "config_version": "qc_acceptance_v2.0.0",
+    "config_version": "qc_acceptance_v2.3.0",
     "config_name": "acceptance_gate",
     "config_path": "configs/qc_acceptance.yaml",
     "config_hash": "sha256:<64 lowercase hex characters>"
   },
   "asset_id": "file-008",
+  "supplier_id": "supplier-a",
   "report_revision": 3,
   "execution": {
     "profile": "acceptance",
@@ -44,9 +52,11 @@ schemas/asset_qc_report.v2.schema.json
   "pipeline_state": {
     "status": "running",
     "last_completed_module": "video_quality",
-    "next_module": "sam3_containment"
+    "next_module": "sam3_containment",
+    "stop_reason": null
   },
   "overall_decision": null,
+  "runtime_errors": [],
   "issues": [
     {
       "issue_id": "video_quality:fps_below_pass:001",
@@ -133,11 +143,14 @@ schemas/asset_qc_report.v2.schema.json
 | `schema_version` | 正式人工流程固定为 `asset_qc_report.v2`；v1 只作为迁移输入。 |
 | `qc_config` | 本次 pipeline 初始化时锁定的统一配置引用。 |
 | `asset_id` | 资产唯一 ID，也是 JSON 文件名。 |
+| `supplier_id` | 供应商唯一 ID；canonical v2 初始化时由 `metadata.supplier_id` / `metadata.supplier` 写入，缺失时为 `unknown`。 |
 | `report_revision` | 每次成功写回加 1，用于防止旧结果覆盖新结果。 |
 | `pipeline_state` | 当前流程位置，不代表单个模块质量。 |
 | `overall_decision` | 只有流程停止或全部完成时才形成最终结论。 |
 | `issues` | 所有模块共享的 warn/fail 事实表。 |
 | `manual_review` | 人工路由输入、状态和结果。 |
+| `canonical_binding` | 发布绑定；冻结 canonical revision、semantic/source fingerprint 和唯一 final QC report revision。 |
+| `canonical_qc_range` | 本报告覆盖的 Canonical 半开区间；Publisher v1 只接受完整 `[0,T)`。 |
 | `<module_name>` | 模块自己的 gate、指标和证据。 |
 
 ### 3.1 `qc_config`
@@ -147,7 +160,7 @@ schemas/asset_qc_report.v2.schema.json
 ```json
 {
   "schema_version": "qc_acceptance_config_schema.v2",
-  "config_version": "qc_acceptance_v2.0.0",
+  "config_version": "qc_acceptance_v2.3.0",
   "config_name": "acceptance_gate",
   "config_path": "configs/qc_acceptance.yaml",
   "config_hash": "sha256:..."
@@ -169,10 +182,60 @@ schemas/asset_qc_report.v2.schema.json
 | `running` | 自动 QC 仍在继续。 | 必须为 `null` |
 | `stopped` | 某个模块 hard fail，后续 QC 已停止。 | 必须为 `fail` |
 | `completed` | 所有应运行模块及适用的人工阶段完成。 | `pass` 或 `fail` |
+| `awaiting_external` | 等待 `semantic_consistency` 或 `manual_review` 外部阶段。 | 必须为 `null` |
+| `error` | runtime/evidence/config/CAS 错误，未形成质量结论。 | 必须为 `null` |
 
-`pending` 不是质量等级，也不等于 warn。`warn` 是模块对具体问题的判定；
+`pending`、`running`、`awaiting_external` 不是质量等级，也不等于 warn。`warn` 是模块对具体问题的判定；
 流程未结束时只保存在 module verdict 和 `issues`，不提前写进
 `overall_decision`。人工阶段尚未完成或出现运行错误时也必须为 `null`。
+
+### 3.3 Publisher 发布绑定
+
+本节只定义质量报告与发布请求之间的 Gate/audit 绑定。QC JSON 不承载 Raw 训练
+payload、supplier extension values 或 batch dataset attributes，也不能作为生成
+LeRobot 的唯一数据源。Publisher 的完整逻辑输入为 Raw source + Canonical metadata/
+field inventory + 本最终报告 + optional Canonical revision artifact。
+
+`canonical_binding` 和 `canonical_qc_range` 是 `asset_qc_report.v2` 已发布字段名，继续
+保持不变；其中 `canonical_qc` 是兼容标识，不代表 Canonical Data 只服务 QC。
+
+最终人工语义和 Warn 复核完成时，报告必须写入：
+
+```json
+{
+  "canonical_binding": {
+    "schema_version": "canonical_publish_binding.v1",
+    "canonical_revision": 3,
+    "semantic_fingerprint": "<64 lowercase hex>",
+    "source_fingerprint": "<64 lowercase hex>",
+    "qc_report_revision": 19
+  },
+  "canonical_qc_range": {
+    "start_frame": 0,
+    "end_frame_exclusive": 1200,
+    "interval_semantics": "half_open"
+  }
+}
+```
+
+同一 canonical revision 只允许绑定一个最终 QC revision。Publisher 请求还必须显式
+提供 `canonical_source_root`，用 Canonical provenance 的相对路径重新校验所有当前
+源文件；不得从 QC JSON 路径推断源目录，也不得接受 escape 或 symlink。
+
+发生非零语义修改时，绑定的 semantic fingerprint 必须对应应用 revision artifact
+后的 Canonical Data view，release manifest 还需绑定 artifact hash。Publisher 通过
+`--revision-artifact` 读取 `canonical_revision_artifact.v1`；缺失、CAS/fingerprint/
+revision/edit-count 不匹配均 fail closed，不得回写 Raw。
+
+发布 Gate 只读取本 PRD 第 8.3 节的正式 `manual_review.reviews[]`；不得另造
+`issue_reviews` 的 pass/fail 字典。每个 candidate issue 必须恰好有一条 review，且
+最终 `asset_action` 只能是 `accept` 或 `accept_with_risk`。`reject` 和
+`return_for_rework` 均不可发布。
+
+Publisher 还会逐 enabled automatic module 核对 `flow.entry_gate/result_gate/exit_gate`
+和 `evaluation.decision`。clean skip 不是通用放行状态：首版只允许未提供 optional
+`quality_hand` Evidence，以及 `sam3_containment` 零候选窗口；任何 runtime、
+`skipped_due_to_fail`、伪造 `stop_qc` 或 result/evaluation 分歧都拒绝发布。
 
 ## 4. Issue 结构
 
@@ -243,9 +306,20 @@ module.thresholds
 
 - `pass`：`continue_to_next_module=true`。
 - `warn`：生成 issue，追加到人工候选，继续下一模块。
-- `fail` 且当前 profile 要求停止：`state=stop_qc`、
+- `acceptance` + `fail`：`state=stop_qc`、
   `continue_to_next_module=false`、`next_module=null`；顶层
   `pipeline_state.status=stopped` 且 `pipeline_state.next_module=null`。
+- `supplier_evaluation` + `fail`：机器 verdict 仍为 `fail`，出口继续，并在 module
+  runtime 写 `continued_after_fail=true`；完成时 `overall_decision=fail`。
+- 非终态正常流转使用 `state=continue`、`continue_to_next_module=true` 和明确的
+  `next_module`；最后一个模块正常完成必须使用 `state=complete_qc`、
+  `continue_to_next_module=false`、`next_module=null`。
+- runtime/evidence/config/CAS 错误：写 `runtime_errors[]`，module state 为
+  `runtime_error`、顶层 `status=error`，不当成质量 fail。
+- Canonical SAM3 在 `metrics.supplier_hand_quality` 保存供应商 Evidence 与机器
+  逐帧结果的 confusion counts、numerator/denominator/rate 和排除计数；
+  `unknown/warning` 不进入一致率。`good + machine fail` 追加
+  `supplier_mask_disagreement` Warn，但不覆盖机器 `result_gate`。
 - 下游只读取上游 `exit_gate` 或顶层 `pipeline_state`，不解析自然语言原因。
 - 上游已 fail 时，后续高成本模块不得运行。
 
@@ -301,7 +375,9 @@ module.thresholds
 到达人工路由模块后，由人工策略统一决定：
 
 - `required=false`：无候选或按抽样策略无需人工。
-- `required=true`：进入 `queued` / `in_progress` / `completed`。
+- `required=true`：进入 `queued` / `in_progress` / `completed`；候选为空时必须是
+  `state=not_required`，不做正常 Pass 样本抽检。
+- 语义 `semantic_consistency` 是 `execution_kind=external`，完成后才进入上述路由。
 - 自动 QC 已 hard fail：`required=false`、`state=skipped_due_to_fail`，问题直接供
   批次统计和返工使用。
 
@@ -381,7 +457,8 @@ revision 与预期不一致时必须报 stale-write 错误，不能静默覆盖�
 
 ## 9. 批次派生输出
 
-以下内容可以从 `quality_archive/*.json` 生成，但都不是单资产主档案：
+以下内容可以从 `quality_archive/*.json` 生成，但都不是单资产主档案；
+`quality_archive/*.json` 是唯一事实源：
 
 - 批次 CSV / XLSX；
 - review queue 和 review index；
@@ -418,3 +495,34 @@ revision 与预期不一致时必须报 stale-write 错误，不能静默覆盖�
 
 四种格式的列统一为 `scope/profile/metric/value_json`，指标名和 JSON 标量值必须
 逐项一致。任何 profile 缺少正式指标时导出直接失败，不允许某一种格式静默缺列。
+
+`sidecar` 是大体积模块明细的旁路文件，sidecar 只作证据和 reconciliation；
+`ledger events` 是流程事件日志；CSV 是表格视图。它们可被 JSON 用相对路径引用，
+但不能代替、覆盖或回退 `<asset_id>.json` 的 master verdict。
+
+## 10. v2 CLI、cache 与迁移边界
+
+```bash
+python tools/build_manual_review_queue.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/manual_review
+
+python tools/build_qc_json_projection.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/qc_projection \
+  --cache-dir sampled/XJGT_20260616/qc_cache \
+  --formats csv parquet xlsx markdown
+
+python tools/build_batch_qc_ledger.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/ledger \
+  --formats csv parquet xlsx markdown
+```
+
+projection/cache 读取每份 JSON 并校验 schema；cache manifest 保存相对路径、revision 和
+SHA-256，任一不一致都必须重建。旧 sidecar 参数只产生 reconciliation 行，不进入正式
+asset/issue/execution/aggregate 结论。
+
+v1 报告仅只读；首次 v2 写回必须先做纯函数 `migrate_v1_to_v2()`，保留 video block、
+unknown fields 和 revision，再通过 v2 schema/CAS 原子写盘。迁移失败或回滚只能保留
+v1 master、另写旁路/迁移产物，禁止覆盖 master verdict 或把 v1 内容写回 v2 主档案。

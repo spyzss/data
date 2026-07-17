@@ -16,7 +16,19 @@ from qc_reporting.projection import BatchProjection
 
 _TERMINAL_STATUSES = frozenset({"completed", "stopped"})
 _NON_COVERAGE_STATES = frozenset(
-    {"skipped_due_to_fail", "disabled", "not_implemented", "unknown"}
+    {
+        "adapter_missing",
+        "blocked",
+        "disabled",
+        "input_invalid",
+        "input_missing",
+        "not_implemented",
+        "not_run",
+        "not_run_due_to_acceptance_frame_budget",
+        "runtime_error",
+        "skipped_due_to_fail",
+        "unknown",
+    }
 )
 
 

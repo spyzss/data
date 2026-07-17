@@ -22,7 +22,7 @@ def _write_config(tmp_path: Path, raw: dict[str, object]) -> Path:
 def test_default_config_is_v2_snapshot_with_two_profiles() -> None:
     loaded = load_qc_acceptance_config()
     assert loaded.schema_version == "qc_acceptance_config_schema.v2"
-    assert loaded.config_version == "qc_acceptance_v2.2.0"
+    assert loaded.config_version == "qc_acceptance_v2.3.0"
     assert loaded.default_profile == "acceptance"
     assert loaded.execution_profile("acceptance")["fail_action"] == "stop"
     assert loaded.execution_profile("supplier_evaluation")["fail_action"] == "record_and_continue"
@@ -71,7 +71,7 @@ def test_default_config_is_v2_snapshot_with_two_profiles() -> None:
 
 def test_active_config_matches_immutable_v2_snapshot() -> None:
     assert Path("configs/qc_acceptance.yaml").read_bytes() == Path(
-        "configs/qc_acceptance/qc_acceptance_v2.2.0.yaml"
+        "configs/qc_acceptance/qc_acceptance_v2.3.0.yaml"
     ).read_bytes()
     assert (
         hashlib.sha256(Path("configs/qc_acceptance/qc_acceptance_v1.1.0.yaml").read_bytes()).hexdigest()
@@ -85,10 +85,10 @@ def test_active_config_matches_immutable_v2_snapshot() -> None:
     )
 
 
-def test_v22_preserves_v21_acceptance_frame_survival_policy() -> None:
+def test_v23_preserves_v22_acceptance_frame_survival_policy() -> None:
     active = load_qc_acceptance_config()
     previous = load_qc_acceptance_config(
-        Path("configs/qc_acceptance/qc_acceptance_v2.1.0.yaml")
+        Path("configs/qc_acceptance/qc_acceptance_v2.2.0.yaml")
     )
 
     assert active.frame_survival_policy("acceptance") == previous.frame_survival_policy(

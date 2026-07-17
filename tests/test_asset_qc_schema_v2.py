@@ -12,6 +12,16 @@ from qc_common.schema import validate_asset_qc_report
 from tests.qc_report_fixtures import make_v1_video_report, make_v2_report
 
 
+def _runtime_error(module: str, message: str) -> dict[str, object]:
+    return {
+        "module": module,
+        "error_type": "process_error",
+        "message": message,
+        "occurred_at": "2026-07-17T00:00:00Z",
+        "retryable": False,
+    }
+
+
 @pytest.mark.parametrize(
     "status", ["pending", "running", "awaiting_external", "incomplete", "error"]
 )
@@ -42,7 +52,7 @@ def test_stopped_v2_report_rejects_non_fail_decision(decision: str | None) -> No
 
 def test_runtime_error_v2_report_uses_error_state_and_null_decision() -> None:
     report = make_v2_report(status="error", overall_decision=None)
-    report["runtime_errors"] = [{"module": "video_quality", "message": "decoder crashed"}]
+    report["runtime_errors"] = [_runtime_error("video_quality", "decoder crashed")]
 
     validate_asset_qc_report(report)
 
@@ -51,7 +61,7 @@ def test_supplier_runtime_error_can_finish_as_incomplete() -> None:
     report = make_v2_report(status="incomplete", overall_decision=None)
     report["execution"]["profile"] = "supplier_evaluation"
     report["runtime_errors"] = [
-        {"module": "video_quality", "message": "decoder crashed"}
+        _runtime_error("video_quality", "decoder crashed")
     ]
     report["execution"]["module_states"] = {
         "video_quality": {"state": "runtime_error", "reason": "process_error"},
@@ -73,7 +83,7 @@ def test_runtime_errors_reject_non_error_pipeline_outcomes(
     error_path: str,
 ) -> None:
     report = make_v2_report(status=status, overall_decision=decision)
-    report["runtime_errors"] = [{"module": "video_quality", "message": "decoder crashed"}]
+    report["runtime_errors"] = [_runtime_error("video_quality", "decoder crashed")]
 
     with pytest.raises(ValueError, match=error_path):
         validate_asset_qc_report(report)
@@ -83,7 +93,7 @@ def test_supplier_runtime_error_can_remain_running_until_other_modules_finish() 
     report = make_v2_report(status="running", overall_decision=None)
     report["execution"]["profile"] = "supplier_evaluation"
     report["runtime_errors"] = [
-        {"module": "hdf5_text_info", "message": "source parse failed"}
+        _runtime_error("hdf5_text_info", "source parse failed")
     ]
 
     validate_asset_qc_report(report)

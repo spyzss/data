@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+import pandas as pd
+
+from qc_reporting.cache import (
+    build_source_manifest,
+    load_projection_cache,
+    write_projection_cache,
+)
+from qc_reporting.projection import project_quality_archive
+from tools.build_qc_json_projection import run_projection_cli
+from tests.test_qc_reporting_projection import _write_report
+
+
+def _make_archive(root: Path) -> Path:
+    archive = root / "quality_archive"
+    _write_report(archive, "a", "acceptance", "pass")
+    _write_report(archive, "b", "acceptance", "fail")
+    return archive
+
+
+def test_cache_can_be_deleted_and_rebuilt_identically(tmp_path: Path) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    manifest = build_source_manifest(archive)
+
+    first = project_quality_archive(archive)
+    write_projection_cache(first, cache_dir)
+    first_loaded = load_projection_cache(cache_dir, manifest)
+
+    assert first_loaded == first
+    shutil.rmtree(cache_dir)
+
+    second = project_quality_archive(archive)
+    write_projection_cache(second, cache_dir)
+    second_loaded = load_projection_cache(cache_dir, build_source_manifest(archive))
+
+    assert second_loaded == second
+    assert first_loaded == second_loaded
+
+
+def test_revision_change_invalidates_cache(tmp_path: Path) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    write_projection_cache(projection, cache_dir)
+
+    report_path = archive / "a.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["report_revision"] = int(report.get("report_revision", 0)) + 1
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    assert load_projection_cache(cache_dir, build_source_manifest(archive)) is None
+
+
+def test_cache_corruption_or_missing_table_returns_none(tmp_path: Path) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    write_projection_cache(projection, cache_dir)
+    manifest = build_source_manifest(archive)
+
+    (cache_dir / "issues.parquet").write_bytes(b"not parquet")
+    assert load_projection_cache(cache_dir, manifest) is None
+
+    write_projection_cache(projection, cache_dir)
+    (cache_dir / "execution.parquet").unlink()
+    assert load_projection_cache(cache_dir, manifest) is None
+
+
+def test_valid_but_altered_table_returns_none(tmp_path: Path) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    write_projection_cache(projection, cache_dir)
+    manifest = build_source_manifest(archive)
+
+    assets_path = cache_dir / "assets.parquet"
+    assets = pd.read_parquet(assets_path)
+    assets.loc[0, "decision"] = "fail"
+    assets.to_parquet(assets_path, index=False)
+
+    assert load_projection_cache(cache_dir, manifest) is None
+
+
+def test_scalar_cache_marker_prefix_round_trips(tmp_path: Path) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    marker_value = "__qc_cache_json__:literal-string"
+    projection.asset_rows[0]["extension_marker"] = marker_value
+
+    write_projection_cache(projection, cache_dir)
+    loaded = load_projection_cache(cache_dir, build_source_manifest(archive))
+
+    assert loaded is not None
+    assert loaded.asset_rows[0]["extension_marker"] == marker_value
+
+
+def test_projection_manifest_tampering_returns_none(tmp_path: Path) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    write_projection_cache(projection, cache_dir)
+    manifest = build_source_manifest(archive)
+
+    projection_manifest = json.loads(
+        (cache_dir / "projection_source_manifest.json").read_text(encoding="utf-8")
+    )
+    projection_manifest[0]["asset_id"] = "tampered"
+    (cache_dir / "projection_source_manifest.json").write_text(
+        json.dumps(projection_manifest), encoding="utf-8"
+    )
+
+    assert load_projection_cache(cache_dir, manifest) is None
+
+
+def test_malformed_source_manifest_entries_return_none_even_for_empty_expected(
+    tmp_path: Path,
+) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    write_projection_cache(projection, cache_dir)
+
+    (cache_dir / "source_reports.json").write_text("[1]", encoding="utf-8")
+    assert load_projection_cache(cache_dir, ()) is None
+
+
+def test_empty_archive_cache_round_trip(tmp_path: Path) -> None:
+    archive = tmp_path / "quality_archive"
+    archive.mkdir()
+    cache_dir = tmp_path / "cache"
+    projection = project_quality_archive(archive)
+    write_projection_cache(projection, cache_dir)
+
+    assert load_projection_cache(cache_dir, build_source_manifest(archive)) == projection
+
+
+def test_cli_rebuilds_missing_or_stale_cache_from_json(tmp_path: Path) -> None:
+    archive = _make_archive(tmp_path)
+    cache_dir = tmp_path / "cache"
+    first_output = tmp_path / "first"
+    second_output = tmp_path / "second"
+
+    run_projection_cli(archive, first_output, formats=("csv",), cache_dir=cache_dir)
+    assert (cache_dir / "source_reports.json").is_file()
+
+    (cache_dir / "assets.parquet").unlink()
+    run_projection_cli(archive, second_output, formats=("csv",), cache_dir=cache_dir)
+
+    assert (cache_dir / "assets.parquet").is_file()
+    assert pd.read_csv(first_output / "assets.csv").equals(
+        pd.read_csv(second_output / "assets.csv")
+    )

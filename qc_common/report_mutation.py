@@ -17,7 +17,7 @@ from qc_common.report import (
 )
 from qc_common.report_migration import migrate_v1_to_v2
 from qc_common.schema import validate_asset_qc_report
-from qc_pipeline.context import AssetContext
+from qc_pipeline.context import AssetContext, _thaw
 
 
 class ModuleOrderError(RuntimeError):
@@ -26,6 +26,17 @@ class ModuleOrderError(RuntimeError):
 
 class ConfigDriftError(RuntimeError):
     pass
+
+
+def _supplier_id_from_metadata(metadata: Mapping[str, Any]) -> str:
+    for key in ("supplier_id", "supplier"):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        supplier_id = str(value).strip()
+        if supplier_id:
+            return supplier_id
+    return "unknown"
 
 
 def initialize_v2_report(
@@ -39,6 +50,7 @@ def initialize_v2_report(
     return {
         "schema_version": "asset_qc_report.v2",
         "asset_id": context.asset_id,
+        "supplier_id": _supplier_id_from_metadata(context.metadata),
         "report_revision": 0,
         "qc_config": config.json_reference(),
         "execution": {
@@ -53,7 +65,7 @@ def initialize_v2_report(
             "stop_reason": None,
         },
         "overall_decision": None,
-        "source_files": copy.deepcopy(dict(context.source_files)),
+        "source_files": _thaw(context.source_files),
         "manifest_metadata": manifest_metadata(context.metadata),
         "issues": [],
         "runtime_errors": [],
@@ -104,7 +116,7 @@ def _assert_report_identity(
         raise ValueError(
             f"asset_id mismatch: {report.get('asset_id')} != {context.asset_id}"
         )
-    if report.get("source_files") != dict(context.source_files):
+    if _thaw(report.get("source_files")) != _thaw(context.source_files):
         raise ValueError("source_files mismatch between report and AssetContext")
     if report.get("manifest_metadata") != manifest_metadata(context.metadata):
         raise ValueError("manifest_metadata mismatch between report and AssetContext")
@@ -213,13 +225,21 @@ def _assert_module_order(
                 continue_to_next = exit_gate.get("continue_to_next_module")
                 recorded_next = exit_gate.get("next_module")
     if last_completed == result_module:
-        continuing_status = "completed" if next_module is None else "running"
         continuing_rerun = (
-            exit_state == "continue"
+            next_module is not None
+            and exit_state == "continue"
             and continue_to_next is True
             and recorded_next == next_module
             and current_next == next_module
-            and pipeline_status == continuing_status
+            and pipeline_status == "running"
+        )
+        completed_rerun = (
+            next_module is None
+            and exit_state == "complete_qc"
+            and continue_to_next is False
+            and recorded_next is None
+            and current_next is None
+            and pipeline_status == "completed"
         )
         stopped_rerun = (
             exit_state == "stop_qc"
@@ -228,7 +248,7 @@ def _assert_module_order(
             and current_next is None
             and pipeline_status == "stopped"
         )
-        if continuing_rerun or stopped_rerun:
+        if continuing_rerun or completed_rerun or stopped_rerun:
             return
 
     raise ModuleOrderError(
@@ -391,7 +411,7 @@ def _rebuild_issue_collections(report: dict[str, Any]) -> None:
     )
 
 
-def _has_machine_fail(
+def has_machine_fail(
     report: Mapping[str, Any],
     modules: tuple[str, ...],
 ) -> bool:
@@ -433,6 +453,10 @@ def _has_machine_fail(
         ):
             return True
     return False
+
+
+# Backward-compatible private name used by the human-review orchestrator.
+_has_machine_fail = has_machine_fail
 
 
 _INCOMPLETE_MODULE_STATES = frozenset(
@@ -652,8 +676,15 @@ def apply_module_result(
         )
     )
     continued_after_fail = result.verdict == "fail" and not hard_stop
-    continue_to_next = not hard_stop
-    exit_state = "continue" if continue_to_next else "stop_qc"
+    if hard_stop:
+        exit_state = "stop_qc"
+        continue_to_next = False
+    elif next_module is None:
+        exit_state = "complete_qc"
+        continue_to_next = False
+    else:
+        exit_state = "continue"
+        continue_to_next = True
     module_block = _module_block(
         result,
         evidence=evidence,
@@ -722,7 +753,7 @@ def apply_module_result(
         report["overall_decision"] = "fail"
     elif pipeline_status == "completed":
         report["overall_decision"] = (
-            "fail" if _has_machine_fail(report, config.pipeline_modules) else "pass"
+            "fail" if has_machine_fail(report, config.pipeline_modules) else "pass"
         )
     else:
         report["overall_decision"] = None
@@ -999,6 +1030,8 @@ def write_pipeline_transition(
     overall_decision: str | None,
     now: str,
 ) -> dict[str, Any]:
+    if state == "error":
+        raise ValueError("error transitions must use record_runtime_error")
     loaded = load_asset_qc_report(path)
     if loaded is None:
         raise FileNotFoundError(path)
@@ -1027,11 +1060,6 @@ def write_pipeline_transition(
     if not isinstance(execution, dict):
         raise ValueError("execution must be an object")
     execution["updated_at"] = now
-    if state == "error" and stop_reason:
-        runtime_errors = report.get("runtime_errors")
-        if not isinstance(runtime_errors, list):
-            raise ValueError("runtime_errors must be an array")
-        runtime_errors.append({"module": module, "message": stop_reason})
 
     report["report_revision"] = expected_revision + 1
     profile = execution.get("profile")

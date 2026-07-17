@@ -122,6 +122,7 @@ def project_quality_archive(quality_archive: Path) -> BatchProjection:
                 "report_path": str(path),
                 "json_path": str(path),
                 "asset_id": asset_row["asset_id"],
+                "batch_id": asset_row["batch_id"],
                 "profile": asset_row["profile"],
                 "report_revision": asset_row["report_revision"],
                 "schema_version": asset_row["schema_version"],
@@ -224,6 +225,7 @@ _REPORT_TOP_LEVEL_KEYS = frozenset(
         "schema_version",
         "asset_id",
         "supplier_id",
+        "batch_id",
         "report_revision",
         "qc_config",
         "execution",
@@ -235,6 +237,9 @@ _REPORT_TOP_LEVEL_KEYS = frozenset(
         "manual_review",
         "metadata",
         "semantic_calibration",
+        "canonical_binding",
+        "canonical_qc_range",
+        "source_gate",
     }
 )
 
@@ -271,6 +276,7 @@ def _project_report_rows(
 
     asset_row: dict[str, Any] = {
         "asset_id": asset_id,
+        "batch_id": str(report.get("batch_id") or "unknown"),
         "supplier_id": _supplier_id(report),
         "profile": profile,
         "schema_version": str(report.get("schema_version") or ""),

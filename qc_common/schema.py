@@ -177,9 +177,11 @@ def _validate_manual_review(block: Mapping[str, Any]) -> None:
         "issue_reviews",
         "completed_at",
     }
-    is_human_block = state in {"required", "queued", "in_progress", "completed"} or bool(
-        human_fields.intersection(block)
-    )
+    if "reviews" in block and "issue_reviews" not in block:
+        # Canonical Publisher reports use the formal review-record array. The
+        # publisher validates its stronger record semantics separately.
+        return
+    is_human_block = bool(human_fields.intersection(block))
     if not is_human_block:
         return
 
@@ -288,7 +290,18 @@ def _validate_human_blocks(report: Mapping[str, Any]) -> None:
         # Keep pre-contract opaque semantic extensions readable during
         # migration.  As soon as a report opts into any v2 contract key, the
         # complete strict block is required.
-        if semantic_contract_keys.intersection(semantic):
+        workbench_keys = {
+            "source_dataset_path",
+            "base_hdf5_sha256",
+            "final_hdf5_sha256",
+            "pending_edit",
+            "audit",
+        }
+        canonical_publish_shape = (
+            "canonical_revision" in semantic
+            and not workbench_keys.intersection(semantic)
+        )
+        if semantic_contract_keys.intersection(semantic) and not canonical_publish_shape:
             _validate_semantic_calibration(semantic)
 
     manual = report.get("manual_review")

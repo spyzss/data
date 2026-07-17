@@ -17,6 +17,82 @@ supplier data / raw video
 
 注意：这个顺序是外部 workflow，不得硬编码进任何 root module。每个 root module 都必须能独立运行或被独立测试。
 
+### 1.1 Canonical QC dataflow (v2)
+
+The acceptance workflow that produces formal quality decisions is separate from
+the legacy annotation outputs above. It is driven by
+`configs/qc_acceptance.yaml` (`qc_acceptance_config_schema.v2`,
+`qc_acceptance_v2.1.0`) and writes one
+`<batch>/quality_archive/<asset_id>.json` per asset with
+`schema_version=asset_qc_report.v2`.
+
+```text
+automatic QC Gate
+  acceptance: hard fail -> stopped/fail; skip semantic/manual
+  supplier_evaluation: hard fail -> record and continue
+-> semantic_consistency (external)
+-> no candidate_issue_ids -> manual_review=not_required
+-> candidate_issue_ids -> manual_review=queued/in_progress/completed
+-> overall_decision=pass|fail
+-> batch projections read quality_archive/*.json only
+```
+
+`semantic_consistency` is before manual warn review and is currently an external
+human calibration stage; a future model may implement the same external
+interface. Runtime errors, evidence failures, config drift and CAS conflicts set
+`pipeline_state.status=error`, append `runtime_errors`, and leave
+`overall_decision=null`; they are not quality fails. The only final decision
+values are `pass`, `fail`, and `null` while incomplete.
+
+`quality_archive/*.json` is the sole master source. Sidecars, overlays, CSV,
+XLSX, Markdown, events and cache are derived evidence/reconciliation only
+（sidecar 只作证据）; they cannot replace or overwrite a report verdict.
+
+### 1.2 Canonical Data ingest and curated publish
+
+标准 HDF5 与 LeRobot 使用同一显式入口：
+
+```text
+immutable Raw -> SourceAdapter -> Canonical Data view
+                                   ├─ standardized Core -> CanonicalQcBridge -> QC
+                                   ├─ supplier extensions/evidence
+batch manifest / dataset attributes┘
+
+QC -> final asset_qc_report.v2 -------------------------+
+Raw + Canonical metadata -------------------------------+-> LeRobotV3Publisher
+optional canonical revision artifact -------------------+        |
+                                                                 v
+                                                    immutable release/CURRENT
+```
+
+Canonical Data 是长期标准化数据视图，不是仅供 QC 使用的中间格式。Core 是跨供应商
+统一字段；supplier extensions/evidence 保留当前 QC 不读取但训练、检索或预研可能
+需要的字段；Derived/QC outputs 只进入 `asset_qc_report.v2`，不得污染 Canonical。
+批次 manifest 的 `dataset_attributes` 用于 sensors/cameras/robot/annotation version/
+language/modality 分类，不参与单资产 QC verdict。
+
+`configs/canonical_qc.yaml` 是 ingest/publish 顶层 active config，并绑定 immutable
+snapshot、QC config hash、Adapter/Publisher/toolchain/official-reader 版本。CLI 必须
+显式接收 source format、source root、路径及 manifest 提供的
+`asset_id/batch_id/supplier_id`；不得猜格式、根目录或失败资产 identity。Source Gate
+在 Adapter 前建立资产报告，确定性合同失败仍进入唯一 QC JSON；可重试错误恢复后
+以 CAS revision 继续并保留历史。自动流程在
+`semantic_consistency` 返回 `awaiting_external`，不会伪造人工完成。训练从
+`CURRENT.json -> releases/<release_id>` 读取，不扫描 staging 或按 mtime 选数据。
+
+当前 path Publisher 支持 format-neutral `canonical_revision_artifact.v1`：只允许
+task/description、subtask 双语文本和成对共享边界 patch，并以 CAS/fingerprint/
+revision/edit-count 校验；无 artifact 的非零编辑仍 fail closed。
+
+Publisher 的目标输入是 Raw source + Canonical metadata/field inventory + final QC
+report + optional revision artifact。QC report 只作为 Gate 和审计绑定，不能被描述为
+训练 payload 来源。当前实现通过 Raw 重建兼容 `CanonicalQcEpisode`，发布 Core、
+`quality_hand`、已登记 supplier extensions 和 typed batch attributes，并在 manifest
+绑定 data/artifact fingerprint。unsupported 类型、schema 漂移或尚无 Adapter 的格式
+会 fail closed，不得静默 drop 后宣称“任意 Raw 全量发布”。
+
+命令和故障恢复见 `docs/canonical-qc-ingest-publish-runbook.md`。
+
 ## 2. Module Ownership
 
 | Module | Owner Scope | Loads Heavy Models | Main Inputs | Main Outputs |
@@ -222,3 +298,38 @@ final_decision
 - `annotation_verify/` 不做 signal-quality checks。
 - `qc_common/` 只放稳定契约和纯工具。
 - Heavy model sidecars 可以放在 `tools/`，但必须明确标注为外部 workflow step。
+
+## 11. Canonical QC projection and migration commands
+
+```bash
+python tools/build_manual_review_queue.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/manual_review
+
+python tools/build_qc_json_projection.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/qc_projection \
+  --cache-dir sampled/XJGT_20260616/qc_cache \
+  --formats csv parquet xlsx markdown
+
+python tools/build_batch_qc_ledger.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/ledger \
+  --formats csv parquet xlsx markdown
+
+python tools/build_xjgt_acceptance_report.py \
+  --quality-archive sampled/XJGT_20260616/quality_archive \
+  --output-dir sampled/XJGT_20260616/xjgt_report
+```
+
+All formal commands validate each JSON before projection. Cache reuse requires a
+source manifest matching relative report path, `report_revision` and SHA-256;
+otherwise rebuild it. Legacy sidecar flags are explicit reconciliation inputs
+only and cannot modify canonical rows.
+
+Report writers use read → identity/config/profile/next-module check → module-owned
+mutation → candidate/fail rebuild → revision + 1 → v2 schema → fsync/atomic
+replace. A stale revision is a CAS error and must not silently overwrite a
+concurrent writer. `asset_qc_report.v1` is read-only; the first v2 write uses
+`migrate_v1_to_v2()` and a new v2 report. Rollback is read-only/sidecar based and
+must not overwrite the master verdict.

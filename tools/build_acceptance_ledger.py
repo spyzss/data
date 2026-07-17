@@ -7,11 +7,18 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+# Keep ``python tools/build_acceptance_ledger.py`` equivalent to module
+# invocation so formal projection imports resolve from the repository root.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import pandas as pd
 import yaml
@@ -78,7 +85,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build an XLSX acceptance ledger from supplier module outputs."
     )
-    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--quality-archive", required=True, type=Path)
+    # Config remains part of the legacy helper API, but is not needed when
+    # formal output is sourced from a canonical quality archive.
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--existing-workbook", type=Path)
     parser.add_argument("--overwrite", action="store_true")
@@ -97,6 +107,7 @@ def main() -> int:
         output_path=args.output,
         existing_workbook=args.existing_workbook,
         overwrite=args.overwrite,
+        quality_archive=args.quality_archive,
     )
     LOGGER.info("Wrote %s", output)
     return 0
@@ -339,15 +350,37 @@ def build_supplier_ledger(
 
 def build_acceptance_ledger(
     *,
-    config_path: Path,
+    config_path: Path | None,
     output_path: Path,
     overwrite: bool = False,
     existing_workbook: Path | None = None,
+    quality_archive: Path | None = None,
 ) -> Path:
-    config_path = Path(config_path)
     output_path = Path(output_path)
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"output exists; pass --overwrite: {output_path}")
+    if quality_archive is not None:
+        # The unified QC JSON projection is the formal ledger.  Keep the
+        # historical function/API usable for callers that omit this argument,
+        # but never let legacy supplier inputs override a canonical verdict.
+        from tools.build_qc_json_projection import run_projection_cli
+
+        paths = run_projection_cli(
+            Path(quality_archive),
+            output_path.parent,
+            formats=("csv", "parquet", "xlsx", "markdown"),
+        )
+        projected_xlsx = paths.get("xlsx")
+        if projected_xlsx is None:
+            raise RuntimeError("QC projection did not produce an XLSX output")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(projected_xlsx, output_path)
+        return output_path
+    if config_path is None:
+        raise ValueError(
+            "config_path is required when quality_archive is not provided"
+        )
+    config_path = Path(config_path)
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if config.get("workbook_mode") == "weekly_template":
         try:

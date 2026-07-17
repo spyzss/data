@@ -16,7 +16,14 @@ MANIFEST_TEXT_METADATA_FIELDS = (
 )
 
 _RUNTIME_METADATA_FIELDS = frozenset(
-    {"clip_inputs", "manifest_row", "profile", "reuse_artifacts"}
+    {
+        "canonical_episode",
+        "canonical_source_root",
+        "clip_inputs",
+        "manifest_row",
+        "profile",
+        "reuse_artifacts",
+    }
 )
 
 

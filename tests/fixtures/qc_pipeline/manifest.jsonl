@@ -1,0 +1,4 @@
+{"asset_id":"pass","primary_video_path":"video/clip.mp4","verdicts":{"hdf5_text_info":"pass","quality_hand":"pass"}}
+{"asset_id":"warn","primary_video_path":"video/clip.mp4","verdicts":{"hdf5_text_info":"pass","quality_hand":"warn"}}
+{"asset_id":"hard-fail","primary_video_path":"video/clip.mp4","verdicts":{"hdf5_text_info":"fail"}}
+{"asset_id":"runtime-error","primary_video_path":"video/clip.mp4","errors":{"quality_hand":"input_missing"}}
