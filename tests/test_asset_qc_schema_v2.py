@@ -228,6 +228,14 @@ def test_v2_schema_keeps_registered_and_unknown_module_blocks_open() -> None:
     validate_asset_qc_report(report)
 
 
+def test_v2_schema_requires_supplier_audit_block_to_be_an_object() -> None:
+    report = make_v2_report()
+    report["supplier_data_audit"] = "invalid"
+
+    with pytest.raises(ValueError, match="supplier_data_audit"):
+        validate_asset_qc_report(report)
+
+
 def test_write_promotes_v1_report_with_explicit_acceptance_profile(tmp_path: Path) -> None:
     path = tmp_path / "report.json"
     report = make_v1_video_report()

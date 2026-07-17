@@ -95,6 +95,7 @@ def test_deepreach_adapter_slices_inclusive_range_without_quality_hand(
         {
             "asset_id": "dr-clip",
             "hdf5_path": str(hdf5_path),
+            "hdf5_reference_dataset": "timestamp",
             "start_frame": 2,
             "end_frame": 5,
             "task": "fold cloth",
@@ -116,6 +117,98 @@ def test_deepreach_adapter_slices_inclusive_range_without_quality_hand(
     assert np.isnan(clip.keypoints["leftHand"][1]).all()
     assert getattr(clip, "supplier_quality_signal") == "not_provided"
     assert getattr(clip, "morphology_status") == "not_ready_topology"
+
+
+def test_deepreach_loader_requires_explicit_reference_dataset(tmp_path: Path) -> None:
+    from tools.run_manifest_precheck import load_deepreach_clip
+
+    hdf5_path = _write_deepreach_hdf5(tmp_path / "deepreach.h5")
+
+    with pytest.raises(ValueError, match="reference_dataset"):
+        load_deepreach_clip(
+            {
+                "asset_id": "dr-clip",
+                "hdf5_path": str(hdf5_path),
+                "start_frame": 0,
+                "end_frame": 1,
+            },
+            episode_idx=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("dataset", "length", "expected_range"),
+    [
+        ("hand/left/valid", 11, [11, 11]),
+        ("hand/right/joints3d", 13, [12, 12]),
+    ],
+)
+def test_deepreach_loader_rejects_unequal_dataset_lengths_before_slicing(
+    tmp_path: Path,
+    dataset: str,
+    length: int,
+    expected_range: list[int],
+) -> None:
+    from tools.run_manifest_precheck import load_deepreach_clip
+
+    hdf5_path = _write_deepreach_hdf5(tmp_path / "deepreach.h5")
+    with h5py.File(hdf5_path, "a") as handle:
+        del handle[dataset]
+        data = (
+            _hand_points(length)
+            if dataset.endswith("joints3d")
+            else np.ones(length, dtype=np.uint8)
+        )
+        handle.create_dataset(dataset, data=data)
+
+    with pytest.raises(ValueError, match="inconsistent_frame_count") as raised:
+        load_deepreach_clip(
+            {
+                "asset_id": "dr-clip",
+                "hdf5_path": str(hdf5_path),
+                "start_frame": 0,
+                "end_frame": 10,
+                "hdf5_reference_dataset": "timestamp",
+            },
+            episode_idx=0,
+        )
+
+    details = json.loads(str(raised.value).split(": ", 1)[1])
+    assert details["reference_dataset"] == "timestamp"
+    assert details["expected_frame_count"] == 12
+    assert details["dataset_lengths"][dataset] == length
+    assert details["mismatch_ranges"][dataset] == expected_range
+    assert details["source_path"] == str(hdf5_path)
+
+
+def test_deepreach_loader_rejects_multiple_length_mismatches(tmp_path: Path) -> None:
+    from tools.run_manifest_precheck import load_deepreach_clip
+
+    hdf5_path = _write_deepreach_hdf5(tmp_path / "deepreach.h5")
+    with h5py.File(hdf5_path, "a") as handle:
+        del handle["hand/left/valid"]
+        handle.create_dataset("hand/left/valid", data=np.ones(11, dtype=np.uint8))
+        del handle["hand/right/valid"]
+        handle.create_dataset("hand/right/valid", data=np.ones(13, dtype=np.uint8))
+
+    with pytest.raises(ValueError, match="inconsistent_frame_count") as raised:
+        load_deepreach_clip(
+            {
+                "asset_id": "dr-clip",
+                "hdf5_path": str(hdf5_path),
+                "start_frame": 0,
+                "end_frame": 10,
+                "hdf5_reference_dataset": "timestamp",
+            },
+            episode_idx=0,
+        )
+
+    details = json.loads(str(raised.value).split(": ", 1)[1])
+    assert details["mismatch_count"] == 2
+    assert details["mismatch_ranges"] == {
+        "hand/left/valid": [11, 11],
+        "hand/right/valid": [12, 12],
+    }
 
 
 def test_jdt_adapter_reshapes_3d_and_preserves_cam_left_2d(tmp_path: Path) -> None:
@@ -397,6 +490,7 @@ def test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows(
             {
                 "asset_id": "dr-range",
                 "hdf5_path": str(hdf5_path),
+                "hdf5_reference_dataset": "timestamp",
                 "start_frame": 3,
                 "end_frame": 10,
                 "task": "fold cloth",
@@ -421,6 +515,18 @@ def test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows(
     ]
     assert [row["source_frame_idx"] for row in temporal] == list(range(3, 11))
     assert [row["local_frame_idx"] for row in temporal] == list(range(8))
+    calibrated_temporal = [
+        row
+        for row in rows
+        if row["check"] == "skeleton_quality_score"
+        and row["frame_idx"] >= 0
+        and row["metrics"].get("temporal_output_valid") is True
+    ]
+    assert calibrated_temporal
+    assert all(
+        row["metrics"]["temporal_pair_end_frame"] == row["source_frame_idx"]
+        for row in calibrated_temporal
+    )
     windows = json.loads((output_dir / "candidate_windows.json").read_text())
     assert windows
     assert all(window["asset_id"] == "dr-range" for window in windows)
@@ -441,25 +547,62 @@ def test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows(
     assert all(window["local_start_frame"] == window["start_frame"] - 3 for window in windows)
     assert all(window["local_end_frame"] == window["end_frame"] - 3 for window in windows)
     from qc_pipeline.adapters.precheck import adapt_keypoint_temporal
+    from qc_common.types import CheckResult
     from tests.qc_report_fixtures import loaded_test_config
 
+    adapted_rows = [
+        CheckResult(
+            check=str(row["check"]),
+            episode_idx=int(row["episode_idx"]),
+            frame_idx=int(row["frame_idx"]),
+            metrics=dict(row.get("metrics") or {}),
+            flag=row.get("flag"),
+            reason=str(row.get("reason") or ""),
+            severity=(
+                str(row["severity"])
+                if row.get("severity") is not None
+                else None
+            ),
+        )
+        for row in rows
+        if row["check"] == "skeleton_quality_score"
+    ]
     adapted = adapt_keypoint_temporal(
         asset_id="dr-range",
         source_relative_path="deepreach.h5",
-        results=[],
+        results=adapted_rows,
         candidate_windows=windows,
         config=loaded_test_config(),
     )
-    assert adapted.verdict == "warn"
-    assert len(adapted.issues) == len(windows)
+    assert adapted.verdict == "fail"
     assert all(issue.module == "keypoint_temporal" for issue in adapted.issues)
+    assert any(
+        issue.rule_id == "keypoint_temporal.strong_temporal_failure"
+        and issue.severity == "fail"
+        for issue in adapted.issues
+    )
+    candidate_issues = [
+        issue
+        for issue in adapted.issues
+        if issue.rule_id == "keypoint_temporal.composite_frame_verdict"
+    ]
+    assert len(candidate_issues) == len(windows)
     assert [
         (issue.context["start_frame"], issue.context["end_frame"])
-        for issue in adapted.issues
+        for issue in candidate_issues
     ] == [(window["start_frame"], window["end_frame"]) for window in windows]
+    candidate_evidence = [
+        evidence for evidence in adapted.evidence if evidence.kind == "candidate_window"
+    ]
+    assert len(candidate_evidence) == len(windows)
     assert all(
         evidence.path == "candidate_windows.json"
         and evidence.coordinate_system == "source_inclusive"
+        for evidence in candidate_evidence
+    )
+    assert any(
+        evidence.kind == "frame_metrics"
+        and evidence.path == "check_results.json"
         for evidence in adapted.evidence
     )
     aggregates = json.loads((output_dir / "clip_aggregates.json").read_text())
@@ -484,6 +627,31 @@ def test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows(
         "run_config.json",
     ):
         assert (output_dir / filename).exists()
+
+
+def test_source_result_mapping_does_not_double_shift_existing_pair_lineage() -> None:
+    from qc_common.types import CheckResult
+    from tools.run_manifest_precheck import _result_in_source_coordinates
+
+    row = CheckResult(
+        "skeleton_quality_score",
+        0,
+        1,
+        {
+            "temporal_pair_start_frame": 50,
+            "temporal_pair_end_frame": 51,
+            "temporal_transition_attribution": "target_frame",
+        },
+        False,
+        "valid source lineage",
+        severity="pass",
+    )
+
+    mapped = _result_in_source_coordinates(row, clip_start_frame=50)
+
+    assert mapped.frame_idx == 51
+    assert mapped.metrics["temporal_pair_start_frame"] == 50
+    assert mapped.metrics["temporal_pair_end_frame"] == 51
 
 
 def test_candidate_window_maps_local_boundaries_to_source_once() -> None:
@@ -580,16 +748,18 @@ def test_manifest_precheck_isolates_invalid_candidate_window(
     pd.DataFrame(
         [
             {
-                "asset_id": "invalid-window",
-                "hdf5_path": str(hdf5_path),
+                    "asset_id": "invalid-window",
+                    "hdf5_path": str(hdf5_path),
+                    "hdf5_reference_dataset": "timestamp",
                 "start_frame": 0,
                 "end_frame": 3,
                 "task": "fold",
                 "subtask_description": "fold edge",
             },
             {
-                "asset_id": "valid-window",
-                "hdf5_path": str(hdf5_path),
+                    "asset_id": "valid-window",
+                    "hdf5_path": str(hdf5_path),
+                    "hdf5_reference_dataset": "timestamp",
                 "start_frame": 4,
                 "end_frame": 7,
                 "task": "fold",
@@ -638,16 +808,18 @@ def test_manifest_precheck_isolates_bad_manifest_rows(tmp_path: Path) -> None:
     pd.DataFrame(
         [
             {
-                "asset_id": "valid",
-                "hdf5_path": str(valid_hdf5),
+                    "asset_id": "valid",
+                    "hdf5_path": str(valid_hdf5),
+                    "hdf5_reference_dataset": "timestamp",
                 "start_frame": 0,
                 "end_frame": 4,
                 "task": "fold",
                 "subtask_description": "fold edge",
             },
             {
-                "asset_id": "missing",
-                "hdf5_path": str(tmp_path / "missing.h5"),
+                    "asset_id": "missing",
+                    "hdf5_path": str(tmp_path / "missing.h5"),
+                    "hdf5_reference_dataset": "timestamp",
                 "start_frame": 0,
                 "end_frame": 4,
                 "task": "fold",
@@ -699,16 +871,18 @@ def test_manifest_precheck_dry_run_validates_without_outputs(tmp_path: Path) -> 
     pd.DataFrame(
         [
             {
-                "asset_id": "valid",
-                "hdf5_path": str(hdf5_path),
+                    "asset_id": "valid",
+                    "hdf5_path": str(hdf5_path),
+                    "hdf5_reference_dataset": "timestamp",
                 "start_frame": 1,
                 "end_frame": 4,
                 "task": "fold",
                 "subtask_description": "fold edge",
             },
             {
-                "asset_id": "invalid",
-                "hdf5_path": str(hdf5_path),
+                    "asset_id": "invalid",
+                    "hdf5_path": str(hdf5_path),
+                    "hdf5_reference_dataset": "timestamp",
                 "start_frame": 5,
                 "end_frame": 9,
                 "task": "fold",
@@ -809,8 +983,9 @@ def test_manifest_precheck_skips_completed_assets_unless_overwrite(
     pd.DataFrame(
         [
             {
-                "asset_id": "dr-range",
-                "hdf5_path": str(hdf5_path),
+                    "asset_id": "dr-range",
+                    "hdf5_path": str(hdf5_path),
+                    "hdf5_reference_dataset": "timestamp",
                 "start_frame": 0,
                 "end_frame": 4,
                 "task": "fold",

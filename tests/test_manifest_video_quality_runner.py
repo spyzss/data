@@ -326,7 +326,7 @@ def test_manifest_video_quality_supplier_profile_keeps_machine_verdict(
     assert report["video_quality"]["flow"]["exit_gate"] == {
         "state": "continue",
         "continue_to_next_module": True,
-        "next_module": "sam3_containment",
+        "next_module": "supplier_data_audit",
     }
     assert report["pipeline_state"]["status"] == "running"
 
@@ -642,8 +642,8 @@ def test_manifest_video_rejects_inconsistent_completed_flow(
 @pytest.mark.parametrize(
     ("profile", "exit_state", "pipeline_status", "exit_next"),
     [
-        ("supplier_evaluation", "continue", "running", "sam3_containment"),
-        ("acceptance", "continue", "running", "sam3_containment"),
+        ("supplier_evaluation", "continue", "running", "supplier_data_audit"),
+        ("acceptance", "continue", "running", "supplier_data_audit"),
     ],
 )
 def test_manifest_video_skips_consistent_completed_outcomes(

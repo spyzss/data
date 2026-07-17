@@ -168,7 +168,7 @@ def test_video_writer_uses_expected_revision_and_preserves_extensions(
         config=loaded_v2_config,
         profile="acceptance",
         expected_revision=revision,
-        next_module="sam3_containment",
+        next_module="supplier_data_audit",
     )
 
     assert updated["report_revision"] == revision + 1

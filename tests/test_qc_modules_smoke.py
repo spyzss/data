@@ -125,6 +125,7 @@ def _skeleton_candidate_result(
     exceeded: list[str],
     flag: bool | None = None,
     invalid: bool = False,
+    temporal_output_valid: bool | None = True,
 ) -> CheckResult:
     metrics = {
         "joint_angle_change_deg_max": 11.0 if "joint_angle_change_deg_max" in exceeded else 1.0,
@@ -138,6 +139,7 @@ def _skeleton_candidate_result(
         "which_thresholds_exceeded": exceeded,
         "keypoint_presence_invalid": 1.0 if invalid else 0.0,
         "skeleton_verdict": "invalid" if invalid else "suspect" if flag else "review",
+        "temporal_output_valid": temporal_output_valid,
     }
     return CheckResult(
         check="skeleton_quality_score",
@@ -585,7 +587,9 @@ def test_skeleton_projection_config_missing_skips_cleanly(tmp_path: Path) -> Non
     ]
     assert frame_rows
     assert all(row.metrics["projection_enabled"] == 0.0 for row in frame_rows)
-    assert all(row.flag is None for row in frame_rows)
+    assert frame_rows[0].flag is None
+    assert all(row.severity in {"uncalibrated", "pass", "warn"} for row in frame_rows)
+    assert any(row.severity == "warn" for row in frame_rows)
 
 
 def test_skeleton_rotation_review_requires_projection_risk(tmp_path: Path) -> None:
@@ -613,11 +617,12 @@ def test_skeleton_rotation_review_requires_projection_risk(tmp_path: Path) -> No
         for result in safe_results
         if result.check == "skeleton_quality_score" and result.frame_idx == 22
     )
-    assert safe_row.flag is None
+    assert safe_row.flag is True
+    assert safe_row.severity == "warn"
     assert safe_row.metrics["skeleton_verdict"] == "review"
     assert safe_row.metrics["which_thresholds_exceeded"] == ["rotation_delta_max"]
     assert safe_row.metrics["needs_rotation_mask_review"] == 0.0
-    assert safe_row.metrics["needs_visual_review"] == 0.0
+    assert safe_row.metrics["needs_visual_review"] == 1.0
     assert not (tmp_path / "rotation_safe_projection" / "candidate_windows.json").exists()
 
     edge_clip = _rotation_jump_clip(episode_idx=112)
@@ -638,7 +643,8 @@ def test_skeleton_rotation_review_requires_projection_risk(tmp_path: Path) -> No
         for result in edge_results
         if result.check == "skeleton_quality_score" and result.frame_idx == 22
     )
-    assert edge_row.flag is None
+    assert edge_row.flag is True
+    assert edge_row.severity == "warn"
     assert edge_row.metrics["skeleton_verdict"] == "review"
     assert edge_row.metrics["left_num_points_near_border"] == 21.0
     assert edge_row.metrics["left_needs_projection_review"] == 1.0
@@ -688,6 +694,7 @@ def test_skeleton_candidate_windows_use_strict_temporal_seed_runs() -> None:
     assert acceleration_windows[0]["end_frame"] == 8
     assert acceleration_windows[0]["window_source"] == "skeleton_quality_temporal_run"
     assert acceleration_windows[0]["review_type"] == ["temporal_geometry_review"]
+    assert acceleration_windows[0]["sam3_eligible"] is True
     assert "acceleration_seed" in acceleration_windows[0]["trigger_reason"]
 
     displacement_rows = [
@@ -710,6 +717,57 @@ def test_skeleton_candidate_windows_use_strict_temporal_seed_runs() -> None:
     assert "multi_signal_seed" in multi_signal_windows[0]["trigger_reason"]
 
 
+def test_uncalibrated_temporal_rows_never_seed_candidate_windows() -> None:
+    clip = ClipInputs(episode_idx=12, frame_indices=list(range(40)))
+    check = _candidate_check(rotation_delta_extreme_review_threshold=0.49)
+
+    extreme_rotation_rows = [
+        _skeleton_candidate_result(
+            frame_idx,
+            ["rotation_delta_max"],
+            flag=None,
+            temporal_output_valid=False,
+        )
+        for frame_idx in [5, 6, 7]
+    ]
+    assert check.build_candidate_windows(clip, extreme_rotation_rows) == []
+
+    side_view_rows = [
+        _skeleton_candidate_result(
+            frame_idx,
+            [],
+            flag=None,
+            temporal_output_valid=None,
+        )
+        for frame_idx in [10, 11, 12]
+    ]
+    for row in side_view_rows:
+        row.metrics["palm_camera_angle_deg_max"] = 90.0
+        row.metrics["side_view_hand_count"] = 2.0
+    side_view_check = _candidate_check(
+        palm_camera_angle_review_threshold_deg=60.0,
+    )
+    assert side_view_check.build_candidate_windows(clip, side_view_rows) == []
+
+    missing_validity_rows = [
+        CheckResult(
+            "skeleton_quality_score",
+            12,
+            frame_idx,
+            {
+                "which_thresholds_exceeded": ["joint_acceleration_m_s2_max"],
+                "joint_acceleration_m_s2_max": 16.0,
+                "keypoint_presence_invalid": 0.0,
+            },
+            True,
+            "legacy row without explicit temporal validity",
+            severity="warn",
+        )
+        for frame_idx in [15, 16, 17]
+    ]
+    assert check.build_candidate_windows(clip, missing_validity_rows) == []
+
+
 def test_skeleton_extreme_rotation_candidate_routes_to_manual_review() -> None:
     clip = ClipInputs(episode_idx=12, frame_indices=list(range(40)))
     check = _candidate_check(rotation_delta_extreme_review_threshold=0.49)
@@ -727,7 +785,7 @@ def test_skeleton_extreme_rotation_candidate_routes_to_manual_review() -> None:
     assert window["review_type"] == ["rotation_manual_review"]
     assert window["window_source"] == "skeleton_rotation_extreme"
     assert window["needs_manual_review"] is True
-    assert window["sam3_containment_eligible"] is False
+    assert window["sam3_eligible"] is False
     assert "extreme_rotation_delta" in window["trigger_reason"]
     assert window["trigger_metrics"]["rotation_delta_max"] == 0.5
 
@@ -780,7 +838,7 @@ def test_palm_orientation_side_view_routes_to_manual_review() -> None:
     assert window["review_type"] == ["side_view_manual_review"]
     assert window["window_source"] == "hand_absolute_orientation"
     assert window["needs_manual_review"] is True
-    assert window["sam3_containment_eligible"] is False
+    assert window["sam3_eligible"] is False
     assert "side_view_hand_orientation" in window["trigger_reason"]
     assert window["trigger_metrics"]["palm_camera_angle_deg_max"] > 89.0
 
@@ -969,7 +1027,8 @@ def test_skeleton_quality_score_without_quality_hand(tmp_path: Path) -> None:
     assert len(composite_summary) == 1
 
     assert skeleton_rows[21].metrics["skeleton_score"] == 1.0
-    assert skeleton_rows[21].flag is None
+    assert skeleton_rows[21].flag is False
+    assert skeleton_rows[21].severity == "pass"
     assert skeleton_rows[22].metrics["skeleton_score"] < 1.0
     assert skeleton_rows[22].flag is True
     assert skeleton_rows[22].metrics["which_thresholds_exceeded"] == [
@@ -988,11 +1047,13 @@ def test_skeleton_quality_score_without_quality_hand(tmp_path: Path) -> None:
     assert all(row.flag is None for row in composite_rows.values())
 
     summary = skeleton_summary[0]
-    assert summary.metrics["count_good"] == 3.0
+    assert summary.metrics["count_good"] == 2.0
     assert summary.metrics["count_suspect"] == 1.0
+    assert summary.metrics["count_uncalibrated"] == 1.0
     assert summary.metrics["num_frames"] == 4.0
-    assert summary.metrics["pass_ratio"] == 3.0 / 4.0
-    assert summary.flag is False
+    assert summary.metrics["valid_frame_count"] == 3.0
+    assert summary.metrics["pass_ratio"] == 2.0 / 3.0
+    assert summary.flag is True
 
 
 def test_skeleton_quality_score_flags_displacement_metric(tmp_path: Path) -> None:
@@ -1012,14 +1073,61 @@ def test_skeleton_quality_score_flags_displacement_metric(tmp_path: Path) -> Non
         for result in results
         if result.check == "skeleton_quality_score" and result.frame_idx != -1
     }
-    assert frame_rows[21].flag is None
+    assert frame_rows[21].flag is False
+    assert frame_rows[21].severity == "pass"
     assert frame_rows[22].flag is True
+    assert frame_rows[22].severity in {"warn", "fail"}
     assert frame_rows[22].metrics["which_thresholds_exceeded"] == [
         "joint_displacement_m_max"
     ]
     assert frame_rows[22].metrics["joint_displacement_m_max"] > 0.005
     assert frame_rows[22].metrics["joint_displacement_m_penalty"] == 0.25
     assert frame_rows[22].metrics["skeleton_score"] == 0.75
+
+    aggregates = json.loads(
+        (tmp_path / "skeleton_displacement_score" / "clip_aggregates.json")
+        .read_text(encoding="utf-8")
+    )
+    aggregate = next(
+        row for row in aggregates if row["check"] == "skeleton_quality_score"
+    )
+    assert aggregate == {
+        "episode_idx": 101,
+        "check": "skeleton_quality_score",
+        "checked_frames": len(frame_rows),
+        "flagged_frames": sum(row.flag is True for row in frame_rows.values()),
+        "uncalibrated_frames": sum(
+            row.flag is None for row in frame_rows.values()
+        ),
+        "clip_flag": True,
+    }
+
+
+def test_finite_extreme_coordinate_is_audited_without_global_clipping(
+    tmp_path: Path,
+) -> None:
+    clip = _displacement_jump_clip(episode_idx=102)
+    assert clip.keypoints is not None
+    clip.keypoints["leftHand"][2, 0] = 181_819.0
+    config = PrecheckConfig(
+        output_dir=tmp_path / "finite_extreme_coordinate",
+        enabled_checks=["skeleton_quality_score"],
+        skeleton_quality_score=SkeletonQualityScoreConfig(),
+        overwrite=True,
+    )
+
+    results = PrecheckRunner(config).run([clip])
+    row = next(
+        result
+        for result in results
+        if result.check == "skeleton_quality_score" and result.frame_idx == 22
+    )
+
+    assert row.metrics["joint_position_abs_m_max"] == 181_819.0
+    assert row.metrics["joint_position_nonfinite_coordinate_count"] == 0.0
+    assert row.metrics["joint_displacement_m_max"] > 100_000.0
+    assert row.flag is True
+    assert row.severity == "fail"
 
 
 def test_composite_frame_verdict_audits_supplier_labels(tmp_path: Path) -> None:

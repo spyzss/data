@@ -105,15 +105,23 @@ def aggregate_results(results: list[CheckResult]) -> list[dict[str, Any]]:
 
     aggregates: list[dict[str, Any]] = []
     for (episode_idx, check), rows in sorted(grouped.items()):
-        calibrated = [row.flag for row in rows if row.flag is not None]
+        frame_rows = [row for row in rows if row.frame_idx >= 0]
+        evaluated_rows = frame_rows or rows
+        calibrated = [
+            row.flag for row in evaluated_rows if row.flag is not None
+        ]
         clip_flag = any(calibrated) if calibrated else None
         aggregates.append(
             {
                 "episode_idx": episode_idx,
                 "check": check,
-                "checked_frames": len(rows),
-                "flagged_frames": sum(row.flag is True for row in rows),
-                "uncalibrated_frames": sum(row.flag is None for row in rows),
+                "checked_frames": len(evaluated_rows),
+                "flagged_frames": sum(
+                    row.flag is True for row in evaluated_rows
+                ),
+                "uncalibrated_frames": sum(
+                    row.flag is None for row in evaluated_rows
+                ),
                 "clip_flag": clip_flag,
             }
         )

@@ -16,7 +16,7 @@ from qc_common.manifest_metadata import (
     manifest_metadata,
     normalized_manifest_text_metadata,
 )
-from qc_common.module_registry import ModulePrerequisiteError, ModuleRunner
+from qc_common.module_registry import ModuleInputError, ModulePrerequisiteError, ModuleRunner
 from qc_common.types import ClipInputs
 from qc_pipeline.context import AssetContext
 
@@ -28,7 +28,8 @@ MODULES = (
     "keypoint_morphology",
     "keypoint_temporal",
 )
-_IMPLEMENTATION_VERSION = "precheck-session-v5-frame-survival-metadata"
+_IMPLEMENTATION_VERSION = "precheck-session-v7-calibrated-temporal-validity"
+_TEMPORAL_OUTPUT_SCHEMA_VERSION = "keypoint_temporal.output.v2"
 _FRAME_SURVIVAL_MODULES = frozenset(
     {"keypoint_presence", "keypoint_morphology", "keypoint_temporal"}
 )
@@ -61,6 +62,14 @@ def precheck_fingerprint(
     fingerprint["manifest_text_metadata"] = normalized_manifest_text_metadata(
         context.metadata
     )
+    fingerprint["temporal_output_schema_version"] = (
+        _TEMPORAL_OUTPUT_SCHEMA_VERSION
+    )
+    fingerprint["source_contract"] = {
+        "hdf5_reference_dataset": context.metadata.get(
+            "hdf5_reference_dataset"
+        )
+    }
     return fingerprint
 
 
@@ -157,10 +166,13 @@ def _load_clip(context: AssetContext, module: str) -> Any:
         return load_jdt_clip(row, episode_idx=0)
 
     hdf5 = _source_path(context, module, "hdf5")
-    if supplier == "deepreach":
+    if supplier in {"dr", "deepreach"}:
         if source_range is None:
             raise ModulePrerequisiteError(module, "source_range for DeepReach precheck")
         from tools.run_manifest_precheck import load_deepreach_clip
+        from acceptance_pull.supplier_adapters.deepreach_hdf5 import (
+            DeepReachFrameContractError,
+        )
 
         start, end = source_range
         row = {
@@ -170,7 +182,10 @@ def _load_clip(context: AssetContext, module: str) -> Any:
             "end_frame": end - 1,
             "hdf5_path": str(hdf5),
         }
-        return load_deepreach_clip(row, episode_idx=0)
+        try:
+            return load_deepreach_clip(row, episode_idx=0)
+        except DeepReachFrameContractError as exc:
+            raise ModuleInputError(module, str(exc)) from exc
 
     from precheck.adapters import load_precheck_inputs
 
@@ -201,6 +216,7 @@ def _run_module_on_clip(
     from qc_pipeline.adapters.precheck import precheck_config_from_unified
     from tools.run_manifest_precheck import (
         _map_candidate_window_to_source,
+        _result_in_source_coordinates,
         _run_clip_in_local_coordinates,
     )
 
@@ -208,16 +224,21 @@ def _run_module_on_clip(
     producer = PrecheckRunner(
         precheck_config_from_unified(
             config,
-            module_names=[module],
+            module_names=(
+                ["skeleton_quality_score"]
+                if module == "keypoint_temporal"
+                else [module]
+            ),
             output_dir=output_dir,
         )
     )
     results = _run_clip_in_local_coordinates(producer, clip)
     source_start = int(getattr(clip, "clip_start_frame", 0))
     results = [
-        replace(row, frame_idx=row.frame_idx + source_start)
-        if row.frame_idx >= 0
-        else row
+        _result_in_source_coordinates(
+            row,
+            clip_start_frame=source_start,
+        )
         for row in results
     ]
     candidates: list[Mapping[str, Any]] = []
@@ -433,6 +454,11 @@ class PrecheckSession:
                     metrics=dict(row.get("metrics") or {}),
                     flag=row.get("flag"),
                     reason=str(row.get("reason") or ""),
+                    severity=(
+                        str(row["severity"])
+                        if row.get("severity") is not None
+                        else None
+                    ),
                 )
             )
         self._raw_results = {
@@ -473,22 +499,53 @@ class PrecheckSession:
                 [dict(value) for value in self._candidate_windows],
                 staging / "candidate_windows.json",
             )
+            temporal_result = (
+                result
+                if module == "keypoint_temporal"
+                else self._results.get("keypoint_temporal")
+            )
+            temporal_output: dict[str, Any] | None = None
+            if temporal_result is not None:
+                evaluation = temporal_result.evaluation
+                status = str(evaluation.get("output_status") or "")
+                if status in {"valid", "no_valid_output"}:
+                    temporal_output = {
+                        "schema_version": _TEMPORAL_OUTPUT_SCHEMA_VERSION,
+                        "status": status,
+                        "valid_frame_count": int(
+                            evaluation.get("valid_frame_count", 0)
+                        ),
+                        "uncalibrated_frame_count": int(
+                            evaluation.get("uncalibrated_frame_count", 0)
+                        ),
+                        "reason": str(
+                            evaluation.get("reason")
+                            or (
+                                "calibrated_temporal_output"
+                                if status == "valid"
+                                else "no_valid_temporal_output"
+                            )
+                        ),
+                    }
+            metadata: dict[str, Any] = {
+                "completed_modules": [
+                    name for name in MODULES if name in self._raw_results
+                ],
+                "frame_survival": self._frame_survival_metadata(),
+                "manifest_metadata": manifest_metadata(self.context.metadata),
+                "manifest_text_metadata": normalized_manifest_text_metadata(
+                    self.context.metadata
+                ),
+            }
+            if temporal_output is not None:
+                metadata["temporal_output"] = temporal_output
             write_run_config(
                 staging,
                 producer="precheck",
                 outcome="completed" if completed else "partial",
                 fingerprint=self._fingerprint(),
                 elapsed_seconds=perf_counter() - self._started_at,
-                metadata={
-                    "completed_modules": [
-                        name for name in MODULES if name in self._raw_results
-                    ],
-                    "frame_survival": self._frame_survival_metadata(),
-                    "manifest_metadata": manifest_metadata(self.context.metadata),
-                    "manifest_text_metadata": normalized_manifest_text_metadata(
-                        self.context.metadata
-                    ),
-                },
+                metadata=metadata,
             )
             promote_artifact(staging, artifact)
 

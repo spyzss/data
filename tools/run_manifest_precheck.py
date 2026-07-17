@@ -8,7 +8,7 @@ import json
 import logging
 import math
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -150,6 +150,32 @@ def load_deepreach_clip(
     if not path_text:
         raise ValueError(f"missing {hdf5_column}")
     path = Path(path_text).expanduser()
+    from acceptance_pull.supplier_adapters.deepreach_hdf5 import (
+        DeepReachFrameContractError,
+        require_deepreach_frame_contract,
+    )
+
+    reference_dataset = _text(row.get("hdf5_reference_dataset"))
+    if not reference_dataset:
+        raise DeepReachFrameContractError(
+            {
+                "status": "mapping_invalid",
+                "reason": "hdf5_reference_dataset_missing",
+                "source_path": str(path),
+                "reference_dataset": None,
+                "expected_frame_count": None,
+                "dataset_lengths": {},
+                "missing_datasets": [],
+                "invalid_shape_datasets": [],
+                "mismatch_ranges": {},
+                "mismatch_count": 0,
+            }
+        )
+    frame_contract = require_deepreach_frame_contract(
+        path,
+        reference_dataset=reference_dataset,
+    )
+    source_frame_count = int(frame_contract["expected_frame_count"])
     with h5py.File(path, "r") as handle:
         required = [
             "timestamp",
@@ -161,7 +187,6 @@ def load_deepreach_clip(
         missing = [name for name in required if name not in handle]
         if missing:
             raise ValueError(f"missing DeepReach datasets: {', '.join(missing)}")
-        source_frame_count = min(int(handle[name].shape[0]) for name in required)
         if end_frame >= source_frame_count:
             raise ValueError(
                 f"end_frame {end_frame} outside source frame count "
@@ -414,6 +439,36 @@ def _run_clip_in_local_coordinates(
         clip.frame_indices = original_frame_indices
 
 
+def _result_in_source_coordinates(
+    result: CheckResult,
+    *,
+    clip_start_frame: int,
+) -> CheckResult:
+    """Map a local result and its temporal pair lineage to source frames."""
+    if result.frame_idx < 0:
+        return result
+    local_target = int(result.frame_idx)
+    source_target = clip_start_frame + local_target
+    metrics = dict(result.metrics)
+    pair_end = metrics.get("temporal_pair_end_frame")
+    if (
+        isinstance(pair_end, (int, np.integer))
+        and not isinstance(pair_end, bool)
+        and int(pair_end) == local_target
+    ):
+        for key in (
+            "temporal_pair_start_frame",
+            "temporal_pair_end_frame",
+        ):
+            value = metrics.get(key)
+            if isinstance(value, (int, np.integer)) and not isinstance(
+                value,
+                bool,
+            ):
+                metrics[key] = clip_start_frame + int(value)
+    return replace(result, frame_idx=source_target, metrics=metrics)
+
+
 def _map_candidate_window_to_source(
     candidate: dict[str, Any],
     *,
@@ -510,19 +565,14 @@ def _result_records(
                 f"result local frame {local_frame_idx} outside clip frame count "
                 f"{clip.num_frames}"
             )
-        source_frame_idx = (
-            start_frame + local_frame_idx
-            if local_frame_idx is not None
-            else None
+        mapped_result = _result_in_source_coordinates(
+            result,
+            clip_start_frame=start_frame,
         )
+        source_frame_idx = mapped_result.frame_idx if local_frame_idx is not None else None
         rows.append(
             {
-                **result.to_record(),
-                "frame_idx": (
-                    source_frame_idx
-                    if source_frame_idx is not None
-                    else result.frame_idx
-                ),
+                **mapped_result.to_record(),
                 "asset_id": getattr(clip, "asset_id"),
                 "supplier_id": getattr(clip, "supplier_id"),
                 "source_path": getattr(clip, "source_path"),

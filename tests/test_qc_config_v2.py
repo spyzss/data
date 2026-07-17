@@ -22,7 +22,7 @@ def _write_config(tmp_path: Path, raw: dict[str, object]) -> Path:
 def test_default_config_is_v2_snapshot_with_two_profiles() -> None:
     loaded = load_qc_acceptance_config()
     assert loaded.schema_version == "qc_acceptance_config_schema.v2"
-    assert loaded.config_version == "qc_acceptance_v2.1.0"
+    assert loaded.config_version == "qc_acceptance_v2.2.0"
     assert loaded.default_profile == "acceptance"
     assert loaded.execution_profile("acceptance")["fail_action"] == "stop"
     assert loaded.execution_profile("supplier_evaluation")["fail_action"] == "record_and_continue"
@@ -38,6 +38,7 @@ def test_default_config_is_v2_snapshot_with_two_profiles() -> None:
         "keypoint_morphology",
         "keypoint_temporal",
         "video_quality",
+        "supplier_data_audit",
         "sam3_containment",
         "semantic_consistency",
         "manual_review",
@@ -47,6 +48,20 @@ def test_default_config_is_v2_snapshot_with_two_profiles() -> None:
     )
     assert loaded.module_config("semantic_consistency")["execution_kind"] == "external"
     assert loaded.module_config("manual_review")["execution_kind"] == "external"
+    assert loaded.module_config("supplier_data_audit")["implementation"] == (
+        "supplier_data_audit.v1"
+    )
+    assert loaded.module_parameters("supplier_data_audit")["suppliers"]["dr"][
+        "mapping_status"
+    ] == "unverified"
+    potentia_audit = loaded.module_parameters("supplier_data_audit")["suppliers"][
+        "potentia"
+    ]
+    assert potentia_audit["max_scaled_intrinsics_relative_error"] == 0.001
+    assert potentia_audit["scaling_mismatch_action"] == "review"
+    assert loaded.module_parameters("video_quality")["supplier_overrides"] == {
+        "potentia": {"hdf5_alignment": {"enabled": False}}
+    }
     assert loaded.module_config("duplicate_check") == {
         **loaded.module_config("duplicate_check"),
         "enabled": False,
@@ -56,7 +71,7 @@ def test_default_config_is_v2_snapshot_with_two_profiles() -> None:
 
 def test_active_config_matches_immutable_v2_snapshot() -> None:
     assert Path("configs/qc_acceptance.yaml").read_bytes() == Path(
-        "configs/qc_acceptance/qc_acceptance_v2.1.0.yaml"
+        "configs/qc_acceptance/qc_acceptance_v2.2.0.yaml"
     ).read_bytes()
     assert (
         hashlib.sha256(Path("configs/qc_acceptance/qc_acceptance_v1.1.0.yaml").read_bytes()).hexdigest()
@@ -68,6 +83,87 @@ def test_active_config_matches_immutable_v2_snapshot() -> None:
         ).hexdigest()
         == V20_SHA256
     )
+
+
+def test_v22_preserves_v21_acceptance_frame_survival_policy() -> None:
+    active = load_qc_acceptance_config()
+    previous = load_qc_acceptance_config(
+        Path("configs/qc_acceptance/qc_acceptance_v2.1.0.yaml")
+    )
+
+    assert active.frame_survival_policy("acceptance") == previous.frame_survival_policy(
+        "acceptance"
+    )
+    assert active.frame_survival_policy("supplier_evaluation") == {"enabled": False}
+
+
+def test_temporal_no_valid_output_rule_is_versioned() -> None:
+    rule = load_qc_acceptance_config().module_rules("keypoint_temporal")[
+        "no_valid_output"
+    ]
+
+    assert rule == {
+        "rule_id": "keypoint_temporal.no_valid_output",
+        "verdict": "warn",
+    }
+
+
+def test_v2_schema_requires_supplier_data_audit_module() -> None:
+    raw = copy.deepcopy(load_qc_acceptance_config().raw)
+    raw["modules"].pop("supplier_data_audit")
+    raw["pipeline"]["modules"].remove("supplier_data_audit")
+
+    with pytest.raises(ValueError, match="supplier_data_audit"):
+        validate_qc_config(raw)
+
+
+def test_v2_schema_rejects_invalid_supplier_audit_mapping_status(
+    tmp_path: Path,
+) -> None:
+    raw = copy.deepcopy(load_qc_acceptance_config().raw)
+    raw["modules"]["supplier_data_audit"]["parameters"]["suppliers"]["dr"][
+        "mapping_status"
+    ] = "guessed"
+
+    with pytest.raises(ValueError, match="mapping_status"):
+        load_qc_acceptance_config(_write_config(tmp_path, raw))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("scaling_mismatch_action", "pass"),
+        ("max_scaled_intrinsics_relative_error", -0.1),
+    ],
+)
+def test_v2_schema_rejects_invalid_potentia_calibration_policy(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    raw = copy.deepcopy(load_qc_acceptance_config().raw)
+    raw["modules"]["supplier_data_audit"]["parameters"]["suppliers"][
+        "potentia"
+    ][field] = value
+
+    with pytest.raises(ValueError, match=field):
+        load_qc_acceptance_config(_write_config(tmp_path, raw))
+
+
+def test_v2_schema_rejects_invalid_timestamp_mapping_unit(tmp_path: Path) -> None:
+    raw = copy.deepcopy(load_qc_acceptance_config().raw)
+    potentia = raw["modules"]["supplier_data_audit"]["parameters"]["suppliers"][
+        "potentia"
+    ]
+    potentia["mapping_status"] = "verified"
+    potentia["mapping"]["frames"] = {
+        "frame_index_column": "frame_index",
+        "timestamp_column": "timestamp",
+        "timestamp_unit": "minutes",
+    }
+
+    with pytest.raises(ValueError, match="timestamp_unit"):
+        load_qc_acceptance_config(_write_config(tmp_path, raw))
 
 
 def test_v2_rejects_enabled_module_without_implementation(tmp_path: Path) -> None:

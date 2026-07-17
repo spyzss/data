@@ -9,7 +9,12 @@ from qc_common.config import LoadedQcConfig
 from qc_common.contracts import ModuleResult
 from qc_common.module_registry import ModuleRegistry, ModuleRunner
 from qc_pipeline.context import AssetContext
-from qc_pipeline.runners import precheck, sam3_containment, video_quality
+from qc_pipeline.runners import (
+    precheck,
+    sam3_containment,
+    supplier_data_audit,
+    video_quality,
+)
 
 
 def build_default_registry(
@@ -24,6 +29,7 @@ def build_default_registry(
     runners: dict[str, ModuleRunner] = {
         **{name: precheck_session.runner_for(name) for name in precheck.MODULES},
         "video_quality": video_quality.run,
+        "supplier_data_audit": supplier_data_audit.run,
         "sam3_containment": sam3_containment.runner(segmenter_factory),
     }
     for module_name, runner in runners.items():

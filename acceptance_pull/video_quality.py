@@ -412,6 +412,7 @@ def load_video_quality_config(path: Path | None) -> VideoQualityConfig:
     loaded = load_qc_acceptance_config(path)
     module = loaded.raw["modules"]["video_quality"]
     parameters = loaded.module_parameters("video_quality")
+    parameters.pop("supplier_overrides", None)
     pipeline_modules = list(loaded.raw["pipeline"]["modules"])
     module_index = pipeline_modules.index("video_quality")
     next_module = (

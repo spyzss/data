@@ -14,6 +14,7 @@ from qc_common.config import LoadedQcConfig
 from qc_common.contracts import ModuleResult
 from qc_common.module_registry import (
     ModuleAdapterMissingError,
+    ModuleBlockedError,
     ModuleInputError,
     ModulePrerequisiteError,
     ModuleRunner,
@@ -71,6 +72,8 @@ def _validated_candidates(
         clip_start, exclusive_end = context.source_range
         clip_end = exclusive_end - 1
     for index, row in enumerate(rows):
+        if row.get("sam3_eligible") is not True:
+            continue
         if str(row.get("asset_id") or "") != context.asset_id:
             raise ModuleInputError(
                 "sam3_containment",
@@ -227,6 +230,26 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
 
         started = perf_counter()
 
+        supplier = str(
+            context.metadata.get("supplier")
+            or context.metadata.get("supplier_id")
+            or "jdt"
+        ).lower()
+        if supplier in {"dr", "deepreach"}:
+            projection_status = str(
+                context.metadata.get("projection_validation_status") or ""
+            ).lower()
+            if projection_status != "validated":
+                reason = (
+                    "transform_ambiguous"
+                    if projection_status == "transform_ambiguous"
+                    else "calibration_unverified"
+                )
+                raise ModuleBlockedError("sam3_containment", reason)
+            raise ModuleBlockedError("sam3_containment", "adapter_missing")
+        if supplier == "potentia":
+            raise ModuleBlockedError("sam3_containment", "no_keypoint_input")
+
         candidate_path = artifact_for(context, "precheck").directory / "candidate_windows.json"
         if not candidate_path.is_file():
             raise ModulePrerequisiteError(
@@ -263,6 +286,17 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
                 "sam3_containment",
                 "current precheck run does not match this asset/config or lacks temporal output",
             )
+        temporal_output = precheck_run.get("temporal_output")
+        if (
+            not isinstance(temporal_output, Mapping)
+            or temporal_output.get("status") != "valid"
+            or not isinstance(temporal_output.get("valid_frame_count"), int)
+            or int(temporal_output["valid_frame_count"]) <= 0
+        ):
+            raise ModuleBlockedError(
+                "sam3_containment",
+                "no_valid_temporal_output",
+            )
         try:
             all_candidate_rows = read_records(candidate_path)
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -280,12 +314,6 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
                 runtime={"artifact_state": "no_candidates"},
             )
 
-        supplier = str(context.metadata.get("supplier") or "jdt").lower()
-        if supplier == "deepreach":
-            raise ModuleAdapterMissingError(
-                "sam3_containment",
-                "DeepReach head calibration/projection adapter is not validated",
-            )
         if supplier != "jdt":
             raise ModuleAdapterMissingError(
                 "sam3_containment",

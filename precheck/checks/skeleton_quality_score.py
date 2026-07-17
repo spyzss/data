@@ -33,6 +33,7 @@ SKELETON_VERDICT_CODES = {
     "review": 1.0,
     "good": 2.0,
     "suspect": 3.0,
+    "uncalibrated": -1.0,
 }
 
 
@@ -145,7 +146,7 @@ class SkeletonQualityScoreCheck(BaseCheck):
             config.get("candidate_merge_overlapping_only", True)
         )
         self.pass_threshold = float(config.get("pass_threshold", 0.90))
-        self.temporal_check = KeypointTemporalCheck({})
+        self.temporal_check = KeypointTemporalCheck(config)
         self.candidate_windows: list[dict[str, Any]] = []
 
     def run(self, clip: ClipInputs) -> list[CheckResult]:
@@ -181,16 +182,34 @@ class SkeletonQualityScoreCheck(BaseCheck):
                 projection_metrics,
             )
             ratios = self.metric_ratios(metric_values)
-            verdict, needs_mask_review, needs_rotation_review, source = self.classify_frame(
-                metric_values,
-                exceeded,
-                presence_metrics,
-                combined_review_metrics,
-            )
+            temporal_output_valid = bool(
+                temporal_result.metrics.get("temporal_pair_eligible", False)
+            ) and len(missing_metrics) < len(GEOMETRY_METRIC_NAMES)
+            if temporal_output_valid:
+                (
+                    verdict,
+                    needs_mask_review,
+                    needs_rotation_review,
+                    source,
+                ) = self.classify_frame(
+                    metric_values,
+                    exceeded,
+                    presence_metrics,
+                    combined_review_metrics,
+                )
+                severity = self.frame_severity(verdict, exceeded, ratios, source)
+            else:
+                verdict = "uncalibrated"
+                needs_mask_review = False
+                needs_rotation_review = False
+                source = "no_valid_temporal_metrics"
+                severity = "uncalibrated"
             penalties = self.penalties(exceeded)
             skeleton_score = (
                 0.0
                 if verdict == "invalid"
+                else math.nan
+                if verdict == "uncalibrated"
                 else max(0.0, 1.0 - float(sum(penalties.values())))
             )
             results.append(
@@ -235,6 +254,8 @@ class SkeletonQualityScoreCheck(BaseCheck):
                         "skeleton_score": skeleton_score,
                         "skeleton_verdict": verdict,
                         "skeleton_verdict_code": SKELETON_VERDICT_CODES[verdict],
+                        "temporal_output_valid": temporal_output_valid,
+                        "temporal_severity": severity,
                         "needs_mask_containment_review": float(needs_mask_review),
                         "needs_rotation_mask_review": float(needs_rotation_review),
                         "needs_projection_review": combined_review_metrics[
@@ -255,6 +276,9 @@ class SkeletonQualityScoreCheck(BaseCheck):
                                 "temporal_pair_start_frame",
                                 "temporal_pair_end_frame",
                                 "temporal_transition_attribution",
+                                "joint_position_abs_m_max",
+                                "joint_position_finite_coordinate_count",
+                                "joint_position_nonfinite_coordinate_count",
                             )
                             if key in temporal_result.metrics
                         },
@@ -262,8 +286,13 @@ class SkeletonQualityScoreCheck(BaseCheck):
                         **palm_orientation_metrics,
                         **projection_metrics,
                     },
-                    flag=True if verdict in {"invalid", "suspect"} else None,
-                    reason=self.reason(verdict, missing_metrics),
+                    flag=(
+                        None
+                        if severity == "uncalibrated"
+                        else severity in {"warn", "fail"}
+                    ),
+                    reason=self.reason(verdict, missing_metrics, severity),
+                    severity=severity,
                 )
             )
 
@@ -278,6 +307,7 @@ class SkeletonQualityScoreCheck(BaseCheck):
             float(result.metrics.get("skeleton_score", 0.0))
             for result in results
             if result.frame_idx != SUMMARY_FRAME_IDX
+            and bool(result.metrics.get("temporal_output_valid", False))
         ]
         results.append(self.summary_row(clip, len(temporal_results), counts, scores))
         return results
@@ -350,6 +380,33 @@ class SkeletonQualityScoreCheck(BaseCheck):
             bool(rotation_review),
             "projection_visual_review" if projection_review else "moderate_temporal_geometry",
         )
+
+    def frame_severity(
+        self,
+        verdict: str,
+        exceeded: list[str],
+        ratios: dict[str, float],
+        source: str,
+    ) -> str:
+        if verdict == "invalid":
+            return "fail"
+        if verdict == "good":
+            return "pass"
+        if verdict == "review":
+            return "warn"
+        strong_motion = (
+            ratios["joint_acceleration_m_s2_max"]
+            >= self.strong_acceleration_ratio
+            or ratios["joint_displacement_m_max"]
+            >= self.strong_displacement_ratio
+        )
+        if (
+            source == "strong_temporal_geometry"
+            or strong_motion
+            or len(exceeded) >= self.hard_exceeded_metric_count
+        ):
+            return "fail"
+        return "warn"
 
     def presence_metrics(
         self,
@@ -631,6 +688,8 @@ class SkeletonQualityScoreCheck(BaseCheck):
             result.metrics["skeleton_decision_source"] = "sustained_review_run"
             result.metrics["needs_visual_review"] = 1.0
             result.flag = True
+            result.severity = "warn"
+            result.metrics["temporal_severity"] = "warn"
             result.reason = "sustained temporal review run needs mask containment"
 
     def refresh_visual_review_after_promotion(self, results: list[CheckResult]) -> None:
@@ -639,7 +698,13 @@ class SkeletonQualityScoreCheck(BaseCheck):
                 result.metrics["needs_visual_review"] = 1.0
 
     def count_verdicts(self, results: list[CheckResult]) -> dict[str, int]:
-        counts = {"invalid": 0, "good": 0, "review": 0, "suspect": 0}
+        counts = {
+            "invalid": 0,
+            "good": 0,
+            "review": 0,
+            "suspect": 0,
+            "uncalibrated": 0,
+        }
         for result in results:
             verdict = str(result.metrics.get("skeleton_verdict", "good"))
             if verdict in counts:
@@ -677,6 +742,8 @@ class SkeletonQualityScoreCheck(BaseCheck):
         asset_id: str | None = None,
     ) -> dict[str, Any] | None:
         metrics = result.metrics
+        if metrics.get("temporal_output_valid") is not True:
+            return None
         if bool(metrics.get("keypoint_presence_invalid", 0.0)):
             return None
         exceeded = set(metrics.get("which_thresholds_exceeded", []))
@@ -747,6 +814,7 @@ class SkeletonQualityScoreCheck(BaseCheck):
             "review_type": review_types,
             "window_source": window_source,
             "needs_manual_review": needs_manual_review,
+            "sam3_eligible": not needs_manual_review,
             "sam3_containment_eligible": False if needs_manual_review else True,
             "trigger_metrics": self.window_trigger_metrics(metrics, "both"),
             "priority_score": self.temporal_seed_priority_score(metrics, reasons),
@@ -980,9 +1048,7 @@ class SkeletonQualityScoreCheck(BaseCheck):
             for seed in seeds
         }
         manual_review = any(bool(seed.get("needs_manual_review")) for seed in seeds)
-        sam3_eligible = not any(
-            seed.get("sam3_containment_eligible") is False for seed in seeds
-        )
+        sam3_eligible = all(seed.get("sam3_eligible") is True for seed in seeds)
         priority_score = float(peak["priority_score"])
         seed_run_frames = len({int(seed["frame_idx"]) for seed in seeds})
         seed_run_length = int(window.get("seed_run_end", peak["frame_idx"])) - int(
@@ -1014,6 +1080,7 @@ class SkeletonQualityScoreCheck(BaseCheck):
             if "skeleton_rotation_extreme" in window_sources
             else "skeleton_quality_temporal_run",
             "needs_manual_review": manual_review,
+            "sam3_eligible": sam3_eligible,
             "sam3_containment_eligible": sam3_eligible,
             "trigger_metrics": peak["trigger_metrics"],
         }
@@ -1025,11 +1092,20 @@ class SkeletonQualityScoreCheck(BaseCheck):
             for name in GEOMETRY_METRIC_NAMES
         }
 
-    def reason(self, skeleton_verdict: str, missing_metrics: list[str]) -> str:
+    def reason(
+        self,
+        skeleton_verdict: str,
+        missing_metrics: list[str],
+        severity: str,
+    ) -> str:
+        if severity == "uncalibrated":
+            return "no valid temporal metrics for configured threshold evaluation"
         if skeleton_verdict == "invalid":
             return "keypoint presence or hand quality invalid"
-        if skeleton_verdict == "suspect":
-            return "temporal skeleton geometry threshold exceeded"
+        if severity == "fail":
+            return "strong configured temporal threshold exceedance"
+        if severity == "warn":
+            return "configured temporal threshold exceeded; visual review required"
         if skeleton_verdict == "review":
             return "temporal skeleton geometry needs mask containment review"
         if len(missing_metrics) == len(GEOMETRY_METRIC_NAMES):
@@ -1049,13 +1125,15 @@ class SkeletonQualityScoreCheck(BaseCheck):
         count_good = float(counts.get("good", 0))
         count_review = float(counts.get("review", 0))
         count_suspect = float(counts.get("suspect", 0))
+        count_uncalibrated = float(counts.get("uncalibrated", 0))
+        valid_frame_count = int(num_frames - count_uncalibrated)
         score_array = np.asarray(scores, dtype=np.float64)
         mean_score = float(np.mean(score_array)) if score_array.size else 0.0
         min_score = float(np.min(score_array)) if score_array.size else 0.0
-        good_ratio = count_good / num_frames if num_frames > 0 else 0.0
-        review_ratio = count_review / num_frames if num_frames > 0 else 0.0
-        suspect_ratio = count_suspect / num_frames if num_frames > 0 else 0.0
-        invalid_ratio = count_invalid / num_frames if num_frames > 0 else 0.0
+        good_ratio = count_good / valid_frame_count if valid_frame_count > 0 else 0.0
+        review_ratio = count_review / valid_frame_count if valid_frame_count > 0 else 0.0
+        suspect_ratio = count_suspect / valid_frame_count if valid_frame_count > 0 else 0.0
+        invalid_ratio = count_invalid / valid_frame_count if valid_frame_count > 0 else 0.0
         if self.decision_mode == "temporal_triage":
             pass_ratio = 1.0 - suspect_ratio - invalid_ratio
         else:
@@ -1069,7 +1147,9 @@ class SkeletonQualityScoreCheck(BaseCheck):
                 "count_good": count_good,
                 "count_review": count_review,
                 "count_suspect": count_suspect,
+                "count_uncalibrated": count_uncalibrated,
                 "num_frames": float(num_frames),
+                "valid_frame_count": float(valid_frame_count),
                 "mean_skeleton_score": mean_score,
                 "min_skeleton_score": min_score,
                 "good_ratio": good_ratio,
@@ -1080,6 +1160,21 @@ class SkeletonQualityScoreCheck(BaseCheck):
                 "pass_threshold": self.pass_threshold,
                 "decision_mode": self.decision_mode,
             },
-            flag=bool(pass_ratio >= self.pass_threshold),
-            reason="clip-level skeleton quality score summary",
+            flag=(
+                None
+                if valid_frame_count == 0
+                else bool(pass_ratio < self.pass_threshold)
+            ),
+            reason=(
+                "clip-level temporal output has no valid calibrated frames"
+                if valid_frame_count == 0
+                else "clip-level skeleton quality score summary"
+            ),
+            severity=(
+                "uncalibrated"
+                if valid_frame_count == 0
+                else "fail"
+                if pass_ratio < self.pass_threshold
+                else "pass"
+            ),
         )

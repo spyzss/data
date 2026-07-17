@@ -60,8 +60,10 @@ MORPHOLOGY_REASON_TO_RULE = {
 
 TEMPORAL_RULES = {
     "candidate": "keypoint_temporal.composite_frame_verdict",
+    "threshold": "keypoint_temporal.skeleton_quality_score",
     "projection": "keypoint_temporal.projection_review",
     "strong": "keypoint_temporal.strong_temporal_failure",
+    "no_valid": "keypoint_temporal.no_valid_output",
 }
 
 _CORE_TEMPORAL_METRICS = (
@@ -985,12 +987,59 @@ def _temporal_row_failures(
             lineage.attribution,
         )
 
+    ratios: dict[str, float] = {}
+    for metric in tokens:
+        observed = row.metrics.get(metric)
+        threshold = parameters.get(f"{metric}_threshold")
+        if (
+            isinstance(observed, Real)
+            and not isinstance(observed, bool)
+            and isinstance(threshold, Real)
+            and not isinstance(threshold, bool)
+            and math.isfinite(float(observed))
+            and float(threshold) > 0.0
+        ):
+            ratios[metric] = float(observed) / float(threshold)
+
     hard_count = int(parameters["hard_exceeded_metric_count"])
-    if skeleton_verdict == "suspect" and len(tokens) >= hard_count:
+    strong_acceleration = (
+        ratios.get("joint_acceleration_m_s2_max", -math.inf)
+        >= float(parameters["strong_acceleration_ratio"])
+    )
+    strong_displacement = (
+        ratios.get("joint_displacement_m_max", -math.inf)
+        >= float(parameters["strong_displacement_ratio"])
+    )
+    if skeleton_verdict == "suspect" and (
+        len(tokens) >= hard_count
+        or strong_acceleration
+        or strong_displacement
+        or row.severity == "fail"
+        or row.metrics.get("temporal_severity") == "fail"
+    ):
+        strongest_metric = max(
+            ratios,
+            key=ratios.__getitem__,
+            default="exceeded_temporal_metric_count",
+        )
+        if len(tokens) >= hard_count:
+            metric = "exceeded_temporal_metric_count"
+            observed: Any = len(tokens)
+            operator = ">="
+            boundary: Any = hard_count
+        elif strongest_metric in ratios:
+            metric = strongest_metric
+            observed = row.metrics.get(strongest_metric)
+            operator = ">"
+            boundary = parameters[f"{strongest_metric}_threshold"]
+        else:
+            metric = "which_thresholds_exceeded"
+            observed = sorted(tokens)
+            operator = "not_empty"
+            boundary = []
         return (
             failure(
-                "strong", "both", "exceeded_temporal_metric_count",
-                len(tokens), ">=", hard_count,
+                "strong", "both", metric, observed, operator, boundary,
             ),
         )
 
@@ -1015,7 +1064,30 @@ def _temporal_row_failures(
             ),
         )
 
+    if tokens and skeleton_verdict in {"review", "suspect"}:
+        strongest_metric = max(
+            tokens,
+            key=lambda metric: ratios.get(metric, -math.inf),
+        )
+        observed = row.metrics.get(strongest_metric)
+        return (
+            failure(
+                "threshold",
+                "both",
+                strongest_metric,
+                observed,
+                ">",
+                parameters[f"{strongest_metric}_threshold"],
+            ),
+        )
+
     return ()
+
+
+def _is_valid_temporal_row(row: CheckResult) -> bool:
+    if row.check != "skeleton_quality_score" or row.frame_idx < 0:
+        return False
+    return row.metrics.get("temporal_output_valid") is True
 
 
 def _source_temporal_candidates(
@@ -1101,30 +1173,93 @@ def adapt_keypoint_temporal(
         if row.check in {"keypoint_temporal", "skeleton_quality_score"}
     ]
     candidates = _source_temporal_candidates(asset_id, candidate_windows)
-    if not rows and not candidates:
+    frame_rows = [row for row in rows if row.frame_idx >= 0]
+    valid_rows = [row for row in frame_rows if _is_valid_temporal_row(row)]
+    uncalibrated_frame_count = len(frame_rows) - len(valid_rows)
+    if not valid_rows:
+        no_valid_rule = _temporal_rule(config, "no_valid")
+        issue_row = (
+            frame_rows[0]
+            if frame_rows
+            else CheckResult(
+                "skeleton_quality_score",
+                0,
+                -1,
+                {},
+                None,
+                "no valid temporal output",
+                severity="uncalibrated",
+            )
+        )
+        issue = _issue_from_row(
+            asset_id=asset_id,
+            module="keypoint_temporal",
+            rule_id=str(no_valid_rule["rule_id"]),
+            row=issue_row,
+            source_relative_path=source_relative_path,
+            severity=_rule_verdict(no_valid_rule),
+            needs_manual_review=True,
+            metric="valid_temporal_frame_count",
+            observed_value=0,
+            operator=">",
+            boundary_value=0,
+            frame_range=(None, None),
+            evidence_kind="check_result",
+        )
         return ModuleResult(
             module="keypoint_temporal",
-            verdict="skipped",
+            verdict="warn",
             evaluation={
-                "decision": "skipped",
-                "reason": "source_signal_not_provided",
+                "decision": "review",
+                "output_status": "no_valid_output",
+                "reason": "no_valid_temporal_output",
+                "checked_frame_count": len(frame_rows),
+                "valid_frame_count": 0,
+                "uncalibrated_frame_count": uncalibrated_frame_count,
+                "candidate_window_count": len(candidates),
             },
-            metrics={},
+            metrics={
+                "valid_frame_count": 0,
+                "uncalibrated_frame_count": uncalibrated_frame_count,
+                "peak_trigger_metrics": _peak_trigger_metrics(candidates),
+                "candidate_window_count": len(candidates),
+                "candidate_frame_union_count": len(
+                    {
+                        frame
+                        for candidate in candidates
+                        for frame in range(
+                            candidate.start_frame,
+                            candidate.end_frame + 1,
+                        )
+                    }
+                ),
+            },
+            issues=(issue,),
         )
 
     parameters = config.module_parameters("keypoint_temporal")
     failures = tuple(
         failure
-        for row in rows
+        for row in valid_rows
         for failure in _temporal_row_failures(
             row,
             config=config,
             parameters=parameters,
         )
     )
+    failures = tuple(
+        failure
+        for failure in failures
+        if failure.severity == "fail"
+        or not any(
+            candidate.start_frame <= failure.frame <= candidate.end_frame
+            and candidate.hand_side in {None, "both", failure.side}
+            for candidate in candidates
+        )
+    )
     compacted_failures = _compact_failures(failures)
     issue_evidence: list[tuple[Issue, EvidenceRef]] = []
-    row_for_issue = rows[0] if rows else None
+    row_for_issue = valid_rows[0] if valid_rows else None
     if row_for_issue is not None:
         for failure, frame_range in compacted_failures:
             issue = _issue_from_row(
@@ -1204,7 +1339,10 @@ def adapt_keypoint_temporal(
         verdict=verdict,
         evaluation={
             "decision": verdict,
+            "output_status": "valid",
             "checked_frame_count": len(checked_frames),
+            "valid_frame_count": len(valid_rows),
+            "uncalibrated_frame_count": uncalibrated_frame_count,
             "candidate_window_count": len(candidates),
         },
         metrics={

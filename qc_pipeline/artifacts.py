@@ -31,6 +31,10 @@ _REQUIRED_FILES: dict[str, tuple[str, ...]] = {
         "run_config.json",
     ),
     "video_quality": ("video_quality_result.json", "run_config.json"),
+    "supplier_data_audit": (
+        "supplier_data_audit_result.json",
+        "run_config.json",
+    ),
     "sam3_containment": (
         "frame_results.json",
         "window_results.json",

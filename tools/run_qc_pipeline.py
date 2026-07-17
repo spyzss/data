@@ -22,6 +22,7 @@ if __package__ in {None, ""}:
 
 from qc_common.config import LoadedQcConfig, load_qc_acceptance_config  # noqa: E402
 from qc_common.module_registry import ModuleRegistry  # noqa: E402
+from qc_common.suppliers import normalize_supplier  # noqa: E402
 from qc_pipeline.context import AssetContext  # noqa: E402
 from qc_pipeline.orchestrator import (  # noqa: E402
     RunOutcome,
@@ -34,8 +35,19 @@ from tools.run_manifest_precheck import read_manifest  # noqa: E402
 RegistryFactory = Callable[[AssetContext], ModuleRegistry]
 _SOURCE_COLUMNS = {
     "video": ("primary_video_path", "video_path"),
+    "head_video": ("head_video_path",),
+    "left_wrist_video": ("left_wrist_video_path",),
+    "right_wrist_video": ("right_wrist_video_path",),
     "hdf5": ("hdf5_path",),
     "parquet": ("parquet_path",),
+    "lerobot_task": ("lerobot_task_dir",),
+    "task_dir": ("task_dir",),
+    "calibration": ("calib_path", "calibration_path"),
+    "trajectory": ("camera_trajectory_path",),
+    "meta": ("meta_path",),
+    "frames": ("frames_path",),
+    "aligned": ("aligned_path",),
+    "imu": ("imu_path",),
     "sam3_model": ("sam3_model", "sam3_model_path"),
 }
 
@@ -120,6 +132,17 @@ def contexts_from_manifest(
     contexts: list[AssetContext] = []
     for row_index, source_row in enumerate(rows):
         row = copy.deepcopy(source_row)
+        raw_manifest_row = copy.deepcopy(source_row)
+        supplier_value = row.get("supplier") or row.get("supplier_id")
+        if _text(supplier_value):
+            supplier_id, supplier_name, supplier_alias = normalize_supplier(
+                supplier_value
+            )
+            row["supplier"] = supplier_id
+            row["supplier_id"] = supplier_id
+            row["supplier_name"] = supplier_name
+            if supplier_alias is not None:
+                row["supplier_alias"] = supplier_alias
         asset_id = _text(row.get("asset_id"))
         source_files: dict[str, Any] = {}
         for source_name, columns in _SOURCE_COLUMNS.items():
@@ -158,7 +181,7 @@ def contexts_from_manifest(
                 source_range=source_range,
                 metadata={
                     **row,
-                    "manifest_row": row,
+                    "manifest_row": raw_manifest_row,
                 },
             )
         )
@@ -274,7 +297,7 @@ def summarize_outcome(outcome: RunOutcome) -> dict[str, Any]:
                 else precheck_states[-1]
             )
         )
-    for producer in ("video_quality", "sam3_containment"):
+    for producer in ("supplier_data_audit", "video_quality", "sam3_containment"):
         state = _module_artifact_state(report, producer)
         if state is not None:
             producers[producer] = state

@@ -66,6 +66,9 @@ def test_module_rerun_replaces_only_owned_block_and_rebuilds_candidates(
         context,
         target_module="keypoint_temporal",
     )
+    next_module = config.pipeline_modules[
+        config.pipeline_modules.index("keypoint_temporal") + 1
+    ]
     issue = Issue(
         "keypoint_temporal:jump:11111111111111111111",
         "jump",
@@ -89,7 +92,7 @@ def test_module_rerun_replaces_only_owned_block_and_rebuilds_candidates(
             "keypoint_temporal", "warn", {}, {"run": 1}, (issue,)
         ),
         expected_revision=revision,
-        next_module="video_quality",
+        next_module=next_module,
         now="2026-07-14T00:00:00Z",
     )
     first["extension"] = {"keep": True}
@@ -101,7 +104,7 @@ def test_module_rerun_replaces_only_owned_block_and_rebuilds_candidates(
         profile="acceptance",
         result=ModuleResult("keypoint_temporal", "pass", {}, {"run": 2}),
         expected_revision=revision + 1,
-        next_module="video_quality",
+        next_module=next_module,
         now="2026-07-14T00:01:00Z",
     )
     assert second["extension"] == {"keep": True}
@@ -259,16 +262,20 @@ def test_module_order_error_never_changes_file(tmp_path: Path) -> None:
 
 def test_fresh_report_rejects_out_of_order_first_module(tmp_path: Path) -> None:
     context = make_asset_context(tmp_path, "a")
+    config = loaded_test_config()
+    next_module = config.pipeline_modules[
+        config.pipeline_modules.index("keypoint_temporal") + 1
+    ]
 
     with pytest.raises(ModuleOrderError, match="expected current module hdf5_text_info"):
         apply_module_result(
             context.report_path,
             context=context,
-            config=loaded_test_config(),
+            config=config,
             profile="acceptance",
             result=ModuleResult("keypoint_temporal", "pass", {}, {}),
             expected_revision=0,
-            next_module="video_quality",
+            next_module=next_module,
             now="2026-07-14T00:00:00Z",
         )
 
@@ -415,6 +422,9 @@ def test_manual_semantic_extension_is_preserved_opaque_on_rerun(
         context,
         target_module="keypoint_temporal",
     )
+    next_module = config.pipeline_modules[
+        config.pipeline_modules.index("keypoint_temporal") + 1
+    ]
     report = apply_module_result(
         context.report_path,
         context=context,
@@ -422,7 +432,7 @@ def test_manual_semantic_extension_is_preserved_opaque_on_rerun(
         profile="acceptance",
         result=ModuleResult("keypoint_temporal", "pass", {}, {}),
         expected_revision=revision,
-        next_module="video_quality",
+        next_module=next_module,
         now="2026-07-14T00:00:00Z",
     )
     semantic_calibration = {
@@ -446,7 +456,7 @@ def test_manual_semantic_extension_is_preserved_opaque_on_rerun(
         profile="acceptance",
         result=ModuleResult("keypoint_temporal", "pass", {}, {"run": 2}),
         expected_revision=revision + 1,
-        next_module="video_quality",
+        next_module=next_module,
         now="2026-07-14T00:01:00Z",
     )
 

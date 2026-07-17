@@ -16,6 +16,49 @@ class ProjectionConfig:
     border_margin_px: float = 20.0
 
 
+def apply_rigid_transform(
+    points_xyz: np.ndarray,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+) -> np.ndarray:
+    """Apply ``R @ p + t`` to row-major 3D points."""
+    points = np.asarray(points_xyz, dtype=np.float64)
+    matrix = np.asarray(rotation, dtype=np.float64)
+    offset = np.asarray(translation, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_xyz must have shape (N, 3)")
+    if matrix.shape != (3, 3):
+        raise ValueError("rotation must have shape (3, 3)")
+    if offset.shape != (3,):
+        raise ValueError("translation must have shape (3,)")
+    return points @ matrix.T + offset
+
+
+def scale_intrinsics(
+    intrinsics: np.ndarray,
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+) -> np.ndarray:
+    """Scale pixel intrinsics from one explicit resolution to another."""
+    camera = np.asarray(intrinsics, dtype=np.float64)
+    if camera.shape != (3, 3):
+        raise ValueError("intrinsics must have shape (3, 3)")
+    source_width, source_height = source_size
+    target_width, target_height = target_size
+    if min(source_width, source_height, target_width, target_height) <= 0:
+        raise ValueError("source and target resolutions must be positive")
+    scale_x = target_width / source_width
+    scale_y = target_height / source_height
+    scaled = camera.copy()
+    scaled[0, 0] *= scale_x
+    scaled[0, 1] *= scale_x
+    scaled[0, 2] *= scale_x
+    scaled[1, 0] *= scale_y
+    scaled[1, 1] *= scale_y
+    scaled[1, 2] *= scale_y
+    return scaled
+
+
 def intrinsics_from_values(
     fx: float | None,
     fy: float | None,
@@ -48,6 +91,28 @@ def project_points_with_validity(
         v = camera[1, 1] * y / z + camera[1, 2]
     valid = finite_xyz & positive_z & np.isfinite(u) & np.isfinite(v)
     return {"u": u, "v": v, "z": z, "projection_valid": valid}
+
+
+def project_points_to_image(
+    points_xyz: np.ndarray,
+    intrinsics: np.ndarray,
+    *,
+    image_width: int,
+    image_height: int,
+) -> dict[str, np.ndarray]:
+    """Project points and distinguish valid depth from in-frame pixels."""
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("image resolution must be positive")
+    result = project_points_with_validity(points_xyz, intrinsics)
+    valid = result["projection_valid"]
+    in_frame = (
+        valid
+        & (result["u"] >= 0.0)
+        & (result["u"] < float(image_width))
+        & (result["v"] >= 0.0)
+        & (result["v"] < float(image_height))
+    )
+    return {**result, "in_frame": in_frame}
 
 
 def hand_projection_metrics(

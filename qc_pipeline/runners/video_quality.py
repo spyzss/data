@@ -61,6 +61,36 @@ def _compute_video_quality(
     hdf5 = _source_path(context, "hdf5", required=False)
     assert video is not None
     detector_config = load_video_quality_config(config.path)
+    supplier = str(
+        context.metadata.get("supplier")
+        or context.metadata.get("supplier_id")
+        or ""
+    ).lower()
+    supplier_overrides = config.module_parameters("video_quality").get(
+        "supplier_overrides", {}
+    )
+    supplier_override = (
+        supplier_overrides.get(supplier, {})
+        if isinstance(supplier_overrides, Mapping)
+        else {}
+    )
+    alignment_override = (
+        supplier_override.get("hdf5_alignment", {})
+        if isinstance(supplier_override, Mapping)
+        else {}
+    )
+    if (
+        supplier == "potentia"
+        and isinstance(alignment_override, Mapping)
+        and alignment_override.get("enabled") is False
+    ):
+        detector_config = replace(
+            detector_config,
+            hdf5_alignment=replace(
+                detector_config.hdf5_alignment,
+                enabled=False,
+            ),
+        )
     if context.source_range is None:
         metrics = analyze_video(video, detector_config, hdf5_path=hdf5)
         alignment = check_hdf5_alignment(

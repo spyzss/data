@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from qc_common.config import LoadedQcConfig
+from qc_common.config import LoadedQcConfig, load_qc_acceptance_config
 from qc_common.contracts import ModuleResult
 from qc_common.frame_survival import FrameExclusion
 from qc_common.module_registry import ModuleRegistry
@@ -262,6 +262,38 @@ def test_manifest_inclusive_range_counts_nonzero_start_and_last_frame(
     assert result.evaluation["frame_survival"]["original_frame_count"] == 5
     assert result.evaluation["frame_survival"]["remaining_frame_count"] == 4
     assert result.evaluation["frame_survival"]["eligible_frame_ranges"] == [[37, 40]]
+
+
+def test_deepreach_alias_normalizes_runtime_identity_and_preserves_source_row(
+    tmp_path: Path,
+) -> None:
+    from tools.run_qc_pipeline import contexts_from_manifest
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "clip.h5").write_bytes(b"hdf5")
+    (source / "head.mp4").write_bytes(b"video")
+    manifest = tmp_path / "manifest.jsonl"
+    source_row = {
+        "asset_id": "task-001",
+        "supplier": "deepreach",
+        "supplier_name": "DeepReach",
+        "hdf5_path": "source/clip.h5",
+        "hdf5_reference_dataset": "timestamp",
+        "primary_camera": "head",
+        "primary_video_path": "source/head.mp4",
+        "start_frame": 0,
+        "end_frame": 2,
+    }
+    manifest.write_text(json.dumps(source_row) + "\n", encoding="utf-8")
+
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+
+    assert context.metadata["supplier"] == "dr"
+    assert context.metadata["supplier_id"] == "dr"
+    assert context.metadata["supplier_name"] == "DR"
+    assert context.metadata["supplier_alias"] == "deepreach"
+    assert context.metadata["manifest_row"] == source_row
 
 
 def test_manifest_metadata_survives_clip_slice_and_frame_survival_preparation(
@@ -591,6 +623,58 @@ def test_supplier_evaluation_keeps_source_indices_for_temporal_lineage(
     assert seen_source_indices == (50, 51, 52)
 
 
+def test_unified_temporal_module_runs_calibrated_checker_with_resolved_thresholds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import run_manifest_precheck as manifest_precheck
+
+    captured: dict[str, object] = {}
+
+    class CapturingRunner:
+        def __init__(self, runtime_config: object) -> None:
+            captured["enabled_checks"] = list(runtime_config.enabled_checks)
+            captured["displacement_threshold"] = (
+                runtime_config.skeleton_quality_score
+                .joint_displacement_m_max_threshold
+            )
+            self.candidate_window_records: list[dict[str, object]] = []
+
+    monkeypatch.setattr("precheck.runner.PrecheckRunner", CapturingRunner)
+    monkeypatch.setattr(
+        manifest_precheck,
+        "_run_clip_in_local_coordinates",
+        lambda producer, clip: [],
+    )
+    monkeypatch.setattr(
+        precheck,
+        "_adapt_module",
+        lambda *args, **kwargs: ModuleResult(
+            "keypoint_temporal",
+            "warn",
+            {"decision": "review", "output_status": "no_valid_output"},
+            {},
+        ),
+    )
+
+    precheck._run_module_on_clip(
+        _context(tmp_path),
+        load_qc_acceptance_config(),
+        "keypoint_temporal",
+        SimpleNamespace(
+            num_frames=0,
+            clip_start_frame=0,
+            clip_end_frame=0,
+            source_path="source/clip.hdf5",
+        ),
+    )
+
+    assert captured == {
+        "enabled_checks": ["skeleton_quality_score"],
+        "displacement_threshold": 0.05,
+    }
+
+
 def test_acceptance_fail_does_not_preexecute_later_prechecks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -721,7 +805,21 @@ def test_completed_session_publishes_canonical_precheck_artifact(
             else []
         )
         return precheck.PrecheckModuleExecution(
-            result=ModuleResult(module, "pass", {}, {}),
+            result=ModuleResult(
+                module,
+                "pass",
+                (
+                    {
+                        "decision": "pass",
+                        "output_status": "valid",
+                        "valid_frame_count": 1,
+                        "uncalibrated_frame_count": 0,
+                    }
+                    if module == "keypoint_temporal"
+                    else {"decision": "pass"}
+                ),
+                {},
+            ),
             check_results=(CheckResult(module, 0, -1, {}, False, "ok"),),
             candidate_windows=tuple(candidates),
         )
@@ -751,8 +849,18 @@ def test_completed_session_publishes_canonical_precheck_artifact(
     ]
     assert run_config["outcome"] == "completed"
     assert run_config["fingerprint"]["implementation_version"] == (
-        "precheck-session-v5-frame-survival-metadata"
+        "precheck-session-v7-calibrated-temporal-validity"
     )
+    assert run_config["fingerprint"]["temporal_output_schema_version"] == (
+        "keypoint_temporal.output.v2"
+    )
+    assert run_config["temporal_output"] == {
+        "schema_version": "keypoint_temporal.output.v2",
+        "status": "valid",
+        "valid_frame_count": 1,
+        "uncalibrated_frame_count": 0,
+        "reason": "calibrated_temporal_output",
+    }
 
 
 def test_temporal_success_publishes_empty_candidate_list(
@@ -764,7 +872,21 @@ def test_temporal_success_publishes_empty_candidate_list(
         precheck,
         "_run_module_on_clip",
         lambda context, config, module, clip: precheck.PrecheckModuleExecution(
-            result=ModuleResult(module, "pass", {}, {}),
+            result=ModuleResult(
+                module,
+                "pass",
+                (
+                    {
+                        "decision": "pass",
+                        "output_status": "valid",
+                        "valid_frame_count": 4,
+                        "uncalibrated_frame_count": 1,
+                    }
+                    if module == "keypoint_temporal"
+                    else {"decision": "pass"}
+                ),
+                {},
+            ),
             check_results=(CheckResult(module, 0, -1, {}, False, "ok"),),
             candidate_windows=(),
         ),
@@ -780,6 +902,81 @@ def test_temporal_success_publishes_empty_candidate_list(
         tmp_path / "module_outputs" / "asset-a" / "precheck" / "candidate_windows.json"
     )
     assert json.loads(candidate_path.read_text()) == []
+    run_config = json.loads((candidate_path.parent / "run_config.json").read_text())
+    assert run_config["temporal_output"] == {
+        "schema_version": "keypoint_temporal.output.v2",
+        "status": "valid",
+        "valid_frame_count": 4,
+        "uncalibrated_frame_count": 1,
+        "reason": "calibrated_temporal_output",
+    }
+
+
+def test_no_valid_temporal_output_is_published_for_sam3_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(precheck, "_load_clip", lambda context, module: object())
+
+    def execute(
+        context: AssetContext,
+        config: LoadedQcConfig,
+        module: str,
+        clip: object,
+    ) -> precheck.PrecheckModuleExecution:
+        temporal = module == "keypoint_temporal"
+        return precheck.PrecheckModuleExecution(
+            result=ModuleResult(
+                module,
+                "warn" if temporal else "pass",
+                (
+                    {
+                        "decision": "review",
+                        "output_status": "no_valid_output",
+                        "reason": "no_valid_temporal_output",
+                        "valid_frame_count": 0,
+                        "uncalibrated_frame_count": 3,
+                    }
+                    if temporal
+                    else {"decision": "pass"}
+                ),
+                {},
+            ),
+            check_results=(
+                CheckResult(
+                    "keypoint_temporal" if temporal else module,
+                    0,
+                    0,
+                    {},
+                    None if temporal else False,
+                    "uncalibrated" if temporal else "ok",
+                    severity="uncalibrated" if temporal else "pass",
+                ),
+            ),
+            candidate_windows=(),
+        )
+
+    monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
+    session = precheck.PrecheckSession(_context(tmp_path), _config(tmp_path))
+    for module in precheck.MODULES:
+        session.run_module(module)
+
+    run_config = json.loads(
+        (
+            tmp_path
+            / "module_outputs"
+            / "asset-a"
+            / "precheck"
+            / "run_config.json"
+        ).read_text()
+    )
+    assert run_config["temporal_output"] == {
+        "schema_version": "keypoint_temporal.output.v2",
+        "status": "no_valid_output",
+        "valid_frame_count": 0,
+        "uncalibrated_frame_count": 3,
+        "reason": "no_valid_temporal_output",
+    }
 
 
 def test_matching_precheck_artifact_reuses_without_source_load_or_check_run(

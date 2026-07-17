@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -103,9 +104,17 @@ def test_failed_video_recompute_preserves_previous_valid_artifact(
     } == before
 
 
-def test_precheck_v4_artifact_is_not_reused_by_current_session(
+@pytest.mark.parametrize(
+    "legacy_version",
+    [
+        "precheck-session-v5-frame-survival-metadata",
+        "precheck-session-v6-calibrated-temporal-output",
+    ],
+)
+def test_precheck_legacy_artifact_is_not_reused_by_current_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    legacy_version: str,
 ) -> None:
     from qc_common.types import CheckResult
     from qc_pipeline.runners import precheck
@@ -140,7 +149,7 @@ def test_precheck_v4_artifact_is_not_reused_by_current_session(
         legacy.setattr(
             precheck,
             "_IMPLEMENTATION_VERSION",
-            "precheck-session-v4-frame-survival-lineage",
+            legacy_version,
         )
         old_session = precheck.PrecheckSession(context, config)
         for module in precheck.MODULES:
@@ -155,9 +164,7 @@ def test_precheck_v4_artifact_is_not_reused_by_current_session(
             / "run_config.json"
         ).read_text(encoding="utf-8")
     )
-    assert old_run_config["fingerprint"]["implementation_version"] == (
-        "precheck-session-v4-frame-survival-lineage"
-    )
+    assert old_run_config["fingerprint"]["implementation_version"] == legacy_version
 
     loads.clear()
     executions.clear()
@@ -188,6 +195,78 @@ def test_precheck_v4_artifact_is_not_reused_by_current_session(
     assert loads == ["hdf5_text_info"]
     assert executions == ["hdf5_text_info"]
     assert reused_modules == []
+
+
+def test_precheck_temporal_output_schema_change_invalidates_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_common.types import CheckResult
+    from qc_pipeline.runners import precheck
+    from tests.test_qc_pipeline_precheck_session import _config, _context
+
+    context = _context(tmp_path)
+    config = _config(tmp_path)
+    executions: list[str] = []
+    monkeypatch.setattr(precheck, "_load_clip", lambda context, module: object())
+
+    def execute(
+        context: AssetContext,
+        config: object,
+        module: str,
+        clip: object,
+    ) -> precheck.PrecheckModuleExecution:
+        executions.append(module)
+        return precheck.PrecheckModuleExecution(
+            result=ModuleResult(module, "pass", {}, {}),
+            check_results=(CheckResult(module, 0, -1, {}, False, "ok"),),
+            candidate_windows=(),
+        )
+
+    monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            precheck,
+            "_TEMPORAL_OUTPUT_SCHEMA_VERSION",
+            "keypoint_temporal.output.v1",
+        )
+        old_session = precheck.PrecheckSession(context, config)
+        for module in precheck.MODULES:
+            old_session.run_module(module)
+
+    executions.clear()
+    current_session = precheck.PrecheckSession(context, config)
+    current_session.run_module("hdf5_text_info")
+
+    assert executions == ["hdf5_text_info"]
+
+
+def test_precheck_fingerprint_includes_dr_hdf5_reference_dataset(
+    tmp_path: Path,
+) -> None:
+    from qc_pipeline.runners.precheck import precheck_fingerprint
+    from tests.test_qc_pipeline_precheck_session import _config, _context
+
+    base = _context(tmp_path)
+    timestamp_context = replace(
+        base,
+        metadata={
+            **dict(base.metadata),
+            "supplier": "dr",
+            "hdf5_reference_dataset": "timestamp",
+        },
+    )
+    joints_context = replace(
+        timestamp_context,
+        metadata={
+            **dict(timestamp_context.metadata),
+            "hdf5_reference_dataset": "hand/left/joints3d",
+        },
+    )
+
+    assert precheck_fingerprint(timestamp_context, _config(tmp_path)) != (
+        precheck_fingerprint(joints_context, _config(tmp_path))
+    )
 
 
 def test_sam3_cache_uses_candidate_sha_and_skips_segmenter_on_hit(

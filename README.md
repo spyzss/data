@@ -4,7 +4,7 @@
 
 ```text
 supplier adapter / canonical manifest
-  -> precheck and video_quality (independent producers)
+  -> precheck -> video_quality -> supplier_data_audit (independent producers)
   -> candidate windows
   -> optional SAM3 containment sidecar
   -> ledger and manual review
@@ -73,13 +73,22 @@ python tools/run_qc_pipeline.py \
 ```text
 <batch-root>/module_outputs/<asset_id>/precheck/
 <batch-root>/module_outputs/<asset_id>/video_quality/
+<batch-root>/module_outputs/<asset_id>/supplier_data_audit/
 <batch-root>/module_outputs/<asset_id>/sam3_containment/
 <batch-root>/quality_archive/<asset_id>.json
 ```
 
 `--resume` 只复用输入、范围、配置和实现指纹完全匹配的 sidecar。CLI JSON 摘要会报告每个 asset 的 `computed/reused/skipped/blocked/failed` producer 状态和总耗时。要强制 producer 重算可使用 `--no-resume`；若已有 QC report，建议使用新的 `batch-root` 保留旧运行，而不是删除或覆盖旧 report。
 
-统一入口的 SAM3 只读取本轮 precheck 写出的 `module_outputs/<asset_id>/precheck/candidate_windows.json`，不要求 manifest 预填 `candidate_windows_path`。空候选不会加载 SAM3。JDT 继续直接读取 Parquet 2D keypoints；DeepReach head calibration/projection adapter 尚未完成时会明确标记 `adapter_missing/blocked`。
+统一入口的实际自动模块顺序是 `precheck -> video_quality -> supplier_data_audit -> sam3_containment`。`video_quality` 与 `supplier_data_audit` 都是独立 producer，顺序不表示前者向后者传值；两者只通过各自 artifact 和共享 QC report 交付结果。
+
+SAM3 只读取本轮 precheck 写出的 `module_outputs/<asset_id>/precheck/candidate_windows.json`，不要求 manifest 预填 `candidate_windows_path`，并且只消费显式 `sam3_eligible=true` 的候选。无有效 temporal output 时为 `blocked/no_valid_temporal_output`；有效 temporal 但无 eligible candidate 时为 `skipped/no_candidates`。JDT 继续直接读取 Parquet 2D keypoints；DR 在标定未验证或变换歧义时分别为 `blocked/calibration_unverified`、`blocked/transform_ambiguous`，即使 projection 已验证，在正式 DR/head SAM3 adapter 落地前也始终为 `blocked/adapter_missing`。
+
+DR 与 Potentia 的 `supplier_evaluation` 通过独立 `supplier_data_audit` producer 接入。DR 默认一个 task 一个 asset，并在同一 manifest 行保留 head/left_wrist/right_wrist 三路视频。DR HDF5 manifest 要求通过 CLI/config 显式选择 reference dataset；当前仓库不替供应商猜默认值，云端确认正式契约后可明确选择 `timestamp`。artifact 记录 `expected_frame_count`、每个 dataset 长度和 mismatch ranges；不一致时 precheck 为 `input_invalid/inconsistent_frame_count`，不再取最短长度伪装完整结果。Potentia 的 package 只是运输分区，一个 task 目录一个 asset。CSV timestamp 必须通过 `s/ms/us/ns` 或单一显式 scale 归一化为秒；标定缩放无法解释时默认 review，只有供应商配置明确为 `fail` 才升级。supplier audit 只做文件、CSV、IMU、标定和轨迹结构审计，不修改 precheck/video 原始输出，也不生成第二套文本 verdict。
+
+当前 cache identity 为 `precheck-session-v7-calibrated-temporal-validity` 和 `supplier-data-audit-producer-v3`；外层仍是 `qc_producer_run_config.v1`，并分别记录 temporal output schema 与 supplier audit raw schema identity。
+
+云端小样本构建、pipeline、projection overlay 和状态审计命令见 `docs/dr_potentia_supplier_evaluation_cloud_smoke_zh.md`。
 
 ### 4. Annotation
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -98,6 +99,7 @@ class KeypointTemporalCheck(BaseCheck):
                         },
                         flag=None,
                         reason="raw temporal pair skipped: current_frame_excluded",
+                        severity="uncalibrated",
                     )
                 )
                 previous_velocity = {}
@@ -108,6 +110,7 @@ class KeypointTemporalCheck(BaseCheck):
                 "joint_count": float(len(joint_names)),
                 "bone_count": float(len(bones)),
             }
+            metrics.update(self._position_audit_metrics(points, frame_offset))
             pair_eligible = frame_offset > 0 and is_eligible(frame_offset - 1)
             metrics["temporal_pair_eligible"] = pair_eligible
             metrics["skipped_pair_count"] = float(frame_offset > 0 and not pair_eligible)
@@ -184,6 +187,7 @@ class KeypointTemporalCheck(BaseCheck):
                     metrics=metrics,
                     flag=None,
                     reason="raw temporal keypoint metrics; thresholds uncalibrated",
+                    severity="uncalibrated",
                 )
             )
             previous_velocity = velocities
@@ -191,6 +195,31 @@ class KeypointTemporalCheck(BaseCheck):
             previous_angles = frame_angles
 
         return results
+
+    @staticmethod
+    def _position_audit_metrics(
+        points: dict[str, np.ndarray],
+        frame_offset: int,
+    ) -> dict[str, float]:
+        coordinates = np.concatenate(
+            [
+                np.asarray(values[frame_offset], dtype=np.float64).reshape(-1)
+                for values in points.values()
+                if values.shape[0] > frame_offset
+            ]
+        )
+        finite = np.isfinite(coordinates)
+        return {
+            "joint_position_abs_m_max": (
+                float(np.max(np.abs(coordinates[finite])))
+                if np.any(finite)
+                else math.nan
+            ),
+            "joint_position_finite_coordinate_count": float(np.sum(finite)),
+            "joint_position_nonfinite_coordinate_count": float(
+                coordinates.size - np.sum(finite)
+            ),
+        }
 
     def _prepare_rotations(
         self,

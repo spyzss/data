@@ -948,9 +948,14 @@ def record_runtime_error(
         "adapter_missing": "adapter_missing",
         "blocked": "blocked",
     }
+    state_reason = error_type
+    if error_type == "blocked":
+        prefix = f"{module} blocked: "
+        if message.startswith(prefix) and message[len(prefix):].strip():
+            state_reason = message[len(prefix):].strip()
     module_states[module] = {
         "state": state_by_error.get(error_type, "runtime_error"),
-        "reason": error_type,
+        "reason": state_reason,
     }
     execution["updated_at"] = now
     if continue_pipeline:

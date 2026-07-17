@@ -96,7 +96,7 @@ def test_default_video_quality_config_comes_from_unified_config() -> None:
     config = load_video_quality_config(None)
 
     assert config.module_version == "video_prefilter_v0.3.2"
-    assert config.qc_config_reference["config_version"] == "qc_acceptance_v2.1.0"
+    assert config.qc_config_reference["config_version"] == "qc_acceptance_v2.2.0"
     assert not hasattr(config, "threshold_version")
     assert config.pipeline.stop_before_mask_if_fail is True
     assert config.pipeline.do_keypoint_quality_check is False
@@ -1062,7 +1062,7 @@ def test_batch_video_skips_valid_completed_block(tmp_path: Path) -> None:
     assert report["video_quality"]["flow"]["exit_gate"] == {
         "state": "continue",
         "continue_to_next_module": True,
-        "next_module": "sam3_containment",
+        "next_module": "supplier_data_audit",
     }
     assert report["pipeline_state"]["status"] == "running"
     before = report_path.read_bytes()
@@ -1106,14 +1106,14 @@ def test_run_video_quality_check_writes_only_quality_archive_and_returns_zero(tm
     assert report["asset_id"] == "408817"
     assert report["schema_version"] == "asset_qc_report.v2"
     assert report["qc_config"]["schema_version"] == "qc_acceptance_config_schema.v2"
-    assert report["qc_config"]["config_version"] == "qc_acceptance_v2.1.0"
+    assert report["qc_config"]["config_version"] == "qc_acceptance_v2.2.0"
     assert report["qc_config"]["config_name"] == "acceptance_gate"
     assert report["qc_config"]["config_path"] == "configs/qc_acceptance.yaml"
     assert report["qc_config"]["config_hash"].startswith("sha256:")
     assert report["pipeline_state"] == {
         "status": "running",
         "last_completed_module": "video_quality",
-        "next_module": "sam3_containment",
+        "next_module": "supplier_data_audit",
         "stop_reason": None,
     }
     assert report["overall_decision"] is None
@@ -1139,7 +1139,7 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["schema_version"] == "asset_qc_report.v2"
-    assert report["qc_config"]["config_version"] == "qc_acceptance_v2.1.0"
+    assert report["qc_config"]["config_version"] == "qc_acceptance_v2.2.0"
     assert report["asset_id"] == "408817"
     assert report["report_revision"] == 6
     assert report["issues"] == []
@@ -1159,7 +1159,7 @@ def test_run_video_quality_check_writes_one_qc_json_report_per_asset_id(tmp_path
     assert report["video_quality"]["flow"]["exit_gate"] == {
         "state": "continue",
         "continue_to_next_module": True,
-        "next_module": "sam3_containment",
+        "next_module": "supplier_data_audit",
     }
     assert "thresholds" not in report["video_quality"]
     assert "threshold_version" not in report["video_quality"]
@@ -1274,7 +1274,7 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     assert report["pipeline_state"] == {
         "status": "running",
         "last_completed_module": "video_quality",
-        "next_module": "sam3_containment",
+        "next_module": "supplier_data_audit",
         "stop_reason": None,
     }
     assert report["overall_decision"] is None
@@ -1292,7 +1292,7 @@ def test_run_video_quality_check_returns_nonzero_for_failed_video(tmp_path: Path
     assert report["video_quality"]["flow"]["exit_gate"] == {
         "state": "continue",
         "continue_to_next_module": True,
-        "next_module": "sam3_containment",
+        "next_module": "supplier_data_audit",
     }
     before = (batch / "quality_archive" / "bad.json").read_bytes()
     assert run_video_quality_check(batch) == 2

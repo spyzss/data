@@ -22,6 +22,7 @@ class CheckResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     flag: bool | None = None
     reason: str = ""
+    severity: str | None = None
 
     def to_record(self) -> dict[str, Any]:
         """Convert to a flat record suitable for pandas storage."""
@@ -32,6 +33,7 @@ class CheckResult:
             "metrics": self.metrics,
             "flag": self.flag,
             "reason": self.reason,
+            "severity": self.severity,
         }
 
 

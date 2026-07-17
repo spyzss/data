@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from qc_common.config import load_qc_acceptance_config
-from qc_common.module_registry import ModuleAdapterMissingError, ModuleInputError
+from qc_common.module_registry import ModuleBlockedError, ModuleInputError
 from qc_pipeline.context import AssetContext
 from qc_pipeline.runners.sam3_containment import runner
 
@@ -71,10 +71,16 @@ def _candidate(start: int = 10, end: int = 12) -> dict[str, object]:
         "start_frame": start,
         "end_frame": end,
         "hand_side": "left",
+        "sam3_eligible": True,
     }
 
 
-def _write_current_run_config(context: AssetContext) -> None:
+def _write_current_run_config(
+    context: AssetContext,
+    *,
+    temporal_status: str = "valid",
+    valid_frame_count: int = 19,
+) -> None:
     from qc_pipeline.artifacts import write_run_config
     from qc_pipeline.runners.precheck import MODULES, precheck_fingerprint
 
@@ -90,7 +96,19 @@ def _write_current_run_config(context: AssetContext) -> None:
         outcome="completed",
         fingerprint=precheck_fingerprint(context, load_qc_acceptance_config()),
         elapsed_seconds=0.0,
-        metadata={"completed_modules": list(MODULES)},
+        metadata={
+            "completed_modules": list(MODULES),
+            "temporal_output": {
+                "status": temporal_status,
+                "valid_frame_count": valid_frame_count,
+                "uncalibrated_frame_count": 0 if valid_frame_count else 20,
+                "reason": (
+                    "calibrated_temporal_output"
+                    if temporal_status == "valid"
+                    else "no_valid_temporal_output"
+                ),
+            },
+        },
     )
 
 
@@ -173,6 +191,49 @@ def test_empty_current_candidates_skip_before_model_or_manifest_lookup(
     assert result.runtime["artifact_state"] == "no_candidates"
 
 
+def test_only_explicitly_eligible_candidates_reach_sam3(tmp_path: Path) -> None:
+    _write_candidates(
+        tmp_path,
+        [
+            {**_candidate(), "sam3_eligible": False},
+            {key: value for key, value in _candidate().items() if key != "sam3_eligible"},
+        ],
+    )
+    context = _context(tmp_path)
+    _write_current_run_config(context)
+
+    result = runner(lambda: pytest.fail("ineligible candidates must not load model"))(
+        context,
+        load_qc_acceptance_config(),
+    )
+
+    assert result.verdict == "skipped"
+    assert result.evaluation == {"decision": "skipped", "reason": "no_candidates"}
+
+
+def test_uncalibrated_temporal_blocks_sam3_instead_of_no_candidates(
+    tmp_path: Path,
+) -> None:
+    _write_candidates(tmp_path, [])
+    context = _context(tmp_path)
+    _write_current_run_config(
+        context,
+        temporal_status="no_valid_output",
+        valid_frame_count=0,
+    )
+
+    with pytest.raises(
+        ModuleBlockedError,
+        match="no_valid_temporal_output",
+    ) as raised:
+        runner(lambda: pytest.fail("blocked temporal output must not load model"))(
+            context,
+            load_qc_acceptance_config(),
+        )
+
+    assert raised.value.reason == "no_valid_temporal_output"
+
+
 @pytest.mark.parametrize(
     "candidate",
     [
@@ -199,18 +260,81 @@ def test_invalid_current_candidate_is_input_invalid_before_model_load(
     assert raised.value.module == "sam3_containment"
 
 
-def test_deepreach_nonempty_candidates_are_explicit_adapter_missing(
+def test_dr_is_blocked_by_unverified_calibration_before_candidate_lookup(
     tmp_path: Path,
 ) -> None:
     _write_candidates(tmp_path, [_candidate()])
-    context = _context(tmp_path, supplier="deepreach")
-    _write_current_run_config(context)
+    context = _context(tmp_path, supplier="dr")
 
-    with pytest.raises(ModuleAdapterMissingError, match="DeepReach head"):
+    with pytest.raises(ModuleBlockedError, match="calibration_unverified") as raised:
         runner(lambda: pytest.fail("unsupported adapter must not load model"))(
             context,
             load_qc_acceptance_config(),
         )
+
+    assert raised.value.reason == "calibration_unverified"
+
+
+def test_dr_transform_ambiguity_is_preserved_as_block_reason(tmp_path: Path) -> None:
+    _write_candidates(tmp_path, [_candidate()])
+    base = _context(tmp_path, supplier="deepreach")
+    context = AssetContext(
+        base.asset_id,
+        base.batch_root,
+        base.report_path,
+        base.source_files,
+        source_range=base.source_range,
+        metadata={**dict(base.metadata), "projection_validation_status": "transform_ambiguous"},
+    )
+
+    with pytest.raises(ModuleBlockedError, match="transform_ambiguous") as raised:
+        runner(lambda: pytest.fail("blocked adapter must not load model"))(
+            context,
+            load_qc_acceptance_config(),
+        )
+
+    assert raised.value.reason == "transform_ambiguous"
+
+
+@pytest.mark.parametrize("candidate_rows", [[], [_candidate()]])
+def test_validated_dr_is_blocked_by_adapter_missing_before_candidate_count(
+    tmp_path: Path,
+    candidate_rows: list[dict[str, object]],
+) -> None:
+    base = _context(tmp_path, supplier="dr")
+    context = AssetContext(
+        base.asset_id,
+        base.batch_root,
+        base.report_path,
+        base.source_files,
+        source_range=base.source_range,
+        metadata={**dict(base.metadata), "projection_validation_status": "validated"},
+    )
+    _write_candidates(tmp_path, candidate_rows)
+    _write_current_run_config(context)
+
+    with pytest.raises(ModuleBlockedError, match="adapter_missing") as raised:
+        runner(lambda: pytest.fail("missing DR adapter must not load model"))(
+            context,
+            load_qc_acceptance_config(),
+        )
+
+    assert raised.value.reason == "adapter_missing"
+
+
+def test_potentia_is_blocked_by_no_keypoint_input_before_candidate_lookup(
+    tmp_path: Path,
+) -> None:
+    _write_candidates(tmp_path, [_candidate()])
+    context = _context(tmp_path, supplier="potentia")
+
+    with pytest.raises(ModuleBlockedError, match="no_keypoint_input") as raised:
+        runner(lambda: pytest.fail("blocked adapter must not load model"))(
+            context,
+            load_qc_acceptance_config(),
+        )
+
+    assert raised.value.reason == "no_keypoint_input"
 
 
 def test_stale_precheck_run_config_is_rejected_before_model_load(

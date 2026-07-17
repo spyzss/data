@@ -328,9 +328,34 @@ def validate_qc_config(data: dict[str, Any]) -> None:
             "$ref": "#/$defs/videoParameters",
             "$defs": legacy_schema["$defs"],
         }
+        video_parameters = dict(data["modules"]["video_quality"]["parameters"])
+        supplier_overrides = video_parameters.pop("supplier_overrides", {})
+        if not isinstance(supplier_overrides, Mapping):
+            raise ValueError("video_quality.supplier_overrides must be a mapping")
+        unknown_suppliers = sorted(set(supplier_overrides) - {"potentia"})
+        if unknown_suppliers:
+            raise ValueError(
+                "video_quality.supplier_overrides only supports potentia"
+            )
+        if supplier_overrides:
+            potentia = supplier_overrides.get("potentia")
+            if not isinstance(potentia, Mapping) or set(potentia) != {"hdf5_alignment"}:
+                raise ValueError(
+                    "video_quality.supplier_overrides.potentia must only define hdf5_alignment"
+                )
+            alignment = potentia["hdf5_alignment"]
+            if (
+                not isinstance(alignment, Mapping)
+                or set(alignment) != {"enabled"}
+                or not isinstance(alignment["enabled"], bool)
+            ):
+                raise ValueError(
+                    "video_quality.supplier_overrides.potentia.hdf5_alignment "
+                    "must define boolean enabled"
+                )
         errors = sorted(
             Draft202012Validator(video_parameters_schema).iter_errors(
-                data["modules"]["video_quality"]["parameters"]
+                video_parameters
             ),
             key=lambda item: list(item.path),
         )

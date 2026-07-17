@@ -680,11 +680,28 @@ def test_presence_explicit_existence_invalid_preserves_side_ranges_and_reasons()
     ]
 
 
+def _valid_temporal_row(frame_idx: int = 0) -> CheckResult:
+    return CheckResult(
+        "skeleton_quality_score",
+        0,
+        frame_idx,
+        {
+            "temporal_output_valid": True,
+            "skeleton_verdict": "good",
+            "which_thresholds_exceeded": [],
+            "joint_displacement_m_max": 0.0,
+        },
+        False,
+        "temporal metrics within configured thresholds",
+        severity="pass",
+    )
+
+
 def test_temporal_candidate_is_one_warn_issue_with_source_range() -> None:
     result = adapt_keypoint_temporal(
         asset_id="a",
         source_relative_path="hdf5/a.h5",
-        results=[],
+        results=[_valid_temporal_row(30)],
         candidate_windows=[
             {
                 "asset_id": "a",
@@ -729,6 +746,7 @@ def test_strong_temporal_failure_remains_hard_fail() -> None:
             0,
             9,
             {
+                "temporal_output_valid": True,
                 "skeleton_verdict": "suspect",
                 "temporal_pair_start_frame": 8,
                 "temporal_pair_end_frame": 9,
@@ -786,6 +804,7 @@ def test_temporal_projection_review_is_warn_without_candidate_window() -> None:
         0,
         20,
         {
+            "temporal_output_valid": True,
             "skeleton_verdict": "review",
             "which_thresholds_exceeded": ["rotation_delta_max"],
             "needs_projection_review": 1.0,
@@ -813,12 +832,13 @@ def test_temporal_projection_review_is_warn_without_candidate_window() -> None:
     assert issue.needs_manual_review is True
 
 
-def test_temporal_non_strong_row_without_candidate_does_not_create_issue() -> None:
+def test_temporal_non_strong_row_without_candidate_is_warn() -> None:
     row = CheckResult(
         "skeleton_quality_score",
         0,
         6,
         {
+            "temporal_output_valid": True,
             "skeleton_verdict": "suspect",
             "which_thresholds_exceeded": ["joint_acceleration_m_s2_max"],
             "joint_acceleration_m_s2_max": 16.0,
@@ -835,8 +855,143 @@ def test_temporal_non_strong_row_without_candidate_does_not_create_issue() -> No
         config=loaded_test_config(),
     )
 
-    assert result.verdict == "pass"
-    assert result.issues == ()
+    assert result.verdict == "warn"
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_id == "keypoint_temporal.skeleton_quality_score"
+
+
+def test_raw_uncalibrated_temporal_rows_are_review_not_pass() -> None:
+    rows = [
+        CheckResult(
+            "keypoint_temporal",
+            0,
+            frame_idx,
+            {"temporal_pair_eligible": frame_idx > 0},
+            None,
+            "raw temporal keypoint metrics; thresholds uncalibrated",
+            severity="uncalibrated",
+        )
+        for frame_idx in range(3)
+    ]
+
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="parquet/episode.parquet",
+        results=rows,
+        candidate_windows=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "warn"
+    assert result.evaluation == {
+        "decision": "review",
+        "output_status": "no_valid_output",
+        "reason": "no_valid_temporal_output",
+        "checked_frame_count": 3,
+        "valid_frame_count": 0,
+        "uncalibrated_frame_count": 3,
+        "candidate_window_count": 0,
+    }
+    assert result.issues[0].rule_id == "keypoint_temporal.no_valid_output"
+
+
+def test_temporal_validity_is_explicit_and_uncalibrated_rows_cannot_fail() -> None:
+    valid_failure = CheckResult(
+        "skeleton_quality_score",
+        0,
+        9,
+        {
+            "temporal_output_valid": True,
+            "skeleton_verdict": "suspect",
+            "which_thresholds_exceeded": [
+                "joint_acceleration_m_s2_max",
+                "joint_displacement_m_max",
+                "rotation_delta_max",
+            ],
+        },
+        True,
+        "valid strong temporal failure",
+        severity="fail",
+    )
+    uncalibrated_projection = CheckResult(
+        "skeleton_quality_score",
+        0,
+        10,
+        {
+            "temporal_output_valid": False,
+            "skeleton_verdict": "invalid",
+            "which_thresholds_exceeded": ["rotation_delta_max"],
+            "left_needs_projection_review": 1.0,
+            "needs_projection_review": 1.0,
+        },
+        True,
+        "uncalibrated row with forced projection failure signals",
+        severity="fail",
+    )
+    legacy_metrics_without_validity = CheckResult(
+        "skeleton_quality_score",
+        0,
+        11,
+        {
+            "skeleton_verdict": "suspect",
+            "which_thresholds_exceeded": ["joint_acceleration_m_s2_max"],
+            "joint_acceleration_m_s2_max": 1e9,
+        },
+        True,
+        "legacy metrics must not imply validity",
+        severity="fail",
+    )
+
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[
+            valid_failure,
+            uncalibrated_projection,
+            legacy_metrics_without_validity,
+        ],
+        candidate_windows=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.evaluation["valid_frame_count"] == 1
+    assert result.evaluation["uncalibrated_frame_count"] == 2
+    assert len(result.issues) == 1
+    assert result.issues[0].context["start_frame"] == 9
+    assert [(item.start_frame, item.end_frame) for item in result.frame_exclusions] == [
+        (9, 9)
+    ]
+
+
+def test_temporal_missing_validity_with_metrics_is_no_valid_output() -> None:
+    row = CheckResult(
+        "skeleton_quality_score",
+        0,
+        4,
+        {
+            "skeleton_verdict": "good",
+            "which_thresholds_exceeded": [],
+            "joint_displacement_m_max": 0.0,
+        },
+        False,
+        "legacy apparently good row",
+        severity="pass",
+    )
+
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="hdf5/a.h5",
+        results=[row],
+        candidate_windows=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "warn"
+    assert result.evaluation["decision"] == "review"
+    assert result.evaluation["output_status"] == "no_valid_output"
+    assert result.evaluation["valid_frame_count"] == 0
+    assert result.evaluation["uncalibrated_frame_count"] == 1
+    assert result.frame_exclusions == ()
 
 
 def test_temporal_matching_row_and_candidate_emit_only_candidate_window() -> None:
@@ -845,6 +1000,7 @@ def test_temporal_matching_row_and_candidate_emit_only_candidate_window() -> Non
         0,
         36,
         {
+            "temporal_output_valid": True,
             "skeleton_verdict": "review",
             "which_thresholds_exceeded": ["rotation_delta_max"],
             "rotation_delta_max": 0.5,
@@ -895,6 +1051,7 @@ def test_temporal_reason_text_does_not_create_a_failure() -> None:
         0,
         7,
         {
+            "temporal_output_valid": True,
             "skeleton_verdict": "good",
             "which_thresholds_exceeded": [],
         },
@@ -917,7 +1074,7 @@ def test_temporal_reason_text_does_not_create_a_failure() -> None:
     assert result.issues == ()
 
 
-def test_temporal_empty_rows_and_windows_are_skipped_not_inferred_pass() -> None:
+def test_temporal_empty_rows_and_windows_are_no_valid_output_not_pass() -> None:
     result = adapt_keypoint_temporal(
         asset_id="a",
         source_relative_path="hdf5/a.h5",
@@ -926,9 +1083,11 @@ def test_temporal_empty_rows_and_windows_are_skipped_not_inferred_pass() -> None
         config=loaded_test_config(),
     )
 
-    assert result.verdict == "skipped"
-    assert result.evaluation["reason"] == "source_signal_not_provided"
-    assert result.issues == ()
+    assert result.verdict == "warn"
+    assert result.evaluation["decision"] == "review"
+    assert result.evaluation["output_status"] == "no_valid_output"
+    assert result.evaluation["reason"] == "no_valid_temporal_output"
+    assert result.issues[0].rule_id == "keypoint_temporal.no_valid_output"
 
 
 def test_temporal_candidate_metrics_use_inclusive_window_union_and_peaks() -> None:
@@ -960,7 +1119,7 @@ def test_temporal_candidate_metrics_use_inclusive_window_union_and_peaks() -> No
     result = adapt_keypoint_temporal(
         asset_id="a",
         source_relative_path="hdf5/a.h5",
-        results=[],
+        results=[_valid_temporal_row(10)],
         candidate_windows=candidates,
         config=loaded_test_config(),
     )
@@ -981,7 +1140,7 @@ def test_temporal_issue_ids_are_stable_and_distinguish_rule_side_window() -> Non
         result = adapt_keypoint_temporal(
             asset_id="a",
             source_relative_path="hdf5/a.h5",
-            results=[],
+            results=[_valid_temporal_row(start)],
             candidate_windows=[
                 {
                     "asset_id": "a",
@@ -1009,6 +1168,7 @@ def test_temporal_issue_ids_are_stable_and_distinguish_rule_side_window() -> Non
                 0,
                 10,
                 {
+                    "temporal_output_valid": True,
                     "skeleton_verdict": "review",
                     "which_thresholds_exceeded": [],
                     "left_needs_projection_review": 1.0,
@@ -1042,7 +1202,7 @@ def test_temporal_candidate_identity_ignores_local_peak_and_seed_coordinates() -
         return adapt_keypoint_temporal(
             asset_id="a",
             source_relative_path="hdf5/a.h5",
-            results=[],
+            results=[_valid_temporal_row(30)],
             candidate_windows=[{**base, **extra}],
             config=loaded_test_config(),
         )

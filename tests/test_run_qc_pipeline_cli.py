@@ -67,6 +67,62 @@ def test_manifest_legacy_candidate_path_is_metadata_not_required_source(
     assert context.metadata["candidate_windows_path"] == str(legacy)
 
 
+def test_manifest_maps_dr_and_potentia_sidecar_paths_into_source_contract(
+    tmp_path: Path,
+) -> None:
+    from tools.run_qc_pipeline import contexts_from_manifest
+
+    source = tmp_path / "source"
+    source.mkdir()
+    files = {
+        "primary_video_path": "head.mp4",
+        "head_video_path": "head.mp4",
+        "left_wrist_video_path": "left.mp4",
+        "right_wrist_video_path": "right.mp4",
+        "calib_path": "calib.json",
+        "camera_trajectory_path": "trajectory.csv",
+        "meta_path": "meta.json",
+        "frames_path": "frames.csv",
+        "aligned_path": "aligned.csv",
+        "imu_path": "imu.csv",
+    }
+    for filename in set(files.values()):
+        (source / filename).write_text("{}", encoding="utf-8")
+    task_dir = source / "task"
+    task_dir.mkdir()
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "asset_id": "asset-a",
+                "supplier": "potentia",
+                **{key: f"source/{value}" for key, value in files.items()},
+                "task_dir": "source/task",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+
+    assert set(context.source_files) == {
+        "video",
+        "head_video",
+        "left_wrist_video",
+        "right_wrist_video",
+        "calibration",
+        "trajectory",
+        "meta",
+        "frames",
+        "aligned",
+        "imu",
+        "task_dir",
+    }
+    assert context.source_files["trajectory"]["path"] == "source/trajectory.csv"
+    assert context.source_files["task_dir"]["path"] == "source/task"
+
+
 def test_run_batch_propagates_artifact_reuse_and_profile_to_runtime_context(
     tmp_path: Path,
 ) -> None:

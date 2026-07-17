@@ -12,7 +12,11 @@ import pytest
 from qc_common.config import LoadedQcConfig, load_qc_acceptance_config
 from qc_common.contracts import EvidenceRef, Issue, ModuleResult
 from qc_common.frame_survival import FrameExclusion
-from qc_common.module_registry import ModuleRegistry, ModuleUnavailableError
+from qc_common.module_registry import (
+    ModuleBlockedError,
+    ModuleRegistry,
+    ModuleUnavailableError,
+)
 from qc_common.report import StaleReportRevisionError, write_asset_qc_report
 from qc_common.report_mutation import (
     ConfigDriftError,
@@ -746,6 +750,60 @@ def test_supplier_profile_records_runtime_error_and_continues(
     }
     assert outcome.report["video_quality"]["flow"]["result_gate"]["verdict"] == "pass"
     assert outcome.report["runtime_errors"][0]["module"] == "hdf5_text_info"
+
+
+def test_supplier_profile_records_blocked_sam3_and_continues_independent_module(
+    tmp_path: Path,
+) -> None:
+    modules = ["sam3_containment", "video_quality"]
+    config = _config(tmp_path, modules)
+    calls: list[str] = []
+    registry = ModuleRegistry()
+
+    def blocked_sam3(
+        context: AssetContext,
+        loaded: LoadedQcConfig,
+    ) -> ModuleResult:
+        calls.append("sam3_containment")
+        raise ModuleBlockedError(
+            "sam3_containment",
+            "no_valid_temporal_output",
+        )
+
+    def video_quality(
+        context: AssetContext,
+        loaded: LoadedQcConfig,
+    ) -> ModuleResult:
+        calls.append("video_quality")
+        return ModuleResult(
+            "video_quality",
+            "pass",
+            {"decision": "pass"},
+            {},
+        )
+
+    registry.register("test.sam3_containment", blocked_sam3)
+    registry.register("test.video_quality", video_quality)
+
+    outcome = run_asset(
+        _context(tmp_path),
+        config=config,
+        profile="supplier_evaluation",
+        registry=registry,
+        now=lambda: "2026-07-17T00:00:00Z",
+    )
+
+    assert calls == modules
+    assert outcome.report["execution"]["module_states"] == {
+        "sam3_containment": {
+            "state": "blocked",
+            "reason": "no_valid_temporal_output",
+        },
+        "video_quality": {"state": "completed"},
+    }
+    assert "no_valid_temporal_output" in outcome.report["runtime_errors"][0][
+        "message"
+    ]
 
 
 def test_external_completion_preserves_incomplete_without_final_verdict(
