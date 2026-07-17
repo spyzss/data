@@ -22,6 +22,7 @@ from qc_common.module_registry import (
 )
 from qc_pipeline.context import AssetContext
 from qc_pipeline.artifacts import artifact_for
+from qc_pipeline.sam3_runtime import SegmenterProvider
 
 
 _IMPLEMENTATION_VERSION = "sam3-containment-producer-v2"
@@ -226,6 +227,7 @@ def _run_canonical(
     context: AssetContext,
     config: LoadedQcConfig,
     segmenter_factory: Callable[..., Any] | None,
+    segmenter_provider: SegmenterProvider | None,
 ) -> ModuleResult:
     """Run SAM3 from CanonicalEpisode without exposing supplier source layouts."""
     import pandas as pd
@@ -234,6 +236,7 @@ def _run_canonical(
     from qc_pipeline.adapters.sam3_containment import adapt_sam3_containment
     from tools.run_manifest_sam3_containment import (
         ManifestSourceCache,
+        SAM3_CONFIG,
         read_records,
         run_manifest_sam3_containment,
     )
@@ -280,13 +283,19 @@ def _run_canonical(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in candidate_rows),
         encoding="utf-8",
     )
-    segmenter = segmenter_factory() if segmenter_factory is not None else None
     model = _source_path(
         context,
         "sam3_model",
-        required=segmenter is None,
+        required=segmenter_factory is None,
         expected_type="directory",
     )
+    if segmenter_factory is not None:
+        segmenter = segmenter_factory()
+    elif segmenter_provider is not None:
+        assert model is not None
+        segmenter = segmenter_provider(model, dict(SAM3_CONFIG))
+    else:
+        segmenter = None
 
     class CanonicalSourceCache(ManifestSourceCache):
         def read_frame(self, path: Path, frame_idx: int):  # type: ignore[no-untyped-def]
@@ -340,10 +349,19 @@ def _run_canonical(
     )
 
 
-def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
+def runner(
+    segmenter_factory: Callable[..., Any] | None,
+    *,
+    segmenter_provider: SegmenterProvider | None = None,
+) -> ModuleRunner:
     def run(context: AssetContext, config: LoadedQcConfig) -> ModuleResult:
         if context.metadata.get("canonical_episode") is not None:
-            return _run_canonical(context, config, segmenter_factory)
+            return _run_canonical(
+                context,
+                config,
+                segmenter_factory,
+                segmenter_provider,
+            )
 
         from qc_pipeline.adapters.sam3_containment import adapt_sam3_containment
         from tools.run_manifest_sam3_containment import (
@@ -553,7 +571,13 @@ def runner(segmenter_factory: Callable[..., Any] | None) -> ModuleRunner:
             encoding="utf-8",
         )
         output_dir = staging_root / "output"
-        segmenter = segmenter_factory() if segmenter_factory is not None else None
+        if segmenter_factory is not None:
+            segmenter = segmenter_factory()
+        elif segmenter_provider is not None:
+            assert model is not None
+            segmenter = segmenter_provider(model, dict(SAM3_CONFIG))
+        else:
+            segmenter = None
         summary = run_manifest_sam3_containment(
             manifest=single_manifest,
             candidate_windows=single_candidates,

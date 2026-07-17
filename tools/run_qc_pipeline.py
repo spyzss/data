@@ -24,6 +24,7 @@ from qc_common.config import LoadedQcConfig, load_qc_acceptance_config  # noqa: 
 from qc_common.module_registry import ModuleRegistry  # noqa: E402
 from qc_common.suppliers import normalize_supplier  # noqa: E402
 from qc_pipeline.context import AssetContext, validate_asset_id  # noqa: E402
+from qc_pipeline.sam3_runtime import Sam3RuntimeProvider  # noqa: E402
 from qc_pipeline.orchestrator import (  # noqa: E402
     RunOutcome,
     build_default_registry,
@@ -303,9 +304,18 @@ def run_batch(
                 "--no-resume requires fresh report paths: " + ", ".join(existing)
             )
 
-    factory = registry_factory or (
-        lambda context: build_default_registry(context, config)
-    )
+    if registry_factory is None:
+        sam3_runtime = Sam3RuntimeProvider()
+
+        def factory(context: AssetContext) -> ModuleRegistry:
+            return build_default_registry(
+                context,
+                config,
+                segmenter_provider=sam3_runtime.get_segmenter,
+            )
+
+    else:
+        factory = registry_factory
 
     def run_one(context: AssetContext) -> RunOutcome:
         started = perf_counter()

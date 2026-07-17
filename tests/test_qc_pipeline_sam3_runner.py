@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 from pathlib import Path
+from threading import Lock
+import time
 
 import pytest
 
@@ -156,6 +159,217 @@ def _write_current_run_config(
             },
         },
     )
+
+
+def test_runtime_provider_reuses_one_segmenter_for_three_sequential_assets(
+    tmp_path: Path,
+) -> None:
+    from qc_pipeline.sam3_runtime import Sam3RuntimeProvider
+
+    model = tmp_path / "sam3-model"
+    model.mkdir()
+    created: list[tuple[Path, dict[str, object]]] = []
+
+    def factory(path: Path, config: dict[str, object]) -> object:
+        created.append((path, config))
+        return object()
+
+    provider = Sam3RuntimeProvider(factory=factory)
+    config = {"device": "cuda", "dtype": "bfloat16", "mask_threshold": 0.5}
+
+    segmenters = [provider.get_segmenter(model, config) for _ in range(3)]
+
+    assert len(created) == 1
+    assert created[0] == (model.resolve(), config)
+    assert segmenters[0] is segmenters[1] is segmenters[2]
+
+
+def test_runtime_provider_initializes_once_for_concurrent_assets(
+    tmp_path: Path,
+) -> None:
+    from qc_pipeline.sam3_runtime import Sam3RuntimeProvider
+
+    model = tmp_path / "sam3-model"
+    model.mkdir()
+    creation_count = 0
+    count_lock = Lock()
+
+    def factory(path: Path, config: dict[str, object]) -> object:
+        nonlocal creation_count
+        with count_lock:
+            creation_count += 1
+        time.sleep(0.03)
+        return object()
+
+    provider = Sam3RuntimeProvider(factory=factory)
+    config = {"device": "cuda", "dtype": "bfloat16"}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        segmenters = list(
+            pool.map(lambda _: provider.get_segmenter(model, config), range(3))
+        )
+
+    assert creation_count == 1
+    assert segmenters[0] is segmenters[1] is segmenters[2]
+
+
+def test_runtime_provider_serializes_only_shared_segmenter_inference(
+    tmp_path: Path,
+) -> None:
+    from qc_pipeline.sam3_runtime import Sam3RuntimeProvider
+
+    model = tmp_path / "sam3-model"
+    model.mkdir()
+    active = 0
+    max_active = 0
+    state_lock = Lock()
+
+    class Segmenter:
+        def segment_frame(self, frame: object) -> object:
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.03)
+            with state_lock:
+                active -= 1
+            return frame
+
+    provider = Sam3RuntimeProvider(factory=lambda path, config: Segmenter())
+    segmenter = provider.get_segmenter(model, {})
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(segmenter.segment_frame, range(3)))
+
+    assert results == [0, 1, 2]
+    assert max_active == 1
+
+
+def test_runtime_provider_uses_resolved_model_path_in_cache_key(
+    tmp_path: Path,
+) -> None:
+    from qc_pipeline.sam3_runtime import Sam3RuntimeProvider
+
+    model = tmp_path / "sam3-model"
+    model.mkdir()
+    link = tmp_path / "sam3-model-link"
+    link.symlink_to(model, target_is_directory=True)
+    calls = 0
+
+    def factory(path: Path, config: dict[str, object]) -> object:
+        nonlocal calls
+        calls += 1
+        return object()
+
+    provider = Sam3RuntimeProvider(factory=factory)
+
+    assert provider.get_segmenter(model, {}) is provider.get_segmenter(link, {})
+    assert calls == 1
+
+
+def test_runtime_provider_separates_different_model_paths(tmp_path: Path) -> None:
+    from qc_pipeline.sam3_runtime import Sam3RuntimeProvider
+
+    first_model = tmp_path / "sam3-model-a"
+    second_model = tmp_path / "sam3-model-b"
+    first_model.mkdir()
+    second_model.mkdir()
+    calls = 0
+
+    def factory(path: Path, config: dict[str, object]) -> object:
+        nonlocal calls
+        calls += 1
+        return object()
+
+    provider = Sam3RuntimeProvider(factory=factory)
+
+    assert provider.get_segmenter(first_model, {}) is not provider.get_segmenter(
+        second_model, {}
+    )
+    assert calls == 2
+
+
+def test_runtime_provider_canonicalizes_config_field_order(tmp_path: Path) -> None:
+    from qc_pipeline.sam3_runtime import Sam3RuntimeProvider
+
+    model = tmp_path / "sam3-model"
+    model.mkdir()
+    calls = 0
+
+    def factory(path: Path, config: dict[str, object]) -> object:
+        nonlocal calls
+        calls += 1
+        return object()
+
+    provider = Sam3RuntimeProvider(factory=factory)
+    first = provider.get_segmenter(
+        model,
+        {"device": "cuda", "dtype": "bfloat16", "thresholds": {"b": 2, "a": 1}},
+    )
+    second = provider.get_segmenter(
+        model,
+        {"thresholds": {"a": 1, "b": 2}, "dtype": "bfloat16", "device": "cuda"},
+    )
+
+    assert first is second
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("changed_config", "field"),
+    [
+        ({"device": "cpu", "dtype": "bfloat16", "mask_threshold": 0.5}, "device"),
+        ({"device": "cuda", "dtype": "float16", "mask_threshold": 0.5}, "dtype"),
+        ({"device": "cuda", "dtype": "bfloat16", "mask_threshold": 0.7}, "config"),
+    ],
+)
+def test_runtime_provider_separates_device_dtype_and_runtime_config(
+    tmp_path: Path,
+    changed_config: dict[str, object],
+    field: str,
+) -> None:
+    from qc_pipeline.sam3_runtime import Sam3RuntimeProvider
+
+    model = tmp_path / "sam3-model"
+    model.mkdir()
+    calls = 0
+
+    def factory(path: Path, config: dict[str, object]) -> object:
+        nonlocal calls
+        calls += 1
+        return object()
+
+    provider = Sam3RuntimeProvider(factory=factory)
+    baseline = provider.get_segmenter(
+        model,
+        {"device": "cuda", "dtype": "bfloat16", "mask_threshold": 0.5},
+    )
+    changed = provider.get_segmenter(model, changed_config)
+
+    assert baseline is not changed, field
+    assert calls == 2
+
+
+def test_runtime_provider_retries_after_initialization_failure(tmp_path: Path) -> None:
+    from qc_pipeline.sam3_runtime import Sam3RuntimeProvider
+
+    model = tmp_path / "sam3-model"
+    model.mkdir()
+    attempts = 0
+    expected = object()
+
+    def factory(path: Path, config: dict[str, object]) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("model load failed")
+        return expected
+
+    provider = Sam3RuntimeProvider(factory=factory)
+
+    with pytest.raises(RuntimeError, match="model load failed"):
+        provider.get_segmenter(model, {})
+
+    assert provider.get_segmenter(model, {}) is not None
+    assert attempts == 2
 
 
 def test_source_path_accepts_model_directory(tmp_path: Path) -> None:
@@ -325,6 +539,43 @@ def test_jdt_model_directory_reaches_manifest_sam3_runner(
     assert "sha256" not in model_identity["files"]["sam3.pt"]
 
 
+def test_jdt_runner_gets_segmenter_from_injected_runtime_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.run_manifest_sam3_containment import SAM3_CONFIG
+
+    context, model = _model_context(tmp_path)
+    _write_candidates(tmp_path, [_candidate()])
+    _write_current_run_config(context)
+    segmenter = object()
+    provider_calls: list[tuple[Path, dict[str, object]]] = []
+    captured: dict[str, object] = {}
+
+    def provider(path: Path, config: dict[str, object]) -> object:
+        provider_calls.append((path, config))
+        return segmenter
+
+    def fake_run(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        _write_successful_sam3_outputs(Path(str(kwargs["output_dir"])))
+        return {"failed_asset_count": 0}
+
+    monkeypatch.setattr(
+        "tools.run_manifest_sam3_containment.run_manifest_sam3_containment",
+        fake_run,
+    )
+
+    result = runner(None, segmenter_provider=provider)(
+        context,
+        load_qc_acceptance_config(),
+    )
+
+    assert result.verdict == "pass"
+    assert provider_calls == [(model, dict(SAM3_CONFIG))]
+    assert captured["segmenter"] is segmenter
+
+
 def test_full_pipeline_uses_current_precheck_artifact_not_legacy_manifest_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -382,7 +633,7 @@ def test_empty_current_candidates_skip_before_model_or_manifest_lookup(
     _write_candidates(tmp_path, [])
     calls = 0
 
-    def forbidden_factory() -> object:
+    def forbidden_provider(model: Path, config: dict[str, object]) -> object:
         nonlocal calls
         calls += 1
         raise AssertionError("segmenter must not load")
@@ -396,7 +647,10 @@ def test_empty_current_candidates_skip_before_model_or_manifest_lookup(
         metadata={"supplier": "jdt"},
     )
     _write_current_run_config(context)
-    result = runner(forbidden_factory)(context, load_qc_acceptance_config())
+    result = runner(None, segmenter_provider=forbidden_provider)(
+        context,
+        load_qc_acceptance_config(),
+    )
 
     assert calls == 0
     assert result.verdict == "skipped"
@@ -415,10 +669,12 @@ def test_only_explicitly_eligible_candidates_reach_sam3(tmp_path: Path) -> None:
     context = _context(tmp_path)
     _write_current_run_config(context)
 
-    result = runner(lambda: pytest.fail("ineligible candidates must not load model"))(
-        context,
-        load_qc_acceptance_config(),
-    )
+    result = runner(
+        None,
+        segmenter_provider=lambda model, config: pytest.fail(
+            "ineligible candidates must not load model"
+        ),
+    )(context, load_qc_acceptance_config())
 
     assert result.verdict == "skipped"
     assert result.evaluation == {"decision": "skipped", "reason": "no_candidates"}
@@ -439,10 +695,12 @@ def test_uncalibrated_temporal_blocks_sam3_instead_of_no_candidates(
         ModuleBlockedError,
         match="no_valid_temporal_output",
     ) as raised:
-        runner(lambda: pytest.fail("blocked temporal output must not load model"))(
-            context,
-            load_qc_acceptance_config(),
-        )
+        runner(
+            None,
+            segmenter_provider=lambda model, config: pytest.fail(
+                "blocked temporal output must not load model"
+            ),
+        )(context, load_qc_acceptance_config())
 
     assert raised.value.reason == "no_valid_temporal_output"
 
@@ -480,10 +738,12 @@ def test_dr_is_blocked_by_unverified_calibration_before_candidate_lookup(
     context = _context(tmp_path, supplier="dr")
 
     with pytest.raises(ModuleBlockedError, match="calibration_unverified") as raised:
-        runner(lambda: pytest.fail("unsupported adapter must not load model"))(
-            context,
-            load_qc_acceptance_config(),
-        )
+        runner(
+            None,
+            segmenter_provider=lambda model, config: pytest.fail(
+                "unsupported adapter must not load model"
+            ),
+        )(context, load_qc_acceptance_config())
 
     assert raised.value.reason == "calibration_unverified"
 
@@ -501,10 +761,12 @@ def test_dr_transform_ambiguity_is_preserved_as_block_reason(tmp_path: Path) -> 
     )
 
     with pytest.raises(ModuleBlockedError, match="transform_ambiguous") as raised:
-        runner(lambda: pytest.fail("blocked adapter must not load model"))(
-            context,
-            load_qc_acceptance_config(),
-        )
+        runner(
+            None,
+            segmenter_provider=lambda model, config: pytest.fail(
+                "blocked adapter must not load model"
+            ),
+        )(context, load_qc_acceptance_config())
 
     assert raised.value.reason == "transform_ambiguous"
 
@@ -527,10 +789,12 @@ def test_validated_dr_is_blocked_by_adapter_missing_before_candidate_count(
     _write_current_run_config(context)
 
     with pytest.raises(ModuleBlockedError, match="adapter_missing") as raised:
-        runner(lambda: pytest.fail("missing DR adapter must not load model"))(
-            context,
-            load_qc_acceptance_config(),
-        )
+        runner(
+            None,
+            segmenter_provider=lambda model, config: pytest.fail(
+                "missing DR adapter must not load model"
+            ),
+        )(context, load_qc_acceptance_config())
 
     assert raised.value.reason == "adapter_missing"
 
@@ -542,10 +806,12 @@ def test_potentia_is_blocked_by_no_keypoint_input_before_candidate_lookup(
     context = _context(tmp_path, supplier="potentia")
 
     with pytest.raises(ModuleBlockedError, match="no_keypoint_input") as raised:
-        runner(lambda: pytest.fail("blocked adapter must not load model"))(
-            context,
-            load_qc_acceptance_config(),
-        )
+        runner(
+            None,
+            segmenter_provider=lambda model, config: pytest.fail(
+                "blocked adapter must not load model"
+            ),
+        )(context, load_qc_acceptance_config())
 
     assert raised.value.reason == "no_keypoint_input"
 

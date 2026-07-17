@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Lock
+import time
+
+import pytest
 
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import ModuleResult
@@ -171,6 +175,96 @@ def test_run_batch_propagates_artifact_reuse_and_profile_to_runtime_context(
 
     assert observed == [(False, "supplier_evaluation")]
     assert outcome.elapsed_seconds >= 0
+
+
+@pytest.mark.parametrize(
+    ("max_workers", "execution"),
+    [(1, "sequential"), (3, "concurrent")],
+)
+def test_run_batch_shares_one_sam3_runtime_provider_across_three_jdt_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_workers: int,
+    execution: str,
+) -> None:
+    from qc_pipeline import sam3_runtime
+    from tools import run_qc_pipeline as cli
+
+    model = tmp_path / "sam3-model"
+    model.mkdir()
+    raw_segmenter = object()
+    factory_calls = 0
+    observed_segmenters: list[object] = []
+    state_lock = Lock()
+
+    def segmenter_factory(path: Path, config: dict[str, object]) -> object:
+        nonlocal factory_calls
+        with state_lock:
+            factory_calls += 1
+        time.sleep(0.03)
+        return raw_segmenter
+
+    monkeypatch.setattr(sam3_runtime, "_default_factory", segmenter_factory)
+
+    def fake_build_default_registry(
+        context: AssetContext,
+        loaded_config: LoadedQcConfig,
+        *,
+        segmenter_factory: object | None = None,
+        segmenter_provider: object | None = None,
+    ) -> ModuleRegistry:
+        assert segmenter_factory is None
+        assert callable(segmenter_provider)
+        registry = ModuleRegistry()
+
+        def run(
+            runner_context: AssetContext,
+            loaded: LoadedQcConfig,
+        ) -> ModuleResult:
+            segmenter = segmenter_provider(  # type: ignore[operator]
+                model,
+                {
+                    "device": "cuda",
+                    "dtype": "bfloat16",
+                    "mask_threshold": 0.5,
+                },
+            )
+            with state_lock:
+                observed_segmenters.append(segmenter)
+            return ModuleResult(
+                "video_quality",
+                "pass",
+                {"decision": "pass"},
+                {},
+                runtime={"artifact_state": "computed"},
+            )
+
+        registry.register("test.video_quality", run)
+        return registry
+
+    monkeypatch.setattr(cli, "build_default_registry", fake_build_default_registry)
+    contexts = [
+        AssetContext(
+            f"jdt-{index}",
+            tmp_path,
+            tmp_path / "quality_archive" / f"jdt-{index}.json",
+            {},
+            metadata={"supplier": "jdt"},
+        )
+        for index in range(3)
+    ]
+
+    outcomes = cli.run_batch(
+        contexts,
+        config=_config(tmp_path),
+        profile="acceptance",
+        max_workers=max_workers,
+    )
+
+    assert set(outcomes) == {"jdt-0", "jdt-1", "jdt-2"}, execution
+    assert factory_calls == 1, execution
+    assert len(observed_segmenters) == 3
+    assert observed_segmenters[0] is observed_segmenters[1] is observed_segmenters[2]
 
 
 def test_outcome_summary_groups_five_prechecks_as_one_producer(tmp_path: Path) -> None:

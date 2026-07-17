@@ -9,6 +9,7 @@ from qc_common.config import LoadedQcConfig
 from qc_common.contracts import ModuleResult
 from qc_common.module_registry import ModuleRegistry, ModuleRunner
 from qc_pipeline.context import AssetContext
+from qc_pipeline.sam3_runtime import SegmenterProvider
 from qc_pipeline.runners import (
     precheck,
     sam3_containment,
@@ -22,6 +23,7 @@ def build_default_registry(
     config: LoadedQcConfig,
     *,
     segmenter_factory: Callable[..., Any] | None = None,
+    segmenter_provider: SegmenterProvider | None = None,
 ) -> ModuleRegistry:
     """Build a fresh automatic-runner registry for one asset worker."""
     registry = ModuleRegistry()
@@ -30,7 +32,10 @@ def build_default_registry(
         **{name: precheck_session.runner_for(name) for name in precheck.MODULES},
         "video_quality": video_quality.run,
         "supplier_data_audit": supplier_data_audit.run,
-        "sam3_containment": sam3_containment.runner(segmenter_factory),
+        "sam3_containment": sam3_containment.runner(
+            segmenter_factory,
+            segmenter_provider=segmenter_provider,
+        ),
     }
     for module_name, runner in runners.items():
         module_config = config.module_config(module_name)
