@@ -37,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--release-root", required=True, type=Path)
     parser.add_argument("--episode-index", type=int)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--batch-metadata", type=Path)
+    parser.add_argument("--revision-artifact", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -79,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
             release_root=args.release_root,
             episode_index=args.episode_index,
             canonical_config_path=args.config,
+            batch_metadata_path=args.batch_metadata,
+            revision_artifact_path=args.revision_artifact,
             dry_run=args.dry_run,
         )
     except CliUsageError as exc:

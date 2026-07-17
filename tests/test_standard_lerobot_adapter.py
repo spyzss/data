@@ -69,6 +69,62 @@ def test_selector_is_explicit_for_multiple_episodes_and_never_selects_first(
     )
 
 
+def test_load_preserves_registered_extra_lerobot_columns_without_mutation(
+    tmp_path: Path,
+) -> None:
+    root = write_standard_lerobot_dataset(tmp_path / "dataset")
+    data_path = next((root / "data").rglob("*.parquet"))
+    table = pq.read_table(data_path)
+    action = np.arange(6, dtype=np.float32).reshape(3, 2)
+    table = table.append_column(
+        "action",
+        pa.array(action.tolist(), type=pa.list_(pa.float32(), 2)),
+    )
+    table = table.append_column(
+        "operator_note",
+        pa.array(["start", "middle", "end"], type=pa.string()),
+    )
+    pq.write_table(table, data_path)
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["features"]["action"] = {
+        "dtype": "float32",
+        "shape": [2],
+        "unit": "normalized",
+    }
+    info["features"]["operator_note"] = {"dtype": "string", "shape": [1]}
+    info_path.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+    before = {
+        path.relative_to(root).as_posix(): _sha256(path)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+    episode = StandardLeRobotAdapter().load(root)
+
+    extensions = {
+        item.published_name: item for item in episode.supplier_extensions.fields
+    }
+    assert extensions["action"].source_path == "parquet:action"
+    assert extensions["action"].time_alignment == "frame"
+    assert extensions["action"].values.tolist() == action.tolist()
+    assert extensions["action"].metadata == {
+        "dtype": "float32",
+        "shape": [2],
+        "unit": "normalized",
+    }
+    assert extensions["operator_note"].values.tolist() == [
+        "start",
+        "middle",
+        "end",
+    ]
+    assert {
+        path.relative_to(root).as_posix(): _sha256(path)
+        for path in root.rglob("*")
+        if path.is_file()
+    } == before
+
+
 @pytest.mark.parametrize("column", ["timestamp_ns", "observation.hand_keypoints_3d"])
 def test_load_rejects_missing_or_wrong_fixed_parquet_field(
     tmp_path: Path, column: str

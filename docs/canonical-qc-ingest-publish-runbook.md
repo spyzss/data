@@ -1,4 +1,4 @@
-# Canonical QC Ingest and LeRobot v3 Publish Runbook
+# Canonical Data Ingest, QC and LeRobot v3 Publish Runbook
 
 本手册覆盖标准 HDF5 / LeRobot 输入、可恢复自动 QC、人工阶段边界，以及 Curated
 LeRobot v3 原子发布。顶层 active 配置为 `configs/canonical_qc.yaml`，必须与
@@ -8,6 +8,12 @@ LeRobot v3 原子发布。顶层 active 配置为 `configs/canonical_qc.yaml`，
 `canonical_qc_v1.1.1.yaml` 是 timestamp tolerance 为 0 的严格诊断版本，不能用临时
 YAML 绕过 active 合同。
 
+Canonical 是供应商 Raw 经过 Adapter 标准化后的长期数据视图；QC 只是消费者。
+`quality_archive/*.json` 是质量结论事实源，但不是训练 payload。Publisher 的目标
+逻辑输入为 Raw source + Canonical metadata + final QC report + optional revision
+artifact。当前 CLI 仍通过 `CanonicalQcEpisode` 兼容对象承载 v1 Core，通用额外字段
+以 typed inventory 保留，并支持 batch metadata 和受控非零 revision，见第 3.1 节。
+
 ## 1. 路径与输入原则
 
 - 必须显式给出 `--source-format hdf5|lerobot`，禁止通过后缀猜格式。
@@ -16,6 +22,25 @@ YAML 绕过 active 合同。
 - LeRobot 多 episode 数据集必须给 `--episode-index`；单 episode 可省略。
 - HDF5 禁止传 `--episode-index`。
 - 内部时间段全部是半开区间 `[start_frame,end_frame_exclusive)`。
+- Raw source 必须只读；任何 QC、人工或 Publisher 步骤都不得原地修改 HDF5、
+  LeRobot、MP4 或供应商 metadata。
+- `quality_archive/` 位于同一批次根、与 Raw 并列保存；它只承载
+  `asset_qc_report.v2`，不得嵌入源容器。
+- 批次 manifest 应使用 `canonical_batch_metadata.v1`，提供 sensors/cameras/robot/
+  annotation version/language/modality 等 `dataset_attributes`；CLI 用
+  `--batch-metadata` 显式绑定，跨批次检索索引另行实现。
+
+推荐布局：
+
+```text
+<batch>/
+  <supplier raw files and directories>   # immutable
+  batch_manifest.json                     # canonical_batch_metadata.v1
+  quality_archive/
+    <asset_id>.json                       # asset_qc_report.v2
+  canonical_revisions/
+    <asset_id>/<revision>.json            # canonical_revision_artifact.v1
+```
 
 ## 2. Ingest 与自动 QC
 
@@ -31,7 +56,8 @@ python tools/run_canonical_qc.py \
   --profile acceptance \
   --asset-id asset-001 \
   --batch-id batch-20260716 \
-  --supplier-id supplier-001
+  --supplier-id supplier-001 \
+  --batch-metadata /data/batch/batch_manifest.json
 ```
 
 LeRobot：
@@ -47,7 +73,8 @@ python tools/run_canonical_qc.py \
   --profile supplier_evaluation \
   --asset-id asset-007 \
   --batch-id batch-20260716 \
-  --supplier-id supplier-001
+  --supplier-id supplier-001 \
+  --batch-metadata /data/batch/batch_manifest.json
 ```
 
 默认 `--resume`。报告已是 terminal 或 `awaiting_external` 时再次执行是字节幂等；
@@ -73,12 +100,24 @@ Gate Pass revision，再继续自动 QC；确定性合同失败写 `stopped/fail
 完成 mutation API；人工工作台 change 应通过 CAS 接口推进。CLI 不伪造人工完成，
 测试中的 completed report 只是明确 fixture。
 
-首版 Publisher 的路径入口只支持未发生语义修改的 Canonical source revision。
-如果 `timeline_edit_count` 或 `subtask_text_edit_count` 大于 0，而人工模块尚未提供
-format-neutral Canonical revision artifact，Publisher 以
+Publisher 路径入口从显式 Raw source 重新加载 Canonical Data，并可叠加 batch manifest
+与 format-neutral revision artifact。QC JSON 只用于 Gate/revision/fingerprint 绑定，
+不是 LeRobot 数据来源。如果任一 edit count 大于 0 但没有 `--revision-artifact`，仍以
 `canonical_revision_artifact_required` fail closed，绝不发布源文件中的旧文本。
 
 ## 3. 发布前置
+
+目标逻辑请求包含：
+
+```text
+raw source
++ Canonical metadata / supplier extension inventory / batch attributes
++ final asset_qc_report.v2
++ optional canonical revision artifact
+```
+
+Raw 提供完整训练 payload；Canonical metadata 提供标准字段映射；QC report 只做
+发布门禁和追踪；revision artifact 只覆盖允许修改的语义/时间轴字段。
 
 发布必须读取最终报告中的 `report_revision` 和
 `canonical_binding.canonical_revision`；CLI 不允许调用者覆盖它们。要求包括：
@@ -98,14 +137,38 @@ python tools/publish_lerobot_v3.py \
   --source-format hdf5 \
   --canonical-source-root /data/batch/asset-001 \
   --qc-report /data/batch/quality_archive/asset-001.json \
+  --batch-metadata /data/batch/batch_manifest.json \
   --release-root /training/curated-egodata \
   --dry-run
+```
+
+零编辑资产不得提供 `--revision-artifact`；非零编辑资产必须提供。Artifact 只允许
+task/description、subtask 双语文本和成对共享边界 patch，并绑定 before/after semantic
+fingerprint、parent/final canonical revision、QC report revision、edit count 和文件 hash。
+共享边界必须同时提交相邻 segment 的 end/start 两条 patch，但只计为一次
+`timeline_edit_count`。
+非零编辑发布在上述命令中追加：
+
+```text
+--revision-artifact /data/batch/canonical_revisions/asset-001/3.json
 ```
 
 正式发布去掉 `--dry-run`。Publisher 会 staging、独立回读、冻结版
 `LeRobotDataset==0.6.0` 首末帧验证、fsync、no-replace rename，最后原子更新
 `CURRENT.json`。失败不改变旧 CURRENT 和旧 release；同一请求重试返回
 `already_published`。
+
+### 3.1 当前实现边界与后续代码项
+
+当前 `PublishRequest` 绑定 Raw-derived episode、canonical source root、final QC、typed
+batch metadata 和 optional revision artifact。已验证 Core、`quality_hand` Evidence、
+标准 HDF5/LeRobot 已登记 extensions、主视频及非零语义修订；release identity/manifest
+绑定完整 data fingerprint 和 artifact SHA-256。
+
+剩余边界：object/vlen、ragged/null、物理 dtype/shape 与 `info.features` 不一致、多媒体
+extension 或尚无 Adapter 的 MCAP/NPZ 等格式会结构化拒绝；需新增显式 supplier
+profile/policy，禁止删字段后重试。跨批次检索索引与人工 revision artifact 生成工作台
+也不在本 Publisher change 内。
 
 ## 4. 训练读取
 
@@ -121,9 +184,10 @@ python tools/publish_lerobot_v3.py \
 <release-root>/releases/<release_id>/
 ```
 
-训练端不得扫描 `.staging`，也不得猜“最新修改时间”。HDF5 与供应商 LeRobot 都会
-由我方 Publisher 重写成同一 Curated LeRobot v3 schema；不同 source provenance 的
-release ID 可以不同，但 normalized Canonical 语义和数组必须等价。
+训练端不得扫描 `.staging`，也不得猜“最新修改时间”。HDF5 与供应商 LeRobot 都由
+我方 Publisher 重写成同一 Curated LeRobot v3 schema。目标状态下，标准 Core 语义
+一致，供应商扩展按 inventory 保留；不同 source provenance 或 extension payload
+必须产生不同 release identity。当前实现只对 v1 Core/`quality_hand` 提供该保证。
 
 ## 5. JSON 与退出码
 
@@ -152,6 +216,8 @@ release ID 可以不同，但 normalized Canonical 语义和数组必须等价�
 - prerequisite：核对 final report、revision、binding 和 source hash。
 - `canonical_revision_artifact_required`：该资产有人工语义编辑；等待人工模块输出
   format-neutral working revision artifact，不能回写或猜测源 HDF5/LeRobot。
+- extension preservation：若 inventory 中字段没有已登记的 LeRobot feature/sidecar
+  policy，禁止发布并补齐 Adapter/Publisher mapping；不得删除字段后重试。
 - validation：不要更新 CURRENT；检查冻结 validator 环境与 staged artifact。
 - commit conflict：保留现有 release，调查 release ID/不可变内容冲突，不覆盖目录。
 

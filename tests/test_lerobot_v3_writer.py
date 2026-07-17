@@ -10,19 +10,27 @@ import subprocess
 import sys
 
 import cv2
+import h5py
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pandas as pd
 import pytest
 
-from canonical_qc import CanonicalQcBridge, StandardHdf5Adapter, StandardLeRobotAdapter
-from canonical_qc.provenance import semantic_fingerprint
+from canonical_qc import (
+    CanonicalQcBridge,
+    StandardHdf5Adapter,
+    StandardLeRobotAdapter,
+    load_batch_metadata,
+    with_batch_metadata,
+)
+from canonical_qc.provenance import data_fingerprint, semantic_fingerprint
 from canonical_qc.video_probe import probe_video
 from lerobot_v3_publisher import (
     PublishPrerequisiteError,
     PublishRequest,
     StagedRelease,
+    validate_staged_release,
     validate_publish_request,
     write_staging,
 )
@@ -104,6 +112,103 @@ def _all_artifact_bytes(staged: StagedRelease) -> dict[str, bytes]:
         for path in staged.root.rglob("*")
         if path.is_file()
     }
+
+
+def test_writer_preserves_extensions_and_batch_attributes_without_mutating_raw(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source" / "asset-001"
+    hdf5_path, _video_path = write_standard_hdf5_episode(source_root)
+    with h5py.File(hdf5_path, "r+") as handle:
+        handle.create_dataset(
+            "/robot/action",
+            data=np.arange(6, dtype=np.float32).reshape(3, 2),
+        )
+        handle.create_dataset(
+            "/metadata/operator_id",
+            data="operator-007",
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+    batch_manifest = tmp_path / "batch_manifest.json"
+    batch_manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": "canonical_batch_metadata.v1",
+                "batch_id": "batch-001",
+                "supplier_id": "supplier-001",
+                "dataset_attributes": {
+                    "robot_platform": "franka",
+                    "modalities": ["video", "action"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    episode = with_batch_metadata(
+        StandardHdf5Adapter().load(source_root),
+        load_batch_metadata(batch_manifest),
+    )
+    before = _source_bytes(source_root)
+    plan = _plan_for_episode(tmp_path / "publish", source_root, episode)
+
+    staged = write_staging(plan, plan.request.release_root / ".staging")
+    report = validate_staged_release(staged, episode)
+
+    assert report.frame_count == 3
+    table = pq.read_table(staged.root / "data/chunk-000/file-000.parquet")
+    assert table["supplier.hdf5.robot.action"].to_pylist() == [
+        [0.0, 1.0],
+        [2.0, 3.0],
+        [4.0, 5.0],
+    ]
+    info = json.loads((staged.root / "meta/info.json").read_text())
+    assert info["features"]["supplier.hdf5.robot.action"]["dtype"] == "float32"
+    assert info["features"]["supplier.hdf5.robot.action"]["shape"] == [2]
+    semantics = json.loads(
+        (staged.root / "meta/episode_semantics.jsonl").read_text()
+    )
+    assert semantics["batch_metadata"]["dataset_attributes"] == {
+        "modalities": ["video", "action"],
+        "robot_platform": "franka",
+    }
+    extension_rows = {
+        row["published_name"]: row for row in semantics["supplier_extensions"]
+    }
+    assert extension_rows["supplier.hdf5.robot.action"]["storage"] == (
+        "lerobot_feature"
+    )
+    operator = extension_rows["supplier.hdf5.metadata.operator_id"]
+    assert operator["storage"] == "semantic_sidecar"
+    assert operator["payload"]["encoding"] == "ndarray_base64.v1"
+    assert _source_bytes(source_root) == before
+
+
+def test_publish_plan_identity_changes_with_data_fingerprint(tmp_path: Path) -> None:
+    source_root = tmp_path / "source" / "asset-001"
+    write_standard_hdf5_episode(source_root)
+    base = StandardHdf5Adapter().load(source_root)
+    first_manifest = tmp_path / "first.json"
+    second_manifest = tmp_path / "second.json"
+    for path, robot in ((first_manifest, "franka"), (second_manifest, "ur5")):
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "canonical_batch_metadata.v1",
+                    "batch_id": "batch-001",
+                    "supplier_id": "supplier-001",
+                    "dataset_attributes": {"robot_platform": robot},
+                }
+            ),
+            encoding="utf-8",
+        )
+    first = with_batch_metadata(base, load_batch_metadata(first_manifest))
+    second = with_batch_metadata(base, load_batch_metadata(second_manifest))
+
+    first_plan = _plan_for_episode(tmp_path / "first-plan", source_root, first)
+    second_plan = _plan_for_episode(tmp_path / "second-plan", source_root, second)
+
+    assert data_fingerprint(first) != data_fingerprint(second)
+    assert first_plan.release_id != second_plan.release_id
 
 
 def _assert_no_absolute_path_strings(value: object) -> None:

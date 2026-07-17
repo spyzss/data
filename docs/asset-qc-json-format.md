@@ -190,6 +190,14 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 
 ### 3.3 Publisher 发布绑定
 
+本节只定义质量报告与发布请求之间的 Gate/audit 绑定。QC JSON 不承载 Raw 训练
+payload、supplier extension values 或 batch dataset attributes，也不能作为生成
+LeRobot 的唯一数据源。Publisher 的完整逻辑输入为 Raw source + Canonical metadata/
+field inventory + 本最终报告 + optional Canonical revision artifact。
+
+`canonical_binding` 和 `canonical_qc_range` 是 `asset_qc_report.v2` 已发布字段名，继续
+保持不变；其中 `canonical_qc` 是兼容标识，不代表 Canonical Data 只服务 QC。
+
 最终人工语义和 Warn 复核完成时，报告必须写入：
 
 ```json
@@ -212,6 +220,11 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 同一 canonical revision 只允许绑定一个最终 QC revision。Publisher 请求还必须显式
 提供 `canonical_source_root`，用 Canonical provenance 的相对路径重新校验所有当前
 源文件；不得从 QC JSON 路径推断源目录，也不得接受 escape 或 symlink。
+
+发生非零语义修改时，绑定的 semantic fingerprint 必须对应应用 revision artifact
+后的 Canonical Data view，release manifest 还需绑定 artifact hash。Publisher 通过
+`--revision-artifact` 读取 `canonical_revision_artifact.v1`；缺失、CAS/fingerprint/
+revision/edit-count 不匹配均 fail closed，不得回写 Raw。
 
 发布 Gate 只读取本 PRD 第 8.3 节的正式 `manual_review.reviews[]`；不得另造
 `issue_reviews` 的 pass/fail 字典。每个 candidate issue 必须恰好有一条 review，且

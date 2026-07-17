@@ -47,12 +47,14 @@ def _placeholder_manifest(plan: PublishPlan) -> ReleaseManifest:
         schema_version="curated_lerobot_v3_release_manifest.v1",
         release_id=plan.release_id,
         publisher_version=plan.publisher_version,
-        asset_id=plan.request.episode.identity.asset_id,
+        asset_id=plan.episode.identity.asset_id,
         canonical_revision=plan.request.canonical_revision,
         semantic_fingerprint=plan.semantic_fingerprint,
         source_fingerprint=plan.source_fingerprint,
         qc_report_revision=plan.qc_report_revision,
         qc_report_sha256=plan.qc_report_sha256,
+        data_fingerprint=plan.data_fingerprint,
+        revision_artifact_sha256=plan.revision_artifact_sha256,
     )
 
 
@@ -469,7 +471,7 @@ def _validate_existing(
         if directories is not None and identity is None:
             raise FileNotFoundError(plan.release_id)
         return validate_staged_release(
-            _release_candidate(plan, plan.release_path, identity), plan.request.episode
+            _release_candidate(plan, plan.release_path, identity), plan.episode
         )
     except (OSError, PublishPrerequisiteError) as exc:
         raise PublishPrerequisiteError(
@@ -509,7 +511,7 @@ def publish(request: PublishRequest) -> PublishResult:
     staged = write_staging(plan, request.release_root / ".staging")
     renamed = False
     try:
-        report = validate_staged_release(staged, request.episode)
+        report = validate_staged_release(staged, plan.episode)
         with _publish_lock(request.release_root) as directories:
             directories.verify()
             if directories.staging_identity_for(staged.transaction_id) != (
@@ -518,14 +520,14 @@ def publish(request: PublishRequest) -> PublishResult:
             ):
                 raise OSError(errno.ESTALE, "staging transaction identity changed")
             revalidate_publish_plan(plan)
-            report = validate_staged_release(staged, request.episode)
+            report = validate_staged_release(staged, plan.episode)
             _fsync_tree(
                 staged.root,
                 parent_fd=directories.staging_fd,
                 name=staged.transaction_id,
                 expected_identity=(staged.root_device, staged.root_inode),
             )
-            report = validate_staged_release(staged, request.episode)
+            report = validate_staged_release(staged, plan.episode)
             revalidate_publish_plan(plan)
             directories.verify()
             if directories.release_identity(plan.release_id) is not None:

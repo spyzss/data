@@ -42,10 +42,17 @@ class PublishRequest:
     qc_report_path: Path
     expected_report_revision: int
     release_root: Path
+    revision_artifact_path: Path | None = None
 
     def __post_init__(self) -> None:
         for name in ("canonical_source_root", "qc_report_path", "release_root"):
             object.__setattr__(self, name, Path(getattr(self, name)))
+        if self.revision_artifact_path is not None:
+            object.__setattr__(
+                self,
+                "revision_artifact_path",
+                Path(self.revision_artifact_path),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,10 +75,15 @@ class PublishPlan:
     qc_report_revision: int
     qc_report_sha256: str
     source_snapshot: tuple[SourceSnapshot, ...]
+    data_fingerprint: str
+    episode: CanonicalQcEpisode
+    revision_artifact_sha256: str | None
 
     def __post_init__(self) -> None:
         if type(self.request) is not PublishRequest:
             raise TypeError("request must be an exact PublishRequest")
+        if type(self.episode) is not CanonicalQcEpisode:
+            raise TypeError("episode must be an exact CanonicalQcEpisode")
         source_snapshot = tuple(self.source_snapshot)
         if any(type(item) is not SourceSnapshot for item in source_snapshot):
             raise TypeError("source_snapshot entries must be exact SourceSnapshot values")
@@ -111,6 +123,8 @@ class ReleaseManifest:
     source_fingerprint: str
     qc_report_revision: int
     qc_report_sha256: str
+    data_fingerprint: str = ""
+    revision_artifact_sha256: str | None = None
     files: tuple[ManifestFile, ...] = ()
     video_materialization: VideoMaterialization | None = None
     toolchain: WriterToolchain | None = None

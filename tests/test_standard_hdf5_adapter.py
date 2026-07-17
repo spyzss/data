@@ -52,6 +52,40 @@ def test_semantics_scalar_io_error_is_retryable() -> None:
     assert caught.value.retryable is True
 
 
+def test_load_inventories_unknown_hdf5_datasets_without_mutating_raw(
+    tmp_path: Path,
+) -> None:
+    episode_dir = tmp_path / "asset-001"
+    hdf5_path, video_path = write_standard_hdf5_episode(episode_dir)
+    with h5py.File(hdf5_path, "r+") as handle:
+        handle.create_dataset(
+            "/robot/action",
+            data=np.arange(6, dtype=np.float32).reshape(3, 2),
+        )
+        handle.create_dataset(
+            "/metadata/operator_id",
+            data="operator-007",
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+    before = (_sha256(hdf5_path), _sha256(video_path))
+
+    episode = StandardHdf5Adapter().load(episode_dir)
+
+    extensions = {
+        item.published_name: item for item in episode.supplier_extensions.fields
+    }
+    action = extensions["supplier.hdf5.robot.action"]
+    assert action.source_path == "/robot/action"
+    assert action.time_alignment == "frame"
+    assert action.values.dtype == np.float32
+    assert action.values.tolist() == [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]
+    operator = extensions["supplier.hdf5.metadata.operator_id"]
+    assert operator.source_path == "/metadata/operator_id"
+    assert operator.time_alignment == "episode"
+    assert operator.values.item() == "operator-007"
+    assert (_sha256(hdf5_path), _sha256(video_path)) == before
+
+
 @pytest.mark.parametrize("source_kind", ["directory", "hdf5"])
 def test_load_reads_real_standard_episode_without_mutating_sources(
     tmp_path: Path,

@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--supplier-id", required=True)
     parser.add_argument("--episode-index", type=int)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--batch-metadata", type=Path)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -81,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_batch_id=args.batch_id,
             expected_supplier_id=args.supplier_id,
             canonical_config_path=args.config,
+            batch_metadata_path=args.batch_metadata,
             episode_index=args.episode_index,
             resume=args.resume,
             dry_run=args.dry_run,

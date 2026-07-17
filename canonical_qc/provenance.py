@@ -199,3 +199,33 @@ def semantic_fingerprint(episode: CanonicalQcEpisode) -> str:
         },
     }
     return hashlib.sha256(_stable_json(payload)).hexdigest()
+
+
+def data_fingerprint(episode: CanonicalQcEpisode) -> str:
+    """Hash Core, Raw identity, batch attributes, and all extension payloads."""
+
+    from .validation import validate_episode
+
+    validate_episode(episode)
+    metadata = episode.batch_metadata
+    payload = {
+        "semantic_fingerprint": semantic_fingerprint(episode),
+        "source_fingerprint": episode.provenance.source_fingerprint,
+        "batch_metadata_sha256": (
+            metadata.content_sha256 if metadata is not None else None
+        ),
+        "supplier_extensions": [
+            {
+                "published_name": item.published_name,
+                "source_path": item.source_path,
+                "time_alignment": item.time_alignment,
+                "metadata": item.metadata,
+                "values": _array_payload(item.values),
+            }
+            for item in sorted(
+                episode.supplier_extensions.fields,
+                key=lambda value: (value.published_name, value.source_path),
+            )
+        ],
+    }
+    return hashlib.sha256(_stable_json(payload)).hexdigest()

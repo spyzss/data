@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fractions import Fraction
+import json
 from numbers import Integral
 from pathlib import PurePosixPath
 import re
@@ -10,6 +11,7 @@ import re
 import numpy as np
 
 from .contracts import (
+    BatchMetadata,
     CameraCalibration,
     CanonicalQcEpisode,
     EpisodeIdentity,
@@ -20,6 +22,8 @@ from .contracts import (
     SourceProvenance,
     Subtask,
     SupplierEvidence,
+    SupplierExtensionField,
+    SupplierExtensions,
     SupplierHandQuality,
     TimeAxis,
     VideoStream,
@@ -55,6 +59,7 @@ def _validate_contract_types(episode: CanonicalQcEpisode) -> None:
         (episode.calibration, CameraCalibration, "calibration"),
         (episode.semantics, EpisodeSemantics, "semantics"),
         (episode.supplier_evidence, SupplierEvidence, "supplier_evidence"),
+        (episode.supplier_extensions, SupplierExtensions, "supplier_extensions"),
     )
     for value, expected, field in contracts:
         _contract_type(value, expected, field)
@@ -76,6 +81,14 @@ def _validate_contract_types(episode: CanonicalQcEpisode) -> None:
             hand_quality,
             SupplierHandQuality,
             "supplier_evidence.hand_quality",
+        )
+    if episode.batch_metadata is not None:
+        _contract_type(episode.batch_metadata, BatchMetadata, "batch_metadata")
+    for index, extension in enumerate(episode.supplier_extensions.fields):
+        _contract_type(
+            extension,
+            SupplierExtensionField,
+            f"supplier_extensions.fields[{index}]",
         )
 
 
@@ -582,6 +595,113 @@ def _validate_supplier_evidence(episode: CanonicalQcEpisode) -> None:
         )
 
 
+def _validate_batch_metadata(episode: CanonicalQcEpisode) -> None:
+    metadata = episode.batch_metadata
+    if metadata is None:
+        return
+    _constant(
+        metadata.schema_version,
+        "canonical_batch_metadata.v1",
+        "batch_metadata.schema_version",
+    )
+    for name in ("batch_id", "supplier_id"):
+        value = getattr(metadata, name)
+        _nonempty_string(value, f"batch_metadata.{name}")
+        expected = getattr(episode.identity, name)
+        if value != expected:
+            _fail(
+                "batch_metadata_identity_mismatch",
+                f"batch_metadata.{name}",
+                f"expected {expected!r}, got {value!r}",
+            )
+    _sha256(metadata.content_sha256, "batch_metadata.content_sha256")
+    try:
+        attributes = json.loads(metadata.dataset_attributes_json)
+    except (TypeError, ValueError) as exc:
+        _fail(
+            "invalid_batch_metadata",
+            "batch_metadata.dataset_attributes_json",
+            f"must contain valid JSON: {exc}",
+        )
+    if not isinstance(attributes, dict):
+        _fail(
+            "invalid_batch_metadata",
+            "batch_metadata.dataset_attributes_json",
+            "must decode to an object",
+        )
+
+
+def _validate_supplier_extensions(episode: CanonicalQcEpisode) -> None:
+    reserved_names = {
+        "index",
+        "episode_index",
+        "frame_index",
+        "timestamp",
+        "timestamp_ns",
+        "task_index",
+        "subtask_index",
+        "observation.hand_keypoints_3d",
+        "observation.hand_joint_valid_3d",
+        "observation.hand_keypoints_2d",
+        "observation.hand_joint_valid_2d",
+        "observation.images.main",
+        "supplier.hand_quality.raw_value",
+        "supplier.hand_quality.normalized_score",
+        "supplier.hand_quality.status",
+    }
+    names: set[str] = set()
+    for index, extension in enumerate(episode.supplier_extensions.fields):
+        prefix = f"supplier_extensions.fields[{index}]"
+        _nonempty_string(extension.published_name, f"{prefix}.published_name")
+        _nonempty_string(extension.source_path, f"{prefix}.source_path")
+        if extension.published_name in reserved_names:
+            _fail(
+                "extension_name_collision",
+                f"{prefix}.published_name",
+                f"published name collides with Core/Evidence: {extension.published_name!r}",
+            )
+        if extension.published_name in names:
+            _fail(
+                "duplicate_extension_name",
+                "supplier_extensions.fields",
+                f"duplicate published name {extension.published_name!r}",
+            )
+        names.add(extension.published_name)
+        if extension.time_alignment not in {"frame", "episode", "batch"}:
+            _fail(
+                "invalid_extension_alignment",
+                f"{prefix}.time_alignment",
+                "must be frame, episode, or batch",
+            )
+        values = extension.values
+        if type(values) is not np.ndarray:
+            _fail(
+                "invalid_contract_type",
+                f"{prefix}.values",
+                "must be an exact ndarray",
+            )
+        if values.dtype.hasobject:
+            _fail(
+                "invalid_extension_dtype",
+                f"{prefix}.values",
+                "object dtype has no lossless registered publication policy",
+            )
+        if values.flags.writeable:
+            _fail(
+                "mutable_array",
+                f"{prefix}.values",
+                "array must be read-only",
+            )
+        if extension.time_alignment == "frame" and (
+            values.ndim < 1 or values.shape[0] != episode.time_axis.frame_count
+        ):
+            _fail(
+                "invalid_extension_shape",
+                f"{prefix}.values",
+                "frame-aligned values must have leading dimension T",
+            )
+
+
 def validate_episode(episode: CanonicalQcEpisode) -> None:
     """Validate without coercing, truncating, regenerating, or repairing data."""
 
@@ -595,6 +715,8 @@ def validate_episode(episode: CanonicalQcEpisode) -> None:
     _validate_calibration(episode)
     _validate_semantics(episode)
     _validate_supplier_evidence(episode)
+    _validate_batch_metadata(episode)
+    _validate_supplier_extensions(episode)
 
 
 def _validated_alignment_timestamps(

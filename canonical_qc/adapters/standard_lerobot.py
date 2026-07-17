@@ -26,11 +26,13 @@ from ..contracts import (
     SourceProvenance,
     Subtask,
     SupplierEvidence,
+    SupplierExtensions,
     SupplierHandQuality,
     TimeAxis,
     VideoStream,
 )
 from ..errors import CanonicalInputError
+from ..extensions import lerobot_extension_inventory
 from ..hand_quality_encoding import (
     STATUS_ENCODING_SIDECAR,
     decode_raw_value_sidecar,
@@ -751,6 +753,8 @@ class StandardLeRobotAdapter:
                     source_frame_range=(start, stop),
                 ), observation=episode.observation, calibration=episode.calibration,
                 semantics=episode.semantics, supplier_evidence=episode.supplier_evidence,
+                batch_metadata=episode.batch_metadata,
+                supplier_extensions=episode.supplier_extensions,
             )
             validate_episode(episode)
         except CanonicalInputError as exc:
@@ -981,6 +985,17 @@ class StandardLeRobotAdapter:
                 description_en=_text(_required(semantic, "description_en", prefix="semantics"), field="semantics.description_en"),
                 subtask_sequence=tuple(subtasks),
             ), supplier_evidence=quality,
+            supplier_extensions=lerobot_extension_inventory(
+                selected,
+                features=info["features"],
+                excluded_names={
+                    *_CORE_FEATURES,
+                    "index",
+                    "supplier.hand_quality.raw_value",
+                    "supplier.hand_quality.normalized_score",
+                    "supplier.hand_quality.status",
+                },
+            ),
         )
 
     def _quality(

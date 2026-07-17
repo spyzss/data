@@ -14,6 +14,7 @@ from qc_pipeline.default_registry import build_default_registry
 from qc_pipeline.orchestrator import RunOutcome, run_asset
 
 from .adapters import StandardHdf5Adapter, StandardLeRobotAdapter
+from .batch_metadata import load_batch_metadata, with_batch_metadata
 from .bridge import CanonicalQcBridge
 from .config import LoadedCanonicalQcConfig, load_canonical_qc_config
 from .contracts import CanonicalQcEpisode
@@ -103,6 +104,7 @@ def load_canonical_source(
     source_format: str,
     source_root: Path,
     episode_index: int | None = None,
+    batch_metadata_path: Path | None = None,
     config: LoadedCanonicalQcConfig | None = None,
 ) -> CanonicalQcEpisode:
     """Load one explicitly typed source without format or root guessing."""
@@ -127,12 +129,22 @@ def load_canonical_source(
                 "episode_index",
                 "episode_index is only valid for LeRobot sources",
             )
-        return StandardHdf5Adapter(max_timestamp_delta_ns=tolerance).load(
+        episode = StandardHdf5Adapter(max_timestamp_delta_ns=tolerance).load(
             resolved_source
         )
-    return StandardLeRobotAdapter(max_timestamp_delta_ns=tolerance).load(
-        resolved_source, episode_index=episode_index
-    )
+    else:
+        episode = StandardLeRobotAdapter(max_timestamp_delta_ns=tolerance).load(
+            resolved_source, episode_index=episode_index
+        )
+    if batch_metadata_path is not None:
+        explicit_metadata = validate_explicit_path(
+            batch_metadata_path, field="batch_metadata"
+        )
+        episode = with_batch_metadata(
+            episode,
+            load_batch_metadata(explicit_metadata),
+        )
+    return episode
 
 
 def run_canonical_source_qc(
@@ -147,6 +159,7 @@ def run_canonical_source_qc(
     expected_batch_id: str,
     expected_supplier_id: str,
     canonical_config_path: Path | None = None,
+    batch_metadata_path: Path | None = None,
     episode_index: int | None = None,
     resume: bool = True,
     dry_run: bool = False,
@@ -164,6 +177,15 @@ def run_canonical_source_qc(
     resolved_source = _resolved_inside(source, resolved_source_root, field="source")
     resolved_archive = _resolved_inside(
         quality_archive, resolved_batch, field="quality_archive"
+    )
+    resolved_batch_metadata = (
+        None
+        if batch_metadata_path is None
+        else _resolved_inside(
+            batch_metadata_path,
+            resolved_batch,
+            field="batch_metadata",
+        )
     )
     try:
         resolved_archive.relative_to(resolved_source_root)
@@ -211,6 +233,7 @@ def run_canonical_source_qc(
             source_format=source_format,
             source_root=resolved_source_root,
             episode_index=episode_index,
+            batch_metadata_path=resolved_batch_metadata,
             config=canonical_config,
         )
         for field, expected in (

@@ -1,13 +1,15 @@
-"""Immutable in-memory contracts for ``CanonicalQcEpisode.v1``."""
+"""Immutable in-memory contracts for the v1 Canonical Data view."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
+from .batch_metadata import BatchMetadata
 from .errors import CanonicalInputError
 
 
@@ -222,6 +224,60 @@ class SupplierEvidence:
     hand_quality: SupplierHandQuality | None = None
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class SupplierExtensionField:
+    published_name: str
+    source_path: str
+    values: NDArray[object]
+    time_alignment: Literal["frame", "episode", "batch"]
+    _metadata_json: str
+
+    def __init__(
+        self,
+        *,
+        published_name: str,
+        source_path: str,
+        values: NDArray[object],
+        time_alignment: Literal["frame", "episode", "batch"],
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            metadata_json = json.dumps(
+                {} if metadata is None else metadata,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise CanonicalInputError(
+                "invalid_extension_metadata",
+                "supplier_extensions.fields.metadata",
+                f"must be JSON-compatible: {exc}",
+            ) from exc
+        object.__setattr__(self, "published_name", published_name)
+        object.__setattr__(self, "source_path", source_path)
+        object.__setattr__(
+            self,
+            "values",
+            _immutable_array(values, field_name=f"supplier_extensions.{published_name}"),
+        )
+        object.__setattr__(self, "time_alignment", time_alignment)
+        object.__setattr__(self, "_metadata_json", metadata_json)
+
+    @property
+    def metadata(self) -> dict[str, object]:
+        return json.loads(self._metadata_json)
+
+
+@dataclass(frozen=True, slots=True)
+class SupplierExtensions:
+    fields: tuple[SupplierExtensionField, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "fields", tuple(self.fields))
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalQcEpisode:
     schema_version: Literal["canonical_qc_episode.v1"]
@@ -234,3 +290,10 @@ class CanonicalQcEpisode:
     calibration: CameraCalibration
     semantics: EpisodeSemantics
     supplier_evidence: SupplierEvidence = field(default_factory=SupplierEvidence)
+    batch_metadata: BatchMetadata | None = None
+    supplier_extensions: SupplierExtensions = field(default_factory=SupplierExtensions)
+
+
+# The architecture term is Canonical Data.  Keep the original class name as a
+# compatibility alias until a future major schema can remove it.
+CanonicalDataEpisode = CanonicalQcEpisode

@@ -48,15 +48,28 @@ values are `pass`, `fail`, and `null` while incomplete.
 XLSX, Markdown, events and cache are derived evidence/reconciliation only
 （sidecar 只作证据）; they cannot replace or overwrite a report verdict.
 
-### 1.2 Canonical ingest and curated publish
+### 1.2 Canonical Data ingest and curated publish
 
 标准 HDF5 与 LeRobot 使用同一显式入口：
 
 ```text
-SourceAdapter -> CanonicalQcEpisode -> CanonicalQcBridge
--> automatic QC/resume -> external semantic calibration -> Warn review
--> final asset_qc_report.v2 -> LeRobotV3Publisher -> immutable release/CURRENT
+immutable Raw -> SourceAdapter -> Canonical Data view
+                                   ├─ standardized Core -> CanonicalQcBridge -> QC
+                                   ├─ supplier extensions/evidence
+batch manifest / dataset attributes┘
+
+QC -> final asset_qc_report.v2 -------------------------+
+Raw + Canonical metadata -------------------------------+-> LeRobotV3Publisher
+optional canonical revision artifact -------------------+        |
+                                                                 v
+                                                    immutable release/CURRENT
 ```
+
+Canonical Data 是长期标准化数据视图，不是仅供 QC 使用的中间格式。Core 是跨供应商
+统一字段；supplier extensions/evidence 保留当前 QC 不读取但训练、检索或预研可能
+需要的字段；Derived/QC outputs 只进入 `asset_qc_report.v2`，不得污染 Canonical。
+批次 manifest 的 `dataset_attributes` 用于 sensors/cameras/robot/annotation version/
+language/modality 分类，不参与单资产 QC verdict。
 
 `configs/canonical_qc.yaml` 是 ingest/publish 顶层 active config，并绑定 immutable
 snapshot、QC config hash、Adapter/Publisher/toolchain/official-reader 版本。CLI 必须
@@ -67,8 +80,16 @@ snapshot、QC config hash、Adapter/Publisher/toolchain/official-reader 版本�
 `semantic_consistency` 返回 `awaiting_external`，不会伪造人工完成。训练从
 `CURRENT.json -> releases/<release_id>` 读取，不扫描 staging 或按 mtime 选数据。
 
-当前 path Publisher 对非零语义编辑 fail closed；format-neutral Canonical working
-revision artifact 及其 CAS 交接属于人工模块 change，未完成前不得发布源文件旧语义。
+当前 path Publisher 支持 format-neutral `canonical_revision_artifact.v1`：只允许
+task/description、subtask 双语文本和成对共享边界 patch，并以 CAS/fingerprint/
+revision/edit-count 校验；无 artifact 的非零编辑仍 fail closed。
+
+Publisher 的目标输入是 Raw source + Canonical metadata/field inventory + final QC
+report + optional revision artifact。QC report 只作为 Gate 和审计绑定，不能被描述为
+训练 payload 来源。当前实现通过 Raw 重建兼容 `CanonicalQcEpisode`，发布 Core、
+`quality_hand`、已登记 supplier extensions 和 typed batch attributes，并在 manifest
+绑定 data/artifact fingerprint。unsupported 类型、schema 漂移或尚无 Adapter 的格式
+会 fail closed，不得静默 drop 后宣称“任意 Raw 全量发布”。
 
 命令和故障恢复见 `docs/canonical-qc-ingest-publish-runbook.md`。
 

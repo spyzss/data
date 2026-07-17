@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
@@ -244,6 +245,18 @@ def _expected_subtask_indices(episode: CanonicalQcEpisode) -> np.ndarray:
     return indices
 
 
+def _fixed_arrow_type(values: np.ndarray) -> pa.DataType:
+    array = np.asarray(values)
+    arrow_type: pa.DataType = (
+        pa.string()
+        if array.dtype.kind in {"U", "S"}
+        else pa.from_numpy_dtype(array.dtype)
+    )
+    for size in reversed(array.shape[1:]):
+        arrow_type = pa.list_(arrow_type, int(size))
+    return arrow_type
+
+
 def _validate_frame_data(reader: _ReleaseReader, expected: CanonicalQcEpisode) -> None:
     table = reader.parquet("data/chunk-000/file-000.parquet")
     frame_count = expected.time_axis.frame_count
@@ -271,6 +284,12 @@ def _validate_frame_data(reader: _ReleaseReader, expected: CanonicalQcEpisode) -
             optional.add("supplier.hand_quality.normalized_score")
         if quality.status is not None:
             optional.add("supplier.hand_quality.status")
+    frame_extensions = {
+        item.published_name: item
+        for item in expected.supplier_extensions.fields
+        if item.time_alignment == "frame"
+    }
+    optional.update(frame_extensions)
     if set(table.column_names) != required | optional:
         _reject("data", "required frame columns are missing")
     exact_types = {
@@ -350,6 +369,17 @@ def _validate_frame_data(reader: _ReleaseReader, expected: CanonicalQcEpisode) -
                 observed, expected_array, equal_nan=expected_array.dtype.kind == "f"
             ):
                 _reject(name, "differs from Canonical supplier Evidence")
+    for name, extension in frame_extensions.items():
+        expected_type = _fixed_arrow_type(extension.values)
+        if table.schema.field(name).type != expected_type:
+            _reject(name, f"expected Arrow type {expected_type}")
+        observed = np.asarray(table[name].to_pylist(), dtype=extension.values.dtype)
+        if observed.shape != extension.values.shape or not np.array_equal(
+            observed,
+            extension.values,
+            equal_nan=extension.values.dtype.kind == "f",
+        ):
+            _reject(name, "differs from Canonical supplier extension")
 
 
 def _validate_subtasks(reader: _ReleaseReader, expected: CanonicalQcEpisode) -> None:
@@ -484,6 +514,17 @@ def _expected_stats(expected: CanonicalQcEpisode) -> dict[str, object]:
             stats["supplier.hand_quality.normalized_score"] = _stats_values(
                 quality.normalized_score
             )
+    for extension in expected.supplier_extensions.fields:
+        if extension.time_alignment != "frame":
+            continue
+        values = extension.values
+        if np.issubdtype(values.dtype, np.bool_):
+            stats[extension.published_name] = {
+                **_range_values(values.astype(np.int8)),
+                "true_count": np.count_nonzero(values, axis=0).tolist(),
+            }
+        elif np.issubdtype(values.dtype, np.number):
+            stats[extension.published_name] = _stats_values(values)
     return stats
 
 
@@ -572,6 +613,15 @@ def _validate_registered_metadata(
                     "shape": [2],
                     "names": None,
                 }
+    for extension in expected.supplier_extensions.fields:
+        if extension.time_alignment != "frame":
+            continue
+        values = extension.values
+        features[extension.published_name] = {
+            "dtype": "string" if values.dtype.kind in {"U", "S"} else values.dtype.name,
+            "shape": list(values.shape[1:]) or [1],
+            "names": None,
+        }
     wanted_info = {
         "codebase_version": "v3.0",
         "fps": int(fps) if fps.is_integer() else fps,
@@ -658,6 +708,40 @@ def _validate_semantics(reader: _ReleaseReader, expected: CanonicalQcEpisode) ->
                     quality.raw_value
                 )
         wanted["supplier_hand_quality"] = state
+    if expected.batch_metadata is not None:
+        batch = expected.batch_metadata
+        wanted["batch_metadata"] = {
+            "schema_version": batch.schema_version,
+            "batch_id": batch.batch_id,
+            "supplier_id": batch.supplier_id,
+            "dataset_attributes": batch.dataset_attributes,
+            "content_sha256": batch.content_sha256,
+        }
+    extension_rows: list[dict[str, object]] = []
+    for extension in expected.supplier_extensions.fields:
+        row: dict[str, object] = {
+            "published_name": extension.published_name,
+            "source_path": extension.source_path,
+            "time_alignment": extension.time_alignment,
+            "dtype": extension.values.dtype.str,
+            "shape": list(extension.values.shape),
+            "metadata": extension.metadata,
+            "storage": (
+                "lerobot_feature"
+                if extension.time_alignment == "frame"
+                else "semantic_sidecar"
+            ),
+        }
+        if extension.time_alignment != "frame":
+            contiguous = np.ascontiguousarray(extension.values)
+            row["payload"] = {
+                "encoding": "ndarray_base64.v1",
+                "dtype": contiguous.dtype.str,
+                "shape": list(contiguous.shape),
+                "data": base64.b64encode(contiguous.tobytes(order="C")).decode("ascii"),
+            }
+        extension_rows.append(row)
+    wanted["supplier_extensions"] = extension_rows
     if payload != wanted:
         _reject("meta/episode_semantics.jsonl", "differs from complete Canonical semantics")
 
@@ -927,6 +1011,8 @@ def validate_staged_release(
             "source_fingerprint": plan.source_fingerprint,
             "qc_report_revision": plan.qc_report_revision,
             "qc_report_sha256": plan.qc_report_sha256,
+            "data_fingerprint": plan.data_fingerprint,
+            "revision_artifact_sha256": plan.revision_artifact_sha256,
         }
         for name, value in binding.items():
             if getattr(manifest, name) != value:

@@ -6,6 +6,14 @@ base-ref: a77a8a4
 
 # Canonical QC 接入、桥接与 LeRobot v3 发布技术设计
 
+> **实现基线说明（2026-07-17）：** 本文保留 2026-07-15 已实现并验证的
+> `CanonicalQcEpisode` / fixed-Core Publisher 设计事实。Canonical 与 Publisher 的
+> 目标架构定位已由
+> `docs/superpowers/specs/2026-07-17-canonical-data-publisher-positioning-design.md`
+> 修正：Canonical 是长期 Data view；Publisher 的逻辑输入是 Raw + Canonical metadata
+> + final QC + optional revision。本文后续出现的 `CanonicalQcEpisode` 是当前代码兼容
+> 标识，不应再解读为“Canonical 只服务 QC”或“Publisher 已保留全部 Raw 字段”。
+
 ## 1. 目标
 
 本设计实现两种固定供应商输入到同一 QC 与训练发布链路：

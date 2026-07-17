@@ -6,6 +6,11 @@ base-ref: a77a8a4
 
 # Canonical QC 接入与 LeRobot v3 发布实施计划
 
+> **历史实施记录（2026-07-17）：** 本计划的勾选项只证明 2026-07-15 fixed Core/
+> `quality_hand` 实现。新的 Canonical Data 与 Publisher 定位及后续模块迁移见
+> `docs/superpowers/plans/2026-07-17-canonical-data-publisher-positioning.md`；下文
+> `CanonicalQcEpisode` 是代码兼容标识，不代表 Raw 额外字段已全量发布。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Every production change follows superpowers:test-driven-development: observe the intended test fail before writing implementation. Do not run implementation tasks in parallel because all tasks share the Canonical contract.
 
 **Goal:** 用两个严格 Adapter 把标准 HDF5/LeRobot 归一为同一 `CanonicalQcEpisode.v1`，接入现有 QC JSON 数据流，并在最终 Pass 后由我方 Publisher 原子发布经过独立验证的 Curated LeRobot v3。

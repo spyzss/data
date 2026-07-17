@@ -47,6 +47,8 @@ def publish_from_paths(
     release_root: Path,
     episode_index: int | None = None,
     canonical_config_path: Path | None = None,
+    batch_metadata_path: Path | None = None,
+    revision_artifact_path: Path | None = None,
     dry_run: bool = False,
 ) -> PublishPlan | PublishResult:
     """Derive revisions from the final report and validate or atomically publish."""
@@ -58,11 +60,19 @@ def publish_from_paths(
     )
     explicit_report = validate_explicit_path(qc_report_path, field="qc_report")
     explicit_release_root = validate_explicit_path(release_root, field="release_root")
+    explicit_revision = (
+        None
+        if revision_artifact_path is None
+        else validate_explicit_path(
+            revision_artifact_path, field="revision_artifact"
+        )
+    )
     episode = load_canonical_source(
         source=explicit_source,
         source_format=source_format,
         source_root=explicit_source_root,
         episode_index=episode_index,
+        batch_metadata_path=batch_metadata_path,
         config=config,
     )
     report_path = explicit_report
@@ -87,6 +97,7 @@ def publish_from_paths(
             report.get("report_revision"), field="report_revision"
         ),
         release_root=explicit_release_root,
+        revision_artifact_path=explicit_revision,
     )
     return validate_publish_request(request) if dry_run else publish(request)
 

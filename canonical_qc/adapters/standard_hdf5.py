@@ -18,10 +18,12 @@ from ..contracts import (
     HandObservation,
     SourceFile,
     SourceProvenance,
+    SupplierExtensions,
     TimeAxis,
     VideoStream,
 )
 from ..errors import CanonicalInputError
+from ..extensions import hdf5_extension_inventory
 from ..provenance import source_fingerprint
 from ..validation import validate_episode, validate_video_alignment
 from ..video_probe import probe_video
@@ -59,6 +61,21 @@ _TRANSIENT_IO_ERRNOS = frozenset(
         errno.ENOSPC,
         getattr(errno, "ESTALE", -1),
         errno.ETIMEDOUT,
+    }
+)
+_CORE_DATASETS = frozenset(
+    {
+        "/time/timestamps_ns",
+        "/observation/hand_keypoints_3d",
+        "/observation/hand_joint_valid_3d",
+        "/observation/hand_keypoints_2d",
+        "/observation/hand_joint_valid_2d",
+        "/camera/main/intrinsic_matrix",
+        "/camera/main/distortion_coefficients",
+        "/semantics/annotation_json",
+        "/supplier/hand_quality/raw_value",
+        "/supplier/hand_quality/normalized_score",
+        "/supplier/hand_quality/status",
     }
 )
 
@@ -315,6 +332,8 @@ class StandardHdf5Adapter:
                 calibration=episode.calibration,
                 semantics=episode.semantics,
                 supplier_evidence=episode.supplier_evidence,
+                batch_metadata=episode.batch_metadata,
+                supplier_extensions=episode.supplier_extensions,
             )
             validate_episode(episode)
         except CanonicalInputError as exc:
@@ -507,4 +526,9 @@ class StandardHdf5Adapter:
             calibration=calibration,
             semantics=_semantics(handle),
             supplier_evidence=_supplier_evidence(handle, frame_count),
+            supplier_extensions=hdf5_extension_inventory(
+                handle,
+                frame_count=frame_count,
+                excluded_paths=_CORE_DATASETS,
+            ),
         )

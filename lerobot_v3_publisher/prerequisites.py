@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -12,9 +12,14 @@ import re
 import stat
 from typing import Any, NoReturn
 
-from canonical_qc.contracts import EpisodeIdentity, SourceFile
+from canonical_qc.contracts import CanonicalQcEpisode, EpisodeIdentity, SourceFile
 from canonical_qc.config import load_canonical_qc_config
-from canonical_qc.provenance import semantic_fingerprint, source_fingerprint
+from canonical_qc.provenance import (
+    data_fingerprint,
+    semantic_fingerprint,
+    source_fingerprint,
+)
+from canonical_qc.revision import apply_revision_artifact, load_revision_artifact
 from canonical_qc.validation import validate_episode
 from qc_common.config import load_qc_acceptance_config
 from qc_common.schema import validate_asset_qc_report
@@ -315,6 +320,16 @@ def _assert_non_overlapping_roots(request: PublishRequest) -> None:
         kind="file",
         must_exist=True,
     ).resolve(strict=True)
+    artifact_path = (
+        None
+        if request.revision_artifact_path is None
+        else _safe_absolute_path(
+            request.revision_artifact_path,
+            "revision_artifact_path",
+            kind="file",
+            must_exist=True,
+        ).resolve(strict=True)
+    )
 
     def contains(parent: Path, child: Path) -> bool:
         try:
@@ -330,8 +345,15 @@ def _assert_non_overlapping_roots(request: PublishRequest) -> None:
         )
     if contains(release_root, report_path):
         _reject("release_root", "must not contain the QC report")
+    if artifact_path is not None and contains(release_root, artifact_path):
+        _reject("release_root", "must not contain the revision artifact")
 
     report_stat = os.stat(report_path, follow_symlinks=False)
+    artifact_stat = (
+        None
+        if artifact_path is None
+        else os.stat(artifact_path, follow_symlinks=False)
+    )
     for index, source in enumerate(request.episode.provenance.source_files):
         relative = _safe_relative_source_path(source.relative_path, index)
         source_path = source_root.joinpath(*relative.parts)
@@ -349,6 +371,14 @@ def _assert_non_overlapping_roots(request: PublishRequest) -> None:
             source_stat.st_ino,
         ):
             _reject("qc_report_path", "must not alias a Canonical source file")
+        if artifact_stat is not None and (
+            artifact_stat.st_dev,
+            artifact_stat.st_ino,
+        ) == (source_stat.st_dev, source_stat.st_ino):
+            _reject(
+                "revision_artifact_path",
+                "must not alias a Canonical source file",
+            )
 
 
 def _mapping(
@@ -851,12 +881,6 @@ def _validated_report_binding(
                 f"semantic_calibration.{edit_count_field}",
                 "must be a non-negative integer",
             )
-        if edit_count > 0:
-            _reject(
-                f"semantic_calibration.{edit_count_field}",
-                "non-noop semantic edits require a format-neutral Canonical revision artifact",
-                code="canonical_revision_artifact_required",
-            )
     _validate_manual_review(report)
 
     if type(request.canonical_revision) is not int or request.canonical_revision < 1:
@@ -921,16 +945,77 @@ def _validated_report_binding(
     return current_semantic
 
 
+def _episode_with_optional_revision(
+    request: PublishRequest,
+    report: Mapping[str, Any],
+) -> tuple[CanonicalQcEpisode, str | None]:
+    semantic_calibration = _mapping(report, "semantic_calibration")
+    counts: dict[str, int] = {}
+    for field in ("timeline_edit_count", "subtask_text_edit_count"):
+        value = semantic_calibration.get(field)
+        if type(value) is not int or value < 0:
+            _reject(
+                f"semantic_calibration.{field}",
+                "must be a non-negative integer",
+            )
+        counts[field] = value
+    has_edits = any(counts.values())
+    artifact_path = request.revision_artifact_path
+    if has_edits and artifact_path is None:
+        field = (
+            "timeline_edit_count"
+            if counts["timeline_edit_count"] > 0
+            else "subtask_text_edit_count"
+        )
+        _reject(
+            f"semantic_calibration.{field}",
+            "non-noop semantic edits require a format-neutral Canonical revision artifact",
+            code="canonical_revision_artifact_required",
+        )
+    if not has_edits and artifact_path is not None:
+        _reject(
+            "revision_artifact_path",
+            "a revision artifact is forbidden when the final report declares zero edits",
+            code="canonical_revision_artifact_invalid",
+        )
+    if artifact_path is None:
+        return request.episode, None
+    try:
+        artifact = load_revision_artifact(artifact_path)
+        episode = apply_revision_artifact(
+            request.episode,
+            artifact,
+            expected_canonical_revision=request.canonical_revision,
+            expected_qc_report_revision=request.expected_report_revision,
+            expected_timeline_edit_count=counts["timeline_edit_count"],
+            expected_subtask_text_edit_count=counts["subtask_text_edit_count"],
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        _reject(
+            "revision_artifact_path",
+            f"invalid Canonical revision artifact: {exc}",
+            code="canonical_revision_artifact_invalid",
+        )
+    return episode, artifact.content_sha256
+
+
 def _build_plan(request: PublishRequest) -> PublishPlan:
     _assert_non_overlapping_roots(request)
     report, report_payload = _read_report(request)
-    semantic_hash = _validated_report_binding(request, report)
+    effective_episode, revision_artifact_sha256 = _episode_with_optional_revision(
+        request, report
+    )
+    effective_request = replace(request, episode=effective_episode)
+    semantic_hash = _validated_report_binding(effective_request, report)
     snapshot = _source_snapshot(request)
+    canonical_data_hash = data_fingerprint(effective_episode)
     release_id = derive_release_id(
-        asset_id=request.episode.identity.asset_id,
+        asset_id=effective_episode.identity.asset_id,
         canonical_revision=request.canonical_revision,
         semantic_fingerprint=semantic_hash,
         publisher_version=PUBLISHER_VERSION,
+        data_fingerprint=canonical_data_hash,
+        revision_artifact_sha256=revision_artifact_sha256,
     )
     layout = layout_for(request.release_root, release_id)
     return PublishPlan(
@@ -940,10 +1025,13 @@ def _build_plan(request: PublishRequest) -> PublishPlan:
         release_path=layout.release_path,
         current_path=layout.current_path,
         semantic_fingerprint=semantic_hash,
-        source_fingerprint=request.episode.provenance.source_fingerprint,
+        source_fingerprint=effective_episode.provenance.source_fingerprint,
         qc_report_revision=request.expected_report_revision,
         qc_report_sha256=_sha256_bytes(report_payload),
         source_snapshot=snapshot,
+        data_fingerprint=canonical_data_hash,
+        episode=effective_episode,
+        revision_artifact_sha256=revision_artifact_sha256,
     )
 
 

@@ -1,36 +1,74 @@
-# Canonical QC 首版必需字段标准
+# Canonical Data 首版字段与 QC 投影标准
 
 文档版本：`canonical_qc_required_fields.v1`  
 适用数据 Profile：`human_ego_hand_pose.v1`  
-状态：实现验证稿（含明确 Deferred 边界）
-日期：2026-07-15
+状态：目标架构 + 当前 v1 兼容实现（Data extension/revision 已实现）
+日期：2026-07-17
+
+> 文件名和当前 Python/schema 标识中的 `canonical_qc` 为 v1 兼容名称，不再代表
+> Canonical 只服务 QC。架构术语统一使用 **Canonical Data**；当前已实现的
+> `CanonicalQcEpisode` / `canonical_qc_episode.v1` 是兼容类型/schema 名称；
+> `CanonicalDataEpisode` 是同一实现的架构别名。
 
 ## 1. 目标
 
-目标端态是让 HDF5 和 LeRobot 两种供应商提交格式经过统一 Adapter 后得到同一份
-`CanonicalQcEpisode.v1`，再串行完成自动 QC、人工语义校准、Warn 人工复核和
-Curated LeRobot v3 发布。本次已实现的首版切片是：Source Gate、Canonical 合同、
-已登记自动模块、外部人工阶段暂停点，以及“无语义编辑”资产的统一 Publisher。
-人工工作台、若干后置自动模块和非零编辑 revision artifact 明确为 Deferred。
+目标端态是让 HDF5、LeRobot 及后续供应商格式经过统一 Adapter 后形成同一套
+Canonical Data view。它是供应商 Raw 的长期标准化访问层，而不是只为 QC 裁剪的
+中间格式；QC 与 Publisher 都是消费者。Raw 始终不可变，Canonical 负责统一语义、
+保留供应商扩展、绑定 batch metadata 和 provenance，检测派生结果则只进入现有
+`asset_qc_report.v2`。
+
+当前实现以 `CanonicalQcEpisode.v1` 兼容对象承载 Core、typed supplier extension
+inventory 和 batch metadata。Publisher 将 frame-aligned extension 写成 LeRobot
+feature，把 episode/batch extension 写入版本化 semantic sidecar，并支持受控非零
+语义 revision artifact。无法无损表示、schema 声明与 Raw dtype/shape 不一致或尚无
+供应商 Adapter 的字段会 fail closed；不能把这一范围扩大解释为任意格式 Raw 已全量支持。
 
 ```text
-显式批次 identity ─> Source Gate ─────────┐
-标准 HDF5 ──────> StandardHdf5Adapter ────┤
-                                          ├─> CanonicalQcEpisode.v1
-标准 LeRobot ───> StandardLeRobotAdapter ─┘
-                                                    │
-                                                    v
-已登记自动 QC -> awaiting_external
-                         |
-                         +-> [Deferred: 语义校准 -> Warn 人工复核]
-                         +-> 无编辑 final report -> LeRobotV3Publisher
+immutable supplier Raw ───────────────┐
+标准 HDF5 ──────> StandardHdf5Adapter ├─> Canonical Data view
+标准 LeRobot ───> StandardLeRobotAdapter ┘    ├─ standardized Core
+                                               ├─ supplier extensions/evidence
+batch manifest / dataset attributes ──────────┘
+                                               |
+                          +--------------------+--------------------+
+                          |                                         |
+                          v                                         v
+              已登记自动 QC -> external stages          publication metadata
+                          |                                         |
+                          v                                         |
+              asset_qc_report.v2                                   |
+                          +------------------+----------------------+
+                                             |
+                         optional canonical revision artifact
+                                             |
+                                             v
+                    Publisher(Raw + metadata + QC + revision)
+                                             |
+                                             v
+                                  Curated LeRobot v3
 ```
 
-本版不支持供应商自定义字段映射模板，也不执行供应商提供的转换脚本。供应商必须使用本标准规定的字段名、类型、shape、单位和语义。
+当前 v1 Adapter 不支持供应商自定义字段映射模板，也不执行供应商提供的转换脚本。
+供应商要进入当前 Core projection，必须使用本标准规定的字段名、类型、shape、单位和
+语义；这不授权 Adapter 或 Publisher 丢弃 Raw 中其他字段。未进入 Core 的字段必须在
+extension inventory 中保留或以结构化错误标记 unsupported，禁止静默丢失。
 
-## 2. 首版边界
+## 2. Canonical Data 分层与首版边界
 
-### 2.1 包含
+### 2.1 三层职责
+
+| 层 | 内容 | 持久化与消费者 |
+| --- | --- | --- |
+| Standardized Core | 跨供应商已统一的 identity、provenance、时间轴、视频、keypoints/validity、标定、任务/subtask。 | Canonical Data；QC 与训练共同读取。 |
+| Supplier extensions/evidence | 当前尚未统一但可能用于训练、检索或预研的 state/action、额外相机、depth、force/tactile、joint rotation、音频、供应商模型输出、私有 metadata；现有 `quality_hand` 属于 Evidence。 | Canonical extension inventory + Raw 引用；不得因 QC 未使用而丢弃。 |
+| Derived/QC outputs | freeze、blur、duplicate、语义判定、人工 verdict、effective duration 等检测结果。 | 只进入 `asset_qc_report.v2` 或可重建 evidence sidecar，不写回 Raw/Canonical。 |
+
+Canonical Data 是 Raw 的标准化只读视图，不是 Raw 的可变副本。标准化只允许单位、
+坐标系、字段名、dtype/shape 和时间对齐等确定性转换；任何可能改变数据含义的人工
+修订都必须经过独立 revision artifact。
+
+### 2.2 当前 v1 已实现 Core projection
 
 - 单路主相机，`camera_id=main`。
 - 外置 MP4。
@@ -39,21 +77,57 @@ Curated LeRobot v3 发布。本次已实现的首版切片是：Source Gate、Ca
 - HDF5 与 LeRobot 两种输入格式。
 - 已登记且启用的自动 QC Gate；未实现模块以 Deferred/disabled 明示。
 - 人工语义校准与 Warn 人工 Pass/Fail 的 external stage 合同和暂停点；工作台实现 Deferred。
-- 无语义编辑且最终 QC Pass 后由我方统一发布 LeRobot v3；编辑 artifact 交接 Deferred。
+- 最终 QC Pass 后由我方统一发布 Core、已登记 extensions、batch attributes；非零
+  文本/共享边界编辑由 `canonical_revision_artifact.v1` 纯函数应用并绑定 release manifest。
 
-### 2.2 不包含
+### 2.3 通过 extension inventory 登记、但尚未统一为 Core 的字段
 
-- 多目、双目、头部加腕部等多相机配置。
-- Robot Teleop `observation.state/action`。
-- 供应商 mask、depth、空间重建、音频和触觉。
-- joint rotation、confidence 和其他可选特征。
+- 多目、双目、头部加腕部等多相机配置；
+- Robot Teleop `observation.state/action`；
+- 供应商 mask、depth、空间重建、音频和触觉；
+- joint rotation、confidence 和其他可选特征；
 - 供应商自定义字段路径、代码或转换脚本。
 
-以上内容在首版全流程稳定后通过新 Profile 或新 schema 版本扩展，不修改 `CanonicalQcEpisode.v1` 的既有语义。
+这些字段不需要进入 Core。标准 HDF5 的非 Core dataset 和标准 LeRobot 中已登记、
+规则定长的额外列会进入 typed inventory；Publisher 对 frame-aligned 值写 feature，
+对 episode/batch 值写 base64 ndarray sidecar。object/vlen、ragged/null、声明与物理
+dtype/shape 不一致、多媒体专用编码或尚无 Adapter 的格式会 fail closed，需新增显式
+profile/policy 后才能发布。
 
-## 3. 必需字段总表
+### 2.4 Batch metadata / dataset attributes
+
+每个批次必须有稳定的批次 manifest，用于数据分类、检索和组合，不参与单资产 QC
+verdict。目标字段至少包含：
+
+```json
+{
+  "schema_version": "canonical_batch_metadata.v1",
+  "batch_id": "batch-20260716",
+  "supplier_id": "supplier-001",
+  "dataset_attributes": {
+    "sensors": ["rgb", "force"],
+    "cameras": ["head", "left_wrist", "right_wrist"],
+    "robot_platform": "franka",
+    "annotation_version": "supplier-annotation.v3",
+    "languages": ["zh", "en"],
+    "modalities": ["video", "hand_keypoints_3d", "force"],
+    "coordinate_system": "camera",
+    "time_sync": "timestamps_ns"
+  }
+}
+```
+
+属性必须由 `canonical_batch_metadata.v1` manifest 显式提供，禁止从目录名猜测。
+CLI 通过 `--batch-metadata` 绑定 manifest、identity 和内容 hash；跨批次检索索引仍为
+后续数据目录能力，不影响当前发布完整性。
+
+## 3. Standardized Core 必需字段总表
 
 `R` 表示供应商提交中必须存在；`A` 表示由 Adapter 从真实文件探测或计算，供应商不得伪造；`O` 表示可选 Evidence。
+
+本节冻结的是当前跨供应商 Core，不是 Canonical Data 的字段全集。当前实现
+`CanonicalQcEpisode` / `canonical_qc_episode.v1` 继续使用这些兼容标识；新增
+extension 不得改变下列字段的既有含义。
 
 ### 3.1 身份与来源
 
@@ -67,6 +141,8 @@ Curated LeRobot v3 发布。本次已实现的首版切片是：Source Gate、Ca
 | `source_schema_version` | string | R | 输入合同版本；未知 major 版本拒绝接入。 |
 | `source_files[]` | object[] | A | 相对路径、文件角色、字节数、SHA-256；Adapter 对实际文件计算。 |
 | `source_fingerprint` | SHA-256 | A | 对源文件 hash、输入 schema、Adapter 版本和必填的 `main_video.source_frame_range` 计算；用于缓存失效和发布前复核。范围参数必须是非负、非空的严格整数半开 tuple，禁止 `None`、list 或 bool。 |
+| `batch_metadata_ref` | string | O | CLI 的 `--batch-metadata` 指向 immutable `canonical_batch_metadata.v1`；不能从目录名推导。 |
+| `dataset_attributes` | object | O | 传感器、相机、robot、annotation version、language、modality 等可索引属性；不参与 QC verdict。 |
 
 ### 3.2 权威时间轴
 
@@ -214,11 +290,28 @@ Subtask 强约束：
 - 不允许空档、重叠、逆序或零长度。
 - 人工语义校准拖动内部共享边界时，必须原子修改相邻两段；一次确认只增加一次 `timeline_edit_count`。
 
-## 4. 可选供应商 Evidence：`quality_hand`
+## 4. Supplier extensions / evidence
+
+Canonical Data 必须维护供应商额外字段 inventory。每项至少记录：
+
+| 字段 | 规则 |
+| --- | --- |
+| `canonical_key` | 稳定、无碰撞的发布键。 |
+| `source_path` | Raw 中的原始字段/attribute/column 路径。 |
+| `dtype` / `shape` | 原始类型与 shape，不得为方便 QC 擅自缩窄。 |
+| `unit` / `coordinate_frame` | 已知时显式登记；未知时写 unknown，不猜测。 |
+| `time_alignment` | `frame`、`episode`、`batch` 或明确的外部时间键。 |
+| `preservation` | `lerobot_feature`、`versioned_sidecar` 或 `unsupported`。 |
+
+首版代码只实现 `quality_hand`，泛化 inventory、frame-aligned passthrough 和 sidecar
+policy 为后续模块改造项。`unsupported` 必须阻止正式发布或依据已审查的版本化策略
+隔离，不能静默删除。
+
+### 4.1 可选供应商 Evidence：`quality_hand`
 
 `quality_hand` 不是 Core 必填字段。供应商未提供时，不得因此判定资产 fail；Keypoint 和 SAM3 QC 仍然正常执行。
 
-### 4.1 Canonical 结构
+### 4.2 Canonical 结构
 
 ```text
 supplier.hand_quality
@@ -433,7 +526,20 @@ LeRobot v3 Parquet 为兼容冻结的官方 reader，使用版本化 `uint8 [T,2
 sidecar 保存 dtype、`[T,2]` shape 与 utf8/base64 payload，由 Adapter 无损恢复，
 避免官方 reader 对 fixed-size string list 的解码限制。
 
-已是 LeRobot v3 的供应商数据也不能直接进入训练集。QC 通过后仍由我方 Publisher 重新生成 Curated LeRobot v3 的 meta、Parquet、索引、统计、checksum 和 ReleaseManifest。正式输出冻结为官方 `lerobot[dataset]==0.6.0` v3 合同；供应商旧方言只作为 Adapter 输入兼容，不原样透传。Publisher 保留 `fps_num/fps_den` 精确帧率，并把 Python、NumPy、PyArrow、Pandas、ffmpeg、libx264 工具链指纹绑定到 manifest 和 release ID。完整 `[0,T)` 且 frame count/PTS/hash 一致的 MP4 可独立复制；共享 span 必须裁剪，禁止 hardlink 源文件。
+已是 LeRobot v3 的供应商数据也不能绕过 Gate 直接进入训练集。QC 通过后仍由我方
+Publisher 重新生成 Curated LeRobot v3 的 meta、Parquet、索引、统计、checksum 和
+ReleaseManifest；但重写不等于只复制 QC Core。Publisher 的 payload 来源是 Raw，
+Canonical metadata 提供标准字段映射和 extension inventory，最终 QC report 只提供
+Gate/audit，可选 revision artifact 只覆盖被批准的语义修改。供应商原有且 QC 未使用
+的字段仍须保留。
+
+正式输出冻结为官方 `lerobot[dataset]==0.6.0` v3 合同；供应商旧方言作为 Adapter
+输入，由标准字段或版本化 extension sidecar 转换，不原样冒充官方字段。当前实现
+证明 Core、`quality_hand`、已登记 extensions 和 batch attributes round-trip；
+unsupported 字段/格式结构化拒绝。Publisher 保留 `fps_num/fps_den` 精确帧率，并把 Python、
+NumPy、PyArrow、Pandas、ffmpeg、libx264 工具链指纹绑定到 manifest 和 release ID。
+完整 `[0,T)` 且 frame count/PTS/hash 一致的 MP4 可独立复制；共享 span 必须裁剪，
+禁止 hardlink 源文件。
 
 ## 8. 各 QC 阶段的字段依赖与实现状态
 
@@ -452,11 +558,12 @@ sidecar 保存 dtype、`[T,2]` shape 与 utf8/base64 payload，由 Adapter 无�
 | Duplicate Check | MP4、asset ID、timestamps。 | **Deferred**；active config 为 disabled / `no_registered_implementation`。 |
 | Content Validity | MP4、task/description/subtasks。 | **Deferred**；active config 为 disabled / `no_registered_implementation`。 |
 | Effective Duration | timestamps 及前序 QC issue 区间。 | **Deferred**；active config 为 disabled / `no_registered_implementation`。 |
-| LeRobot v3 Publisher | 完整 Canonical、最终语义 revision、最终 QC pass。 | 未编辑 revision 已 implemented + tested；非零人工编辑 artifact 交接 Deferred 并 fail closed。 |
+| LeRobot v3 Publisher | Raw source、Canonical metadata/field inventory、最终 QC pass、optional revision artifact。 | Core、Evidence、已登记 extensions、typed batch metadata、非零文本/共享边界 revision implemented + tested；unsupported Raw 类型/格式 fail closed。 |
 
-因此本标准列出的 Core 已足够作为目标 QC 的输入合同；上表 Deferred 阶段不能宣称
-已有检测覆盖。无需为此把 `quality_hand`、供应商 mask、joint rotation、confidence
-或多相机字段强制加入首版。
+因此本标准列出的 Core 已足够作为目标 QC 的输入合同，但不等于训练数据全集；上表
+Deferred 阶段不能宣称已有检测或发布覆盖。无需把 `quality_hand`、供应商 mask、
+joint rotation、confidence 或多相机强制提升为 Core，但必须通过 supplier extension
+机制保留/登记。
 
 ## 9. Adapter 规则
 
@@ -469,8 +576,11 @@ sidecar 保存 dtype、`[T,2]` shape 与 utf8/base64 payload，由 Adapter 无�
 5. 不静默跳过非法 shape、dtype 或 joint。
 6. 不截断不同长度的数组来伪造对齐。
 7. 不在 Adapter 内形成 QC Pass/Fail。
-8. 输出不可变 `CanonicalQcEpisode.v1` 或结构化失败诊断。
+8. 输出不可变 Canonical Data view；当前兼容对象为 `CanonicalQcEpisode.v1`。
 9. 同一逻辑 episode 且视频物理 span 相同的 HDF5 与 LeRobot 输入，除 source provenance 外必须产生相同 Canonical 语义 fingerprint；不同 `source_frame_range` 在当前 v1 中视为不同视频身份。
+10. 枚举未进入 Core 的 Raw 字段并形成 extension inventory；标准 HDF5/LeRobot 的
+    已支持 dtype/shape 必须 round-trip，unsupported 字段结构化拒绝。
+11. 绑定 batch manifest / dataset attributes，不从路径猜测批次能力。
 
 ### 9.1 统一 QC CLI 的 Canonical manifest 合同
 
@@ -525,15 +635,32 @@ Python 对象或覆盖 Canonical 保留键。
 
 为同时支持 HDF5 和 LeRobot 输入，人工语义修订不依赖某一种源格式：
 
+Publisher 的逻辑输入关系为：
+
+```text
+Raw source
++ Canonical metadata / field inventory / batch attributes
++ final asset_qc_report.v2
++ optional Canonical revision artifact
+-> Curated LeRobot v3
+```
+
+具体规则：
+
 1. 人工确认一次时间边界或文本修改。
 2. 目标合同要求 format-neutral Canonical working revision artifact 通过 CAS 原子更新。
-3. QC JSON 记录 `timeline_edit_count`、`subtask_text_edit_count` 及 before/after 审计。
-4. 源 HDF5/LeRobot 保持只读。
-5. 最终 LeRobotV3Publisher 应读取最新 artifact，将修订后的文本和时间轴写入 Curated LeRobot v3。
+3. QC JSON 记录 `timeline_edit_count`、`subtask_text_edit_count` 及 before/after 审计，
+   但不承载修订后的训练 payload。
+4. 源 HDF5/LeRobot/MP4 保持只读。
+5. Publisher 从 Raw 读取完整 payload，通过 Canonical metadata 进行字段映射，并将最新
+   artifact 只应用到允许修订的语义/时间轴字段。
+6. Release manifest 绑定 Raw fingerprint、field inventory、QC revision、artifact hash
+   和应用后的 semantic fingerprint。
 
-第 2、5 步的 artifact 接口属于 `add-human-semantic-warn-review` 后续 change，当前尚未
-实现。现有 path Publisher 只允许两个 edit count 都为 0；任一非零时返回
-`canonical_revision_artifact_required`，禁止把 raw source 的旧语义发布出去。
+第 2、5、6 步已由 `canonical_revision_artifact.v1`、纯函数 patch 应用和
+ReleaseManifest hash 绑定实现。现有 path Publisher 从 Raw 重新加载 Canonical Data；
+任一 edit count 非零但缺少 artifact 时返回 `canonical_revision_artifact_required`，
+禁止把 raw source 的旧语义发布出去。
 
 只有 `overall_decision=pass`、语义阶段完成、Warn 复核完成且 source fingerprint 未变化的资产可以发布。
 
@@ -552,4 +679,6 @@ Python 对象或覆盖 Canonical 保留键。
 - [x] HDF5 与 LeRobot 的 Canonical 等价性测试通过。
 - [x] QC 通过后只使用我方 LeRobotV3Publisher 生成训练数据。
 - [x] Publisher 未完成验证前，训练 release 不可见。
-- [ ] 非零人工语义编辑的 format-neutral revision artifact（Deferred；当前 fail closed）。
+- [x] Supplier extension inventory 与已支持 Raw 额外字段无损发布；unsupported 类型 fail closed。
+- [x] Batch metadata / dataset attributes typed contract 与发布绑定（跨批次检索索引另行实现）。
+- [x] 非零人工语义编辑的 format-neutral revision artifact、CAS 与 manifest hash 绑定。

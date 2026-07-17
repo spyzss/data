@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fractions import Fraction
@@ -303,7 +304,7 @@ def _identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
 
 @contextmanager
 def _verified_video_source(plan: PublishPlan) -> Iterator[tuple[int, Path]]:
-    episode = plan.request.episode
+    episode = plan.episode
     relative = PurePosixPath(episode.main_video.path)
     if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
         _reject("main_video.path", "must be a normalized relative path")
@@ -475,7 +476,7 @@ def _video_is_directly_reusable(episode: CanonicalQcEpisode, source: Path) -> bo
 
 
 def _materialize_video(plan: PublishPlan, root: _SafeRoot) -> tuple[VideoMaterialization, Any]:
-    episode = plan.request.episode
+    episode = plan.episode
     relative = "videos/observation.images.main/chunk-000/file-000.mp4"
     with _verified_video_source(plan) as (source_fd, source_path):
         direct = _video_is_directly_reusable(episode, source_path)
@@ -579,6 +580,15 @@ def _data_table(episode: CanonicalQcEpisode) -> pa.Table:
             columns["supplier.hand_quality.status"] = _fixed_array(
                 encode_status(quality.status)
             )
+    for extension in episode.supplier_extensions.fields:
+        if extension.time_alignment != "frame":
+            continue
+        if extension.published_name in columns:
+            _reject(
+                "supplier_extensions",
+                f"published name collides with a registered feature: {extension.published_name}",
+            )
+        columns[extension.published_name] = _fixed_array(extension.values)
     return pa.table(columns)
 
 
@@ -638,6 +648,16 @@ def _features(episode: CanonicalQcEpisode, probed: Any, table: pa.Table) -> dict
         else:
             dtype = np.dtype(value_type.to_pandas_dtype()).name
         features[name] = _feature(dtype, [2], names=None)
+    for extension in episode.supplier_extensions.fields:
+        if extension.time_alignment != "frame":
+            continue
+        values = extension.values
+        dtype = "string" if values.dtype.kind in {"U", "S"} else values.dtype.name
+        features[extension.published_name] = _feature(
+            dtype,
+            list(values.shape[1:]) or [1],
+            names=None,
+        )
     return features
 
 
@@ -720,7 +740,47 @@ def _stats(episode: CanonicalQcEpisode) -> dict[str, object]:
             stats["supplier.hand_quality.normalized_score"] = _safe_stats(
                 quality.normalized_score
             )
+    for extension in episode.supplier_extensions.fields:
+        if extension.time_alignment != "frame":
+            continue
+        values = extension.values
+        if np.issubdtype(values.dtype, np.bool_):
+            stats[extension.published_name] = _boolean_stats(values)
+        elif np.issubdtype(values.dtype, np.number):
+            stats[extension.published_name] = _safe_stats(values)
     return stats
+
+
+def _encoded_extension_payload(values: np.ndarray) -> dict[str, object]:
+    contiguous = np.ascontiguousarray(values)
+    return {
+        "encoding": "ndarray_base64.v1",
+        "dtype": contiguous.dtype.str,
+        "shape": list(contiguous.shape),
+        "data": base64.b64encode(contiguous.tobytes(order="C")).decode("ascii"),
+    }
+
+
+def _extension_rows(episode: CanonicalQcEpisode) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for extension in episode.supplier_extensions.fields:
+        row: dict[str, object] = {
+            "published_name": extension.published_name,
+            "source_path": extension.source_path,
+            "time_alignment": extension.time_alignment,
+            "dtype": extension.values.dtype.str,
+            "shape": list(extension.values.shape),
+            "metadata": extension.metadata,
+            "storage": (
+                "lerobot_feature"
+                if extension.time_alignment == "frame"
+                else "semantic_sidecar"
+            ),
+        }
+        if extension.time_alignment != "frame":
+            row["payload"] = _encoded_extension_payload(extension.values)
+        rows.append(row)
+    return rows
 
 
 def _semantics(episode: CanonicalQcEpisode) -> dict[str, object]:
@@ -776,6 +836,16 @@ def _semantics(episode: CanonicalQcEpisode) -> dict[str, object]:
                     quality.raw_value
                 )
         payload["supplier_hand_quality"] = state
+    if episode.batch_metadata is not None:
+        batch = episode.batch_metadata
+        payload["batch_metadata"] = {
+            "schema_version": batch.schema_version,
+            "batch_id": batch.batch_id,
+            "supplier_id": batch.supplier_id,
+            "dataset_attributes": batch.dataset_attributes,
+            "content_sha256": batch.content_sha256,
+        }
+    payload["supplier_extensions"] = _extension_rows(episode)
     return payload
 
 
@@ -906,12 +976,14 @@ def _manifest(
         schema_version="curated_lerobot_v3_release_manifest.v1",
         release_id=plan.release_id,
         publisher_version=plan.publisher_version,
-        asset_id=plan.request.episode.identity.asset_id,
+        asset_id=plan.episode.identity.asset_id,
         canonical_revision=plan.request.canonical_revision,
         semantic_fingerprint=plan.semantic_fingerprint,
         source_fingerprint=plan.source_fingerprint,
         qc_report_revision=plan.qc_report_revision,
         qc_report_sha256=plan.qc_report_sha256,
+        data_fingerprint=plan.data_fingerprint,
+        revision_artifact_sha256=plan.revision_artifact_sha256,
         files=files,
         video_materialization=video,
         toolchain=toolchain,
@@ -1025,7 +1097,7 @@ def write_staging(plan: PublishPlan, staging_root: Path) -> StagedRelease:
         _prepare_private_directories(root)
         video, probed = _materialize_video(plan, root)
         transaction.verify_paths()
-        _write_dataset_files(root, plan.request.episode, probed)
+        _write_dataset_files(root, plan.episode, probed)
         transaction.verify_paths()
         manifest = _manifest(plan, root, video)
         manifest_sha, checksums_sha = _write_inventory(root, manifest)

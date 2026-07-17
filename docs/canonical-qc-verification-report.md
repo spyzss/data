@@ -1,5 +1,11 @@
 # Canonical QC → Curated LeRobot v3 验证报告
 
+> **范围说明（2026-07-17）：** 本报告是当前 fixed Core 实现的历史验证证据，不是
+> Canonical Data 目标架构完成证明。新的定位见
+> `docs/superpowers/specs/2026-07-17-canonical-data-publisher-positioning-design.md`。
+> 下文 `CanonicalQcEpisode` 是兼容实现类型。原 fixed-Core 结论保留；2026-07-17
+> P0 addendum 已为 supplier extensions、batch metadata 和非零 revision 增加代码证据。
+
 ## 1. 验证范围
 
 - 分支：`codex/human-qc-semantic-review`
@@ -10,8 +16,8 @@
   `asset_qc_report.v2`
 - 输出：原子发布的 Curated LeRobot v3 release
 
-本报告只验证当前仓库已经实现的首版切片。未实现能力列为 Deferred，不用文档
-措辞替代代码和测试证据。
+第 1–7 节保留首版历史验证；第 8 节记录本次 Data Canonical/Publisher 修正。未实现
+能力继续列为 Deferred，不用文档措辞替代代码和测试证据。
 
 ## 2. 数据流结论
 
@@ -46,9 +52,12 @@ Source Gate、报告 schema 或 Publisher 的 fail-closed 合同。
 | Canonical 配置注册 | Implemented + Tested | active `v1.1.0` 与 immutable snapshot 字节一致；`v1.1.1` 为严格时间容差；pre-v1.1 不可执行。 |
 | QC Bridge | Implemented + Tested | 保持 21 点顺序、数值、validity、视频和语义，输出现有 pipeline context。 |
 | `quality_hand` Evidence | Implemented + Tested | 可选；unknown 不 fail；与机器观测分开统计，分歧可生成 warn。 |
+| Canonical Data supplier extension inventory | Implemented + Tested | 标准 HDF5 非 Core dataset、标准 LeRobot 已登记规则定长列进入 immutable inventory；unsupported 类型 fail closed。 |
+| Batch metadata / dataset attributes | Implemented + Tested | `canonical_batch_metadata.v1`、identity/content hash、CLI overlay 和 Publisher metadata 已绑定；跨批次检索索引另行实现。 |
 | QC report batch projection | Implemented + Tested | asset row/source manifest 保留 `batch_id`；源文件删除后仍可按 JSON 汇总 Source Gate fail。 |
 | Publisher 前置 | Implemented + Tested | 绑定 identity、report revision、Canonical revision/fingerprint、完整最终 Gate 与人工状态。 |
-| 非零人工语义修订发布 | Deferred | 尚无 format-neutral Canonical working revision artifact；任一 edit count 非零时 fail closed。 |
+| Publisher 已登记字段 preservation | Implemented + Tested | frame extension 写 LeRobot feature；episode/batch extension 写 ndarray sidecar；data fingerprint 绑定 release identity。 |
+| 非零人工语义修订发布 | Implemented + Tested | `canonical_revision_artifact.v1` 支持 task/subtask text 和共享边界，校验 CAS/fingerprint/revision/edit count 并绑定 manifest hash。 |
 | LeRobot v3 writer | Implemented + Tested | 统一 writer 生成逐帧 Parquet、metadata、语义、视频、manifest 和 checksums。 |
 | 独立官方 reader 回读 | Implemented + Tested | 校验 row/index/timestamp、arrays、subtask、视频 PTS 与 checksum。 |
 | 原子发布和故障注入 | Implemented + Tested | staging/validate/commit 任一失败都不改变已有 release 或 `CURRENT.json`。 |
@@ -81,8 +90,8 @@ CLI 参数缺失、不安全路径或不可执行的 pre-v1.1 配置发生在可
 - 若 UI 展示闭区间，界面结束帧 `410` 对应内部右边界 `411`。
 - Publisher 比较 semantic fingerprint、source fingerprint、Canonical revision 和
   QC report revision，防止时间轴或文本与最终报告错配。
-- 当前只有 edit count 为 0 的源 Canonical revision 可发布；非零修订必须等待共享
-  artifact 接口，不能回退发布旧文本。
+- edit count 为 0 时禁止提供 artifact；非零修订必须提供匹配的
+  `canonical_revision_artifact.v1`，不能回退发布旧文本。
 
 ## 6. 验证证据
 
@@ -126,3 +135,23 @@ Publisher identity/config 绑定缺口。修复后两位全新 reviewer 独立�
 - `canonical_qc_v1.1.1`: `2b30e457e25f6d96e844b8f374b24c3d047eb126f133f74a0d3a07603cce19ef`
 
 最终结论：PASS。Task 11 的实现、边界说明、独立复审和 fresh 全量门禁均完成。
+
+## 8. 2026-07-17 P0 Data Canonical / Publisher addendum
+
+- `CanonicalDataEpisode` 作为兼容别名，新增 immutable `BatchMetadata`、
+  `SupplierExtensions` 和完整 `data_fingerprint`。
+- HDF5/LeRobot Adapter 枚举未被 Core/Evidence 消费的已支持字段；Publisher 与独立
+  validator 对 feature、sidecar、metadata、stats、manifest 做 round-trip 对账。
+- `canonical_revision_artifact.v1` 纯函数应用允许的语义 patch，不修改 Raw；CLI 新增
+  `--batch-metadata` 和 `--revision-artifact`。
+- 星际硅途真实 HDF5 样本以只读 inventory 验证：140 个 dataset（138 frame、2
+  episode），前后 SHA-256 均为
+  `ae72e18c82af92370eea257e7e7423c5d72e95beef3ebf052843e8f5346df5dc`。
+- 京东真实 LeRobot 样本只读验证发现 `info.features` 声明 `float32`、物理 Parquet 为
+  `double` 的 schema drift；Adapter 按设计 fail closed，样本 SHA-256 前后均为
+  `8411a4331797a40e9bec8eba1a6b943b34927bff299626fa32d1a466afc720bd`。
+- Fresh full-suite gate：`.venv/bin/python -m pytest -q` 为 `1091 passed, 1 skipped in
+  83.09s`；`compileall` 与 `git diff --check` 均为 exit 0。
+
+本 addendum 不宣称 MCAP/NPZ、多相机专用媒体或 object/vlen/ragged extension 已支持；
+这些格式需要各供应商 Adapter/profile，不能删除字段后绕过发布门禁。

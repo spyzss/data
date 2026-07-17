@@ -14,6 +14,22 @@ and compatibility ledgers are projections; sidecar 只作证据 and reconciliati
 
 ## Canonical ingest and Curated LeRobot v3
 
+Canonical 在这里表示 **Canonical Data view**：供应商 Raw 经 Adapter 形成的长期标准化
+访问层，不是只为 QC 裁剪的中间格式。它包含跨供应商 Core、supplier
+extensions/evidence，以及批次 manifest 提供的 dataset attributes；freeze、blur、
+semantic/manual verdict 等 Derived/QC outputs 仍只进入 `asset_qc_report.v2`。
+
+Raw source 始终不可变。`quality_archive/` 与 Raw 并列保存，每资产一份 QC 主报告，
+但 QC JSON 不是训练 payload。Publisher 的目标逻辑输入是：
+
+```text
+Raw source
++ Canonical metadata / field inventory / batch attributes
++ final asset_qc_report.v2
++ optional canonical revision artifact
+-> Curated LeRobot v3
+```
+
 新标准入口同时支持显式 HDF5 与 LeRobot source：
 
 ```bash
@@ -26,15 +42,21 @@ python tools/run_canonical_qc.py \
   --profile acceptance \
   --asset-id asset-001 \
   --batch-id batch-20260716 \
-  --supplier-id supplier-001
+  --supplier-id supplier-001 \
+  --batch-metadata /data/batch/batch_manifest.json
 ```
 
 自动 QC 可以安全 resume，并在当前人工语义边界返回 `awaiting_external`。最终人工
 状态和 `canonical_binding` 完成后执行：
 
 显式 identity 来自批次 manifest；Source Gate 的确定性失败也会原子写入该资产的
-QC JSON，保证后续批次统计不依赖 CLI 日志。存在非零语义编辑时，首版 Publisher
-在 format-neutral revision artifact 落地前 fail closed，不会发布旧语义。
+QC JSON，保证后续批次统计不依赖 CLI 日志。存在非零语义编辑时，Publisher 要求
+显式 `canonical_revision_artifact.v1`，否则 fail closed，不会发布旧语义。
+
+当前兼容实现仍使用 `CanonicalQcEpisode` / `canonical_qc_episode.v1`，并提供
+`CanonicalDataEpisode` 架构别名。标准 HDF5/LeRobot 已支持 Core、`quality_hand`、
+typed extensions、batch attributes 和受控非零 revision；unsupported dtype/shape、
+schema 漂移或尚无 Adapter 的供应商格式会结构化拒绝，不能静默丢字段。
 
 ```bash
 python tools/publish_lerobot_v3.py \
@@ -42,8 +64,11 @@ python tools/publish_lerobot_v3.py \
   --source-format hdf5 \
   --canonical-source-root /data/batch/asset-001 \
   --qc-report /data/batch/quality_archive/asset-001.json \
+  --batch-metadata /data/batch/batch_manifest.json \
   --release-root /training/curated-egodata
 ```
+
+非零编辑资产还必须追加 `--revision-artifact <absolute-path>`；零编辑资产不得提供。
 
 两条命令均支持 `--dry-run`，输出单行机器 JSON。正式发布只在所有门禁和官方
 reader 验证通过后原子更新 `CURRENT.json`。完整参数、退出码、训练读取和恢复步骤见

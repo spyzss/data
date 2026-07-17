@@ -18,14 +18,21 @@ def derive_release_id(
     canonical_revision: int,
     semantic_fingerprint: str,
     publisher_version: str,
+    data_fingerprint: str | None = None,
+    revision_artifact_sha256: str | None = None,
 ) -> str:
+    identity = {
+        "asset_id": asset_id,
+        "canonical_revision": canonical_revision,
+        "publisher_version": publisher_version,
+        "semantic_fingerprint": semantic_fingerprint,
+    }
+    if data_fingerprint is not None:
+        identity["data_fingerprint"] = data_fingerprint
+    if revision_artifact_sha256 is not None:
+        identity["revision_artifact_sha256"] = revision_artifact_sha256
     payload = json.dumps(
-        {
-            "asset_id": asset_id,
-            "canonical_revision": canonical_revision,
-            "publisher_version": publisher_version,
-            "semantic_fingerprint": semantic_fingerprint,
-        },
+        identity,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
