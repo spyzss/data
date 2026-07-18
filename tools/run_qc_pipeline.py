@@ -21,6 +21,10 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from qc_common.config import LoadedQcConfig, load_qc_acceptance_config  # noqa: E402
+from qc_common.manifest_metadata import (  # noqa: E402
+    canonical_manifest_metadata,
+    canonicalize_manifest_value,
+)
 from qc_common.module_registry import ModuleRegistry  # noqa: E402
 from qc_common.suppliers import normalize_supplier  # noqa: E402
 from qc_pipeline.context import AssetContext, validate_asset_id  # noqa: E402
@@ -55,7 +59,8 @@ _SOURCE_COLUMNS = {
 
 
 def _text(value: Any) -> str:
-    return "" if value is None else str(value).strip()
+    canonical = canonicalize_manifest_value(value)
+    return "" if canonical is None else str(canonical).strip()
 
 
 def _integer(value: Any, field: str) -> int:
@@ -96,20 +101,22 @@ def _path_inside_batch(
     )
     resolved_absolute = lexical_absolute.resolve()
 
-    containment_path = (
-        lexical_absolute
-        if allow_symlinked_sources
-        else resolved_absolute
-    )
-
     try:
-        relative = containment_path.relative_to(batch_root)
+        logical_relative = lexical_absolute.relative_to(batch_root)
     except ValueError:
         raise ValueError(
             f"{field} is outside batch_root: {resolved_absolute}"
         ) from None
 
-    return relative.as_posix(), str(resolved_absolute)
+    if not allow_symlinked_sources:
+        try:
+            resolved_absolute.relative_to(batch_root)
+        except ValueError:
+            raise ValueError(
+                f"{field} is outside batch_root: {resolved_absolute}"
+            ) from None
+
+    return logical_relative.as_posix(), str(resolved_absolute)
 
 
 def contexts_from_manifest(
@@ -134,8 +141,9 @@ def contexts_from_manifest(
 
     contexts: list[AssetContext] = []
     for row_index, source_row in enumerate(rows):
-        row = copy.deepcopy(source_row)
-        raw_manifest_row = copy.deepcopy(source_row)
+        canonical_row = canonical_manifest_metadata(source_row)
+        row = copy.deepcopy(canonical_row)
+        raw_manifest_row = copy.deepcopy(canonical_row)
         supplier_value = row.get("supplier") or row.get("supplier_id")
         if _text(supplier_value):
             supplier_id, supplier_name, supplier_alias = normalize_supplier(
@@ -165,6 +173,7 @@ def contexts_from_manifest(
                 allow_symlinked_sources=allow_symlinked_sources,
             )
             source_files[source_name] = {"path": relative}
+            raw_manifest_row[column] = relative
             row[column] = absolute
 
         canonical_format = _text(row.get("canonical_format")).lower()
@@ -213,13 +222,14 @@ def contexts_from_manifest(
                 raise ValueError(
                     f"manifest row {row_index} missing canonical_source_path"
                 )
-            _relative, absolute = _path_inside_batch(
+            relative, absolute = _path_inside_batch(
                 canonical_source,
                 batch_root=batch_root,
                 manifest_dir=manifest.parent,
                 field="canonical_source_path",
                 allow_symlinked_sources=allow_symlinked_sources,
             )
+            raw_manifest_row["canonical_source_path"] = relative
             from canonical_qc import StandardHdf5Adapter, StandardLeRobotAdapter
             from canonical_qc.bridge import CanonicalQcBridge
 

@@ -61,13 +61,18 @@ def read_manifest(path: Path) -> list[dict[str, Any]]:
         ]
     else:
         raise ValueError(f"unsupported manifest extension: {path.suffix}")
-    frame = frame.where(pd.notna(frame), None)
+    frame = frame.astype(object).where(pd.notna(frame), None)
     return [dict(row) for row in frame.to_dict(orient="records")]
 
 
 def _text(value: Any) -> str:
     if value is None:
         return ""
+    try:
+        if math.isnan(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace").strip()
     return str(value).strip()

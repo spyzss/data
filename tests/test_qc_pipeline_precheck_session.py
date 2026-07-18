@@ -726,6 +726,96 @@ def test_supplier_evaluation_loads_source_once_for_five_modules(
         assert outcome.report[module]["flow"]["result_gate"]["verdict"] == "pass"
 
 
+def test_dr_csv_manifest_runs_five_prechecks_without_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.run_qc_pipeline import contexts_from_manifest
+
+    source = tmp_path / "source" / "dr" / "hdf5"
+    source.mkdir(parents=True)
+    (source / "task-a.h5").write_bytes(b"synthetic hdf5")
+    manifest = tmp_path / "manifest.csv"
+    manifest.write_text(
+        "asset_id,supplier,hdf5_path,hdf5_reference_dataset,content_id,calib_path,camera_trajectory_path\n"
+        "dr-task-a,dr,source/dr/hdf5/task-a.h5,timestamp,,,\n",
+        encoding="utf-8",
+    )
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+    config = _config(tmp_path)
+    executions: list[str] = []
+    monkeypatch.setattr(precheck, "_load_clip", lambda context, module: object())
+    monkeypatch.setattr(
+        precheck,
+        "_run_module_on_clip",
+        lambda context, config, module, clip: executions.append(module)
+        or ModuleResult(module, "pass", {"decision": "pass"}, {}),
+    )
+    session = precheck.PrecheckSession(context, config)
+
+    outcome = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=_registry(session, config),
+        now=lambda: "2026-07-18T00:00:00Z",
+    )
+
+    assert executions == list(precheck.MODULES)
+    assert outcome.executed_modules == precheck.MODULES
+    assert outcome.report["pipeline_state"]["status"] == "completed"
+    assert outcome.report["manifest_metadata"]["calib_path"] is None
+    assert outcome.report["manifest_metadata"]["camera_trajectory_path"] is None
+
+
+def test_dr_csv_runtime_error_is_recorded_without_secondary_identity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.run_qc_pipeline import contexts_from_manifest
+
+    source = tmp_path / "source" / "dr" / "hdf5"
+    source.mkdir(parents=True)
+    (source / "task-a.h5").write_bytes(b"synthetic hdf5")
+    manifest = tmp_path / "manifest.csv"
+    manifest.write_text(
+        "asset_id,supplier,hdf5_path,hdf5_reference_dataset,calib_path,camera_trajectory_path\n"
+        "dr-task-a,dr,source/dr/hdf5/task-a.h5,timestamp,,\n",
+        encoding="utf-8",
+    )
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+    config = _config(tmp_path)
+    monkeypatch.setattr(precheck, "_load_clip", lambda context, module: object())
+
+    def execute(
+        context: AssetContext,
+        config: LoadedQcConfig,
+        module: str,
+        clip: object,
+    ) -> ModuleResult:
+        if module == "quality_hand":
+            raise RuntimeError("synthetic detector failure")
+        return ModuleResult(module, "pass", {"decision": "pass"}, {})
+
+    monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
+    session = precheck.PrecheckSession(context, config)
+
+    outcome = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=_registry(session, config),
+        now=lambda: "2026-07-18T00:00:00Z",
+    )
+
+    assert outcome.status == "incomplete"
+    assert outcome.report["runtime_errors"][0]["module"] == "quality_hand"
+    assert outcome.report["execution"]["module_states"]["quality_hand"] == {
+        "state": "runtime_error",
+        "reason": "process_error",
+    }
+
+
 def test_supplier_evaluation_keeps_all_frames_eligible(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

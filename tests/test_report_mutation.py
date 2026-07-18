@@ -2,17 +2,20 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import qc_common.report_mutation as report_mutation
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import EvidenceRef, Issue, ModuleResult
+from qc_common.manifest_metadata import manifest_metadata
 from qc_common.report import StaleReportRevisionError
 from qc_common.report_mutation import (
     ConfigDriftError,
     ModuleOrderError,
     apply_module_result,
     initialize_v2_report,
+    validate_report_identity,
     write_pipeline_transition,
 )
 from qc_common.schema import validate_asset_qc_report
@@ -163,6 +166,121 @@ def test_initialize_v2_report_is_uncommitted_and_source_faithful(
     assert report["source_files"] == context.source_files
     assert report["manifest_metadata"] == dict(context.metadata)
     assert not context.report_path.exists()
+
+
+def test_manifest_identity_normalizes_missing_values_and_ignores_runtime_metadata(
+    tmp_path: Path,
+) -> None:
+    manifest_row = {
+        "asset_id": "dr-task-a",
+        "supplier": "dr",
+        "hdf5_path": "source/dr/hdf5/task-a.h5",
+        "content_id": float("nan"),
+        "calib_path": np.float64("nan"),
+        "camera_trajectory_path": "",
+    }
+    context = AssetContext(
+        "dr-task-a",
+        tmp_path,
+        tmp_path / "quality_archive" / "dr-task-a.json",
+        {"hdf5": {"path": "source/dr/hdf5/task-a.h5"}},
+        metadata={
+            "hdf5_path": "/mnt/oss/dr/hdf5/task-a.h5",
+            "manifest_row": manifest_row,
+        },
+    )
+    config = loaded_test_config()
+    report = apply_module_result(
+        context.report_path,
+        context=context,
+        config=config,
+        profile="acceptance",
+        result=ModuleResult("hdf5_text_info", "pass", {}, {}),
+        expected_revision=0,
+        next_module="quality_hand",
+        now="2026-07-18T00:00:00Z",
+    )
+
+    assert report["manifest_metadata"] == {
+        **manifest_row,
+        "content_id": None,
+        "calib_path": None,
+        "camera_trajectory_path": None,
+    }
+    json.dumps(report["manifest_metadata"], allow_nan=False)
+
+    runtime_context = replace(
+        context,
+        metadata={
+            **dict(context.metadata),
+            "profile": "acceptance",
+            "reuse_artifacts": True,
+            "producer_session_id": "session-2",
+            "cache_attempt": 3,
+        },
+    )
+    validate_report_identity(
+        report,
+        context=runtime_context,
+        config=config,
+        profile="acceptance",
+    )
+    assert manifest_metadata(runtime_context.metadata) == report[
+        "manifest_metadata"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("hdf5_path", "source/dr/hdf5/other.h5"),
+        ("hdf5_reference_dataset", "observations/timestamp"),
+        ("start_frame", 7),
+    ],
+)
+def test_manifest_identity_rejects_real_manifest_field_changes(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    manifest_row = {
+        "asset_id": "dr-task-a",
+        "supplier": "dr",
+        "hdf5_path": "source/dr/hdf5/task-a.h5",
+        "hdf5_reference_dataset": "timestamp",
+        "start_frame": 0,
+        "end_frame": 9,
+    }
+    context = AssetContext(
+        "dr-task-a",
+        tmp_path,
+        tmp_path / "quality_archive" / "dr-task-a.json",
+        {"hdf5": {"path": "source/dr/hdf5/task-a.h5"}},
+        metadata={"manifest_row": manifest_row},
+    )
+    config = loaded_test_config()
+    report = apply_module_result(
+        context.report_path,
+        context=context,
+        config=config,
+        profile="acceptance",
+        result=ModuleResult("hdf5_text_info", "pass", {}, {}),
+        expected_revision=0,
+        next_module="quality_hand",
+        now="2026-07-18T00:00:00Z",
+    )
+    changed = replace(
+        context,
+        metadata={"manifest_row": {**manifest_row, field: replacement}},
+    )
+
+    with pytest.raises(ValueError, match="manifest_metadata mismatch"):
+        validate_report_identity(
+            report,
+            context=changed,
+            config=config,
+            profile="acceptance",
+        )
 
 
 def test_asset_context_rejects_report_outside_batch(tmp_path: Path) -> None:

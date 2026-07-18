@@ -127,6 +127,112 @@ def test_manifest_maps_dr_and_potentia_sidecar_paths_into_source_contract(
     assert context.source_files["task_dir"]["path"] == "source/task"
 
 
+def test_csv_nan_optional_paths_stay_missing_in_canonical_manifest_identity(
+    tmp_path: Path,
+) -> None:
+    from qc_common.manifest_metadata import manifest_metadata
+    from tools.run_qc_pipeline import contexts_from_manifest
+
+    source = tmp_path / "source" / "dr" / "hdf5"
+    source.mkdir(parents=True)
+    (source / "task-a.h5").write_bytes(b"synthetic hdf5")
+    manifest = tmp_path / "manifest.csv"
+    manifest.write_text(
+        "asset_id,supplier,hdf5_path,hdf5_reference_dataset,content_id,calib_path,camera_trajectory_path\n"
+        "dr-task-a,dr,source/dr/hdf5/task-a.h5,timestamp,,,\n",
+        encoding="utf-8",
+    )
+
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+    identity = manifest_metadata(context.metadata)
+
+    assert set(context.source_files) == {"hdf5"}
+    assert context.source_files["hdf5"]["path"] == "source/dr/hdf5/task-a.h5"
+    assert identity["content_id"] is None
+    assert identity["calib_path"] is None
+    assert identity["camera_trajectory_path"] is None
+    assert all(
+        "nan" not in str(source["path"]).lower()
+        for source in context.source_files.values()
+    )
+
+
+def test_manifest_identity_uses_logical_symlink_path_while_access_path_resolves(
+    tmp_path: Path,
+) -> None:
+    from qc_common.manifest_metadata import manifest_metadata
+    from qc_common.report_mutation import (
+        apply_module_result,
+        validate_report_identity,
+    )
+    from tools.run_qc_pipeline import contexts_from_manifest
+
+    batch_root = tmp_path / "batch"
+    logical_parent = batch_root / "source" / "dr"
+    logical_parent.mkdir(parents=True)
+    first_target = tmp_path / "mnt-a" / "hdf5"
+    second_target = tmp_path / "mnt-b" / "hdf5"
+    for target, payload in ((first_target, b"first"), (second_target, b"second")):
+        target.mkdir(parents=True)
+        (target / "task-a.h5").write_bytes(payload)
+    link = logical_parent / "hdf5"
+    link.symlink_to(first_target, target_is_directory=True)
+    manifest = batch_root / "manifest.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "asset_id": "dr-task-a",
+                "supplier": "dr",
+                "hdf5_path": str(link / "task-a.h5"),
+                "hdf5_reference_dataset": "timestamp",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    first = contexts_from_manifest(
+        manifest,
+        batch_root=batch_root,
+        allow_symlinked_sources=True,
+    )[0]
+    config = _config(batch_root)
+    report = apply_module_result(
+        first.report_path,
+        context=first,
+        config=config,
+        profile="acceptance",
+        result=ModuleResult("video_quality", "pass", {}, {}),
+        expected_revision=0,
+        next_module=None,
+        now="2026-07-18T00:00:00Z",
+    )
+
+    link.unlink()
+    link.symlink_to(second_target, target_is_directory=True)
+    second = contexts_from_manifest(
+        manifest,
+        batch_root=batch_root,
+        allow_symlinked_sources=True,
+    )[0]
+
+    assert first.source_files == second.source_files == {
+        "hdf5": {"path": "source/dr/hdf5/task-a.h5"}
+    }
+    assert first.metadata["hdf5_path"] == str((first_target / "task-a.h5").resolve())
+    assert second.metadata["hdf5_path"] == str((second_target / "task-a.h5").resolve())
+    assert manifest_metadata(first.metadata) == manifest_metadata(second.metadata)
+    assert manifest_metadata(first.metadata)["hdf5_path"] == (
+        "source/dr/hdf5/task-a.h5"
+    )
+    validate_report_identity(
+        report,
+        context=second,
+        config=config,
+        profile="acceptance",
+    )
+
+
 def test_run_batch_propagates_artifact_reuse_and_profile_to_runtime_context(
     tmp_path: Path,
 ) -> None:
