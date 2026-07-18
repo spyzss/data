@@ -193,7 +193,28 @@
         "imu": {"$ref": "#/$defs/timestampMapping"},
         "trajectory": {"$ref": "#/$defs/timestampMapping"},
         "meta": {"type": "object"},
-        "calibration": {"type": "object"}
+        "calibration": {"type": "object"},
+        "projection": {"$ref": "#/$defs/drProjectionMapping"}
+      }
+    },
+    "drProjectionMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "camera_name",
+        "joints3d_coordinate_frame",
+        "joints3d_unit",
+        "projection_direction",
+        "trajectory_usage",
+        "resolution_policy"
+      ],
+      "properties": {
+        "camera_name": {"const": "head"},
+        "joints3d_coordinate_frame": {"const": "head_camera"},
+        "joints3d_unit": {"const": "meter"},
+        "projection_direction": {"const": "direct_camera"},
+        "trajectory_usage": {"const": "lineage_only"},
+        "resolution_policy": {"enum": ["exact", "scale_intrinsics"]}
       }
     },
     "timestampMapping": {

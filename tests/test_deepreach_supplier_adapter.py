@@ -95,6 +95,56 @@ def test_task_manifest_requires_explicit_hdf5_reference_dataset(
         build_deepreach_manifest(root=root, calib_cache=calib_cache)
 
 
+def test_task_manifest_does_not_guess_content_id_from_task_name(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "deepreach"
+    calib_cache = tmp_path / "calib"
+    make_deepreach_task(root, "task_001")
+    guessed = make_calib(calib_cache, "task_001")
+
+    row = build_deepreach_manifest(
+        root=root,
+        calib_cache=calib_cache,
+        reference_dataset="timestamp",
+    )[0]
+
+    assert guessed.is_file()
+    assert row["content_id"] == ""
+    assert row["calibration_mapping_status"] == "mapping_missing"
+    assert row["calib_path"] == ""
+    assert row["camera_trajectory_path"] == ""
+    assert row["calibration_status"] == "mapping_missing"
+    assert row["trajectory_status"] == "mapping_missing"
+    assert row["projection_validation_status"] == "calibration_unverified"
+
+
+def test_task_manifest_uses_explicit_task_to_content_id_mapping(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "deepreach"
+    calib_cache = tmp_path / "calib"
+    make_deepreach_task(root, "task_001")
+    calib = make_calib(calib_cache, "content-abc")
+
+    row = build_deepreach_manifest(
+        root=root,
+        calib_cache=calib_cache,
+        calibration_mapping={"task_001": "content-abc"},
+        reference_dataset="timestamp",
+    )[0]
+
+    assert row["content_id"] == "content-abc"
+    assert row["calibration_mapping_status"] == "mapped"
+    assert row["calib_path"] == str(calib.resolve())
+    assert row["camera_trajectory_path"] == str(
+        (calib.parent / "camera_trajectory.csv").resolve()
+    )
+    assert row["calibration_status"] == "present_unverified"
+    assert row["trajectory_status"] == "present_unverified"
+    assert row["projection_validation_status"] == "calibration_unverified"
+
+
 def test_build_deepreach_manifest_defaults_to_head_and_canonical_columns(
     tmp_path: Path,
 ) -> None:
@@ -106,13 +156,14 @@ def test_build_deepreach_manifest_defaults_to_head_and_canonical_columns(
     rows = build_deepreach_manifest(
         root=root,
         calib_cache=calib_cache,
+        calibration_mapping={"task_001": "task_001"},
         reference_dataset="timestamp",
     )
 
     assert len(rows) == 1
     assert list(rows[0]) == MANIFEST_COLUMNS
     row = rows[0]
-    assert row["schema_version"] == "supplier_manifest.dr.v2"
+    assert row["schema_version"] == "supplier_manifest.dr.v3"
     assert row["supplier"] == "dr"
     assert row["supplier_id"] == "dr"
     assert row["supplier_name"] == "DR"
@@ -342,6 +393,7 @@ def test_manifest_cli_writes_manifest_calib_sidecar_and_staging(
         output_dir=output_dir,
         calib_cache=calib_cache,
         hdf5_reference_dataset="timestamp",
+        calibration_mapping={"task_001": "task_001"},
         stage_video_quality=True,
     )
 
@@ -363,6 +415,7 @@ def test_manifest_cli_writes_manifest_calib_sidecar_and_staging(
         {
             "asset_id": "task_001",
             "task_name": "task_001",
+            "content_id": "task_001",
             "primary_camera": "head",
             "calib_path": str(
                 (calib_cache / "task_001" / "calib.json").resolve()
@@ -372,6 +425,9 @@ def test_manifest_cli_writes_manifest_calib_sidecar_and_staging(
             ),
             "calibration_status": "present_unverified",
             "trajectory_status": "present_unverified",
+            "calibration_mapping_status": "mapped",
+            "projection_validation_status": "calibration_unverified",
+            "projection_validation_reason": "requires_projection_audit",
         }
     ]
 
@@ -398,3 +454,27 @@ def test_dr_cli_max_assets_bounds_task_level_smoke_manifest(tmp_path: Path) -> N
     ).open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert [row["asset_id"] for row in rows] == ["task_001"]
+
+
+def test_calibration_mapping_reader_requires_unique_explicit_task_content_pairs(
+    tmp_path: Path,
+) -> None:
+    from acceptance_pull.build_supplier_manifest import read_calibration_mapping
+
+    mapping = tmp_path / "calibration_map.csv"
+    mapping.write_text(
+        "task_name,content_id\ntask_001,content-a\ntask_002,content-b\n",
+        encoding="utf-8",
+    )
+
+    assert read_calibration_mapping(mapping) == {
+        "task_001": "content-a",
+        "task_002": "content-b",
+    }
+
+    mapping.write_text(
+        "task_name,content_id\ntask_001,content-a\ntask_001,content-b\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        read_calibration_mapping(mapping)

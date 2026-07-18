@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import logging
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from acceptance_pull.supplier_adapters.deepreach import (
     SUPPORTED_CAMERAS,
@@ -41,6 +43,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Camera view to include; repeat for multiple views. Default: head.",
     )
     parser.add_argument("--calib-cache", type=Path)
+    parser.add_argument(
+        "--calibration-map",
+        type=Path,
+        help=(
+            "Explicit CSV/JSON task_name to content_id mapping for DR calibration; "
+            "task_name is never treated as content_id implicitly."
+        ),
+    )
     parser.add_argument("--max-assets", type=int)
     parser.add_argument(
         "--granularity",
@@ -74,6 +84,7 @@ def run(
     primary_camera: str = "head",
     hdf5_reference_dataset: str | None = None,
     max_assets: int | None = None,
+    calibration_mapping: Mapping[str, str] | None = None,
 ) -> int:
     if supplier == "potentia":
         rows = build_potentia_manifest(root, max_assets=max_assets)
@@ -95,6 +106,7 @@ def run(
         granularity=granularity,
         primary_camera=primary_camera,
         reference_dataset=hdf5_reference_dataset,
+        calibration_mapping=calibration_mapping,
     )
     if max_assets is not None:
         if max_assets < 1:
@@ -126,7 +138,53 @@ def main(argv: Sequence[str] | None = None) -> int:
         primary_camera=args.primary_camera,
         hdf5_reference_dataset=args.hdf5_reference_dataset,
         max_assets=args.max_assets,
+        calibration_mapping=(
+            read_calibration_mapping(args.calibration_map)
+            if args.calibration_map is not None
+            else None
+        ),
     )
+
+
+def read_calibration_mapping(path: Path) -> dict[str, str]:
+    """Read an explicit one-to-one DR task_name -> content_id mapping."""
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    elif suffix in {".jsonl", ".ndjson"}:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    elif suffix == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, Mapping):
+            rows = [
+                {"task_name": task_name, "content_id": content_id}
+                for task_name, content_id in payload.items()
+            ]
+        elif isinstance(payload, list):
+            rows = payload
+        else:
+            raise ValueError("calibration mapping JSON must be an object or row list")
+    else:
+        raise ValueError("calibration mapping must be CSV, JSON, or JSONL")
+    mapping: dict[str, str] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"calibration mapping row {index} must be an object")
+        task_name = str(row.get("task_name") or "").strip()
+        content_id = str(row.get("content_id") or "").strip()
+        if not task_name or not content_id:
+            raise ValueError(
+                f"calibration mapping row {index} requires task_name and content_id"
+            )
+        if task_name in mapping:
+            raise ValueError(f"duplicate calibration mapping task_name: {task_name}")
+        mapping[task_name] = content_id
+    return mapping
 
 
 if __name__ == "__main__":

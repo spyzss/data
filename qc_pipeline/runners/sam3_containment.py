@@ -140,6 +140,33 @@ def _validated_candidates(
     return validated
 
 
+def _dr_has_hard_presence_invalid(row: Mapping[str, Any]) -> bool:
+    if (
+        row.get("pipeline_module") != "keypoint_presence"
+        or row.get("check") != "keypoint_missing"
+    ):
+        return False
+    metrics = row.get("metrics")
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+    for side in ("left", "right"):
+        if metrics.get(f"keypoint_existence_invalid_{side}") is True:
+            return True
+        missing_value = metrics.get(f"missing_keypoint_count_{side}")
+        valid_value = metrics.get(f"valid_keypoint_count_{side}")
+        try:
+            if float(missing_value) > 0.0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        try:
+            if float(valid_value) < 21.0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return row.get("flag") is True and row.get("severity") == "fail"
+
+
 def _with_artifact_runtime(
     result: ModuleResult,
     *,
@@ -221,6 +248,284 @@ def _publish_sam3_artifact(
         )
         promote_artifact(staging, artifact)
     return window_summaries, rewritten
+
+
+def _dr_projection_inputs(
+    context: AssetContext,
+    config: LoadedQcConfig,
+) -> tuple[Path, Path, Path, Path, Any, Mapping[str, Any]]:
+    from acceptance_pull.supplier_adapters.deepreach_projection import (
+        validate_head_projection_contract,
+    )
+
+    hdf5_path = _source_path(context, "hdf5")
+    video_path = _source_path(context, "video", required=False)
+    if video_path is None:
+        video_path = _source_path(context, "head_video")
+    calibration_path = _source_path(context, "calibration")
+    trajectory_path = _source_path(context, "trajectory")
+    assert hdf5_path is not None
+    assert video_path is not None
+    assert calibration_path is not None
+    assert trajectory_path is not None
+    suppliers = config.module_parameters("supplier_data_audit").get("suppliers")
+    dr_config = (
+        suppliers.get("dr", {}) if isinstance(suppliers, Mapping) else {}
+    )
+    mapping = dr_config.get("mapping", {}) if isinstance(dr_config, Mapping) else {}
+    if not isinstance(mapping, Mapping):
+        mapping = {}
+    validation = validate_head_projection_contract(
+        hdf5_path=hdf5_path,
+        video_path=video_path,
+        calibration_path=calibration_path,
+        trajectory_path=trajectory_path,
+        source_range=context.source_range,
+        reference_dataset=str(
+            context.metadata.get("hdf5_reference_dataset") or ""
+        ),
+        primary_camera=str(context.metadata.get("primary_camera") or ""),
+        content_id=(
+            str(context.metadata.get("content_id"))
+            if context.metadata.get("content_id") is not None
+            else None
+        ),
+        calibration_mapping_status=str(
+            context.metadata.get("calibration_mapping_status") or ""
+        ),
+        projection_validation_status=str(
+            context.metadata.get("projection_validation_status") or ""
+        ),
+        mapping_status=str(
+            dr_config.get("mapping_status")
+            if isinstance(dr_config, Mapping)
+            else ""
+        ),
+        mapping=mapping,
+    )
+    return (
+        hdf5_path,
+        video_path,
+        calibration_path,
+        trajectory_path,
+        validation,
+        dr_config if isinstance(dr_config, Mapping) else {},
+    )
+
+
+def _candidate_hand_sides(candidate: Mapping[str, Any]) -> tuple[str, ...]:
+    side = str(candidate.get("hand_side") or "both").lower()
+    if side == "both":
+        return ("left", "right")
+    if side in {"left", "right"}:
+        return (side,)
+    raise ValueError(f"invalid candidate hand_side: {side}")
+
+
+def _run_dr_containment(
+    *,
+    context: AssetContext,
+    config: LoadedQcConfig,
+    candidate_rows: list[dict[str, Any]],
+    hdf5_path: Path,
+    video_path: Path,
+    calibration_path: Path,
+    validation: Any,
+    segmenter: Any,
+    staging_root: Path,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+    import cv2
+
+    from acceptance_pull.supplier_adapters.deepreach_projection import (
+        project_dr_hands_for_frame,
+    )
+    from qc_common.keypoints import acceptance_joint_names
+    from tools.run_manifest_sam3_containment import (
+        DEFAULT_QUERIES,
+        SAM3_CONFIG,
+        configured_sam3_thresholds,
+        sample_manifest_window_frames,
+    )
+    from tools.sam3_keypoint_containment import (
+        aggregate_window_containment_summaries,
+        candidate_window_metadata,
+        score_keypoints_against_masks,
+        write_combined_overlay_image,
+    )
+
+    if context.source_range is None:
+        raise ModulePrerequisiteError(
+            "sam3_containment", "source_range for DR containment"
+        )
+    clip_start, clip_end_exclusive = context.source_range
+    clip_end = clip_end_exclusive - 1
+    frame_thresholds, window_thresholds = configured_sam3_thresholds(config)
+    queries = [
+        value.strip() for value in DEFAULT_QUERIES.split(",") if value.strip()
+    ]
+    joint_names = {
+        side: [
+            name for name in acceptance_joint_names() if name.startswith(side)
+        ]
+        for side in ("left", "right")
+    }
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        raise ModuleInputError("sam3_containment", "DR head video is unreadable")
+    frame_cache: dict[int, Any] = {}
+    mask_cache: dict[int, list[Any]] = {}
+    frame_rows: list[dict[str, Any]] = []
+    evidence_rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    try:
+        for window_index, candidate in enumerate(candidate_rows):
+            sampled_frames = sample_manifest_window_frames(
+                candidate,
+                clip_start_frame=clip_start,
+                clip_end_frame=clip_end,
+                frames_per_window=3,
+            )
+            for source_frame in sampled_frames:
+                local_frame = source_frame - clip_start
+                if source_frame not in frame_cache:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, local_frame)
+                    ok, frame_bgr = capture.read()
+                    if not ok or frame_bgr is None:
+                        raise ModuleInputError(
+                            "sam3_containment",
+                            f"DR head video frame {source_frame} is unreadable",
+                        )
+                    frame_cache[source_frame] = frame_bgr[..., ::-1].copy()
+                frame = frame_cache[source_frame]
+                if source_frame not in mask_cache:
+                    mask_cache[source_frame] = segmenter.segment_frame(
+                        frame,
+                        queries,
+                        dict(SAM3_CONFIG),
+                    )
+                masks = mask_cache[source_frame]
+                projected = project_dr_hands_for_frame(
+                    hdf5_path,
+                    source_frame=source_frame,
+                    clip_start_frame=clip_start,
+                    calibration=validation.calibration,
+                )
+                combined_hands: dict[str, dict[str, Any]] = {}
+                for side in ("left", "right"):
+                    hand = projected[side]
+                    containment, _union_mask, valid, inside = (
+                        score_keypoints_against_masks(
+                            frame=frame,
+                            pixels=hand["pixels"],
+                            joint_names=joint_names[side],
+                            masks=masks,
+                            valid=hand["valid"],
+                            **frame_thresholds,
+                        )
+                    )
+                    combined_hands[side] = {
+                        "pixels": hand["pixels"],
+                        "valid": valid,
+                        "inside": inside,
+                        "joint_names": joint_names[side],
+                    }
+                    if side not in _candidate_hand_sides(candidate):
+                        continue
+                    frame_rows.append(
+                        {
+                            "clip_id": context.asset_id,
+                            "asset_id": context.asset_id,
+                            "episode_idx": 0,
+                            "hdf5_path": str(hdf5_path),
+                            "video_path": str(video_path),
+                            "calibration_path": str(calibration_path),
+                            "frame_idx": source_frame,
+                            "source_frame_idx": source_frame,
+                            "local_frame_idx": local_frame,
+                            "clip_start_frame": clip_start,
+                            "clip_end_frame": clip_end,
+                            "candidate_start_frame": candidate["start_frame"],
+                            "candidate_end_frame": candidate["end_frame"],
+                            "coordinate_space": "source",
+                            "projection_mode": "dr_head_direct_calibration",
+                            "projection_mode_used": "dr_head_direct_calibration",
+                            "projection_input_status": hand[
+                                "projection_input_status"
+                            ],
+                            "projection_input_reason": hand[
+                                "projection_input_reason"
+                            ],
+                            "image_width": int(frame.shape[1]),
+                            "image_height": int(frame.shape[0]),
+                            "camera_id": "main",
+                            "camera_name": "head",
+                            "hand_side": side,
+                            "candidate_hand_side": candidate.get(
+                                "hand_side", "both"
+                            ),
+                            **containment,
+                            **candidate_window_metadata(candidate),
+                        }
+                    )
+                overlay_path = write_combined_overlay_image(
+                    frame=frame,
+                    hands=combined_hands,
+                    clip_id=(
+                        f"{context.asset_id}_window_"
+                        f"{candidate['start_frame']}_{candidate['end_frame']}_combined"
+                    ),
+                    frame_idx=source_frame,
+                    output_dir=staging_root / "combined_overlays",
+                )
+                evidence_rows.append(
+                    {
+                        "review_id": "",
+                        "supplier_id": "dr",
+                        "asset_id": context.asset_id,
+                        "window_start_frame": candidate["start_frame"],
+                        "window_end_frame": candidate["end_frame"],
+                        "frame_idx": source_frame,
+                        "source_module": "sam3_containment",
+                        "evidence_type": "combined_overlay",
+                        "hand_side": "both",
+                        "source_path": str(Path(overlay_path).resolve()),
+                        "metadata_json": json.dumps(
+                            {
+                                "camera_name": "head",
+                                "source_frame_idx": source_frame,
+                                "local_frame_idx": local_frame,
+                                "coordinate_space": "source",
+                            },
+                            sort_keys=True,
+                        ),
+                    }
+                )
+    finally:
+        capture.release()
+    window_summaries = aggregate_window_containment_summaries(
+        frame_rows,
+        **window_thresholds,
+    )
+    producer_run_config = {
+        "supplier": "dr",
+        "primary_camera": "head",
+        "keypoint_source": "DR HDF5 hand/<side>/joints3d",
+        "projection_status": validation.status,
+        "projection_reason": validation.reason,
+        "trajectory_usage": validation.trajectory_usage,
+        "candidate_window_count": len(candidate_rows),
+        "sampled_source_frame_count": len(frame_cache),
+        "frame_thresholds": frame_thresholds,
+        "window_thresholds": window_thresholds,
+    }
+    return frame_rows, window_summaries, failures, evidence_rows, producer_run_config
 
 
 def _run_canonical(
@@ -385,6 +690,7 @@ def runner(
             or context.metadata.get("supplier_id")
             or "jdt"
         ).lower()
+        dr_inputs: tuple[Path, Path, Path, Path, Any, Mapping[str, Any]] | None = None
         if supplier in {"dr", "deepreach"}:
             projection_status = str(
                 context.metadata.get("projection_validation_status") or ""
@@ -393,10 +699,33 @@ def runner(
                 reason = (
                     "transform_ambiguous"
                     if projection_status == "transform_ambiguous"
+                    else projection_status
+                    if projection_status
+                    in {
+                        "mapping_missing",
+                        "resolution_mismatch",
+                        "frame_alignment_unverified",
+                    }
                     else "calibration_unverified"
                 )
                 raise ModuleBlockedError("sam3_containment", reason)
-            raise ModuleBlockedError("sam3_containment", "adapter_missing")
+            dr_inputs = _dr_projection_inputs(context, config)
+            validation = dr_inputs[4]
+            if validation.status != "validated":
+                reason = (
+                    validation.reason
+                    if validation.reason
+                    in {
+                        "mapping_missing",
+                        "resolution_mismatch",
+                        "calibration_video_resolution_mismatch",
+                        "frame_alignment_unverified",
+                        "hdf5_video_frame_count_mismatch",
+                        "direct_head_transform_chain_not_explicit",
+                    }
+                    else validation.status
+                )
+                raise ModuleBlockedError("sam3_containment", reason)
         if supplier == "potentia":
             raise ModuleBlockedError("sam3_containment", "no_keypoint_input")
 
@@ -447,6 +776,21 @@ def runner(
                 "sam3_containment",
                 "no_valid_temporal_output",
             )
+        if supplier in {"dr", "deepreach"}:
+            check_results_path = candidate_path.parent / "check_results.json"
+            if check_results_path.is_file():
+                try:
+                    check_rows = read_records(check_results_path)
+                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ModuleInputError(
+                        "sam3_containment",
+                        f"current precheck check_results are unreadable: {exc}",
+                    ) from exc
+                if any(_dr_has_hard_presence_invalid(row) for row in check_rows):
+                    raise ModuleBlockedError(
+                        "sam3_containment",
+                        "invalid_keypoint_input",
+                    )
         try:
             all_candidate_rows = read_records(candidate_path)
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -464,25 +808,54 @@ def runner(
                 runtime={"artifact_state": "no_candidates"},
             )
 
-        if supplier != "jdt":
+        if supplier not in {"jdt", "dr", "deepreach"}:
             raise ModuleAdapterMissingError(
                 "sam3_containment",
                 f"supplier adapter is not implemented: {supplier}",
             )
-        for source_name in ("video", "parquet"):
-            _source_path(context, source_name, required=False)
-        manifest_path = _source_path(context, "manifest", required=False)
+        if supplier == "jdt":
+            for source_name in ("video", "parquet"):
+                _source_path(context, source_name, required=False)
+            manifest_path = _source_path(context, "manifest", required=False)
+            source_names = tuple(
+                name
+                for name in ("video", "parquet")
+                if name in context.source_files
+            )
+        else:
+            assert dr_inputs is not None
+            manifest_path = None
+            source_names = tuple(
+                name
+                for name in ("video", "hdf5", "calibration", "trajectory")
+                if name in context.source_files
+            )
         model = _source_path(
             context,
             "sam3_model",
             required=segmenter_factory is None,
             expected_type="directory",
         )
-        source_names = tuple(
-            name
-            for name in ("video", "parquet")
-            if name in context.source_files
-        )
+        fingerprint_extra: dict[str, Any] = {
+            "candidate_sha256": file_sha256(candidate_path),
+            "queries": DEFAULT_QUERIES,
+            "sam3_runtime": SAM3_CONFIG,
+        }
+        if dr_inputs is not None:
+            validation = dr_inputs[4]
+            fingerprint_extra["dr_projection_contract"] = {
+                "adapter_version": "dr-head-hdf5-v1",
+                "status": validation.status,
+                "reason": validation.reason,
+                "content_id": context.metadata.get("content_id"),
+                "calibration_mapping_status": context.metadata.get(
+                    "calibration_mapping_status"
+                ),
+                "projection_validation_status": context.metadata.get(
+                    "projection_validation_status"
+                ),
+                "trajectory_usage": validation.trajectory_usage,
+            }
         fingerprint = build_run_fingerprint(
             context=context,
             producer="sam3_containment",
@@ -490,11 +863,7 @@ def runner(
             module_names=("sam3_containment",),
             source_names=source_names,
             implementation_version=_IMPLEMENTATION_VERSION,
-            extra={
-                "candidate_sha256": file_sha256(candidate_path),
-                "queries": DEFAULT_QUERIES,
-                "sam3_runtime": SAM3_CONFIG,
-            },
+            extra=fingerprint_extra,
         )
         if model is not None:
             fingerprint["sources"]["sam3_model"] = directory_identity(
@@ -523,6 +892,71 @@ def runner(
                 result,
                 state="reused",
                 elapsed_seconds=perf_counter() - started,
+                fingerprint_sha256=fingerprint_sha256,
+            )
+        staging_root = context.batch_root / ".qc_pipeline" / context.asset_id / "sam3"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        if supplier in {"dr", "deepreach"}:
+            if segmenter_factory is not None:
+                segmenter = segmenter_factory()
+            elif segmenter_provider is not None:
+                assert model is not None
+                segmenter = segmenter_provider(model, dict(SAM3_CONFIG))
+            else:
+                segmenter = None
+            if segmenter is None:
+                raise ModulePrerequisiteError(
+                    "sam3_containment", "SAM3 segmenter runtime"
+                )
+            assert dr_inputs is not None
+            (
+                hdf5_path,
+                video_path,
+                calibration_path,
+                _trajectory_path,
+                validation,
+                _dr_config,
+            ) = dr_inputs
+            (
+                frame_results,
+                window_summaries,
+                failures,
+                evidence_rows,
+                producer_run_config,
+            ) = _run_dr_containment(
+                context=context,
+                config=config,
+                candidate_rows=candidate_rows,
+                hdf5_path=hdf5_path,
+                video_path=video_path,
+                calibration_path=calibration_path,
+                validation=validation,
+                segmenter=segmenter,
+                staging_root=staging_root,
+            )
+            elapsed = perf_counter() - started
+            window_summaries, evidence_rows = _publish_sam3_artifact(
+                context=context,
+                frame_results=frame_results,
+                window_summaries=window_summaries,
+                failures=failures,
+                evidence_rows=evidence_rows,
+                producer_run_config=producer_run_config,
+                producer_root=staging_root,
+                fingerprint=fingerprint,
+                elapsed_seconds=elapsed,
+            )
+            result = adapt_sam3_containment(
+                asset_id=context.asset_id,
+                batch_root=context.batch_root,
+                window_summaries=window_summaries,
+                evidence_rows=evidence_rows,
+                config=config,
+            )
+            return _with_artifact_runtime(
+                result,
+                state="computed",
+                elapsed_seconds=elapsed,
                 fingerprint_sha256=fingerprint_sha256,
             )
         if manifest_path is not None:
@@ -555,8 +989,6 @@ def runner(
                 manifest_row[field] = str(
                     value if value.is_absolute() else manifest_dir / value
                 )
-        staging_root = context.batch_root / ".qc_pipeline" / context.asset_id / "sam3"
-        staging_root.mkdir(parents=True, exist_ok=True)
         single_manifest = staging_root / "manifest.jsonl"
         single_candidates = staging_root / "candidate_windows.jsonl"
         single_manifest.write_text(

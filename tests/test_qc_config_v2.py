@@ -166,6 +166,23 @@ def test_v2_schema_rejects_invalid_timestamp_mapping_unit(tmp_path: Path) -> Non
         load_qc_acceptance_config(_write_config(tmp_path, raw))
 
 
+def test_v2_schema_rejects_ambiguous_dr_projection_chain(tmp_path: Path) -> None:
+    raw = copy.deepcopy(load_qc_acceptance_config().raw)
+    dr = raw["modules"]["supplier_data_audit"]["parameters"]["suppliers"]["dr"]
+    dr["mapping_status"] = "verified"
+    dr["mapping"]["projection"] = {
+        "camera_name": "head",
+        "joints3d_coordinate_frame": "head_camera",
+        "joints3d_unit": "meter",
+        "projection_direction": "direct_camera",
+        "trajectory_usage": "apply",
+        "resolution_policy": "exact",
+    }
+
+    with pytest.raises(ValueError, match="trajectory_usage"):
+        load_qc_acceptance_config(_write_config(tmp_path, raw))
+
+
 def test_v2_rejects_enabled_module_without_implementation(tmp_path: Path) -> None:
     raw = copy.deepcopy(load_qc_acceptance_config().raw)
     raw["modules"]["duplicate_check"].update({"enabled": True})

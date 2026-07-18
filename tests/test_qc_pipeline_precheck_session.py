@@ -11,7 +11,7 @@ from qc_common.config import LoadedQcConfig, load_qc_acceptance_config
 from qc_common.contracts import ModuleResult
 from qc_common.frame_survival import FrameExclusion
 from qc_common.module_registry import ModuleRegistry
-from qc_common.module_registry import ModulePrerequisiteError
+from qc_common.module_registry import ModuleInputError, ModulePrerequisiteError
 from qc_common.types import CheckResult, ClipInputs
 from qc_pipeline.context import AssetContext
 from qc_pipeline.orchestrator import run_asset
@@ -294,6 +294,215 @@ def test_deepreach_alias_normalizes_runtime_identity_and_preserves_source_row(
     assert context.metadata["supplier_name"] == "DR"
     assert context.metadata["supplier_alias"] == "deepreach"
     assert context.metadata["manifest_row"] == source_row
+
+
+@pytest.mark.parametrize("supplier", ["dr", "deepreach"])
+def test_dr_supplier_dispatch_wins_over_coexisting_lerobot_parquet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supplier: str,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "clip.h5").write_bytes(b"hdf5")
+    (source / "episode.parquet").write_bytes(b"lerobot parquet inventory")
+    context = AssetContext(
+        "task-a",
+        tmp_path,
+        tmp_path / "quality_archive" / "task-a.json",
+        {
+            "hdf5": {"path": "source/clip.h5"},
+            "parquet": {"path": "source/episode.parquet"},
+        },
+        source_range=(4, 7),
+        metadata={
+            "supplier": supplier,
+            "hdf5_reference_dataset": "timestamp",
+        },
+    )
+    sentinel = object()
+    observed: list[dict[str, object]] = []
+
+    def load_dr(row: dict[str, object], episode_idx: int) -> object:
+        observed.append(row)
+        return sentinel
+
+    monkeypatch.setattr(
+        "tools.run_manifest_precheck.load_deepreach_clip",
+        load_dr,
+    )
+    monkeypatch.setattr(
+        "tools.run_manifest_precheck.load_jdt_clip",
+        lambda row, episode_idx: pytest.fail("DR must not call the JDT loader"),
+    )
+
+    loaded = precheck._load_clip(context, "hdf5_text_info")
+
+    assert loaded is sentinel
+    assert observed == [
+        {
+            **dict(context.metadata),
+            "asset_id": "task-a",
+            "start_frame": 4,
+            "end_frame": 6,
+            "hdf5_path": str(source / "clip.h5"),
+        }
+    ]
+
+
+def test_dr_five_precheck_modules_share_one_hdf5_load_when_parquet_is_present(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "clip.h5").write_bytes(b"hdf5")
+    (source / "episode.parquet").write_bytes(b"lerobot parquet inventory")
+    context = AssetContext(
+        "task-a",
+        tmp_path,
+        tmp_path / "quality_archive" / "task-a.json",
+        {
+            "hdf5": {"path": "source/clip.h5"},
+            "parquet": {"path": "source/episode.parquet"},
+        },
+        source_range=(0, 3),
+        metadata={"supplier": "dr", "hdf5_reference_dataset": "timestamp"},
+    )
+    clip = ClipInputs(episode_idx=0, frame_indices=[0, 1, 2])
+    loads = 0
+    executed: list[str] = []
+
+    def load_dr(row: dict[str, object], episode_idx: int) -> ClipInputs:
+        nonlocal loads
+        loads += 1
+        return clip
+
+    def execute(
+        context: AssetContext,
+        config: LoadedQcConfig,
+        module: str,
+        loaded_clip: object,
+    ) -> ModuleResult:
+        assert loaded_clip is clip
+        executed.append(module)
+        return ModuleResult(module, "pass", {"decision": "pass"}, {})
+
+    monkeypatch.setattr(
+        "tools.run_manifest_precheck.load_deepreach_clip",
+        load_dr,
+    )
+    monkeypatch.setattr(
+        "tools.run_manifest_precheck.load_jdt_clip",
+        lambda row, episode_idx: pytest.fail("DR must not call the JDT loader"),
+    )
+    monkeypatch.setattr(precheck, "_run_module_on_clip", execute)
+
+    session = precheck.PrecheckSession(context, _config(tmp_path))
+    for module in precheck.MODULES:
+        session.run_module(module)
+
+    assert loads == 1
+    assert executed == list(precheck.MODULES)
+
+
+def test_dr_hdf5_without_jdt_columns_completes_loader_with_parquet_inventory(
+    tmp_path: Path,
+) -> None:
+    from tests.test_manifest_precheck_runner import _write_deepreach_hdf5
+
+    source = tmp_path / "source"
+    source.mkdir()
+    hdf5 = _write_deepreach_hdf5(source / "clip.h5", frame_count=4)
+    (source / "episode.parquet").write_bytes(b"contains no JDT keypoint columns")
+    context = AssetContext(
+        "task-a",
+        tmp_path,
+        tmp_path / "quality_archive" / "task-a.json",
+        {
+            "hdf5": {"path": "source/clip.h5"},
+            "parquet": {"path": "source/episode.parquet"},
+        },
+        source_range=(0, 4),
+        metadata={"supplier": "dr", "hdf5_reference_dataset": "timestamp"},
+    )
+
+    clip = precheck._load_clip(context, "keypoint_presence")
+
+    assert clip.source_path == str(hdf5)
+    assert clip.num_frames == 4
+    assert clip.hand_keypoints_3d is not None
+    assert clip.hand_keypoints_3d.shape == (4, 2, 21, 3)
+
+
+def test_dr_missing_joints_is_input_invalid_without_jdt_fallback(
+    tmp_path: Path,
+) -> None:
+    import h5py
+    import numpy as np
+    import pandas as pd
+
+    source = tmp_path / "source"
+    source.mkdir()
+    with h5py.File(source / "clip.h5", "w") as handle:
+        handle.create_dataset("timestamp", data=np.arange(3, dtype=float))
+        left = handle.create_group("hand/left")
+        left.create_dataset("joints3d", data=np.ones((3, 21, 3), dtype=np.float32))
+    pd.DataFrame({"inventory_only": [1, 2, 3]}).to_parquet(
+        source / "episode.parquet",
+        index=False,
+    )
+    context = AssetContext(
+        "task-a",
+        tmp_path,
+        tmp_path / "quality_archive" / "task-a.json",
+        {
+            "hdf5": {"path": "source/clip.h5"},
+            "parquet": {"path": "source/episode.parquet"},
+        },
+        source_range=(0, 3),
+        metadata={"supplier": "dr", "hdf5_reference_dataset": "timestamp"},
+    )
+
+    with pytest.raises(ModuleInputError, match="missing_dataset"):
+        precheck._load_clip(context, "keypoint_presence")
+
+
+def test_dr_single_nonfinite_joint_is_hard_presence_invalid(
+    tmp_path: Path,
+) -> None:
+    import h5py
+    import numpy as np
+
+    from tests.test_manifest_precheck_runner import _write_deepreach_hdf5
+
+    source = tmp_path / "source"
+    source.mkdir()
+    hdf5_path = _write_deepreach_hdf5(source / "clip.h5", frame_count=100)
+    with h5py.File(hdf5_path, "a") as handle:
+        handle["hand/left/joints3d"][50, 0, 0] = np.nan
+    context = AssetContext(
+        "task-a",
+        tmp_path,
+        tmp_path / "quality_archive" / "task-a.json",
+        {"hdf5": {"path": "source/clip.h5"}},
+        source_range=(0, 100),
+        metadata={"supplier": "dr", "hdf5_reference_dataset": "timestamp"},
+    )
+
+    session = precheck.PrecheckSession(context, load_qc_acceptance_config())
+    result = session.run_module("keypoint_presence")
+    invalid = next(
+        row
+        for row in session._raw_results["keypoint_presence"]
+        if row.frame_idx == 50
+    )
+
+    assert result.verdict == "fail"
+    assert invalid.flag is True
+    assert invalid.severity == "fail"
+    assert invalid.metrics["keypoint_existence_invalid_left"] is True
+    assert invalid.metrics["keypoint_existence_invalid_right"] is False
 
 
 def test_manifest_metadata_survives_clip_slice_and_frame_survival_preparation(

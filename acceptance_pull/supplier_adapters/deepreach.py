@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from acceptance_pull.supplier_adapters.deepreach_hdf5 import (
     inspect_deepreach_frame_contract,
@@ -38,6 +38,10 @@ MANIFEST_COLUMNS = [
     "source_granularity",
     "task_name",
     "task_id",
+    "content_id",
+    "calibration_mapping_status",
+    "projection_validation_status",
+    "projection_validation_reason",
     "start_frame",
     "end_frame",
     "source_frame_count",
@@ -70,11 +74,15 @@ MANIFEST_COLUMNS = [
 CALIBRATION_SIDECAR_COLUMNS = [
     "asset_id",
     "task_name",
+    "content_id",
     "primary_camera",
     "calib_path",
     "camera_trajectory_path",
     "calibration_status",
     "trajectory_status",
+    "calibration_mapping_status",
+    "projection_validation_status",
+    "projection_validation_reason",
 ]
 LEGACY_CALIBRATION_SIDECAR_COLUMNS = [
     "asset_id",
@@ -93,6 +101,7 @@ def build_deepreach_manifest(
     primary_camera: str = "head",
     granularity: str = "task",
     reference_dataset: str | None = None,
+    calibration_mapping: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """Discover DR assets without reading large HDF5/video payloads."""
     root = root.resolve()
@@ -106,6 +115,7 @@ def build_deepreach_manifest(
             root=root,
             calib_cache=calib_cache,
             cameras=cameras,
+            calibration_mapping=calibration_mapping,
         )
     if reference_dataset is None:
         raise ValueError(
@@ -114,7 +124,12 @@ def build_deepreach_manifest(
 
     rows: list[dict[str, str]] = []
     for task_name in discover_task_names(root):
-        paths = _task_paths(root, calib_cache, task_name)
+        paths = _task_paths(
+            root,
+            calib_cache,
+            task_name,
+            calibration_mapping=calibration_mapping,
+        )
         frame_contract = inspect_deepreach_frame_contract(
             paths["hdf5_path"],
             reference_dataset=reference_dataset,
@@ -133,6 +148,7 @@ def build_deepreach_manifest(
             camera: "present" if path.is_file() else "missing"
             for camera, path in videos.items()
         }
+        mapped = bool(paths["content_id"])
         required_paths = (
             paths["hdf5_path"],
             paths["task_dir"],
@@ -147,7 +163,9 @@ def build_deepreach_manifest(
             if videos[primary_camera].is_file()
             else "primary_camera_missing"
         )
-        required_paths_present = all(path.exists() for path in required_paths)
+        required_paths_present = all(
+            isinstance(path, Path) and path.exists() for path in required_paths
+        )
         contract_status = str(frame_contract["status"])
         if contract_status not in {"consistent", "unreadable"}:
             adapter_status = "input_invalid"
@@ -157,7 +175,7 @@ def build_deepreach_manifest(
             adapter_status = "ready_unverified"
         rows.append(
             {
-                "schema_version": "supplier_manifest.dr.v2",
+                "schema_version": "supplier_manifest.dr.v3",
                 "supplier": "dr",
                 "supplier_id": "dr",
                 "supplier_name": "DR",
@@ -166,6 +184,14 @@ def build_deepreach_manifest(
                 "source_granularity": "task",
                 "task_name": task_name,
                 "task_id": task_name,
+                "content_id": str(paths["content_id"] or ""),
+                "calibration_mapping_status": (
+                    "mapped" if mapped else "mapping_missing"
+                ),
+                "projection_validation_status": "calibration_unverified",
+                "projection_validation_reason": (
+                    "requires_projection_audit" if mapped else "mapping_missing"
+                ),
                 "start_frame": "0" if frame_count is not None else "",
                 "end_frame": str(frame_count - 1) if frame_count is not None else "",
                 "source_frame_count": str(frame_count) if frame_count is not None else "",
@@ -191,13 +217,15 @@ def build_deepreach_manifest(
                 "primary_camera_status": primary_status,
                 "calibration_status": (
                     "present_unverified"
-                    if paths["calib_path"].is_file()
-                    else "missing"
+                    if isinstance(paths["calib_path"], Path)
+                    and paths["calib_path"].is_file()
+                    else "missing" if mapped else "mapping_missing"
                 ),
                 "trajectory_status": (
                     "present_unverified"
-                    if paths["trajectory_path"].is_file()
-                    else "missing"
+                    if isinstance(paths["trajectory_path"], Path)
+                    and paths["trajectory_path"].is_file()
+                    else "missing" if mapped else "mapping_missing"
                 ),
                 "hdf5_status": (
                     "readable" if contract_status == "consistent" else contract_status
@@ -227,16 +255,30 @@ def build_deepreach_manifest(
     return rows
 
 
-def _task_paths(root: Path, calib_cache: Path, task_name: str) -> dict[str, Path]:
+def _task_paths(
+    root: Path,
+    calib_cache: Path,
+    task_name: str,
+    *,
+    calibration_mapping: Mapping[str, str] | None,
+) -> dict[str, Any]:
     task_dir = root / "lerobot_v2" / task_name
-    calibration_dir = calib_cache / task_name
+    content_id = (
+        str(calibration_mapping.get(task_name) or "").strip()
+        if isinstance(calibration_mapping, Mapping)
+        else ""
+    )
+    calibration_dir = calib_cache / content_id if content_id else None
     return {
+        "content_id": content_id,
         "task_dir": task_dir,
         "hdf5_path": find_hdf5_path(root, task_name),
         "parquet_path": task_dir / "data" / "chunk-000" / "episode_000000.parquet",
         "wrist_calibration_path": task_dir / "meta" / "wrist_calibration.json",
-        "calib_path": calibration_dir / "calib.json",
-        "trajectory_path": calibration_dir / "camera_trajectory.csv",
+        "calib_path": calibration_dir / "calib.json" if calibration_dir else None,
+        "trajectory_path": (
+            calibration_dir / "camera_trajectory.csv" if calibration_dir else None
+        ),
     }
 
 
@@ -255,18 +297,26 @@ def _build_task_camera_manifest(
     root: Path,
     calib_cache: Path,
     cameras: Iterable[str],
+    calibration_mapping: Mapping[str, str] | None,
 ) -> list[dict[str, str]]:
     selected_cameras = validate_cameras(cameras)
     rows: list[dict[str, str]] = []
     for task_name in discover_task_names(root):
-        paths = _task_paths(root, calib_cache, task_name)
+        paths = _task_paths(
+            root,
+            calib_cache,
+            task_name,
+            calibration_mapping=calibration_mapping,
+        )
         task_dir = paths["task_dir"]
         hdf5_path = paths["hdf5_path"]
         parquet_path = paths["parquet_path"]
         wrist_calibration_path = paths["wrist_calibration_path"]
         calib_path = paths["calib_path"]
         calibration_status = (
-            "present_unverified" if calib_path.is_file() else "missing"
+            "present_unverified"
+            if isinstance(calib_path, Path) and calib_path.is_file()
+            else "missing"
         )
 
         for camera_name in selected_cameras:
@@ -281,7 +331,7 @@ def _build_task_camera_manifest(
             )
             adapter_status = (
                 "ready"
-                if all(path is not None and path.exists() for path in required_paths)
+                if all(isinstance(path, Path) and path.exists() for path in required_paths)
                 else "input_missing"
             )
             rows.append(

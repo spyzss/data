@@ -119,6 +119,62 @@ def test_deepreach_adapter_slices_inclusive_range_without_quality_hand(
     assert getattr(clip, "morphology_status") == "not_ready_topology"
 
 
+def test_deepreach_adapter_accepts_optional_valid_datasets(tmp_path: Path) -> None:
+    from tools.run_manifest_precheck import load_deepreach_clip
+
+    hdf5_path = _write_deepreach_hdf5(tmp_path / "deepreach.h5", frame_count=4)
+    with h5py.File(hdf5_path, "a") as handle:
+        del handle["hand/left/valid"]
+        del handle["hand/right/valid"]
+
+    clip = load_deepreach_clip(
+        {
+            "asset_id": "dr-clip",
+            "hdf5_path": str(hdf5_path),
+            "hdf5_reference_dataset": "timestamp",
+            "start_frame": 1,
+            "end_frame": 3,
+        },
+        episode_idx=0,
+    )
+
+    assert clip.frame_indices == [1, 2, 3]
+    assert clip.hand_keypoints_3d is not None
+    assert clip.hand_keypoints_3d.shape == (3, 2, 21, 3)
+    assert clip.hand_keypoints_3d.dtype == np.float32
+    assert clip.hand_joint_valid_3d is not None
+    assert clip.hand_joint_valid_3d.shape == (3, 2, 21)
+    assert clip.hand_joint_valid_3d.dtype == np.bool_
+    assert clip.hand_joint_valid_3d.all()
+
+
+def test_deepreach_valid_dataset_marks_every_joint_in_invalid_hand_frame(
+    tmp_path: Path,
+) -> None:
+    from tools.run_manifest_precheck import load_deepreach_clip
+
+    hdf5_path = _write_deepreach_hdf5(
+        tmp_path / "deepreach.h5",
+        frame_count=4,
+        invalid_frame=2,
+    )
+
+    clip = load_deepreach_clip(
+        {
+            "asset_id": "dr-clip",
+            "hdf5_path": str(hdf5_path),
+            "hdf5_reference_dataset": "timestamp",
+            "start_frame": 1,
+            "end_frame": 3,
+        },
+        episode_idx=0,
+    )
+
+    assert clip.hand_joint_valid_3d is not None
+    assert not clip.hand_joint_valid_3d[1].any()
+    assert clip.hand_joint_valid_3d[[0, 2]].all()
+
+
 def test_deepreach_loader_requires_explicit_reference_dataset(tmp_path: Path) -> None:
     from tools.run_manifest_precheck import load_deepreach_clip
 

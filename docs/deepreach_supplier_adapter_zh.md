@@ -12,11 +12,12 @@ DeepReach adapter 将三视角 deliverable 扫描为 acceptance workflow 可消�
 - DeepReach HDF5 到 canonical `ClipInputs` 的 precheck schema adapter
 - HDF5 dataset frame-contract 审计
 - video-quality staging symlinks
+- 经显式验证的 head-camera HDF5 3D→2D SAM3 containment adapter
 
 当前不包含：
 
-- SAM3/DA3 模型执行
-- calibration 坐标系验证
+- DA3 模型执行
+- 未经 mapping / overlay 验证的 calibration 自动放行
 - 视频、HDF5 或 calib 文件复制
 
 实现位置：
@@ -49,6 +50,8 @@ DeepReach adapter 将三视角 deliverable 扫描为 acceptance workflow 可消�
 ```
 
 Adapter 会对 `hdf5/` 文件名和 `lerobot_v2/` 子目录名取并集，因此缺少其中一侧时仍会尽量发出 manifest row。
+
+Calibration 必须另外提供显式 `task_name,content_id` 映射。Adapter 只会在有该映射时读取 `<calib-cache>/<content_id>/calib.json`，不再用 `task_name` 充当 `content_id`。
 
 ## 3. Asset 和 Camera 定义
 
@@ -84,6 +87,9 @@ CLI 默认只生成 `head`。重复传入 `--camera` 可生成多视角。
 | `supplier_name` | 固定为 `DR` |
 | `asset_id` | `<task_name>` |
 | `task_name` | HDF5 stem / LeRobot task 目录名 |
+| `content_id` | 由显式 mapping 绑定的 calibration content ID |
+| `calibration_mapping_status` | `mapped` 或 `mapping_missing` |
+| `projection_validation_status` | 默认 `calibration_unverified`；完成显式审计后才能为 `validated` |
 | `primary_camera` | 正式 video-quality 主视角 |
 | `primary_video_path` | 主视角视频；不做静默 fallback |
 | `head_video_path` / wrist paths | 同一 task 的三路视频 inventory |
@@ -110,31 +116,21 @@ Calibration sidecar：
 包含：
 
 ```text
-asset_id,task_name,primary_camera,calib_path,camera_trajectory_path,calibration_status,trajectory_status
+asset_id,task_name,content_id,primary_camera,calib_path,camera_trajectory_path,
+calibration_status,trajectory_status,calibration_mapping_status,
+projection_validation_status,projection_validation_reason
 ```
 
-## 5. Calibration 限制
+## 5. Calibration 与 projection 门禁
 
-当前 adapter 使用：
+Calibration mapping CSV 格式：
 
 ```text
-<calib-cache>/<task_name>/calib.json
+task_name,content_id
+task_001,content_abc
 ```
 
-作为 `<content_id>` lookup 的 v0 候选路径。
-
-但是，当前仓库没有代码或 schema 证明：
-
-1. `task_name` 一定等于 OSS `content_id`；
-2. `calib.json` 对应哪个 camera stream；
-3. SLAM/world/camera/MANO 坐标系的变换方向；
-4. wrist calibration 与外部 calib 的组合顺序。
-
-因此：
-
-- `present_unverified` 只表示文件存在；
-- 在 mapping 和投影约定确认前，DeepReach SAM3 containment 仍是 blocked；
-- 不应把 projection mismatch 解释为 skeleton hard fail。
+`projection_validation_status=validated` 不是单独放行条件。Runtime 还会验证 supplier config 中 `mapping_status=verified`，以及 `projection` 的 head camera、`head_camera`、meter、`direct_camera`、`trajectory_usage=lineage_only` 和分辨率政策。Calibration K、实际 head video 分辨率、HDF5/video 帧数和 source range 也必须一致。任一条不成立时 SAM3 blocked，不加载模型。
 
 ## 6. 生成 Head Manifest
 
@@ -146,6 +142,7 @@ RUN=outputs/acceptance_5x100/deepreach
   --root /mnt/oss/dr-3camera-deliverable \
   --output-dir "$RUN" \
   --calib-cache /mnt/workspace/spy/marmalade/data_cache/deepreach_calib/mano-mesh-3d \
+  --calibration-map /path/to/task_content_mapping.csv \
   --granularity task \
   --primary-camera head \
   --hdf5-reference-dataset timestamp \
@@ -211,7 +208,7 @@ $RUN/video_quality/quality_archive/<asset_id>.json
 /camera/slam_valid
 ```
 
-当前 adapter 读取 `timestamp`、左右手 `valid` 和 `joints3d`。五个 dataset 必须长度一致；禁止使用 `min(lengths)` 静默截断。长度不一致时，manifest 保存 reference、expected count、所有长度和 mismatch ranges，正式 precheck 输出 `input_invalid/inconsistent_frame_count`，不会用共同前缀生成伪完整结果。supplier evaluation 中的 video quality 与 supplier audit 仍独立继续。
+当前 adapter 必需读取 `timestamp` 和左右手 `joints3d`。左右手 `valid` 为 optional；存在时必须与 reference 等长，并展开为每手 21 点 validity；不存在时只使用 finite 3D values 判定有效性。禁止使用 `min(lengths)` 静默截断。长度不一致时，manifest 保存 reference、expected count、所有已提供 dataset 长度和 mismatch ranges，正式 precheck 输出 `input_invalid/inconsistent_frame_count`。
 
 真实数据扩量前仍需确认：
 

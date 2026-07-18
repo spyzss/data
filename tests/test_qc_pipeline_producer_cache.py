@@ -267,6 +267,12 @@ def test_precheck_fingerprint_includes_dr_hdf5_reference_dataset(
     assert precheck_fingerprint(timestamp_context, _config(tmp_path)) != (
         precheck_fingerprint(joints_context, _config(tmp_path))
     )
+    assert precheck_fingerprint(timestamp_context, _config(tmp_path))[
+        "source_contract"
+    ] == {
+        "hdf5_reference_dataset": "timestamp",
+        "supplier_adapter": "deepreach-hdf5-precheck-v2",
+    }
 
 
 def test_sam3_cache_uses_candidate_sha_and_skips_segmenter_on_hit(

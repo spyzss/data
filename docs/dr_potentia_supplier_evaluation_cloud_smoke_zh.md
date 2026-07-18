@@ -12,6 +12,7 @@ export DR_RUN="$BATCH_ROOT/qc_runs/dr_smoke"
 export DR_MANIFEST="$DR_RUN/manifests/supplier_manifest_deepreach.csv"
 export DR_QC_CONFIG=/path/to/qc_acceptance_dr_smoke.yaml
 export DR_PROJECTION_MAPPING=/path/to/dr_projection_mapping.yaml
+export DR_CALIBRATION_MAP=/path/to/task_content_mapping.csv
 
 # 仅在供应商正式 frame contract 已确认 timestamp 为 reference 后使用该值；
 # 否则替换为已确认的参与 dataset，禁止省略或猜测。
@@ -20,6 +21,7 @@ python -m acceptance_pull.build_supplier_manifest \
   --supplier dr \
   --root "$DR_ROOT" \
   --calib-cache "$DR_CALIB_ROOT" \
+  --calibration-map "$DR_CALIBRATION_MAP" \
   --output-dir "$DR_RUN" \
   --primary-camera head \
   --granularity task \
@@ -38,7 +40,7 @@ print(json.dumps(rows, ensure_ascii=False, indent=2))
 PY
 ```
 
-必须确认：每个 `asset_id` 是 task 且不带 camera 后缀；三路 video path 均保留；`primary_camera=head`；`hdf5_reference_dataset=timestamp`；`hdf5_expected_frame_count` 与 `hdf5_dataset_lengths` 一致；`hdf5_mismatch_ranges={}`；`start_frame=0`、`end_frame=N-1`；HDF5、calib 和 trajectory 属于同一 task。若出现 `hdf5_status=inconsistent_frame_count`，不要把共同前缀当完整数据；pipeline 会把 precheck 记为 input-invalid，但 supplier evaluation 的 video/audit 仍继续。
+必须确认：每个 `asset_id` 是 task 且不带 camera 后缀；三路 video path 均保留；`primary_camera=head`；显式 mapping 中的 `task_name` 与 `content_id` 正确；`hdf5_reference_dataset=timestamp`；`hdf5_expected_frame_count` 与 `hdf5_dataset_lengths` 一致；`hdf5_mismatch_ranges={}`；`start_frame=0`、`end_frame=N-1`；HDF5、calib 和 trajectory 属于同一 task。若出现 `hdf5_status=inconsistent_frame_count`，不要把共同前缀当完整数据；pipeline 会把 precheck 记为 input-invalid，但 supplier evaluation 的 video/audit 仍继续。
 
 ### DR supplier_evaluation
 
@@ -54,17 +56,13 @@ python tools/run_qc_pipeline.py \
   --no-resume
 ```
 
-本轮 SAM3 不会加载模型。DR 未经 overlay 验证时，`execution.module_states.sam3_containment` 必须是：
+DR 未经 overlay 验证时，SAM3 不会加载模型，`execution.module_states.sam3_containment` 必须是：
 
 ```json
 {"state": "blocked", "reason": "calibration_unverified"}
 ```
 
-若 mapping 明确暴露外参方向冲突，则 reason 应为 `transform_ambiguous`。若 projection 已人工确认并写成 `validated`，本轮仍必须是：
-
-```json
-{"state": "blocked", "reason": "adapter_missing"}
-```
+若 mapping 明确暴露外参方向冲突，则 reason 应为 `transform_ambiguous`。只有 projection 已人工确认、manifest 写成 `validated`、runtime mapping contract 全部通过且存在明确 `sam3_eligible=true` 候选时，才会加载模型并执行 DR head containment。有效 temporal 输出但零候选仍是 `skipped/no_candidates`。
 
 ### DR projection overlay 抽样
 
@@ -94,12 +92,16 @@ python tools/audit_deepreach_projection.py \
 
 ### 通过 overlay 后的 SAM3 开启条件
 
-当前代码有两道门：
+当前 runtime 会逐 asset 重新核对，而不是只相信一个 `validated` 字符串：
 
-1. manifest/config 记录 `projection_validation_status=validated`；
-2. DR 专用 SAM3 keypoint adapter 已实现并通过真实 overlay 回归。
+1. 显式 `task_name -> content_id` mapping 覆盖当前 asset；
+2. manifest 记录 `projection_validation_status=validated`；
+3. supplier config 的 `mapping_status=verified`，且 projection 明确声明 `camera_name=head`、`joints3d_coordinate_frame=head_camera`、`joints3d_unit=meter`、`projection_direction=direct_camera`、`trajectory_usage=lineage_only` 和 resolution policy；
+4. calibration K、标定分辨率、实际 head 视频分辨率、HDF5/video 帧数和 source range 一致；
+5. 当前 precheck fingerprint、有效 temporal 输出和 source-inclusive candidate 均通过；
+6. hard keypoint presence invalid 会 blocked，不进入 SAM3；零 eligible candidates 会 skipped 且不加载模型。
 
-本次只完成第一道门之前的 projection audit。即使手工把状态改成 `validated`，当前 runner 仍会诚实返回 `adapter_missing`，不会把 DR 当成 JDT Parquet 强行 reshape。完成第二道门前不要在正式交付中声称 DR SAM3 已启用。
+满足这些条件后，DR adapter 从 HDF5 读取左右手 21x3，投影为 head 21x2，复用统一 containment、overlay、artifact publisher 和共享 SAM3 runtime。云端正式启用前仍必须用真实 overlay 验证 mapping；不能仅手工修改状态字段。
 
 ## 2. Potentia：3～5 个 task-level asset
 

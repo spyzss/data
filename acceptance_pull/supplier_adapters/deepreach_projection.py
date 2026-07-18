@@ -43,6 +43,16 @@ class TrajectoryLoad:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class HeadProjectionValidation:
+    status: str
+    reason: str
+    calibration: Calibration
+    video_resolution: tuple[int, int] | None
+    frame_count: int | None
+    trajectory_usage: str | None
+
+
 def _number(value: Any) -> float | None:
     try:
         numeric = float(value)
@@ -289,11 +299,349 @@ def project_hand(
     return records
 
 
+def _blocked_projection(
+    *,
+    status: str,
+    reason: str,
+    calibration_path: Path,
+    video_resolution: tuple[int, int] | None = None,
+    frame_count: int | None = None,
+    trajectory_usage: str | None = None,
+) -> HeadProjectionValidation:
+    return HeadProjectionValidation(
+        status=status,
+        reason=reason,
+        calibration=Calibration(
+            "calibration_unverified",
+            "head",
+            None,
+            None,
+            str(calibration_path),
+            reason,
+        ),
+        video_resolution=video_resolution,
+        frame_count=frame_count,
+        trajectory_usage=trajectory_usage,
+    )
+
+
+def validate_head_projection_contract(
+    *,
+    hdf5_path: Path,
+    video_path: Path,
+    calibration_path: Path,
+    trajectory_path: Path,
+    source_range: tuple[int, int] | None,
+    reference_dataset: str,
+    primary_camera: str,
+    content_id: str | None,
+    calibration_mapping_status: str,
+    projection_validation_status: str,
+    mapping_status: str,
+    mapping: Mapping[str, Any],
+) -> HeadProjectionValidation:
+    """Validate the explicit DR head-camera projection contract without guessing."""
+    if calibration_mapping_status != "mapped" or not str(content_id or "").strip():
+        return _blocked_projection(
+            status="calibration_unverified",
+            reason="mapping_missing",
+            calibration_path=calibration_path,
+        )
+    declared_status = str(projection_validation_status or "").lower()
+    if declared_status != "validated":
+        status = (
+            declared_status
+            if declared_status
+            in {
+                "calibration_unverified",
+                "transform_ambiguous",
+                "resolution_mismatch",
+                "frame_alignment_unverified",
+            }
+            else "calibration_unverified"
+        )
+        return _blocked_projection(
+            status=status,
+            reason=status,
+            calibration_path=calibration_path,
+        )
+    if mapping_status != "verified":
+        return _blocked_projection(
+            status="calibration_unverified",
+            reason="mapping_missing",
+            calibration_path=calibration_path,
+        )
+    if primary_camera != "head":
+        return _blocked_projection(
+            status="calibration_unverified",
+            reason="unsupported_primary_camera",
+            calibration_path=calibration_path,
+        )
+    projection = mapping.get("projection")
+    if not isinstance(projection, Mapping):
+        return _blocked_projection(
+            status="transform_ambiguous",
+            reason="direct_head_transform_chain_not_explicit",
+            calibration_path=calibration_path,
+        )
+    trajectory_usage = projection.get("trajectory_usage")
+    direct_chain = (
+        projection.get("camera_name") == "head"
+        and projection.get("joints3d_coordinate_frame") == "head_camera"
+        and projection.get("joints3d_unit") == "meter"
+        and projection.get("projection_direction") == "direct_camera"
+        and trajectory_usage == "lineage_only"
+    )
+    if not direct_chain:
+        return _blocked_projection(
+            status="transform_ambiguous",
+            reason="direct_head_transform_chain_not_explicit",
+            calibration_path=calibration_path,
+            trajectory_usage=(
+                str(trajectory_usage) if trajectory_usage is not None else None
+            ),
+        )
+    if not trajectory_path.is_file():
+        return _blocked_projection(
+            status="calibration_unverified",
+            reason="missing_trajectory_lineage",
+            calibration_path=calibration_path,
+            trajectory_usage="lineage_only",
+        )
+    calibration_mapping = mapping.get("calibration")
+    calibration = load_calibration(
+        calibration_path,
+        "head",
+        calibration_mapping if isinstance(calibration_mapping, Mapping) else {},
+    )
+    if calibration.status != "verified":
+        return HeadProjectionValidation(
+            status="calibration_unverified",
+            reason=calibration.reason or "calibration_unverified",
+            calibration=calibration,
+            video_resolution=None,
+            frame_count=None,
+            trajectory_usage="lineage_only",
+        )
+
+    import cv2
+    import h5py
+
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        if not capture.isOpened():
+            return _blocked_projection(
+                status="calibration_unverified",
+                reason="head_video_unreadable",
+                calibration_path=calibration_path,
+                trajectory_usage="lineage_only",
+            )
+        video_width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        video_height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        video_frame_count = int(round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+    finally:
+        capture.release()
+    video_resolution = (video_width, video_height)
+    if min(video_width, video_height, video_frame_count) <= 0:
+        return _blocked_projection(
+            status="calibration_unverified",
+            reason="head_video_metadata_invalid",
+            calibration_path=calibration_path,
+            video_resolution=video_resolution,
+            frame_count=video_frame_count,
+            trajectory_usage="lineage_only",
+        )
+
+    try:
+        with h5py.File(hdf5_path, "r") as handle:
+            if reference_dataset not in handle:
+                raise ValueError("reference_dataset_missing")
+            reference_shape = handle[reference_dataset].shape
+            if not reference_shape:
+                raise ValueError("reference_dataset_has_no_frame_axis")
+            hdf5_frame_count = int(reference_shape[0])
+            for side in ("left", "right"):
+                name = f"hand/{side}/joints3d"
+                if name not in handle or handle[name].shape != (hdf5_frame_count, 21, 3):
+                    raise ValueError(f"{name}_shape_invalid")
+            declared_frame = str(handle.attrs.get("coordinate_frame") or "").strip()
+            declared_units = str(handle.attrs.get("units") or "").strip()
+    except (OSError, ValueError) as exc:
+        return _blocked_projection(
+            status="frame_alignment_unverified",
+            reason=str(exc),
+            calibration_path=calibration_path,
+            video_resolution=video_resolution,
+            frame_count=video_frame_count,
+            trajectory_usage="lineage_only",
+        )
+    if declared_frame and declared_frame != "head_camera":
+        return _blocked_projection(
+            status="transform_ambiguous",
+            reason="hdf5_coordinate_frame_conflicts_with_mapping",
+            calibration_path=calibration_path,
+            video_resolution=video_resolution,
+            frame_count=hdf5_frame_count,
+            trajectory_usage="lineage_only",
+        )
+    if declared_units and declared_units not in {"m", "meter", "meters"}:
+        return _blocked_projection(
+            status="transform_ambiguous",
+            reason="hdf5_units_conflict_with_mapping",
+            calibration_path=calibration_path,
+            video_resolution=video_resolution,
+            frame_count=hdf5_frame_count,
+            trajectory_usage="lineage_only",
+        )
+    if source_range != (0, hdf5_frame_count) or video_frame_count != hdf5_frame_count:
+        return _blocked_projection(
+            status="frame_alignment_unverified",
+            reason="hdf5_video_frame_count_mismatch",
+            calibration_path=calibration_path,
+            video_resolution=video_resolution,
+            frame_count=hdf5_frame_count,
+            trajectory_usage="lineage_only",
+        )
+
+    resolution_policy = projection.get("resolution_policy")
+    if calibration.resolution != video_resolution:
+        if resolution_policy != "scale_intrinsics":
+            return HeadProjectionValidation(
+                status="resolution_mismatch",
+                reason="calibration_video_resolution_mismatch",
+                calibration=calibration,
+                video_resolution=video_resolution,
+                frame_count=hdf5_frame_count,
+                trajectory_usage="lineage_only",
+            )
+        assert calibration.intrinsics is not None
+        from qc_common.projection import scale_intrinsics
+
+        calibration = Calibration(
+            "verified",
+            "head",
+            scale_intrinsics(
+                calibration.intrinsics,
+                calibration.resolution,
+                video_resolution,
+            ),
+            video_resolution,
+            calibration.source,
+        )
+    elif resolution_policy not in {"exact", "scale_intrinsics"}:
+        return HeadProjectionValidation(
+            status="resolution_mismatch",
+            reason="resolution_policy_missing",
+            calibration=calibration,
+            video_resolution=video_resolution,
+            frame_count=hdf5_frame_count,
+            trajectory_usage="lineage_only",
+        )
+    return HeadProjectionValidation(
+        status="validated",
+        reason="validated_direct_head_projection",
+        calibration=calibration,
+        video_resolution=video_resolution,
+        frame_count=hdf5_frame_count,
+        trajectory_usage="lineage_only",
+    )
+
+
+def project_dr_hands_for_frame(
+    hdf5_path: Path,
+    *,
+    source_frame: int,
+    clip_start_frame: int,
+    calibration: Calibration,
+) -> dict[str, dict[str, Any]]:
+    """Read one DR local HDF5 row and project both hands to head pixels."""
+    if (
+        calibration.status != "verified"
+        or calibration.intrinsics is None
+        or calibration.resolution is None
+    ):
+        raise ValueError("verified head calibration is required")
+    local_frame = int(source_frame) - int(clip_start_frame)
+    if local_frame < 0:
+        raise ValueError("source frame precedes clip start")
+
+    import h5py
+
+    projected_hands: dict[str, dict[str, Any]] = {}
+    with h5py.File(hdf5_path, "r") as handle:
+        for side in ("left", "right"):
+            joints_path = f"hand/{side}/joints3d"
+            valid_path = f"hand/{side}/valid"
+            if joints_path not in handle:
+                points = np.full((21, 3), np.nan, dtype=np.float64)
+                hand_valid = False
+                input_status = "missing_hand_input"
+                input_reason = f"missing_dataset:{joints_path}"
+            else:
+                dataset = handle[joints_path]
+                if dataset.ndim != 3 or dataset.shape[1:] != (21, 3):
+                    raise ValueError(f"{joints_path} must have shape (N, 21, 3)")
+                if local_frame >= dataset.shape[0]:
+                    raise ValueError(
+                        f"source frame {source_frame} maps outside {joints_path}"
+                    )
+                points = np.asarray(dataset[local_frame], dtype=np.float64)
+                hand_valid = True
+                if valid_path in handle:
+                    valid_dataset = handle[valid_path]
+                    if valid_dataset.ndim < 1 or local_frame >= valid_dataset.shape[0]:
+                        raise ValueError(
+                            f"source frame {source_frame} maps outside {valid_path}"
+                        )
+                    hand_valid = bool(
+                        np.asarray(valid_dataset[local_frame]).reshape(-1)[0]
+                    )
+                input_status = "valid"
+                input_reason = None
+            projection = project_points_to_image(
+                points,
+                calibration.intrinsics,
+                image_width=calibration.resolution[0],
+                image_height=calibration.resolution[1],
+            )
+            valid = np.asarray(projection["projection_valid"], dtype=bool)
+            if not hand_valid:
+                valid[:] = False
+            pixels = np.stack((projection["u"], projection["v"]), axis=1)
+            pixels = np.asarray(pixels, dtype=np.float64)
+            pixels[~valid] = np.nan
+            valid_count = int(np.sum(valid))
+            if input_status != "missing_hand_input":
+                if valid_count == 21:
+                    input_status = "valid"
+                elif valid_count == 0:
+                    input_status = "hand_invalid"
+                    input_reason = "hand_valid_false_or_no_projectable_points"
+                else:
+                    input_status = "partial_invalid"
+                    input_reason = "some_keypoints_not_projectable"
+            projected_hands[side] = {
+                "source_frame": int(source_frame),
+                "local_frame": local_frame,
+                "hand_side": side,
+                "points_3d": points,
+                "pixels": pixels,
+                "valid": valid,
+                "in_frame": np.asarray(projection["in_frame"], dtype=bool) & valid,
+                "projection_input_status": input_status,
+                "projection_input_reason": input_reason,
+            }
+    return projected_hands
+
+
 __all__ = [
     "Calibration",
+    "HeadProjectionValidation",
     "TrajectoryLoad",
     "TrajectoryPose",
     "load_calibration",
     "load_trajectory",
     "project_hand",
+    "project_dr_hands_for_frame",
+    "validate_head_projection_contract",
 ]

@@ -6,7 +6,10 @@ import json
 from pathlib import Path
 from threading import Lock
 import time
+from types import SimpleNamespace
 
+import h5py
+import numpy as np
 import pytest
 
 from qc_common.config import load_qc_acceptance_config
@@ -17,6 +20,7 @@ from qc_common.module_registry import (
 )
 from qc_pipeline.context import AssetContext
 from qc_pipeline.runners.sam3_containment import _source_path, runner
+from tests.fixtures import solid_frame, write_test_video
 
 
 def _write_candidates(tmp_path: Path, rows: list[dict[str, object]]) -> Path:
@@ -100,6 +104,116 @@ def _model_context(tmp_path: Path) -> tuple[AssetContext, Path]:
         ),
         model,
     )
+
+
+def _dr_context(
+    tmp_path: Path,
+    *,
+    invalid_depth: bool = False,
+    invalid_right_hand: bool = False,
+) -> AssetContext:
+    source = tmp_path / "source"
+    source.mkdir(parents=True, exist_ok=True)
+    with h5py.File(source / "task.h5", "w") as handle:
+        handle.attrs["coordinate_frame"] = "head_camera"
+        handle.attrs["units"] = "meters"
+        handle.create_dataset("timestamp", data=np.arange(3, dtype=float) / 10.0)
+        for side in ("left", "right"):
+            group = handle.create_group(f"hand/{side}")
+            points = np.zeros((3, 21, 3), dtype=np.float32)
+            points[..., 2] = 1.0
+            points[..., 0] = np.linspace(-0.1, 0.1, 21)
+            if side == "left" and invalid_depth:
+                points[1, 0, 2] = 0.0
+                points[1, 1, 0] = np.nan
+            group.create_dataset("joints3d", data=points)
+            valid = np.ones(3, dtype=np.uint8)
+            if side == "right" and invalid_right_hand:
+                valid[1] = 0
+            group.create_dataset("valid", data=valid)
+    write_test_video(
+        source / "head.mp4",
+        [solid_frame(50, width=100, height=80) for _ in range(3)],
+        fps=10.0,
+    )
+    (source / "calib.json").write_text(
+        json.dumps(
+            {
+                "head": {
+                    "K": [[100, 0, 50], [0, 100, 40], [0, 0, 1]],
+                    "width": 100,
+                    "height": 80,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "trajectory.csv").write_text("frame\n0\n1\n2\n", encoding="utf-8")
+    return AssetContext(
+        asset_id="asset-a",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-a.json",
+        source_files={
+            "video": {"path": "source/head.mp4"},
+            "head_video": {"path": "source/head.mp4"},
+            "hdf5": {"path": "source/task.h5"},
+            "calibration": {"path": "source/calib.json"},
+            "trajectory": {"path": "source/trajectory.csv"},
+        },
+        source_range=(0, 3),
+        metadata={
+            "supplier": "dr",
+            "primary_camera": "head",
+            "content_id": "content-abc",
+            "calibration_mapping_status": "mapped",
+            "projection_validation_status": "validated",
+            "hdf5_reference_dataset": "timestamp",
+            "manifest_row": {
+                "asset_id": "asset-a",
+                "supplier": "dr",
+                "start_frame": 0,
+                "end_frame": 2,
+            },
+        },
+    )
+
+
+def _dr_config():
+    config = load_qc_acceptance_config()
+    config.raw["modules"]["supplier_data_audit"]["parameters"]["suppliers"]["dr"] = {
+        "mapping_status": "verified",
+        "max_trajectory_gap_frames": 1,
+        "mapping": {
+            "projection": {
+                "camera_name": "head",
+                "joints3d_coordinate_frame": "head_camera",
+                "joints3d_unit": "meter",
+                "projection_direction": "direct_camera",
+                "trajectory_usage": "lineage_only",
+                "resolution_policy": "exact",
+            },
+            "calibration": {
+                "intrinsics_matrix_path": "head.K",
+                "width_path": "head.width",
+                "height_path": "head.height",
+            },
+        },
+    }
+    return config
+
+
+class _FullMaskSegmenter:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def segment_frame(self, frame, queries, config):
+        self.calls += 1
+        return [
+            SimpleNamespace(
+                mask=np.ones(frame.shape[:2], dtype=bool),
+                category="hand",
+            )
+        ]
 
 
 def _write_successful_sam3_outputs(output_dir: Path) -> None:
@@ -771,32 +885,199 @@ def test_dr_transform_ambiguity_is_preserved_as_block_reason(tmp_path: Path) -> 
     assert raised.value.reason == "transform_ambiguous"
 
 
-@pytest.mark.parametrize("candidate_rows", [[], [_candidate()]])
-def test_validated_dr_is_blocked_by_adapter_missing_before_candidate_count(
+def test_validated_dr_with_no_candidates_skips_before_model_load(
     tmp_path: Path,
-    candidate_rows: list[dict[str, object]],
 ) -> None:
-    base = _context(tmp_path, supplier="dr")
-    context = AssetContext(
-        base.asset_id,
-        base.batch_root,
-        base.report_path,
-        base.source_files,
-        source_range=base.source_range,
-        metadata={**dict(base.metadata), "projection_validation_status": "validated"},
-    )
-    _write_candidates(tmp_path, candidate_rows)
+    context = _dr_context(tmp_path)
+    _write_candidates(tmp_path, [])
     _write_current_run_config(context)
 
-    with pytest.raises(ModuleBlockedError, match="adapter_missing") as raised:
-        runner(
-            None,
-            segmenter_provider=lambda model, config: pytest.fail(
-                "missing DR adapter must not load model"
-            ),
-        )(context, load_qc_acceptance_config())
+    result = runner(lambda: pytest.fail("no candidates must not load model"))(
+        context,
+        _dr_config(),
+    )
 
-    assert raised.value.reason == "adapter_missing"
+    assert result.verdict == "skipped"
+    assert result.evaluation == {"decision": "skipped", "reason": "no_candidates"}
+
+
+def test_validated_dr_candidates_use_hdf5_calibration_without_jdt_parquet(
+    tmp_path: Path,
+) -> None:
+    context = _dr_context(tmp_path)
+    _write_candidates(tmp_path, [_candidate(0, 2)])
+    _write_current_run_config(context)
+    segmenter = _FullMaskSegmenter()
+
+    result = runner(lambda: segmenter)(context, _dr_config())
+
+    assert result.verdict == "pass"
+    assert segmenter.calls == 3
+    artifact = tmp_path / "module_outputs" / "asset-a" / "sam3_containment"
+    frame_rows = json.loads((artifact / "frame_results.json").read_text())
+    assert {row["hand_side"] for row in frame_rows} == {"left"}
+    assert {row["frame_idx"] for row in frame_rows} == {0, 1, 2}
+    assert {row["projection_mode"] for row in frame_rows} == {
+        "dr_head_direct_calibration"
+    }
+    assert {row["camera_id"] for row in frame_rows} == {"main"}
+    assert all("parquet_path" not in row for row in frame_rows)
+    assert all(row["hdf5_path"].endswith("source/task.h5") for row in frame_rows)
+
+
+def test_dr_invalid_depth_nan_and_invalid_hand_are_recorded(
+    tmp_path: Path,
+) -> None:
+    context = _dr_context(
+        tmp_path,
+        invalid_depth=True,
+        invalid_right_hand=True,
+    )
+    _write_candidates(
+        tmp_path,
+        [{**_candidate(1, 1), "hand_side": "both"}],
+    )
+    _write_current_run_config(context)
+
+    runner(lambda: _FullMaskSegmenter())(context, _dr_config())
+
+    frame_rows = json.loads(
+        (
+            tmp_path
+            / "module_outputs"
+            / "asset-a"
+            / "sam3_containment"
+            / "frame_results.json"
+        ).read_text()
+    )
+    by_side = {row["hand_side"]: row for row in frame_rows}
+    assert len(by_side["left"]["invalid_projected_joint_names"]) == 2
+    assert by_side["left"]["projection_input_status"] == "partial_invalid"
+    assert len(by_side["right"]["invalid_projected_joint_names"]) == 21
+    assert by_side["right"]["projection_input_status"] == "hand_invalid"
+
+
+def test_dr_hard_presence_failure_blocks_before_model_load(tmp_path: Path) -> None:
+    context = _dr_context(tmp_path)
+    candidate_path = _write_candidates(tmp_path, [_candidate(0, 2)])
+    _write_current_run_config(context)
+    (candidate_path.parent / "check_results.json").write_text(
+        json.dumps(
+            [
+                {
+                    "pipeline_module": "keypoint_presence",
+                    "check": "keypoint_missing",
+                    "episode_idx": 0,
+                    "frame_idx": 1,
+                    "flag": False,
+                    "severity": None,
+                    "reason": "missing or invalid hand keypoints",
+                    "metrics": {
+                        "missing_keypoint_count_left": 1.0,
+                        "missing_keypoint_count_right": 0.0,
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ModuleBlockedError, match="invalid_keypoint_input") as raised:
+        runner(lambda: pytest.fail("hard-invalid keypoints must not load SAM3"))(
+            context,
+            _dr_config(),
+        )
+
+    assert raised.value.reason == "invalid_keypoint_input"
+
+
+def test_dr_out_of_bounds_candidate_is_rejected_before_model_load(
+    tmp_path: Path,
+) -> None:
+    context = _dr_context(tmp_path)
+    _write_candidates(tmp_path, [_candidate(0, 3)])
+    _write_current_run_config(context)
+
+    with pytest.raises(ModuleInputError, match="outside clip"):
+        runner(lambda: pytest.fail("invalid DR candidate must not load SAM3"))(
+            context,
+            _dr_config(),
+        )
+
+
+def test_dr_assets_reuse_injected_run_scoped_segmenter_provider(
+    tmp_path: Path,
+) -> None:
+    from qc_pipeline.sam3_runtime import Sam3RuntimeProvider
+
+    context = _dr_context(tmp_path)
+    model = tmp_path / "source" / "sam3-model"
+    model.mkdir()
+    (model / "config.json").write_text("{}\n", encoding="utf-8")
+    context = replace(
+        context,
+        source_files={
+            **dict(context.source_files),
+            "sam3_model": {"path": "source/sam3-model"},
+        },
+        metadata={**dict(context.metadata), "reuse_artifacts": False},
+    )
+    _write_candidates(tmp_path, [_candidate(0, 2)])
+    _write_current_run_config(context)
+    factory_calls = 0
+
+    def factory(path: Path, config: dict[str, object]) -> _FullMaskSegmenter:
+        nonlocal factory_calls
+        factory_calls += 1
+        assert path == model.resolve()
+        return _FullMaskSegmenter()
+
+    provider = Sam3RuntimeProvider(factory=factory)
+    dr_runner = runner(None, segmenter_provider=provider.get_segmenter)
+
+    first = dr_runner(context, _dr_config())
+    second = dr_runner(context, _dr_config())
+
+    assert first.verdict == "pass"
+    assert second.verdict == "pass"
+    assert factory_calls == 1
+
+
+def test_dr_projection_reads_local_frame_once_for_source_coordinate(
+    tmp_path: Path,
+) -> None:
+    from acceptance_pull.supplier_adapters.deepreach_projection import (
+        Calibration,
+        project_dr_hands_for_frame,
+    )
+
+    hdf5 = tmp_path / "clip.h5"
+    with h5py.File(hdf5, "w") as handle:
+        for side in ("left", "right"):
+            group = handle.create_group(f"hand/{side}")
+            points = np.zeros((6, 21, 3), dtype=np.float32)
+            points[..., 2] = 1.0
+            points[:, :, 0] = np.arange(6)[:, None] / 10.0
+            group.create_dataset("joints3d", data=points)
+    calibration = Calibration(
+        "verified",
+        "head",
+        np.asarray([[100, 0, 50], [0, 100, 40], [0, 0, 1]], dtype=float),
+        (100, 80),
+        "calib.json",
+    )
+
+    projected = project_dr_hands_for_frame(
+        hdf5,
+        source_frame=105,
+        clip_start_frame=100,
+        calibration=calibration,
+    )
+
+    assert projected["left"]["source_frame"] == 105
+    assert projected["left"]["local_frame"] == 5
+    assert projected["left"]["pixels"].shape == (21, 2)
+    assert projected["left"]["pixels"][0].tolist() == pytest.approx([100.0, 40.0])
 
 
 def test_potentia_is_blocked_by_no_keypoint_input_before_candidate_lookup(

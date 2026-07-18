@@ -179,9 +179,7 @@ def load_deepreach_clip(
     with h5py.File(path, "r") as handle:
         required = [
             "timestamp",
-            "hand/left/valid",
             "hand/left/joints3d",
-            "hand/right/valid",
             "hand/right/joints3d",
         ]
         missing = [name for name in required if name not in handle]
@@ -194,6 +192,8 @@ def load_deepreach_clip(
             )
         source_slice = slice(start_frame, end_frame + 1)
         side_joints: dict[str, np.ndarray] = {}
+        side_raw_joints: dict[str, np.ndarray] = {}
+        side_joint_valid: dict[str, np.ndarray] = {}
         for side in ("left", "right"):
             joints = np.asarray(
                 handle[f"hand/{side}/joints3d"][source_slice],
@@ -203,14 +203,24 @@ def load_deepreach_clip(
                 raise ValueError(
                     f"hand/{side}/joints3d must have shape (N, 21, 3)"
                 )
-            valid = np.asarray(
-                handle[f"hand/{side}/valid"][source_slice]
-            ).reshape(-1)
-            if valid.shape[0] != joints.shape[0]:
-                raise ValueError(f"hand/{side}/valid length mismatch")
-            joints = joints.copy()
-            joints[~valid.astype(bool)] = np.nan
-            side_joints[side] = joints
+            valid_path = f"hand/{side}/valid"
+            if valid_path in handle:
+                valid = np.asarray(handle[valid_path][source_slice]).reshape(-1)
+                if valid.shape[0] != joints.shape[0]:
+                    raise ValueError(f"{valid_path} length mismatch")
+                hand_valid = valid.astype(bool)
+            else:
+                hand_valid = np.ones(joints.shape[0], dtype=np.bool_)
+            raw_joints = joints.copy()
+            joint_valid = (
+                hand_valid[:, np.newaxis]
+                & np.isfinite(raw_joints).all(axis=-1)
+            )
+            checked_joints = raw_joints.copy()
+            checked_joints[~joint_valid] = np.nan
+            side_raw_joints[side] = raw_joints
+            side_joint_valid[side] = joint_valid
+            side_joints[side] = checked_joints
         fps = float(row.get("fps") or handle.attrs.get("fps") or 29.97)
         hdf5_task = _text(handle.attrs.get("task"))
         coordinate_frame = _text(handle.attrs.get("coordinate_frame"))
@@ -230,6 +240,14 @@ def load_deepreach_clip(
         quality_hand=None,
         instruction=text_label["subtask_description"] or text_label["task"],
         text_label=text_label,
+        hand_keypoints_3d=np.stack(
+            (side_raw_joints["left"], side_raw_joints["right"]),
+            axis=1,
+        ).astype(np.float32, copy=False),
+        hand_joint_valid_3d=np.stack(
+            (side_joint_valid["left"], side_joint_valid["right"]),
+            axis=1,
+        ).astype(np.bool_, copy=False),
         fps=fps,
     )
     setattr(clip, "source_frame_count", source_frame_count)

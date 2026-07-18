@@ -65,11 +65,19 @@ def precheck_fingerprint(
     fingerprint["temporal_output_schema_version"] = (
         _TEMPORAL_OUTPUT_SCHEMA_VERSION
     )
-    fingerprint["source_contract"] = {
+    source_contract: dict[str, Any] = {
         "hdf5_reference_dataset": context.metadata.get(
             "hdf5_reference_dataset"
         )
     }
+    supplier = str(
+        context.metadata.get("supplier")
+        or context.metadata.get("supplier_id")
+        or ""
+    ).lower()
+    if supplier in {"dr", "deepreach"}:
+        source_contract["supplier_adapter"] = "deepreach-hdf5-precheck-v2"
+    fingerprint["source_contract"] = source_contract
     return fingerprint
 
 
@@ -170,7 +178,31 @@ def _load_clip(context: AssetContext, module: str) -> Any:
         or context.metadata.get("supplier_id")
         or ""
     ).lower()
-    if supplier == "jdt" or _source_entry(context, "parquet") is not None:
+    if supplier in {"dr", "deepreach"}:
+        if source_range is None:
+            raise ModulePrerequisiteError(module, "source_range for DeepReach precheck")
+        from tools.run_manifest_precheck import load_deepreach_clip
+        from acceptance_pull.supplier_adapters.deepreach_hdf5 import (
+            DeepReachFrameContractError,
+        )
+
+        hdf5 = _source_path(context, module, "hdf5")
+        start, end = source_range
+        row = {
+            **dict(context.metadata),
+            "asset_id": context.asset_id,
+            "start_frame": start,
+            "end_frame": end - 1,
+            "hdf5_path": str(hdf5),
+        }
+        try:
+            return load_deepreach_clip(row, episode_idx=0)
+        except (DeepReachFrameContractError, OSError, ValueError) as exc:
+            raise ModuleInputError(module, str(exc)) from exc
+
+    if supplier == "jdt" or (
+        not supplier and _source_entry(context, "parquet") is not None
+    ):
         if source_range is None:
             raise ModulePrerequisiteError(module, "source_range for parquet precheck")
         from tools.run_manifest_precheck import load_jdt_clip
@@ -186,27 +218,6 @@ def _load_clip(context: AssetContext, module: str) -> Any:
         return load_jdt_clip(row, episode_idx=0)
 
     hdf5 = _source_path(context, module, "hdf5")
-    if supplier in {"dr", "deepreach"}:
-        if source_range is None:
-            raise ModulePrerequisiteError(module, "source_range for DeepReach precheck")
-        from tools.run_manifest_precheck import load_deepreach_clip
-        from acceptance_pull.supplier_adapters.deepreach_hdf5 import (
-            DeepReachFrameContractError,
-        )
-
-        start, end = source_range
-        row = {
-            **dict(context.metadata),
-            "asset_id": context.asset_id,
-            "start_frame": start,
-            "end_frame": end - 1,
-            "hdf5_path": str(hdf5),
-        }
-        try:
-            return load_deepreach_clip(row, episode_idx=0)
-        except DeepReachFrameContractError as exc:
-            raise ModuleInputError(module, str(exc)) from exc
-
     from precheck.adapters import load_precheck_inputs
 
     clips = load_precheck_inputs(hdf5, episode_idx=0)
@@ -221,6 +232,61 @@ def _load_clip(context: AssetContext, module: str) -> Any:
         setattr(clip, "clip_start_frame", 0)
         setattr(clip, "clip_end_frame", max(clip.num_frames - 1, 0))
     return clip
+
+
+def _normalize_dr_hard_presence_results(
+    context: AssetContext,
+    module: str,
+    results: list[Any],
+) -> list[Any]:
+    """Make the DR 21-point existence contract explicit at the runner boundary."""
+    supplier = str(
+        context.metadata.get("supplier")
+        or context.metadata.get("supplier_id")
+        or ""
+    ).lower()
+    if supplier not in {"dr", "deepreach"} or module != "keypoint_presence":
+        return results
+
+    normalized: list[Any] = []
+    for row in results:
+        if getattr(row, "check", None) != "keypoint_missing":
+            normalized.append(row)
+            continue
+        metrics = dict(getattr(row, "metrics", {}) or {})
+        invalid_sides: list[str] = []
+        for side in ("left", "right"):
+            missing_value = metrics.get(f"missing_keypoint_count_{side}")
+            valid_value = metrics.get(f"valid_keypoint_count_{side}")
+            try:
+                missing = float(missing_value) > 0.0
+            except (TypeError, ValueError):
+                missing = False
+            try:
+                incomplete = float(valid_value) < 21.0
+            except (TypeError, ValueError):
+                incomplete = False
+            invalid = bool(
+                metrics.get(f"keypoint_existence_invalid_{side}")
+            ) or missing or incomplete
+            metrics[f"keypoint_existence_invalid_{side}"] = invalid
+            if invalid:
+                invalid_sides.append(side)
+                metrics.setdefault(
+                    f"invalid_reasons_{side}",
+                    ["canonical_validity_or_nonfinite"],
+                )
+        normalized.append(
+            replace(
+                row,
+                metrics=metrics,
+                flag=True,
+                severity="fail",
+            )
+            if invalid_sides
+            else replace(row, metrics=metrics)
+        )
+    return normalized
 
 
 def _run_module_on_clip(
@@ -261,6 +327,7 @@ def _run_module_on_clip(
         )
         for row in results
     ]
+    results = _normalize_dr_hard_presence_results(context, module, results)
     candidates: list[Mapping[str, Any]] = []
     if module == "keypoint_temporal":
         source_path = _source_relative_path(context)
