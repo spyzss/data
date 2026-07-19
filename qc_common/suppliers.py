@@ -9,6 +9,8 @@ _ALIASES = {
     "dr": ("dr", "DR"),
     "deepreach": ("dr", "DR"),
     "potentia": ("potentia", "Potentia"),
+    "qy": ("qy", "QY"),
+    "qingyu": ("qy", "QY"),
 }
 
 

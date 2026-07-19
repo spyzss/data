@@ -1,0 +1,11 @@
+schema_version: qy.camera_selection.v1
+minimum_hand_coverage: 0.90
+minimum_both_hand_coverage: 0.85
+minimum_valid_joint_ratio: 0.95
+minimum_timeline_match_ratio: 0.99
+tie_tolerance: 0.01
+weights:
+  minimum_hand_coverage: 0.35
+  both_hand_coverage: 0.30
+  valid_joint_ratio: 0.20
+  timeline_match_ratio: 0.15

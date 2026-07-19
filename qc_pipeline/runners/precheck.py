@@ -42,15 +42,36 @@ class PrecheckModuleExecution:
     candidate_windows: tuple[Mapping[str, Any], ...] = ()
 
 
+def _precheck_source_names(context: AssetContext) -> tuple[str, ...]:
+    supplier = str(
+        context.metadata.get("supplier")
+        or context.metadata.get("supplier_id")
+        or ""
+    ).lower()
+    if supplier in {"qy", "qingyu"}:
+        return (
+            "observations_2d",
+            "trajectory_3d",
+            "coordinate_system",
+            "timebase",
+        )
+    return tuple(
+        name for name in ("hdf5", "parquet") if name in context.source_files
+    )
+
+
 def precheck_fingerprint(
     context: AssetContext,
     config: LoadedQcConfig,
 ) -> dict[str, Any]:
     from qc_pipeline.artifacts import build_run_fingerprint
 
-    source_names = tuple(
-        name for name in ("hdf5", "parquet") if name in context.source_files
-    )
+    supplier = str(
+        context.metadata.get("supplier")
+        or context.metadata.get("supplier_id")
+        or ""
+    ).lower()
+    source_names = _precheck_source_names(context)
     fingerprint = build_run_fingerprint(
         context=context,
         producer="precheck",
@@ -70,13 +91,12 @@ def precheck_fingerprint(
             "hdf5_reference_dataset"
         )
     }
-    supplier = str(
-        context.metadata.get("supplier")
-        or context.metadata.get("supplier_id")
-        or ""
-    ).lower()
     if supplier in {"dr", "deepreach"}:
         source_contract["supplier_adapter"] = "deepreach-hdf5-precheck-v2"
+    elif supplier in {"qy", "qingyu"}:
+        source_contract["supplier_adapter"] = "qingyu-hand-pose-precheck-v2"
+        source_contract["frame_mapping"] = "explicit-source-step-v1"
+        source_contract["joint_topology"] = "unverified-no-anatomical-remap"
     fingerprint["source_contract"] = source_contract
     return fingerprint
 
@@ -98,11 +118,13 @@ def _source_path(context: AssetContext, module: str, name: str) -> Path:
 
 
 def _source_relative_path(context: AssetContext) -> str:
-    for name in ("hdf5", "parquet"):
+    for name in ("hdf5", "parquet", "trajectory_3d"):
         entry = _source_entry(context, name)
         if entry is not None and isinstance(entry.get("path"), str):
             return str(entry["path"])
-    raise ModulePrerequisiteError("precheck", "hdf5 or parquet source path")
+    raise ModulePrerequisiteError(
+        "precheck", "hdf5, parquet, or trajectory_3d source path"
+    )
 
 
 def _slice_clip(clip: Any, source_range: tuple[int, int]) -> Any:
@@ -147,6 +169,9 @@ def _slice_clip(clip: Any, source_range: tuple[int, int]) -> Any:
         "source_path",
         "supplier_quality_signal",
         "morphology_status",
+        "joint_topology_status",
+        "topology_agnostic_joint_names",
+        "metric_coordinate_status",
     ):
         if hasattr(clip, name):
             setattr(selected, name, getattr(clip, name))
@@ -200,6 +225,31 @@ def _load_clip(context: AssetContext, module: str) -> Any:
         except (DeepReachFrameContractError, OSError, ValueError) as exc:
             raise ModuleInputError(module, str(exc)) from exc
 
+    if supplier in {"qy", "qingyu"}:
+        if source_range is None:
+            raise ModulePrerequisiteError(module, "source_range for QY precheck")
+        from acceptance_pull.supplier_adapters.qingyu_hand_pose import (
+            load_qingyu_clip,
+        )
+
+        start, end = source_range
+        row = {
+            **dict(context.metadata),
+            "asset_id": context.asset_id,
+            "start_frame": start,
+            "end_frame": end - 1,
+            "observations_2d_path": str(
+                _source_path(context, module, "observations_2d")
+            ),
+            "trajectory_3d_path": str(
+                _source_path(context, module, "trajectory_3d")
+            ),
+        }
+        try:
+            return load_qingyu_clip(row, episode_idx=0)
+        except (OSError, ValueError) as exc:
+            raise ModuleInputError(module, str(exc)) from exc
+
     if supplier == "jdt" or (
         not supplier and _source_entry(context, "parquet") is not None
     ):
@@ -239,13 +289,13 @@ def _normalize_dr_hard_presence_results(
     module: str,
     results: list[Any],
 ) -> list[Any]:
-    """Make the DR 21-point existence contract explicit at the runner boundary."""
+    """Make required supplier 21-point contracts explicit at the boundary."""
     supplier = str(
         context.metadata.get("supplier")
         or context.metadata.get("supplier_id")
         or ""
     ).lower()
-    if supplier not in {"dr", "deepreach"} or module != "keypoint_presence":
+    if supplier not in {"dr", "deepreach", "qy", "qingyu"} or module != "keypoint_presence":
         return results
 
     normalized: list[Any] = []
@@ -297,6 +347,89 @@ def _run_module_on_clip(
 ) -> PrecheckModuleExecution:
     if module not in MODULES:
         raise ValueError(f"unsupported precheck module: {module}")
+
+    qy_supplier = str(context.metadata.get("supplier") or "").lower() in {
+        "qy",
+        "qingyu",
+    }
+    topology_unverified = (
+        str(getattr(clip, "joint_topology_status", "")) != "verified"
+    )
+    coordinate_unverified = (
+        str(getattr(clip, "metric_coordinate_status", ""))
+        != "verified_declared_camera_frame_meters_stable_reference"
+    )
+    if qy_supplier and (
+        (module == "keypoint_morphology" and topology_unverified)
+        or (module == "keypoint_temporal" and coordinate_unverified)
+    ):
+        from qc_common.types import CheckResult
+
+        if module == "keypoint_morphology":
+            raw = (
+                CheckResult(
+                    check="keypoint_morphology",
+                    episode_idx=int(getattr(clip, "episode_idx", 0)),
+                    frame_idx=-1,
+                    metrics={
+                        "morphology_verdict": "review",
+                        "joint_topology_status": "unverified",
+                    },
+                    flag=None,
+                    reason="qy_joint_topology_unverified",
+                    severity="uncalibrated",
+                ),
+            )
+            result = _adapt_module(
+                context,
+                config,
+                module,
+                raw,
+                (),
+                artifact_state="computed",
+            )
+            result = replace(
+                result,
+                evaluation={
+                    **dict(result.evaluation),
+                    "decision": "review",
+                    "output_status": "no_valid_output",
+                    "reason": "qy_joint_topology_unverified",
+                },
+            )
+            return PrecheckModuleExecution(result, raw)
+        source_frames = tuple(
+            int(value)
+            for value in getattr(clip, "source_frame_indices", clip.frame_indices)
+        )
+        raw = tuple(
+            CheckResult(
+                check="skeleton_quality_score",
+                episode_idx=int(getattr(clip, "episode_idx", 0)),
+                frame_idx=source_frame,
+                metrics={
+                    "temporal_output_valid": False,
+                    "joint_topology_status": "unverified",
+                },
+                flag=None,
+                reason=(
+                    "qy_joint_topology_unverified"
+                    if module == "keypoint_morphology"
+                    else "qy_metric_coordinate_mapping_unverified"
+                ),
+                severity="uncalibrated",
+            )
+            for source_frame in source_frames
+        )
+        result = _adapt_module(
+            context,
+            config,
+            module,
+            raw,
+            (),
+            artifact_state="computed",
+        )
+        return PrecheckModuleExecution(result, raw, ())
 
     from precheck.runner import PrecheckRunner
     from qc_pipeline.adapters.precheck import precheck_config_from_unified
@@ -507,10 +640,10 @@ class PrecheckSession:
         self._cache_checked = True
         if not bool(self.context.metadata.get("reuse_artifacts", True)):
             return
-        for source_name in ("hdf5", "parquet"):
+        for source_name in _precheck_source_names(self.context):
             source = _source_entry(self.context, source_name)
             if source is None or source.get("path") is None:
-                continue
+                return
             if not (self.context.batch_root / str(source["path"])).is_file():
                 return
         from qc_common.types import CheckResult

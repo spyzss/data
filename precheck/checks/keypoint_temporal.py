@@ -45,7 +45,15 @@ class KeypointTemporalCheck(BaseCheck):
             return []
 
         all_joint_names = sorted(keypoints)
-        joint_names = self.joint_names or select_hand_joints(all_joint_names, self.sides)
+        topology_agnostic = getattr(
+            clip, "topology_agnostic_joint_names", None
+        )
+        joint_names = (
+            list(topology_agnostic)
+            if topology_agnostic is not None
+            else self.joint_names
+            or select_hand_joints(all_joint_names, self.sides)
+        )
         joint_names = [name for name in joint_names if name in keypoints]
         if not joint_names:
             return []

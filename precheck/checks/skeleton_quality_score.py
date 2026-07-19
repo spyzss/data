@@ -270,6 +270,17 @@ class SkeletonQualityScoreCheck(BaseCheck):
                         "skeleton_decision_source": source,
                         "sustained_review_promoted": 0.0,
                         "skeleton_decision_mode": self.decision_mode,
+                        "joint_topology_status": str(
+                            getattr(clip, "joint_topology_status", "verified")
+                        ),
+                        "topology_dependent_metrics_status": (
+                            "uncalibrated"
+                            if str(
+                                getattr(clip, "joint_topology_status", "verified")
+                            )
+                            != "verified"
+                            else "valid"
+                        ),
                         **{
                             key: temporal_result.metrics[key]
                             for key in (
@@ -413,6 +424,36 @@ class SkeletonQualityScoreCheck(BaseCheck):
         clip: ClipInputs,
         frame_offset: int,
     ) -> dict[str, float]:
+        if (
+            str(getattr(clip, "joint_topology_status", "verified"))
+            != "verified"
+            and clip.hand_joint_valid_3d is not None
+            and clip.hand_keypoints_3d is not None
+        ):
+            valid = np.asarray(clip.hand_joint_valid_3d, dtype=bool)
+            points = np.asarray(clip.hand_keypoints_3d, dtype=np.float64)
+            metrics: dict[str, float] = {
+                "keypoint_presence_invalid": 0.0,
+                "low_quality_hand_invalid": 0.0,
+            }
+            invalid = False
+            for side_index, side in enumerate(("left", "right")):
+                if frame_offset >= valid.shape[0] or frame_offset >= points.shape[0]:
+                    valid_count = 0
+                else:
+                    finite = np.isfinite(points[frame_offset, side_index]).all(axis=-1)
+                    valid_count = int(
+                        np.sum(valid[frame_offset, side_index] & finite)
+                    )
+                missing_count = 21 - valid_count
+                metrics[f"valid_keypoint_count_{side}"] = float(valid_count)
+                metrics[f"missing_keypoint_count_{side}"] = float(missing_count)
+                metrics[f"low_quality_hand_{side}"] = 0.0
+                if missing_count > self.allowed_missing_keypoints_per_hand:
+                    invalid = invalid or self.reject_missing_keypoints
+            metrics["keypoint_presence_invalid"] = float(invalid)
+            return metrics
+
         keypoints = clip.keypoints or {}
         quality_hand = clip.quality_hand
         metrics: dict[str, float] = {

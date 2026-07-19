@@ -19,6 +19,7 @@
     },
     "config_name": {"const": "acceptance_gate"},
     "acceptance_policy": {"$ref": "#/$defs/acceptancePolicy"},
+    "supplier_adapters": {"$ref": "#/$defs/supplierAdapters"},
     "execution_profiles": {
       "type": "object",
       "minProperties": 1,
@@ -89,6 +90,57 @@
     }
   ],
   "$defs": {
+    "supplierAdapters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "qy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["camera_selection"],
+          "properties": {
+            "camera_selection": {"$ref": "#/$defs/qyCameraSelection"}
+          }
+        }
+      }
+    },
+    "qyCameraSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "minimum_hand_coverage",
+        "minimum_both_hand_coverage",
+        "minimum_valid_joint_ratio",
+        "minimum_timeline_match_ratio",
+        "tie_tolerance",
+        "weights"
+      ],
+      "properties": {
+        "schema_version": {"const": "qy.camera_selection.v1"},
+        "minimum_hand_coverage": {"type": "number", "minimum": 0, "maximum": 1},
+        "minimum_both_hand_coverage": {"type": "number", "minimum": 0, "maximum": 1},
+        "minimum_valid_joint_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        "minimum_timeline_match_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        "tie_tolerance": {"type": "number", "minimum": 0, "maximum": 1},
+        "weights": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "minimum_hand_coverage",
+            "both_hand_coverage",
+            "valid_joint_ratio",
+            "timeline_match_ratio"
+          ],
+          "properties": {
+            "minimum_hand_coverage": {"type": "number", "minimum": 0},
+            "both_hand_coverage": {"type": "number", "minimum": 0},
+            "valid_joint_ratio": {"type": "number", "minimum": 0},
+            "timeline_match_ratio": {"type": "number", "minimum": 0}
+          }
+        }
+      }
+    },
     "acceptancePolicy": {
       "type": "object",
       "additionalProperties": false,

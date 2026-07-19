@@ -41,6 +41,23 @@ _REQUIRED_SOURCES = {
         "imu",
         "calibration",
     ),
+    "qy": (
+        "video",
+        "episode_manifest",
+        "observations_2d",
+        "trajectory_3d",
+        "coordinate_system",
+        "quality",
+        "timebase",
+        "semantic",
+        "review_video",
+        "qy_left_cam_left_video",
+        "qy_left_cam_right_video",
+        "qy_mid_cam_left_video",
+        "qy_mid_cam_right_video",
+        "qy_right_cam_left_video",
+        "qy_right_cam_right_video",
+    ),
 }
 
 
@@ -50,8 +67,12 @@ def _inventory_entry(context: AssetContext, source_name: str) -> dict[str, Any]:
     if not isinstance(value, str) or not value.strip():
         return {"status": "missing", "path": None}
     path = context.batch_root / value
+    supplier = str(context.metadata.get("supplier") or "").lower()
+    status = "present" if path.exists() else "missing"
+    if supplier in {"qy", "qingyu"} and path.exists() and not path.is_file():
+        status = "wrong_type"
     return {
-        "status": "present" if path.exists() else "missing",
+        "status": status,
         "path": value,
         "kind": "directory" if path.is_dir() else "file",
     }
@@ -119,11 +140,19 @@ def audit_supplier_data(
         for source_name, item in inventory.items()
         if item["status"] != "present"
     ]
-    mapping_status = (
-        str(supplier_config.get("mapping_status") or "unverified")
-        if isinstance(supplier_config, Mapping)
-        else "unverified"
-    )
+    if supplier == "qy":
+        mapping_status = (
+            "verified"
+            if str(context.metadata.get("frame_mapping_status") or "")
+            == "verified"
+            else "unverified"
+        )
+    else:
+        mapping_status = (
+            str(supplier_config.get("mapping_status") or "unverified")
+            if isinstance(supplier_config, Mapping)
+            else "unverified"
+        )
     issues: list[dict[str, Any]] = [
         {
             "code": "required_source_missing",
@@ -133,6 +162,17 @@ def audit_supplier_data(
         }
         for source_name in missing
     ]
+    if supplier == "qy":
+        for source_name, item in inventory.items():
+            if item["status"] == "wrong_type":
+                issues.append(
+                    {
+                        "code": "required_source_wrong_type",
+                        "severity": "fail",
+                        "source_name": source_name,
+                        "observed_value": item.get("kind"),
+                    }
+                )
     if supplier == "dr" and str(
         context.metadata.get("primary_camera_status") or "present"
     ) == "primary_camera_missing":
@@ -144,6 +184,60 @@ def audit_supplier_data(
                 "observed_value": context.metadata.get("primary_camera"),
             }
         )
+    if supplier == "qy":
+        if not str(context.metadata.get("primary_camera") or "").strip():
+            issues.append(
+                {
+                    "code": "primary_camera_missing",
+                    "severity": "fail",
+                    "source_name": "video",
+                    "observed_value": None,
+                }
+            )
+        skeleton_status = str(
+            context.metadata.get("skeleton_3d_status") or "input_missing"
+        )
+        if skeleton_status in {"no_valid_output", "input_missing"}:
+            issues.append(
+                {
+                    "code": "required_skeleton_input_missing",
+                    "severity": "fail",
+                    "source_name": "trajectory_3d",
+                    "observed_value": skeleton_status,
+                }
+            )
+        elif skeleton_status == "input_invalid":
+            issues.append(
+                {
+                    "code": "required_skeleton_input_invalid",
+                    "severity": "fail",
+                    "source_name": "trajectory_3d",
+                    "observed_value": skeleton_status,
+                }
+            )
+        if str(context.metadata.get("joint_topology_status") or "") != "verified":
+            issues.append(
+                {
+                    "code": "joint_topology_unverified",
+                    "severity": "warn",
+                    "source_name": "trajectory_3d",
+                    "observed_value": context.metadata.get(
+                        "joint_topology_status"
+                    ),
+                }
+            )
+        coordinate_status = str(
+            context.metadata.get("coordinate_system_status") or ""
+        )
+        if coordinate_status.endswith("schema_unverified"):
+            issues.append(
+                {
+                    "code": "coordinate_system_schema_unverified",
+                    "severity": "warn",
+                    "source_name": "coordinate_system",
+                    "observed_value": coordinate_status,
+                }
+            )
     if mapping_status != "verified":
         issues.append(
             {
@@ -181,6 +275,40 @@ def audit_supplier_data(
             effective_mapping,
             supplier_config,
         )
+    elif supplier == "qy":
+        structured = {
+            "timebase_status": context.metadata.get("timebase_status"),
+            "frame_mapping_status": context.metadata.get(
+                "frame_mapping_status"
+            ),
+            "skeleton_2d_status": context.metadata.get("skeleton_2d_status"),
+            "skeleton_3d_status": context.metadata.get("skeleton_3d_status"),
+            "skeleton_3d_coverage_status": context.metadata.get(
+                "skeleton_3d_coverage_status"
+            ),
+            "skeleton_3d_valid_row_count": context.metadata.get(
+                "skeleton_3d_valid_row_count"
+            ),
+            "joint_topology_status": context.metadata.get(
+                "joint_topology_status"
+            ),
+            "coordinate_system_status": context.metadata.get(
+                "coordinate_system_status"
+            ),
+            "reference_camera_status": context.metadata.get(
+                "reference_camera_status"
+            ),
+            "primary_camera": context.metadata.get("primary_camera"),
+            "primary_camera_source": context.metadata.get(
+                "primary_camera_source"
+            ),
+            "camera_coverage": context.metadata.get("camera_coverage"),
+        }
+        supplier_quality_signal = {
+            "status": "auxiliary_only",
+            "value": None,
+            "source": "trajectory_3d supplier quality fields",
+        }
     for name, result in _structured_status_results(structured):
         if not isinstance(result, Mapping):
             continue

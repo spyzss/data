@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import shutil
@@ -28,6 +28,17 @@ from qc_pipeline.sam3_runtime import SegmenterProvider
 _IMPLEMENTATION_VERSION = "sam3-containment-producer-v2"
 _MODEL_IDENTITY_FILES = ("config.json", "model.safetensors", "sam3.pt")
 _MODEL_HASH_FILES = ("config.json",)
+
+
+@dataclass(frozen=True)
+class _QyContainmentInputs:
+    video_path: Path
+    observations_path: Path
+    timebase_path: Path
+    primary_camera: str
+    timebase: Mapping[str, Any]
+    direct_2d: Mapping[tuple[int, str], Mapping[str, Any]]
+    sampled_frames: Mapping[int, tuple[int, ...]]
 
 
 def _source_entry(context: AssetContext, name: str) -> Mapping[str, Any] | None:
@@ -528,6 +539,288 @@ def _run_dr_containment(
     return frame_rows, window_summaries, failures, evidence_rows, producer_run_config
 
 
+def _qy_containment_inputs(
+    context: AssetContext,
+    candidate_rows: list[dict[str, Any]],
+) -> _QyContainmentInputs:
+    from acceptance_pull.supplier_adapters.qingyu import load_qingyu_timebase
+    from acceptance_pull.supplier_adapters.qingyu_hand_pose import (
+        QingyuHandPoseSession,
+    )
+    from tools.run_manifest_sam3_containment import sample_manifest_window_frames
+
+    if context.source_range is None:
+        raise ModuleBlockedError("sam3_containment", "frame_mapping_unverified")
+    primary_camera = str(context.metadata.get("primary_camera") or "").strip()
+    if not primary_camera:
+        raise ModuleBlockedError("sam3_containment", "primary_camera_missing")
+    if str(context.metadata.get("frame_mapping_status") or "") != "verified":
+        raise ModuleBlockedError("sam3_containment", "frame_mapping_unverified")
+    video_path = _source_path(context, "video")
+    observations_path = _source_path(context, "observations_2d")
+    timebase_path = _source_path(context, "timebase")
+    assert video_path is not None
+    assert observations_path is not None
+    assert timebase_path is not None
+    episode_root = timebase_path.parent.parent
+    try:
+        timebase_by_camera = load_qingyu_timebase(
+            timebase_path,
+            episode_root=episode_root,
+        )
+    except ValueError as exc:
+        raise ModuleInputError("sam3_containment", str(exc)) from exc
+    timebase = timebase_by_camera.get(primary_camera)
+    if timebase is None:
+        raise ModuleBlockedError("sam3_containment", "primary_camera_missing")
+    if Path(timebase["video_path"]).resolve() != video_path.resolve():
+        raise ModuleBlockedError("sam3_containment", "frame_mapping_unverified")
+    start_frame, end_frame_exclusive = context.source_range
+    end_frame = end_frame_exclusive - 1
+    if (
+        int(timebase["source_start_frame"]) != start_frame
+        or int(timebase["source_end_frame"]) != end_frame
+    ):
+        raise ModuleBlockedError("sam3_containment", "frame_mapping_unverified")
+    session = QingyuHandPoseSession(
+        observations_path=observations_path,
+    )
+    direct_2d = session.direct_2d_index(
+        camera=primary_camera,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        video_frame_count=int(timebase["frames"]),
+        timestamp_start=float(timebase["source_start_timestamp"]),
+        timestamp_end=float(timebase["source_end_timestamp"]),
+        fps=float(timebase["fps"]),
+    )
+    if not direct_2d:
+        raise ModuleBlockedError("sam3_containment", "frame_mapping_unverified")
+    sampled_frames: dict[int, tuple[int, ...]] = {}
+    for index, candidate in enumerate(candidate_rows):
+        sampled = tuple(
+            sample_manifest_window_frames(
+                candidate,
+                clip_start_frame=start_frame,
+                clip_end_frame=end_frame,
+                frames_per_window=3,
+            )
+        )
+        sampled_frames[index] = sampled
+        for source_frame in sampled:
+            for side in _candidate_hand_sides(candidate):
+                if (source_frame, side) not in direct_2d:
+                    raise ModuleBlockedError(
+                        "sam3_containment", "primary_camera_2d_missing"
+                    )
+    return _QyContainmentInputs(
+        video_path=video_path,
+        observations_path=observations_path,
+        timebase_path=timebase_path,
+        primary_camera=primary_camera,
+        timebase=timebase,
+        direct_2d=direct_2d,
+        sampled_frames=sampled_frames,
+    )
+
+
+def _run_qy_containment(
+    *,
+    context: AssetContext,
+    config: LoadedQcConfig,
+    candidate_rows: list[dict[str, Any]],
+    inputs: _QyContainmentInputs,
+    segmenter: Any,
+    staging_root: Path,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+    import cv2
+    import numpy as np
+
+    from tools.run_manifest_sam3_containment import (
+        DEFAULT_QUERIES,
+        SAM3_CONFIG,
+        configured_sam3_thresholds,
+    )
+    from tools.sam3_keypoint_containment import (
+        aggregate_window_containment_summaries,
+        candidate_window_metadata,
+        score_keypoints_against_masks,
+        write_combined_overlay_image,
+    )
+
+    assert context.source_range is not None
+    clip_start, clip_end_exclusive = context.source_range
+    clip_end = clip_end_exclusive - 1
+    frame_thresholds, window_thresholds = configured_sam3_thresholds(config)
+    queries = [value.strip() for value in DEFAULT_QUERIES.split(",") if value.strip()]
+    # The QY 21-point order is not yet an anatomical contract.  Containment
+    # ratios are order-invariant, so use opaque labels and draw points only;
+    # never attach acceptance/MANO names or inferred bones to raw QY indices.
+    joint_names = {
+        side: [f"qy_{side}_joint_{index:02d}" for index in range(21)]
+        for side in ("left", "right")
+    }
+    capture = cv2.VideoCapture(str(inputs.video_path))
+    if not capture.isOpened():
+        capture.release()
+        raise ModuleInputError("sam3_containment", "QY primary video is unreadable")
+    frame_cache: dict[int, Any] = {}
+    mask_cache: dict[int, list[Any]] = {}
+    frame_rows: list[dict[str, Any]] = []
+    evidence_rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    try:
+        for window_index, candidate in enumerate(candidate_rows):
+            for source_frame in inputs.sampled_frames[window_index]:
+                requested_sides = _candidate_hand_sides(candidate)
+                video_frames = {
+                    int(inputs.direct_2d[(source_frame, side)]["video_frame"])
+                    for side in requested_sides
+                }
+                if len(video_frames) != 1:
+                    raise ModuleBlockedError(
+                        "sam3_containment", "frame_mapping_unverified"
+                    )
+                video_frame = next(iter(video_frames))
+                if video_frame not in frame_cache:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, video_frame)
+                    ok, frame_bgr = capture.read()
+                    if not ok or frame_bgr is None:
+                        raise ModuleInputError(
+                            "sam3_containment",
+                            f"QY video frame {video_frame} for source frame "
+                            f"{source_frame} is unreadable",
+                        )
+                    frame_cache[video_frame] = frame_bgr[..., ::-1].copy()
+                frame = frame_cache[video_frame]
+                if video_frame not in mask_cache:
+                    mask_cache[video_frame] = segmenter.segment_frame(
+                        frame,
+                        queries,
+                        dict(SAM3_CONFIG),
+                    )
+                masks = mask_cache[video_frame]
+                combined_hands: dict[str, dict[str, Any]] = {}
+                for side in ("left", "right"):
+                    direct = inputs.direct_2d.get((source_frame, side))
+                    if direct is None:
+                        continue
+                    side_video_frame = int(direct["video_frame"])
+                    if side_video_frame != video_frame:
+                        raise ModuleBlockedError(
+                            "sam3_containment", "frame_mapping_unverified"
+                        )
+                    pixels = np.asarray(direct["keypoints_2d"], dtype=np.float32)
+                    containment, _union_mask, valid, inside = (
+                        score_keypoints_against_masks(
+                            frame=frame,
+                            pixels=pixels,
+                            joint_names=joint_names[side],
+                            masks=masks,
+                            valid=np.ones(21, dtype=bool),
+                            **frame_thresholds,
+                        )
+                    )
+                    combined_hands[side] = {
+                        "pixels": pixels,
+                        "valid": valid,
+                        "inside": inside,
+                        "joint_names": joint_names[side],
+                    }
+                    if side not in requested_sides:
+                        continue
+                    frame_rows.append(
+                        {
+                            "clip_id": context.asset_id,
+                            "asset_id": context.asset_id,
+                            "episode_idx": 0,
+                            "video_path": str(inputs.video_path),
+                            "observations_2d_path": str(inputs.observations_path),
+                            "frame_idx": source_frame,
+                            "source_frame_idx": source_frame,
+                            "source_local_frame_idx": source_frame - clip_start,
+                            "video_frame_idx": video_frame,
+                            "clip_start_frame": clip_start,
+                            "clip_end_frame": clip_end,
+                            "candidate_start_frame": candidate["start_frame"],
+                            "candidate_end_frame": candidate["end_frame"],
+                            "coordinate_space": "source",
+                            "projection_mode": "qy_direct_2d",
+                            "projection_mode_used": "qy_direct_2d",
+                            "projection_input_status": "direct_2d_valid",
+                            "projection_input_reason": "explicit_qy_observation_mapping",
+                            "image_width": int(frame.shape[1]),
+                            "image_height": int(frame.shape[0]),
+                            "camera_id": inputs.primary_camera,
+                            "camera_name": inputs.primary_camera,
+                            "joint_topology_status": "unverified_points_only",
+                            "hand_side": side,
+                            "candidate_hand_side": candidate.get("hand_side", "both"),
+                            **containment,
+                            **candidate_window_metadata(candidate),
+                        }
+                    )
+                overlay_path = write_combined_overlay_image(
+                    frame=frame,
+                    hands=combined_hands,
+                    clip_id=(
+                        f"{context.asset_id}_window_"
+                        f"{candidate['start_frame']}_{candidate['end_frame']}_combined"
+                    ),
+                    frame_idx=source_frame,
+                    output_dir=staging_root / "combined_overlays",
+                )
+                evidence_rows.append(
+                    {
+                        "review_id": "",
+                        "supplier_id": "qy",
+                        "asset_id": context.asset_id,
+                        "window_start_frame": candidate["start_frame"],
+                        "window_end_frame": candidate["end_frame"],
+                        "frame_idx": source_frame,
+                        "source_module": "sam3_containment",
+                        "evidence_type": "combined_overlay",
+                        "hand_side": "both",
+                        "source_path": str(Path(overlay_path).resolve()),
+                        "metadata_json": json.dumps(
+                            {
+                                "camera_name": inputs.primary_camera,
+                                "source_frame_idx": source_frame,
+                                "video_frame_idx": video_frame,
+                                "coordinate_space": "source",
+                            },
+                            sort_keys=True,
+                        ),
+                    }
+                )
+    finally:
+        capture.release()
+    window_summaries = aggregate_window_containment_summaries(
+        frame_rows,
+        **window_thresholds,
+    )
+    producer_run_config = {
+        "supplier": "qy",
+        "primary_camera": inputs.primary_camera,
+        "keypoint_source": "QY observations_2d direct pixels",
+        "frame_mapping": "explicit_source_frame_index_to_video_frame",
+        "candidate_window_count": len(candidate_rows),
+        "sampled_source_frame_count": len(
+            {frame for values in inputs.sampled_frames.values() for frame in values}
+        ),
+        "sampled_video_frame_count": len(frame_cache),
+        "frame_thresholds": frame_thresholds,
+        "window_thresholds": window_thresholds,
+    }
+    return frame_rows, window_summaries, failures, evidence_rows, producer_run_config
+
+
 def _run_canonical(
     context: AssetContext,
     config: LoadedQcConfig,
@@ -691,6 +984,7 @@ def runner(
             or "jdt"
         ).lower()
         dr_inputs: tuple[Path, Path, Path, Path, Any, Mapping[str, Any]] | None = None
+        qy_inputs: _QyContainmentInputs | None = None
         if supplier in {"dr", "deepreach"}:
             projection_status = str(
                 context.metadata.get("projection_validation_status") or ""
@@ -728,6 +1022,15 @@ def runner(
                 raise ModuleBlockedError("sam3_containment", reason)
         if supplier == "potentia":
             raise ModuleBlockedError("sam3_containment", "no_keypoint_input")
+        if supplier in {"qy", "qingyu"}:
+            if not str(context.metadata.get("primary_camera") or "").strip():
+                raise ModuleBlockedError(
+                    "sam3_containment", "primary_camera_missing"
+                )
+            if str(context.metadata.get("frame_mapping_status") or "") != "verified":
+                raise ModuleBlockedError(
+                    "sam3_containment", "frame_mapping_unverified"
+                )
 
         candidate_path = artifact_for(context, "precheck").directory / "candidate_windows.json"
         if not candidate_path.is_file():
@@ -808,7 +1111,10 @@ def runner(
                 runtime={"artifact_state": "no_candidates"},
             )
 
-        if supplier not in {"jdt", "dr", "deepreach"}:
+        if supplier in {"qy", "qingyu"}:
+            qy_inputs = _qy_containment_inputs(context, candidate_rows)
+
+        if supplier not in {"jdt", "dr", "deepreach", "qy", "qingyu"}:
             raise ModuleAdapterMissingError(
                 "sam3_containment",
                 f"supplier adapter is not implemented: {supplier}",
@@ -822,12 +1128,20 @@ def runner(
                 for name in ("video", "parquet")
                 if name in context.source_files
             )
-        else:
+        elif supplier in {"dr", "deepreach"}:
             assert dr_inputs is not None
             manifest_path = None
             source_names = tuple(
                 name
                 for name in ("video", "hdf5", "calibration", "trajectory")
+                if name in context.source_files
+            )
+        else:
+            assert qy_inputs is not None
+            manifest_path = None
+            source_names = tuple(
+                name
+                for name in ("video", "observations_2d", "timebase")
                 if name in context.source_files
             )
         model = _source_path(
@@ -855,6 +1169,17 @@ def runner(
                     "projection_validation_status"
                 ),
                 "trajectory_usage": validation.trajectory_usage,
+            }
+        if qy_inputs is not None:
+            fingerprint_extra["qy_direct_2d_contract"] = {
+                "adapter_version": "qy-direct-2d-sam3-v2",
+                "primary_camera": qy_inputs.primary_camera,
+                "frame_mapping": "explicit_source_frame_index_to_video_frame",
+                "joint_topology": "unverified_points_only",
+                "source_frame_count": int(
+                    qy_inputs.timebase["source_frame_count"]
+                ),
+                "video_frame_count": int(qy_inputs.timebase["frames"]),
             }
         fingerprint = build_run_fingerprint(
             context=context,
@@ -896,6 +1221,57 @@ def runner(
             )
         staging_root = context.batch_root / ".qc_pipeline" / context.asset_id / "sam3"
         staging_root.mkdir(parents=True, exist_ok=True)
+        if qy_inputs is not None:
+            if segmenter_factory is not None:
+                segmenter = segmenter_factory()
+            elif segmenter_provider is not None:
+                assert model is not None
+                segmenter = segmenter_provider(model, dict(SAM3_CONFIG))
+            else:
+                segmenter = None
+            if segmenter is None:
+                raise ModulePrerequisiteError(
+                    "sam3_containment", "SAM3 segmenter runtime"
+                )
+            (
+                frame_results,
+                window_summaries,
+                failures,
+                evidence_rows,
+                producer_run_config,
+            ) = _run_qy_containment(
+                context=context,
+                config=config,
+                candidate_rows=candidate_rows,
+                inputs=qy_inputs,
+                segmenter=segmenter,
+                staging_root=staging_root,
+            )
+            elapsed = perf_counter() - started
+            window_summaries, evidence_rows = _publish_sam3_artifact(
+                context=context,
+                frame_results=frame_results,
+                window_summaries=window_summaries,
+                failures=failures,
+                evidence_rows=evidence_rows,
+                producer_run_config=producer_run_config,
+                producer_root=staging_root,
+                fingerprint=fingerprint,
+                elapsed_seconds=elapsed,
+            )
+            result = adapt_sam3_containment(
+                asset_id=context.asset_id,
+                batch_root=context.batch_root,
+                window_summaries=window_summaries,
+                evidence_rows=evidence_rows,
+                config=config,
+            )
+            return _with_artifact_runtime(
+                result,
+                state="computed",
+                elapsed_seconds=elapsed,
+                fingerprint_sha256=fingerprint_sha256,
+            )
         if supplier in {"dr", "deepreach"}:
             if segmenter_factory is not None:
                 segmenter = segmenter_factory()

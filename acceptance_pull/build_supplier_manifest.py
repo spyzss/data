@@ -20,6 +20,10 @@ from acceptance_pull.supplier_adapters.potentia import (
     build_potentia_manifest,
     write_potentia_manifest,
 )
+from acceptance_pull.supplier_adapters.qingyu import (
+    build_qingyu_manifest,
+    write_qingyu_manifest,
+)
 
 
 LOGGER = logging.getLogger("build_supplier_manifest")
@@ -32,7 +36,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--supplier",
         required=True,
-        choices=("dr", "deepreach", "potentia"),
+        choices=("dr", "deepreach", "potentia", "qy", "qingyu"),
     )
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -59,8 +63,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--primary-camera",
-        choices=SUPPORTED_CAMERAS,
-        default="head",
+        help=(
+            "Explicit primary camera. DR defaults to head; QY defaults to "
+            "coverage recommendation."
+        ),
+    )
+    parser.add_argument(
+        "--camera-selection-config",
+        type=Path,
+        help="Optional JSON/YAML QY camera-selection config override.",
     )
     parser.add_argument(
         "--hdf5-reference-dataset",
@@ -81,14 +92,25 @@ def run(
     calib_cache: Path | None = None,
     stage_video_quality: bool = False,
     granularity: str = "task",
-    primary_camera: str = "head",
+    primary_camera: str | None = None,
     hdf5_reference_dataset: str | None = None,
     max_assets: int | None = None,
     calibration_mapping: Mapping[str, str] | None = None,
+    camera_selection_config: Mapping[str, object] | None = None,
 ) -> int:
     if supplier == "potentia":
         rows = build_potentia_manifest(root, max_assets=max_assets)
         manifest_path = write_potentia_manifest(rows, output_dir)
+        LOGGER.info("Wrote %d rows to %s", len(rows), manifest_path)
+        return 0
+    if supplier in {"qy", "qingyu"}:
+        rows = build_qingyu_manifest(
+            root,
+            primary_camera=primary_camera,
+            camera_selection=camera_selection_config,
+            max_assets=max_assets,
+        )
+        manifest_path = write_qingyu_manifest(rows, output_dir)
         LOGGER.info("Wrote %d rows to %s", len(rows), manifest_path)
         return 0
     if supplier not in {"dr", "deepreach"}:
@@ -104,7 +126,7 @@ def run(
         calib_cache=calib_cache,
         cameras=cameras,
         granularity=granularity,
-        primary_camera=primary_camera,
+        primary_camera=primary_camera or "head",
         reference_dataset=hdf5_reference_dataset,
         calibration_mapping=calibration_mapping,
     )
@@ -143,7 +165,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.calibration_map is not None
             else None
         ),
+        camera_selection_config=(
+            read_camera_selection_config(args.camera_selection_config)
+            if args.camera_selection_config is not None
+            else None
+        ),
     )
+
+
+def read_camera_selection_config(path: Path) -> dict[str, object]:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    elif suffix in {".yaml", ".yml"}:
+        import yaml
+
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    else:
+        raise ValueError("camera-selection config must be JSON or YAML")
+    if not isinstance(payload, Mapping):
+        raise ValueError("camera-selection config must be an object")
+    return dict(payload)
 
 
 def read_calibration_mapping(path: Path) -> dict[str, str]:
