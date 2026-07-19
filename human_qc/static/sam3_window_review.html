@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SAM3 Containment Window Review</title>
+  <link rel="stylesheet" href="/static/sam3_window_review.css">
+</head>
+<body>
+  <main id="app" class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Window-level human QC</p>
+        <h1>SAM3 Containment Review</h1>
+      </div>
+      <label class="reviewer-field">Reviewer
+        <input data-reviewer autocomplete="name" placeholder="Required before saving">
+      </label>
+      <strong data-global-progress>0 / 0</strong>
+    </header>
+    <div data-error class="global-error" role="alert" hidden></div>
+    <section data-review-stage class="review-stage" aria-live="polite">
+      Loading review queue…
+    </section>
+  </main>
+  <script type="module" src="/static/sam3_window_review.js"></script>
+</body>
+</html>
