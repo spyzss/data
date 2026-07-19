@@ -290,6 +290,8 @@ class WarnReviewService:
         reason: str | None,
         expected_revision: int,
         lease_token: str,
+        *,
+        reviewer: str | None = None,
     ) -> WarnTaskView:
         report = self._load(_non_empty(asset_id, "asset_id"))
         if report is None:
@@ -311,6 +313,9 @@ class WarnReviewService:
             raise TypeError("reason must be a string or None")
         normalized_reason = reason.strip() if isinstance(reason, str) else None
         normalized_reason = normalized_reason or None
+        review_author = (
+            self._reviewer if reviewer is None else _non_empty(reviewer, "reviewer")
+        )
         issue = self._issues(report).get(issue_id)
         if issue is None:
             raise WarnStateError(f"selected issue {issue_id} is missing from report issues")
@@ -325,7 +330,7 @@ class WarnReviewService:
             ),
             "machine_verdict": machine,
             "reason": normalized_reason,
-            "reviewer": self._reviewer,
+            "reviewer": review_author,
             "reviewed_at": reviewed_at,
         }
 

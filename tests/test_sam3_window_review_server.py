@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from http.client import HTTPConnection
 import json
+import multiprocessing
 from pathlib import Path
 from threading import Thread
 from urllib.parse import quote
@@ -10,6 +11,7 @@ from urllib.parse import quote
 import pandas as pd
 import pytest
 
+import human_qc.sam3_window_review as sam3_window_review_module
 from human_qc.sam3_window_review import (
     ReviewConflictError,
     ReviewValidationError,
@@ -91,6 +93,70 @@ def _fixture_bundle(
     )
 
 
+def _server_process_save(
+    manifest_path: str,
+    queue_path: str,
+    evidence_path: str,
+    review_dir: str,
+    save_dir: str,
+    review_index: int,
+    verdict: str,
+    reviewer: str,
+    ready,
+    proceed,
+    results,
+) -> None:
+    server = None
+    try:
+        bundle = load_review_bundle(
+            manifest_path=Path(manifest_path),
+            queue_path=Path(queue_path),
+            evidence_path=Path(evidence_path),
+            review_dir=Path(review_dir),
+        )
+        store = Sam3WindowReviewStore(bundle, Path(save_dir))
+        server = create_sam3_window_review_server(
+            "127.0.0.1", 0, bundle=bundle, store=store
+        )
+        ready.set()
+        if not proceed.wait(timeout=20):
+            raise TimeoutError("timed out waiting to save")
+        review_id = bundle.items[review_index]["review_id"]
+        record = server.store.save(
+            review_id,
+            verdict,
+            reviewer,
+            expected_revision=0,
+        )
+        results.put(
+            {
+                "status": "saved",
+                "review_id": review_id,
+                "revision": record["revision"],
+            }
+        )
+    except Exception as exc:  # pragma: no cover - asserted in the parent process.
+        results.put(
+            {
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            }
+        )
+    finally:
+        if server is not None:
+            server.server_close()
+
+
+def _join_process(process) -> None:
+    process.join(timeout=20)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+        pytest.fail("server process did not exit")
+    assert process.exitcode == 0
+
+
 def test_store_saves_same_asset_windows_independently_and_recovers_after_refresh(
     tmp_path: Path,
 ) -> None:
@@ -129,6 +195,163 @@ def test_store_saves_same_asset_windows_independently_and_recovers_after_refresh
     assert all(row["duration_resolution_status"] == "not_annotated" for row in rows)
     forbidden = {"affected_start_frame", "affected_end_frame", "rejected_duration"}
     assert forbidden.isdisjoint(rows[0])
+
+
+def test_two_server_processes_preserve_independent_window_writes(tmp_path: Path) -> None:
+    bundle = _fixture_bundle(tmp_path)
+    save_dir = tmp_path / "saved"
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    first_ready = context.Event()
+    first_proceed = context.Event()
+    second_ready = context.Event()
+    second_proceed = context.Event()
+    second_proceed.set()
+    common = (
+        str(bundle.manifest_path),
+        str(bundle.queue_path),
+        str(bundle.evidence_path),
+        str(bundle.review_dir),
+        str(save_dir),
+    )
+    first = context.Process(
+        target=_server_process_save,
+        args=(*common, 1, "fail", "alice", first_ready, first_proceed, results),
+    )
+    second = context.Process(
+        target=_server_process_save,
+        args=(*common, 0, "pass", "bob", second_ready, second_proceed, results),
+    )
+    try:
+        first.start()
+        assert first_ready.wait(timeout=20)
+        second.start()
+        assert second_ready.wait(timeout=20)
+        second_result = results.get(timeout=20)
+        assert second_result["status"] == "saved"
+        first_proceed.set()
+        first_result = results.get(timeout=20)
+        assert first_result["status"] == "saved"
+    finally:
+        first_proceed.set()
+        if first.pid is not None:
+            _join_process(first)
+        if second.pid is not None:
+            _join_process(second)
+
+    restored = Sam3WindowReviewStore(bundle, save_dir).snapshot()
+    assert set(restored["reviews"]) == {
+        bundle.items[0]["review_id"],
+        bundle.items[1]["review_id"],
+    }
+
+
+def test_stale_revision_is_rejected_across_server_processes(tmp_path: Path) -> None:
+    bundle = _fixture_bundle(tmp_path, windows=((0, 20),))
+    save_dir = tmp_path / "saved"
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    stale_ready = context.Event()
+    stale_proceed = context.Event()
+    current_ready = context.Event()
+    current_proceed = context.Event()
+    current_proceed.set()
+    common = (
+        str(bundle.manifest_path),
+        str(bundle.queue_path),
+        str(bundle.evidence_path),
+        str(bundle.review_dir),
+        str(save_dir),
+    )
+    stale = context.Process(
+        target=_server_process_save,
+        args=(*common, 0, "fail", "alice", stale_ready, stale_proceed, results),
+    )
+    current = context.Process(
+        target=_server_process_save,
+        args=(*common, 0, "pass", "bob", current_ready, current_proceed, results),
+    )
+    try:
+        stale.start()
+        assert stale_ready.wait(timeout=20)
+        current.start()
+        assert current_ready.wait(timeout=20)
+        current_result = results.get(timeout=20)
+        assert current_result["status"] == "saved"
+        stale_proceed.set()
+        stale_result = results.get(timeout=20)
+        assert stale_result["status"] == "error"
+        assert stale_result["error_type"] == "ReviewConflictError"
+        assert "revision" in stale_result["message"]
+    finally:
+        stale_proceed.set()
+        if stale.pid is not None:
+            _join_process(stale)
+        if current.pid is not None:
+            _join_process(current)
+
+    restored = Sam3WindowReviewStore(bundle, save_dir).snapshot()
+    review = restored["reviews"][bundle.items[0]["review_id"]]
+    assert review["verdict"] == "pass"
+    assert review["reviewer"] == "bob"
+
+
+@pytest.mark.parametrize("damage", ["missing", "inconsistent"])
+def test_startup_rebuilds_derived_csv_from_authoritative_state(
+    tmp_path: Path, damage: str
+) -> None:
+    bundle = _fixture_bundle(tmp_path)
+    save_dir = tmp_path / "saved"
+    store = Sam3WindowReviewStore(bundle, save_dir)
+    store.save(bundle.items[0]["review_id"], "pass", "alice", expected_revision=0)
+    results_path = save_dir / "sam3_window_review_results.csv"
+    expected = results_path.read_text(encoding="utf-8")
+    if damage == "missing":
+        results_path.unlink()
+    else:
+        results_path.write_text("stale,csv\n", encoding="utf-8")
+
+    restored = Sam3WindowReviewStore(bundle, save_dir)
+
+    assert restored.snapshot()["reviews"]
+    assert results_path.read_text(encoding="utf-8") == expected
+
+
+def test_derived_csv_write_failure_does_not_roll_back_authoritative_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _fixture_bundle(tmp_path)
+    save_dir = tmp_path / "saved"
+    store = Sam3WindowReviewStore(bundle, save_dir)
+    review_id = bundle.items[0]["review_id"]
+    real_write = sam3_window_review_module._write_text_files_atomically
+
+    def fail_csv(save_root: Path, files: dict[str, str]) -> None:
+        if "sam3_window_review_results.csv" in files:
+            raise OSError("derived CSV unavailable")
+        real_write(save_root, files)
+
+    monkeypatch.setattr(
+        sam3_window_review_module,
+        "_write_text_files_atomically",
+        fail_csv,
+    )
+    saved = store.save(review_id, "fail", "alice", expected_revision=0)
+
+    assert saved["verdict"] == "fail"
+    authoritative = json.loads(
+        (save_dir / "sam3_window_review_state.json").read_text(encoding="utf-8")
+    )
+    assert authoritative["reviews"][review_id]["verdict"] == "fail"
+    assert not (save_dir / "sam3_window_review_results.csv").exists()
+
+    monkeypatch.setattr(
+        sam3_window_review_module,
+        "_write_text_files_atomically",
+        real_write,
+    )
+    Sam3WindowReviewStore(bundle, save_dir)
+    assert (save_dir / "sam3_window_review_results.csv").is_file()
 
 
 def test_prefixed_jdt_asset_id_is_preserved_in_state_and_csv(tmp_path: Path) -> None:

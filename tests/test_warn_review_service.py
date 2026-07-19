@@ -14,6 +14,7 @@ from human_qc.warn_service import (
     effective_issue_verdict,
     reduce_overall_decision,
 )
+from human_qc.workbench_service import WorkbenchService
 from qc_common.report import load_asset_qc_report, write_asset_qc_report
 from tests.qc_report_fixtures import make_v2_report
 
@@ -119,6 +120,30 @@ def test_human_pass_does_not_mutate_machine_issue(tmp_path: Path) -> None:
     assert after["issues"][0] == before_issue
     assert view.issue_reviews["warn-1"]["effective_verdict"] == "pass"
     assert view.issue_reviews["warn-1"]["machine_verdict"] == "warn"
+
+
+def test_workbench_persists_current_lease_reviewer_in_issue_review(tmp_path: Path) -> None:
+    report_path = _report(tmp_path)
+    warn = WarnReviewService(
+        reports={ASSET_ID: report_path},
+        reviewer="human",
+        clock=lambda: NOW,
+    )
+    workbench = WorkbenchService(warn_service=warn)
+    lease = workbench.acquire_lease(ASSET_ID, "alice", 60)
+    task = workbench.get_asset_task(ASSET_ID)
+
+    workbench.warn_verdict(
+        ASSET_ID,
+        issue_id="warn-1",
+        verdict="pass",
+        expected_revision=task["revision"],
+        lease_token=lease.token,
+    )
+
+    persisted = load_asset_qc_report(report_path)
+    assert persisted is not None
+    assert persisted["manual_review"]["issue_reviews"]["warn-1"]["reviewer"] == "alice"
 
 
 def test_selected_issue_requires_verdict_before_complete(tmp_path: Path) -> None:

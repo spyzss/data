@@ -419,8 +419,8 @@ class WorkbenchService:
     def validate_lease(self, asset_id: str, lease_token: str) -> Lease:
         return self.lease_store.validate(asset_id, lease_token)
 
-    def _prepare_mutation(self, asset_id: str, lease_token: str) -> None:
-        self.validate_lease(asset_id, lease_token)
+    def _prepare_mutation(self, asset_id: str, lease_token: str) -> Lease:
+        return self.validate_lease(asset_id, lease_token)
 
     def _latest(self, asset_id: str) -> dict[str, Any]:
         return self.get_asset_task(asset_id)
@@ -671,7 +671,7 @@ class WorkbenchService:
         expected_revision: int,
         lease_token: str,
     ) -> dict[str, Any]:
-        self._prepare_mutation(asset_id, lease_token)
+        lease = self._prepare_mutation(asset_id, lease_token)
         if self.warn_service is None:
             raise KeyError(f"warn service is not configured for {asset_id}")
         self.warn_service.submit_verdict(
@@ -681,6 +681,7 @@ class WorkbenchService:
             reason,
             expected_revision,
             lease_token,
+            reviewer=lease.reviewer,
         )
         return self._latest(asset_id)
 

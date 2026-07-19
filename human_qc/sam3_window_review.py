@@ -8,24 +8,28 @@ to one source-inclusive window.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import csv
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import shutil
 import tempfile
 from threading import RLock
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 from urllib.parse import quote, unquote
 
 import numpy as np
 import pandas as pd
 
 
+LOGGER = logging.getLogger(__name__)
 MANUAL_STATES = frozenset({"fail", "review"})
 AUTOMATIC_PASS_STATES = frozenset({"pass", "auto_pass", "completed_pass"})
 EXPECTED_EVIDENCE_COUNT = 5
@@ -58,6 +62,25 @@ class ReviewValidationError(ValueError):
 
 class ReviewConflictError(RuntimeError):
     """The requested mutation conflicts with current durable state."""
+
+
+@contextmanager
+def _exclusive_state_lock(path: Path) -> Iterator[None]:
+    """Lock a stable sidecar while the authoritative state inode is replaced."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    locked = False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        try:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -107,9 +130,13 @@ class Sam3WindowReviewStore:
         self.save_dir = Path(save_dir).resolve()
         self.state_path = self.save_dir / "sam3_window_review_state.json"
         self.results_path = self.save_dir / "sam3_window_review_results.csv"
+        self.lock_path = self.save_dir / ".sam3_window_review_state.json.lock"
         self._lock = RLock()
         self._items = bundle.item_map()
-        self._state = self._load_state()
+        with self._lock, _exclusive_state_lock(self.lock_path):
+            self._state = self._load_state()
+            if self.state_path.is_file():
+                self._sync_results_csv(self._state)
 
     def _empty_state(self) -> dict[str, Any]:
         return {
@@ -146,8 +173,33 @@ class Sam3WindowReviewStore:
         return value
 
     def snapshot(self) -> dict[str, Any]:
-        with self._lock:
+        with self._lock, _exclusive_state_lock(self.lock_path):
+            self._state = self._load_state()
             return _json_copy(self._state)
+
+    def _sync_results_csv(self, state: Mapping[str, Any]) -> None:
+        expected = _results_csv(state, self.bundle.items)
+        try:
+            current = (
+                self.results_path.read_text(encoding="utf-8")
+                if self.results_path.is_file()
+                else None
+            )
+        except (OSError, UnicodeError):
+            current = None
+        if current == expected:
+            return
+        try:
+            _write_text_files_atomically(
+                self.save_dir,
+                {self.results_path.name: expected},
+            )
+        except OSError as exc:
+            LOGGER.warning(
+                "Could not rebuild derived SAM3 review CSV %s: %s",
+                self.results_path,
+                exc,
+            )
 
     def save(
         self,
@@ -163,7 +215,7 @@ class Sam3WindowReviewStore:
         reviewer = _required_text(reviewer, "reviewer")
         if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
             raise ReviewValidationError("expected_revision must be an integer")
-        with self._lock:
+        with self._lock, _exclusive_state_lock(self.lock_path):
             item = self._items.get(review_id)
             if item is None:
                 raise KeyError(f"unknown review_id: {review_id}")
@@ -179,7 +231,9 @@ class Sam3WindowReviewStore:
                     "review evidence is incomplete: staged evidence missing: "
                     + ", ".join(missing_staged)
                 )
-            reviews = self._state.get("reviews")
+            durable_state = self._load_state()
+            self._state = durable_state
+            reviews = durable_state.get("reviews")
             if not isinstance(reviews, dict):
                 raise ReviewValidationError("saved state reviews must be an object")
             prior = reviews.get(review_id)
@@ -206,21 +260,23 @@ class Sam3WindowReviewStore:
                 "evidence_provenance": _json_copy(item["evidence_provenance"]),
                 "duration_resolution_status": DURATION_RESOLUTION_STATUS,
             }
-            candidate = _json_copy(self._state)
+            candidate = _json_copy(durable_state)
             candidate["reviews"][review_id] = record
-            files = {
-                self.state_path.name: json.dumps(
-                    candidate,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                    allow_nan=False,
-                )
-                + "\n",
-                self.results_path.name: _results_csv(candidate, self.bundle.items),
-            }
-            _write_text_files_atomically(self.save_dir, files)
+            _write_text_files_atomically(
+                self.save_dir,
+                {
+                    self.state_path.name: json.dumps(
+                        candidate,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                },
+            )
             self._state = candidate
+            self._sync_results_csv(candidate)
             return _json_copy(record)
 
 
