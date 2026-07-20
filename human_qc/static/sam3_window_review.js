@@ -11,6 +11,18 @@ function jsonText(value) {
   return JSON.stringify(value ?? null, null, 2);
 }
 
+export function resolveAppUrl(path, baseURI = globalThis.document?.baseURI) {
+  const value = String(path ?? "").trim();
+  if (!value) return "";
+  try {
+    return new URL(value).toString();
+  } catch (_error) {
+    if (!baseURI) return value;
+    const pageDirectory = new URL(".", baseURI);
+    return new URL(value.replace(/^\/+/, ""), pageDirectory).toString();
+  }
+}
+
 export function reviewProgress(items) {
   const rows = Array.isArray(items) ? items : [];
   return {
@@ -19,7 +31,7 @@ export function reviewProgress(items) {
   };
 }
 
-function evidenceMarkup(item) {
+function evidenceMarkup(item, baseURI) {
   const evidence = Array.isArray(item?.evidence) ? item.evidence : [];
   if (!evidence.length) return '<div class="evidence-error">Evidence unavailable: no combined overlays</div>';
   return evidence.map((row, index) => {
@@ -27,11 +39,12 @@ function evidenceMarkup(item) {
     if (row.status !== "ready" || !row.url) {
       return `<article class="evidence-card evidence-card-error"><strong>Sample ${index + 1}</strong><span>source frame ${frame}</span><span>Evidence unavailable: ${escapeHtml(row.status)}</span></article>`;
     }
-    return `<article class="evidence-card" data-evidence-index="${index}"><header><strong>Sample ${index + 1}</strong><span>source frame ${frame}</span></header><img src="${escapeHtml(row.url)}" alt="SAM3 containment combined overlay at source frame ${frame}" loading="eager" data-source-frame="${frame}"></article>`;
+    const url = resolveAppUrl(row.url, baseURI);
+    return `<article class="evidence-card" data-evidence-index="${index}"><header><strong>Sample ${index + 1}</strong><span>source frame ${frame}</span></header><img src="${escapeHtml(url)}" alt="SAM3 containment combined overlay at source frame ${frame}" loading="eager" data-source-frame="${frame}"></article>`;
   }).join("");
 }
 
-export function renderReviewMarkup(item, index, total) {
+export function renderReviewMarkup(item, index, total, baseURI = globalThis.document?.baseURI) {
   if (!item) return '<div class="empty-state">No SAM3 windows require human review.</div>';
   const review = item.manual_review ?? { status: "unresolved", verdict: null };
   const completed = ["pass", "fail"].includes(review.verdict);
@@ -62,7 +75,7 @@ export function renderReviewMarkup(item, index, total) {
       <div class="hand-verdicts"><span>Left: <b>${escapeHtml(item.left_window_containment_verdict || "—")}</b></span><span>Right: <b>${escapeHtml(item.right_window_containment_verdict || "—")}</b></span></div>
       <div class="trigger-grid"><div><h3>Trigger reason</h3><pre>${escapeHtml(jsonText(item.trigger_reason))}</pre></div><div><h3>Key metrics</h3><pre>${escapeHtml(jsonText(item.trigger_metrics))}</pre></div></div>
       ${evidenceError}
-      <div class="evidence-grid">${evidenceMarkup(item)}</div>
+      <div class="evidence-grid">${evidenceMarkup(item, baseURI)}</div>
     </section>
     <footer class="decision-bar">
       <div><span>Server state</span><strong data-save-status>${saved}</strong></div>
@@ -75,16 +88,21 @@ export function renderReviewMarkup(item, index, total) {
 }
 
 export class Sam3WindowReviewApp {
-  constructor({ fetcher = globalThis.fetch?.bind(globalThis), root = null } = {}) {
+  constructor({
+    fetcher = globalThis.fetch?.bind(globalThis),
+    root = null,
+    baseURI = globalThis.document?.baseURI,
+  } = {}) {
     this.fetcher = fetcher;
     this.root = root;
+    this.baseURI = baseURI;
     this.items = [];
     this.index = 0;
     this.lastError = null;
   }
 
   async load() {
-    const response = await this.fetcher("/api/review-bundle", { cache: "no-store" });
+    const response = await this.fetcher(resolveAppUrl("api/review-bundle", this.baseURI), { cache: "no-store" });
     if (!response.ok) throw new Error(`Unable to load review queue: HTTP ${response.status}`);
     const payload = await response.json();
     this.items = Array.isArray(payload?.bundle?.items) ? payload.bundle.items : [];
@@ -120,7 +138,7 @@ export class Sam3WindowReviewApp {
     const reviewer = this.reviewer();
     if (!reviewer) throw new Error("Reviewer is required");
     const expectedRevision = Number(item.manual_review?.revision ?? 0);
-    const response = await this.fetcher(`/api/reviews/${encodeURIComponent(item.review_id)}`, {
+    const response = await this.fetcher(resolveAppUrl(`api/reviews/${encodeURIComponent(item.review_id)}`, this.baseURI), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ verdict, reviewer, expected_revision: expectedRevision }),
@@ -134,9 +152,9 @@ export class Sam3WindowReviewApp {
   }
 
   render() {
-    if (!this.root) return renderReviewMarkup(this.currentItem(), this.index, this.items.length);
+    if (!this.root) return renderReviewMarkup(this.currentItem(), this.index, this.items.length, this.baseURI);
     const stage = this.root.querySelector?.("[data-review-stage]");
-    if (stage) stage.innerHTML = renderReviewMarkup(this.currentItem(), this.index, this.items.length);
+    if (stage) stage.innerHTML = renderReviewMarkup(this.currentItem(), this.index, this.items.length, this.baseURI);
     const progress = reviewProgress(this.items);
     const progressNode = this.root.querySelector?.("[data-global-progress]");
     if (progressNode) progressNode.textContent = `${progress.completed} / ${progress.total}`;

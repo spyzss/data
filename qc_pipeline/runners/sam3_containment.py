@@ -34,7 +34,7 @@ _MODEL_HASH_FILES = ("config.json",)
 class _QyContainmentInputs:
     video_path: Path
     observations_path: Path
-    timebase_path: Path
+    timebase_path: Path | None
     primary_camera: str
     timebase: Mapping[str, Any]
     direct_2d: Mapping[tuple[int, str], Mapping[str, Any]]
@@ -266,6 +266,7 @@ def _dr_projection_inputs(
     config: LoadedQcConfig,
 ) -> tuple[Path, Path, Path, Path, Any, Mapping[str, Any]]:
     from acceptance_pull.supplier_adapters.deepreach_projection import (
+        validate_heuristic_head_projection_contract,
         validate_head_projection_contract,
     )
 
@@ -273,10 +274,23 @@ def _dr_projection_inputs(
     video_path = _source_path(context, "video", required=False)
     if video_path is None:
         video_path = _source_path(context, "head_video")
-    calibration_path = _source_path(context, "calibration")
-    trajectory_path = _source_path(context, "trajectory")
     assert hdf5_path is not None
     assert video_path is not None
+    if context.metadata.get("projection_mode") == "approx_pinhole_from_hfov":
+        validation = validate_heuristic_head_projection_contract(
+            hdf5_path=hdf5_path,
+            video_path=video_path,
+            source_range=context.source_range,
+            reference_dataset=str(
+                context.metadata.get("hdf5_reference_dataset") or ""
+            ),
+            primary_camera=str(context.metadata.get("primary_camera") or ""),
+            metadata=context.metadata,
+        )
+        lineage = Path(validation.calibration.source)
+        return hdf5_path, video_path, lineage, lineage, validation, {}
+    calibration_path = _source_path(context, "calibration")
+    trajectory_path = _source_path(context, "trajectory")
     assert calibration_path is not None
     assert trajectory_path is not None
     suppliers = config.module_parameters("supplier_data_audit").get("suppliers")
@@ -396,12 +410,13 @@ def _run_dr_containment(
     evidence_rows: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     try:
+        heuristic_projection = validation.status == "heuristic_ready"
         for window_index, candidate in enumerate(candidate_rows):
             sampled_frames = sample_manifest_window_frames(
                 candidate,
                 clip_start_frame=clip_start,
                 clip_end_frame=clip_end,
-                frames_per_window=3,
+                frames_per_window=5 if heuristic_projection else 3,
             )
             for source_frame in sampled_frames:
                 local_frame = source_frame - clip_start
@@ -456,7 +471,7 @@ def _run_dr_containment(
                             "episode_idx": 0,
                             "hdf5_path": str(hdf5_path),
                             "video_path": str(video_path),
-                            "calibration_path": str(calibration_path),
+                            "calibration_path": str(validation.calibration.source),
                             "frame_idx": source_frame,
                             "source_frame_idx": source_frame,
                             "local_frame_idx": local_frame,
@@ -465,8 +480,26 @@ def _run_dr_containment(
                             "candidate_start_frame": candidate["start_frame"],
                             "candidate_end_frame": candidate["end_frame"],
                             "coordinate_space": "source",
-                            "projection_mode": "dr_head_direct_calibration",
-                            "projection_mode_used": "dr_head_direct_calibration",
+                            "projection_mode": (
+                                "approx_pinhole_from_hfov"
+                                if heuristic_projection
+                                else "dr_head_direct_calibration"
+                            ),
+                            "projection_mode_used": (
+                                "approx_pinhole_from_hfov"
+                                if heuristic_projection
+                                else "dr_head_direct_calibration"
+                            ),
+                            "calibration_status": (
+                                "heuristic" if heuristic_projection else "verified"
+                            ),
+                            "projection_validation_status": (
+                                "pending_visual_validation"
+                                if heuristic_projection
+                                else "validated"
+                            ),
+                            "distortion_applied": False,
+                            "camera_trajectory_applied": False,
                             "projection_input_status": hand[
                                 "projection_input_status"
                             ],
@@ -513,6 +546,16 @@ def _run_dr_containment(
                                 "source_frame_idx": source_frame,
                                 "local_frame_idx": local_frame,
                                 "coordinate_space": "source",
+                                "projection_mode": (
+                                    "approx_pinhole_from_hfov"
+                                    if heuristic_projection
+                                    else "dr_head_direct_calibration"
+                                ),
+                                "calibration_status": (
+                                    "heuristic"
+                                    if heuristic_projection
+                                    else "verified"
+                                ),
                             },
                             sort_keys=True,
                         ),
@@ -524,6 +567,22 @@ def _run_dr_containment(
         frame_rows,
         **window_thresholds,
     )
+    if heuristic_projection:
+        for summary in window_summaries:
+            summary["raw_window_containment_verdict"] = summary.get(
+                "window_containment_verdict"
+            )
+            summary["window_containment_verdict"] = "projection_review"
+            summary["routing_reason"] = (
+                "dr_heuristic_projection_requires_human_review"
+            )
+            summary["projection_mode"] = "approx_pinhole_from_hfov"
+            summary["calibration_status"] = "heuristic"
+            summary["projection_validation_status"] = (
+                "pending_visual_validation"
+            )
+            summary["distortion_applied"] = False
+            summary["camera_trajectory_applied"] = False
     producer_run_config = {
         "supplier": "dr",
         "primary_camera": "head",
@@ -531,6 +590,21 @@ def _run_dr_containment(
         "projection_status": validation.status,
         "projection_reason": validation.reason,
         "trajectory_usage": validation.trajectory_usage,
+        "projection_mode": (
+            "approx_pinhole_from_hfov"
+            if heuristic_projection
+            else "dr_head_direct_calibration"
+        ),
+        "calibration_status": (
+            "heuristic" if heuristic_projection else "verified"
+        ),
+        "projection_validation_status": (
+            "pending_visual_validation"
+            if heuristic_projection
+            else "validated"
+        ),
+        "distortion_applied": False,
+        "camera_trajectory_applied": False,
         "candidate_window_count": len(candidate_rows),
         "sampled_source_frame_count": len(frame_cache),
         "frame_thresholds": frame_thresholds,
@@ -558,21 +632,56 @@ def _qy_containment_inputs(
         raise ModuleBlockedError("sam3_containment", "frame_mapping_unverified")
     video_path = _source_path(context, "video")
     observations_path = _source_path(context, "observations_2d")
-    timebase_path = _source_path(context, "timebase")
     assert video_path is not None
     assert observations_path is not None
-    assert timebase_path is not None
-    episode_root = timebase_path.parent.parent
-    try:
-        timebase_by_camera = load_qingyu_timebase(
-            timebase_path,
-            episode_root=episode_root,
-        )
-    except ValueError as exc:
-        raise ModuleInputError("sam3_containment", str(exc)) from exc
-    timebase = timebase_by_camera.get(primary_camera)
+    session = QingyuHandPoseSession(
+        observations_path=observations_path,
+    )
+    timebase_source = str(context.metadata.get("timebase_source") or "").strip()
+    timebase_path: Path | None = None
+    if timebase_source == "derived_from_video_and_observations_2d":
+        try:
+            timebase = session.derive_camera_timebase(
+                camera=primary_camera,
+                video_path=video_path,
+            )
+        except ValueError as exc:
+            raise ModuleInputError("sam3_containment", str(exc)) from exc
+        if timebase is not None:
+            expected_values = {
+                "frames": context.metadata.get("video_frame_count"),
+                "width": context.metadata.get("video_width"),
+                "height": context.metadata.get("video_height"),
+                "fps": context.metadata.get("fps"),
+                "source_start_frame": context.metadata.get("start_frame"),
+                "source_end_frame": context.metadata.get("end_frame"),
+            }
+            try:
+                metadata_matches = all(
+                    float(timebase[field]) == float(expected)
+                    for field, expected in expected_values.items()
+                    if expected not in {None, ""}
+                )
+            except (TypeError, ValueError):
+                metadata_matches = False
+            if not metadata_matches:
+                raise ModuleBlockedError(
+                    "sam3_containment", "frame_mapping_unverified"
+                )
+    else:
+        timebase_path = _source_path(context, "timebase")
+        assert timebase_path is not None
+        episode_root = timebase_path.parent.parent
+        try:
+            timebase_by_camera = load_qingyu_timebase(
+                timebase_path,
+                episode_root=episode_root,
+            )
+        except ValueError as exc:
+            raise ModuleInputError("sam3_containment", str(exc)) from exc
+        timebase = timebase_by_camera.get(primary_camera)
     if timebase is None:
-        raise ModuleBlockedError("sam3_containment", "primary_camera_missing")
+        raise ModuleBlockedError("sam3_containment", "timebase_unavailable")
     if Path(timebase["video_path"]).resolve() != video_path.resolve():
         raise ModuleBlockedError("sam3_containment", "frame_mapping_unverified")
     start_frame, end_frame_exclusive = context.source_range
@@ -582,9 +691,6 @@ def _qy_containment_inputs(
         or int(timebase["source_end_frame"]) != end_frame
     ):
         raise ModuleBlockedError("sam3_containment", "frame_mapping_unverified")
-    session = QingyuHandPoseSession(
-        observations_path=observations_path,
-    )
     direct_2d = session.direct_2d_index(
         camera=primary_camera,
         start_frame=start_frame,
@@ -986,10 +1092,14 @@ def runner(
         dr_inputs: tuple[Path, Path, Path, Path, Any, Mapping[str, Any]] | None = None
         qy_inputs: _QyContainmentInputs | None = None
         if supplier in {"dr", "deepreach"}:
+            heuristic_projection = (
+                context.metadata.get("projection_mode")
+                == "approx_pinhole_from_hfov"
+            )
             projection_status = str(
                 context.metadata.get("projection_validation_status") or ""
             ).lower()
-            if projection_status != "validated":
+            if not heuristic_projection and projection_status != "validated":
                 reason = (
                     "transform_ambiguous"
                     if projection_status == "transform_ambiguous"
@@ -1005,7 +1115,7 @@ def runner(
                 raise ModuleBlockedError("sam3_containment", reason)
             dr_inputs = _dr_projection_inputs(context, config)
             validation = dr_inputs[4]
-            if validation.status != "validated":
+            if validation.status not in {"validated", "heuristic_ready"}:
                 reason = (
                     validation.reason
                     if validation.reason
@@ -1069,7 +1179,13 @@ def runner(
                 "current precheck run does not match this asset/config or lacks temporal output",
             )
         temporal_output = precheck_run.get("temporal_output")
-        if (
+        qy_temporal_not_applicable = bool(
+            supplier in {"qy", "qingyu"}
+            and isinstance(temporal_output, Mapping)
+            and temporal_output.get("status") == "not_applicable"
+            and temporal_output.get("reason") == "qy_hand_topology_not_validated"
+        )
+        if not qy_temporal_not_applicable and (
             not isinstance(temporal_output, Mapping)
             or temporal_output.get("status") != "valid"
             or not isinstance(temporal_output.get("valid_frame_count"), int)
@@ -1169,6 +1285,19 @@ def runner(
                     "projection_validation_status"
                 ),
                 "trajectory_usage": validation.trajectory_usage,
+                "projection_mode": context.metadata.get("projection_mode"),
+                "calibration_status": context.metadata.get(
+                    "calibration_status"
+                ),
+                "head_hfov_deg": context.metadata.get("head_hfov_deg"),
+                "intrinsics": {
+                    name: context.metadata.get(name)
+                    for name in ("fx", "fy", "cx", "cy")
+                },
+                "distortion_applied": context.metadata.get(
+                    "distortion_applied"
+                ),
+                "selected_by": context.metadata.get("selected_by"),
             }
         if qy_inputs is not None:
             fingerprint_extra["qy_direct_2d_contract"] = {
@@ -1176,6 +1305,7 @@ def runner(
                 "primary_camera": qy_inputs.primary_camera,
                 "frame_mapping": "explicit_source_frame_index_to_video_frame",
                 "joint_topology": "unverified_points_only",
+                "timebase_source": context.metadata.get("timebase_source"),
                 "source_frame_count": int(
                     qy_inputs.timebase["source_frame_count"]
                 ),

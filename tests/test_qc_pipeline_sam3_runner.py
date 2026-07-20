@@ -111,29 +111,30 @@ def _dr_context(
     *,
     invalid_depth: bool = False,
     invalid_right_hand: bool = False,
+    frame_count: int = 3,
 ) -> AssetContext:
     source = tmp_path / "source"
     source.mkdir(parents=True, exist_ok=True)
     with h5py.File(source / "task.h5", "w") as handle:
         handle.attrs["coordinate_frame"] = "head_camera"
         handle.attrs["units"] = "meters"
-        handle.create_dataset("timestamp", data=np.arange(3, dtype=float) / 10.0)
+        handle.create_dataset("timestamp", data=np.arange(frame_count, dtype=float) / 10.0)
         for side in ("left", "right"):
             group = handle.create_group(f"hand/{side}")
-            points = np.zeros((3, 21, 3), dtype=np.float32)
+            points = np.zeros((frame_count, 21, 3), dtype=np.float32)
             points[..., 2] = 1.0
             points[..., 0] = np.linspace(-0.1, 0.1, 21)
             if side == "left" and invalid_depth:
                 points[1, 0, 2] = 0.0
                 points[1, 1, 0] = np.nan
             group.create_dataset("joints3d", data=points)
-            valid = np.ones(3, dtype=np.uint8)
+            valid = np.ones(frame_count, dtype=np.uint8)
             if side == "right" and invalid_right_hand:
                 valid[1] = 0
             group.create_dataset("valid", data=valid)
     write_test_video(
         source / "head.mp4",
-        [solid_frame(50, width=100, height=80) for _ in range(3)],
+        [solid_frame(50, width=100, height=80) for _ in range(frame_count)],
         fps=10.0,
     )
     (source / "calib.json").write_text(
@@ -160,7 +161,7 @@ def _dr_context(
             "calibration": {"path": "source/calib.json"},
             "trajectory": {"path": "source/trajectory.csv"},
         },
-        source_range=(0, 3),
+        source_range=(0, frame_count),
         metadata={
             "supplier": "dr",
             "primary_camera": "head",
@@ -172,7 +173,7 @@ def _dr_context(
                 "asset_id": "asset-a",
                 "supplier": "dr",
                 "start_frame": 0,
-                "end_frame": 2,
+                "end_frame": frame_count - 1,
             },
         },
     )
@@ -211,6 +212,17 @@ class _FullMaskSegmenter:
         return [
             SimpleNamespace(
                 mask=np.ones(frame.shape[:2], dtype=bool),
+                category="hand",
+            )
+        ]
+
+
+class _EmptyMaskSegmenter(_FullMaskSegmenter):
+    def segment_frame(self, frame, queries, config):
+        self.calls += 1
+        return [
+            SimpleNamespace(
+                mask=np.zeros(frame.shape[:2], dtype=bool),
                 category="hand",
             )
         ]
@@ -923,6 +935,77 @@ def test_validated_dr_candidates_use_hdf5_calibration_without_jdt_parquet(
     assert {row["camera_id"] for row in frame_rows} == {"main"}
     assert all("parquet_path" not in row for row in frame_rows)
     assert all(row["hdf5_path"].endswith("source/task.h5") for row in frame_rows)
+
+
+@pytest.mark.parametrize(
+    ("segmenter_type", "expected_raw_verdict"),
+    [
+        (_FullMaskSegmenter, "acceptable_flagged"),
+        (_EmptyMaskSegmenter, "containment_fail"),
+    ],
+)
+def test_user_selected_dr_heuristic_projection_forces_review_and_preserves_raw_verdict(
+    tmp_path: Path,
+    segmenter_type: type[_FullMaskSegmenter],
+    expected_raw_verdict: str,
+) -> None:
+    base = _dr_context(tmp_path, frame_count=5)
+    context = replace(
+        base,
+        source_files={
+            name: value
+            for name, value in base.source_files.items()
+            if name not in {"calibration", "trajectory"}
+        },
+        metadata={
+            **dict(base.metadata),
+            "projection_mode": "approx_pinhole_from_hfov",
+            "head_hfov_deg": 100.0,
+            "fx": 41.954981558864,
+            "fy": 41.954981558864,
+            "cx": 50.0,
+            "cy": 40.0,
+            "image_width": 100,
+            "image_height": 80,
+            "calibration_status": "heuristic",
+            "projection_validation_status": "pending_visual_validation",
+            "distortion_applied": False,
+            "camera_trajectory_applied": False,
+            "selected_by": "user_visual_confirmation",
+        },
+    )
+    _write_candidates(tmp_path, [_candidate(0, 4)])
+    _write_current_run_config(context)
+    segmenter = segmenter_type()
+
+    result = runner(lambda: segmenter)(context, _dr_config())
+
+    assert result.verdict == "warn"
+    assert result.evaluation["decision"] == "warn"
+    assert segmenter.calls == 5
+    artifact = tmp_path / "module_outputs" / "asset-a" / "sam3_containment"
+    windows = json.loads((artifact / "window_results.json").read_text())
+    assert {row["window_containment_verdict"] for row in windows} == {
+        "projection_review"
+    }
+    assert {row["raw_window_containment_verdict"] for row in windows} == {
+        expected_raw_verdict
+    }
+    assert {row["calibration_status"] for row in windows} == {"heuristic"}
+    assert {row["projection_validation_status"] for row in windows} == {
+        "pending_visual_validation"
+    }
+    assert {row["routing_reason"] for row in windows} == {
+        "dr_heuristic_projection_requires_human_review"
+    }
+    evidence = json.loads((artifact / "evidence_manifest.json").read_text())
+    assert len(evidence) == 5
+    assert all(row["supplier_id"] == "dr" for row in evidence)
+    assert all("rejected_duration" not in row for row in windows)
+    producer = json.loads((artifact / "producer_run_config.json").read_text())
+    assert producer["projection_mode"] == "approx_pinhole_from_hfov"
+    assert producer["calibration_status"] == "heuristic"
+    assert producer["camera_trajectory_applied"] is False
 
 
 def test_dr_invalid_depth_nan_and_invalid_hand_are_recorded(

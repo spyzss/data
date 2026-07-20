@@ -135,10 +135,18 @@ def audit_supplier_data(
         source_name: _inventory_entry(context, source_name)
         for source_name in required
     }
+    derived_qy_timebase = bool(
+        supplier == "qy"
+        and context.metadata.get("timebase_source")
+        == "derived_from_video_and_observations_2d"
+        and context.metadata.get("timebase_status") == "derived"
+        and context.metadata.get("frame_mapping_status") == "verified"
+    )
     missing = [
         source_name
         for source_name, item in inventory.items()
         if item["status"] != "present"
+        and not (source_name == "timebase" and derived_qy_timebase)
     ]
     if supplier == "qy":
         mapping_status = (
@@ -163,6 +171,15 @@ def audit_supplier_data(
         for source_name in missing
     ]
     if supplier == "qy":
+        if derived_qy_timebase:
+            issues.append(
+                {
+                    "code": "supplier_timebase_missing_derived",
+                    "severity": "warn",
+                    "source_name": "timebase",
+                    "observed_value": context.metadata.get("timebase_source"),
+                }
+            )
         for source_name, item in inventory.items():
             if item["status"] == "wrong_type":
                 issues.append(
@@ -278,8 +295,15 @@ def audit_supplier_data(
     elif supplier == "qy":
         structured = {
             "timebase_status": context.metadata.get("timebase_status"),
+            "timebase_source": context.metadata.get("timebase_source"),
             "frame_mapping_status": context.metadata.get(
                 "frame_mapping_status"
+            ),
+            "frame_mapping_source": context.metadata.get(
+                "frame_mapping_source"
+            ),
+            "source_video_identity_assumed": context.metadata.get(
+                "source_video_identity_assumed"
             ),
             "skeleton_2d_status": context.metadata.get("skeleton_2d_status"),
             "skeleton_3d_status": context.metadata.get("skeleton_3d_status"),

@@ -168,20 +168,7 @@ class QingyuHandPoseSession:
         records: list[dict[str, Any]] = []
         for row_index, row in frame.iterrows():
             points = _strict_points(row.get("pred_keypoints_2d"), (21, 2))
-            raw_points = row.get("pred_keypoints_2d")
-            finite_joint_count = 0
-            if not _is_missing(raw_points):
-                try:
-                    raw_array = np.asarray(raw_points)
-                    if raw_array.ndim == 1 and len(raw_array) > 0:
-                        raw_array = np.stack(list(raw_array), axis=0)
-                    raw_array = np.asarray(raw_array, dtype=np.float64)
-                    if raw_array.ndim == 2 and raw_array.shape[1:] == (2,):
-                        finite_joint_count = int(
-                            np.sum(np.isfinite(raw_array).all(axis=-1))
-                        )
-                except (TypeError, ValueError):
-                    pass
+            finite_joint_count = 21 if points is not None else 0
             records.append(
                 {
                     "row_index": int(row_index),
@@ -209,6 +196,68 @@ class QingyuHandPoseSession:
             "cameras": sorted({str(row["camera"]) for row in records if row["camera"]}),
         }
 
+    def derive_camera_timebase(
+        self,
+        *,
+        camera: str,
+        video_path: Path,
+    ) -> dict[str, Any] | None:
+        """Derive physical video metadata plus the observed source range.
+
+        This is deliberately not a supplier timebase.  Source/video pairing
+        remains the explicit mapping carried by each observations_2d row.
+        Conflicts are audited by :meth:`camera_coverage` rather than repaired.
+        """
+        import cv2
+
+        records = [
+            row for row in self._parsed_observations() if row["camera"] == camera
+        ]
+        source_frames = [
+            int(row["source_frame_index"])
+            for row in records
+            if row["source_frame_index"] is not None
+        ]
+        timestamps = [
+            float(row["timestamp"])
+            for row in records
+            if row["timestamp"] is not None
+        ]
+        if not records or not source_frames or not timestamps or not video_path.is_file():
+            return None
+        capture = cv2.VideoCapture(str(video_path))
+        try:
+            if not capture.isOpened():
+                return None
+            frames = int(round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+            width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+            height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
+        finally:
+            capture.release()
+        if frames < 1 or width < 1 or height < 1 or not math.isfinite(fps) or fps <= 0:
+            return None
+        start = min(source_frames)
+        end = max(source_frames)
+        return {
+            "camera": camera,
+            "video_path": video_path,
+            "frames": frames,
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "source_start_frame": start,
+            "source_end_frame": end,
+            "source_frame_count": end - start + 1,
+            "source_start_timestamp": min(timestamps),
+            "source_end_timestamp": max(timestamps),
+            "timebase_source": "derived_from_video_and_observations_2d",
+            "frame_mapping_source": (
+                "explicit_source_frame_index_to_video_frame"
+            ),
+            "source_video_identity_assumed": False,
+        }
+
     def camera_coverage(
         self,
         *,
@@ -225,12 +274,33 @@ class QingyuHandPoseSession:
             "camera": camera,
             "row_count": row_count,
             "video_available": bool(video_available),
-            "timebase_status": "valid" if timebase is not None else "input_missing",
+            "timebase_status": (
+                "derived"
+                if timebase is not None
+                and timebase.get("timebase_source")
+                == "derived_from_video_and_observations_2d"
+                else "valid" if timebase is not None else "input_missing"
+            ),
+            "timebase_source": (
+                timebase.get("timebase_source") if timebase is not None else None
+            ),
+            "frame_mapping_source": (
+                timebase.get("frame_mapping_source")
+                if timebase is not None
+                else None
+            ),
             "frame_mapping_status": "mapping_unverified",
             "eligible": False,
+            "explicit_camera_eligible": False,
             "source_video_identity_assumed": False,
         }
         if timebase is None:
+            if not records:
+                reason = "primary_camera_2d_missing"
+            elif not video_available:
+                reason = "primary_video_missing"
+            else:
+                reason = "video_metadata_invalid_or_timebase_missing"
             result.update(
                 {
                     "video_frame_count": None,
@@ -239,7 +309,7 @@ class QingyuHandPoseSession:
                         not row["shape_valid"] for row in records
                     ),
                     "score": None,
-                    "reason": "timebase_missing",
+                    "reason": reason,
                 }
             )
             return result
@@ -254,14 +324,19 @@ class QingyuHandPoseSession:
         tolerance = 1.0 / fps
         legal_rows: list[dict[str, Any]] = []
         invalid_shape_count = 0
-        invalid_mapping_count = 0
+        source_frame_out_of_range_count = 0
+        video_frame_out_of_range_count = 0
+        timestamp_out_of_range_count = 0
+        missing_mapping_count = 0
         invalid_hand_count = 0
         finite_joint_count = 0
         source_to_video: dict[tuple[str, int], int] = {}
         video_to_source: dict[tuple[str, int], int] = {}
         global_source_to_video: dict[int, int] = {}
         global_video_to_source: dict[int, int] = {}
-        conflict_keys: set[tuple[str, int]] = set()
+        duplicate_keys: set[tuple[str, int]] = set()
+        source_conflict_keys: set[int] = set()
+        video_conflict_keys: set[int] = set()
         for row in records:
             finite_joint_count += int(row["finite_joint_count"])
             if not row["shape_valid"]:
@@ -274,45 +349,51 @@ class QingyuHandPoseSession:
             if hand not in QY_HANDS:
                 invalid_hand_count += 1
                 continue
-            legal = bool(
-                source_frame is not None
-                and start <= source_frame <= end
-                and video_frame is not None
-                and 0 <= video_frame < video_frames
-                and timestamp is not None
-                and timestamp_start - tolerance <= timestamp <= timestamp_end + tolerance
-            )
-            if not legal:
-                invalid_mapping_count += 1
+            if source_frame is None or video_frame is None or timestamp is None:
+                missing_mapping_count += 1
                 continue
-            assert source_frame is not None and video_frame is not None
+            if not start <= source_frame <= end:
+                source_frame_out_of_range_count += 1
+                continue
+            if not 0 <= video_frame < video_frames:
+                video_frame_out_of_range_count += 1
+                continue
+            if not timestamp_start - tolerance <= timestamp <= timestamp_end + tolerance:
+                timestamp_out_of_range_count += 1
+                continue
             source_key = (hand, source_frame)
             video_key = (hand, video_frame)
             if (
                 source_key in source_to_video
                 or video_key in video_to_source
             ):
-                if source_to_video.get(source_key) != video_frame:
-                    conflict_keys.add(source_key)
-                if video_to_source.get(video_key) != source_frame:
-                    conflict_keys.add(video_key)
+                if (
+                    source_key in source_to_video
+                    and source_to_video[source_key] != video_frame
+                ):
+                    source_conflict_keys.add(source_frame)
+                if (
+                    video_key in video_to_source
+                    and video_to_source[video_key] != source_frame
+                ):
+                    video_conflict_keys.add(video_frame)
                 if (
                     source_to_video.get(source_key) == video_frame
                     and video_to_source.get(video_key) == source_frame
                 ):
-                    conflict_keys.add(source_key)
+                    duplicate_keys.add(source_key)
                 continue
             if (
                 source_frame in global_source_to_video
                 and global_source_to_video[source_frame] != video_frame
             ):
-                conflict_keys.add(("source", source_frame))
+                source_conflict_keys.add(source_frame)
                 continue
             if (
                 video_frame in global_video_to_source
                 and global_video_to_source[video_frame] != source_frame
             ):
-                conflict_keys.add(("video", video_frame))
+                video_conflict_keys.add(video_frame)
                 continue
             source_to_video[source_key] = video_frame
             video_to_source[video_key] = source_frame
@@ -320,7 +401,10 @@ class QingyuHandPoseSession:
             global_video_to_source.setdefault(video_frame, source_frame)
             legal_rows.append(row)
 
-        conflict_count = len(conflict_keys)
+        source_conflict_count = len(source_conflict_keys)
+        video_conflict_count = len(video_conflict_keys)
+        duplicate_count = len(duplicate_keys)
+        conflict_count = source_conflict_count + video_conflict_count + duplicate_count
         if conflict_count:
             legal_rows = []
         by_hand = {
@@ -339,6 +423,12 @@ class QingyuHandPoseSession:
             finite_joint_count / (row_count * 21) if row_count else 0.0
         )
         timeline_match_ratio = len(legal_rows) / row_count if row_count else 0.0
+        invalid_mapping_count = (
+            missing_mapping_count
+            + source_frame_out_of_range_count
+            + video_frame_out_of_range_count
+            + timestamp_out_of_range_count
+        )
         mapping_verified = bool(
             row_count
             and invalid_mapping_count == 0
@@ -365,9 +455,48 @@ class QingyuHandPoseSession:
             and timeline_match_ratio
             >= float(config["minimum_timeline_match_ratio"])
         )
+        explicit_camera_eligible = bool(
+            video_available
+            and mapping_verified
+            and invalid_shape_count == 0
+            and bool(legal_rows)
+        )
+        if not records:
+            reason = "primary_camera_2d_missing"
+        elif not video_available:
+            reason = "primary_video_missing"
+        elif invalid_shape_count == row_count:
+            reason = "no_valid_2d_points"
+        elif source_conflict_count:
+            reason = "source_to_video_conflict"
+        elif video_conflict_count:
+            reason = "video_to_source_conflict"
+        elif video_frame_out_of_range_count:
+            reason = "video_frame_out_of_range"
+        elif source_frame_out_of_range_count:
+            reason = "source_frame_out_of_range"
+        elif timestamp_out_of_range_count:
+            reason = "timestamp_mapping_invalid"
+        elif missing_mapping_count:
+            reason = "frame_mapping_missing"
+        elif invalid_hand_count:
+            reason = "hand_identity_invalid"
+        elif duplicate_count:
+            reason = "duplicate_frame_mapping"
+        else:
+            reason = "eligible" if eligible else "minimum_qualification_not_met"
         result.update(
             {
                 "video_frame_count": video_frames,
+                "video_width": (
+                    int(timebase["width"]) if timebase.get("width") is not None else None
+                ),
+                "video_height": (
+                    int(timebase["height"])
+                    if timebase.get("height") is not None
+                    else None
+                ),
+                "fps": fps,
                 "source_start_frame": start,
                 "source_end_frame": end,
                 "source_frame_count": source_count,
@@ -379,15 +508,27 @@ class QingyuHandPoseSession:
                 "timeline_match_ratio": timeline_match_ratio,
                 "explicit_mapping_valid_count": len(legal_rows),
                 "invalid_mapping_row_count": invalid_mapping_count,
+                "missing_mapping_row_count": missing_mapping_count,
+                "source_frame_out_of_range_count": source_frame_out_of_range_count,
+                "video_frame_out_of_range_count": video_frame_out_of_range_count,
+                "timestamp_out_of_range_count": timestamp_out_of_range_count,
                 "invalid_hand_row_count": invalid_hand_count,
                 "invalid_shape_row_count": invalid_shape_count,
                 "mapping_conflict_count": conflict_count,
+                "source_to_video_conflict_count": source_conflict_count,
+                "video_to_source_conflict_count": video_conflict_count,
+                "duplicate_mapping_count": duplicate_count,
+                "source_to_video_mapping": {
+                    str(source): video
+                    for source, video in sorted(global_source_to_video.items())
+                },
                 "frame_mapping_status": (
                     "verified" if mapping_verified else "mapping_unverified"
                 ),
                 "score": score,
                 "eligible": eligible,
-                "reason": "eligible" if eligible else "minimum_qualification_not_met",
+                "explicit_camera_eligible": explicit_camera_eligible,
+                "reason": reason,
             }
         )
         return result

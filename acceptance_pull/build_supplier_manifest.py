@@ -48,6 +48,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--calib-cache", type=Path)
     parser.add_argument(
+        "--sam3-model",
+        type=Path,
+        help="Explicit SAM3 model directory recorded in the supplier manifest.",
+    )
+    parser.add_argument(
         "--calibration-map",
         type=Path,
         help=(
@@ -97,6 +102,7 @@ def run(
     max_assets: int | None = None,
     calibration_mapping: Mapping[str, str] | None = None,
     camera_selection_config: Mapping[str, object] | None = None,
+    sam3_model: Path | None = None,
 ) -> int:
     if supplier == "potentia":
         rows = build_potentia_manifest(root, max_assets=max_assets)
@@ -109,6 +115,7 @@ def run(
             primary_camera=primary_camera,
             camera_selection=camera_selection_config,
             max_assets=max_assets,
+            sam3_model=sam3_model,
         )
         manifest_path = write_qingyu_manifest(rows, output_dir)
         LOGGER.info("Wrote %d rows to %s", len(rows), manifest_path)
@@ -170,6 +177,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.camera_selection_config is not None
             else None
         ),
+        sam3_model=args.sam3_model,
     )
 
 

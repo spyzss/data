@@ -299,6 +299,88 @@ def contexts_from_manifest(
     return contexts
 
 
+def apply_dr_heuristic_projection_mapping(
+    contexts: Iterable[AssetContext],
+    mapping_path: Path,
+) -> list[AssetContext]:
+    """Overlay user-confirmed DR HFOV choices without mutating manifest identity."""
+    context_list = list(contexts)
+    mapping_path = Path(mapping_path).resolve()
+    if not mapping_path.is_file():
+        raise FileNotFoundError(mapping_path)
+    rows_by_asset: dict[str, dict[str, Any]] = {}
+    for index, source in enumerate(read_manifest(mapping_path)):
+        row = canonical_manifest_metadata(source)
+        asset_id = _text(row.get("asset_id"))
+        if not asset_id:
+            raise ValueError(f"DR heuristic mapping row {index} missing asset_id")
+        if asset_id in rows_by_asset:
+            raise ValueError(f"duplicate DR heuristic mapping asset_id: {asset_id}")
+        if (
+            _text(row.get("projection_mode")) != "approx_pinhole_from_hfov"
+            or _text(row.get("calibration_status")) != "heuristic"
+            or _text(row.get("projection_validation_status"))
+            != "pending_visual_validation"
+            or _text(row.get("selected_by")) != "user_visual_confirmation"
+            or _text(row.get("distortion_applied")).lower() not in {"false", "0"}
+            or _text(row.get("camera_trajectory_applied")).lower()
+            not in {"false", "0"}
+        ):
+            raise ValueError(
+                f"invalid DR heuristic projection contract for asset_id: {asset_id}"
+            )
+        rows_by_asset[asset_id] = row
+
+    context_ids = {context.asset_id for context in context_list}
+    unknown = sorted(set(rows_by_asset) - context_ids)
+    if unknown:
+        raise ValueError(
+            "DR heuristic mapping contains assets absent from manifest: "
+            + ", ".join(unknown)
+        )
+
+    updated: list[AssetContext] = []
+    for context in context_list:
+        row = rows_by_asset.get(context.asset_id)
+        if row is None:
+            updated.append(context)
+            continue
+        supplier = _text(
+            context.metadata.get("supplier")
+            or context.metadata.get("supplier_id")
+        ).lower()
+        if supplier not in {"dr", "deepreach"}:
+            raise ValueError(
+                f"DR heuristic mapping targets non-DR asset: {context.asset_id}"
+            )
+        overlay = {
+            key: row.get(key)
+            for key in (
+                "projection_mode",
+                "head_hfov_deg",
+                "fx",
+                "fy",
+                "cx",
+                "cy",
+                "image_width",
+                "image_height",
+                "calibration_status",
+                "projection_validation_status",
+                "distortion_applied",
+                "camera_trajectory_applied",
+                "selected_by",
+            )
+        }
+        overlay["dr_heuristic_projection_mapping_path"] = str(mapping_path)
+        updated.append(
+            replace(
+                context,
+                metadata={**context.metadata, **overlay},
+            )
+        )
+    return updated
+
+
 def run_batch(
     contexts: Iterable[AssetContext],
     *,
@@ -450,6 +532,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("acceptance", "supplier_evaluation"),
     )
     parser.add_argument("--config", type=Path)
+    parser.add_argument(
+        "--dr-heuristic-projection-map",
+        type=Path,
+        help=(
+            "Explicit user-confirmed heuristic DR head projection mapping. "
+            "Applied as runtime metadata; the canonical manifest is unchanged."
+        ),
+    )
     parser.add_argument("--max-workers", type=int, default=1)
     parser.add_argument(
         "--resume",
@@ -467,6 +557,11 @@ def main(argv: list[str] | None = None) -> int:
         batch_root=args.batch_root,
         allow_symlinked_sources=args.allow_symlinked_sources,
     )
+    if args.dr_heuristic_projection_map is not None:
+        contexts = apply_dr_heuristic_projection_mapping(
+            contexts,
+            args.dr_heuristic_projection_map,
+        )
     outcomes = run_batch(
         contexts,
         config=config,

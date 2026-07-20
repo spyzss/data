@@ -108,6 +108,69 @@ def test_browser_render_has_five_overlays_navigation_progress_and_missing_guard(
     assert result.returncode == 0, result.stderr
 
 
+def test_browser_urls_resolve_under_dsw_reverse_proxy_base_path() -> None:
+    html = _source("sam3_window_review.html")
+    assert 'href="static/sam3_window_review.css"' in html
+    assert 'src="static/sam3_window_review.js"' in html
+    assert 'href="/static/' not in html
+    assert 'src="/static/' not in html
+
+    script = r'''
+      import assert from "node:assert/strict";
+      import {
+        Sam3WindowReviewApp,
+        renderReviewMarkup,
+        resolveAppUrl,
+      } from "./human_qc/static/sam3_window_review.js";
+
+      const baseURI = "https://host/ide/proxy/8898/";
+      assert.equal(
+        resolveAppUrl("/api/review-bundle", baseURI),
+        "https://host/ide/proxy/8898/api/review-bundle",
+      );
+      assert.equal(
+        resolveAppUrl("/assets/review-1/frame.png", baseURI),
+        "https://host/ide/proxy/8898/assets/review-1/frame.png",
+      );
+
+      const calls = [];
+      const item = {
+        review_id: "review-1",
+        asset_id: "jdt__episode_1",
+        window_start_frame: 0,
+        window_end_frame: 10,
+        can_review: true,
+        evidence: [{
+          frame_idx: 5,
+          status: "ready",
+          url: "/assets/review-1/frame.png",
+        }],
+        manual_review: { verdict: null, revision: 0 },
+      };
+      const app = new Sam3WindowReviewApp({
+        baseURI,
+        fetcher: async (url) => {
+          calls.push(url);
+          return { ok: true, json: async () => ({ bundle: { items: [item] } }) };
+        },
+      });
+      await app.load();
+      assert.equal(calls[0], "https://host/ide/proxy/8898/api/review-bundle");
+      assert.match(
+        renderReviewMarkup(item, 0, 1, baseURI),
+        /https:\/\/host\/ide\/proxy\/8898\/assets\/review-1\/frame\.png/,
+      );
+    '''
+    result = subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        cwd=STATIC.parents[1],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_cli_requires_explicit_contract_paths_and_has_no_run_root_defaults(tmp_path: Path) -> None:
     args = parse_args(
         [

@@ -18,6 +18,7 @@ from acceptance_pull.supplier_adapters.qingyu_hand_pose import (
     load_qingyu_clip,
 )
 from qc_common.manifest_metadata import canonical_manifest_metadata
+from tests.fixtures import solid_frame, write_test_video
 from tests.qingyu_fixtures import (
     QY_CAMERAS,
     keypoints_2d,
@@ -26,6 +27,148 @@ from tests.qingyu_fixtures import (
     observation_rows,
     trajectory_rows,
 )
+
+
+def _make_qy_without_supplier_timebase(
+    tmp_path: Path,
+    *,
+    observations: list[dict] | None = None,
+) -> tuple[Path, Path]:
+    root = tmp_path / "QY"
+    episode = make_qy_episode(root, observations=observations)
+    (episode / "timestamps" / "episode_timebase.json").unlink()
+    write_test_video(
+        episode / "videos" / "mid_cam_left.mp4",
+        [solid_frame(value, width=64, height=48) for value in (10, 20, 30, 40)],
+        fps=30.0,
+    )
+    return root, episode
+
+
+def test_qy_explicit_camera_derives_timebase_from_video_and_explicit_mapping(
+    tmp_path: Path,
+) -> None:
+    root, episode = _make_qy_without_supplier_timebase(tmp_path)
+
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
+
+    assert row["primary_camera"] == "mid_cam_left"
+    assert row["primary_camera_source"] == "explicit_config"
+    assert row["primary_video_path"] == str(
+        episode / "videos" / "mid_cam_left.mp4"
+    )
+    assert row["adapter_status"] == "ready"
+    assert row["reason"] == "ready"
+    assert row["timebase_status"] == "derived"
+    assert row["timebase_source"] == "derived_from_video_and_observations_2d"
+    assert row["frame_mapping_status"] == "verified"
+    assert row["frame_mapping_source"] == (
+        "explicit_source_frame_index_to_video_frame"
+    )
+    assert row["source_video_identity_assumed"] == "false"
+    assert row["timebase_path"] == ""
+    assert row["video_frame_count"] == "4"
+    assert row["video_width"] == "64"
+    assert row["video_height"] == "48"
+    assert float(row["fps"]) == pytest.approx(30.0)
+    assert row["start_frame"] == "100"
+    assert row["end_frame"] == "102"
+
+    coverage = json.loads(row["camera_coverage"])["mid_cam_left"]
+    assert coverage["source_video_identity_assumed"] is False
+    assert coverage["timebase_source"] == (
+        "derived_from_video_and_observations_2d"
+    )
+    assert coverage["source_to_video_mapping"] == {
+        "100": 0,
+        "101": 2,
+        "102": 3,
+    }
+
+
+def test_qy_explicit_camera_is_not_rejected_by_auto_coverage_thresholds(
+    tmp_path: Path,
+) -> None:
+    root, _ = _make_qy_without_supplier_timebase(
+        tmp_path,
+        observations=observation_rows(hands=("left",)),
+    )
+
+    row = build_qingyu_manifest(
+        root,
+        primary_camera="mid_cam_left",
+        camera_selection={
+            "minimum_hand_coverage": 1.0,
+            "minimum_both_hand_coverage": 1.0,
+        },
+    )[0]
+
+    assert row["primary_camera"] == "mid_cam_left"
+    assert row["frame_mapping_status"] == "verified"
+    assert row["adapter_status"] == "ready"
+    coverage = json.loads(row["camera_coverage"])["mid_cam_left"]
+    assert coverage["eligible"] is False
+    assert coverage["explicit_camera_eligible"] is True
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_reason"),
+    [
+        (
+            lambda rows: rows.__setitem__(
+                1,
+                {**rows[1], "source_frame_index": rows[0]["source_frame_index"], "video_frame": 1},
+            ),
+            "source_to_video_conflict",
+        ),
+        (
+            lambda rows: rows.__setitem__(
+                2,
+                {**rows[2], "source_frame_index": 101, "video_frame": rows[0]["video_frame"]},
+            ),
+            "video_to_source_conflict",
+        ),
+        (
+            lambda rows: rows.__setitem__(0, {**rows[0], "video_frame": 99}),
+            "video_frame_out_of_range",
+        ),
+        (
+            lambda rows: [row.update(pred_keypoints_2d=keypoints_2d()[:20]) for row in rows],
+            "no_valid_2d_points",
+        ),
+    ],
+)
+def test_qy_derived_timebase_reports_precise_mapping_failures(
+    tmp_path: Path,
+    mutate,
+    expected_reason: str,
+) -> None:
+    rows = observation_rows()
+    mutate(rows)
+    root, _ = _make_qy_without_supplier_timebase(tmp_path, observations=rows)
+
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
+
+    assert row["primary_camera"] == ""
+    assert row["adapter_status"] == "input_missing"
+    assert row["reason"] == expected_reason
+    assert row["camera_recommendation_reason"] == expected_reason
+
+
+def test_qy_camera_group_is_not_accepted_as_exact_camera_identity(
+    tmp_path: Path,
+) -> None:
+    rows = observation_rows()
+    for row in rows:
+        row["camera_group"] = "mid"
+        row.pop("camera")
+    root, _ = _make_qy_without_supplier_timebase(tmp_path, observations=rows)
+
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
+
+    assert row["primary_camera"] == ""
+    assert row["adapter_status"] == "input_missing"
+    assert row["reason"] == "primary_camera_2d_missing"
 
 
 def test_qy_manifest_uses_authoritative_timebase_and_unique_recommendation(
@@ -113,8 +256,8 @@ def test_qy_timebase_episode_identity_mismatch_is_not_accepted(
 
     assert row["primary_camera"] == ""
     assert row["timebase_status"] == "input_invalid"
-    assert row["adapter_status"] == "input_missing"
-    assert row["reason"] == "primary_camera_missing"
+    assert row["adapter_status"] == "input_invalid"
+    assert row["reason"] == "timebase_invalid"
 
 
 def test_qy_duplicate_timebase_camera_is_invalid_even_if_first_is_not_ok(
@@ -134,8 +277,8 @@ def test_qy_duplicate_timebase_camera_is_invalid_even_if_first_is_not_ok(
     assert row["timebase_status"] == "input_invalid"
     assert row["frame_mapping_status"] == "mapping_unverified"
     assert row["primary_camera"] == ""
-    assert row["adapter_status"] == "input_missing"
-    assert row["reason"] == "primary_camera_missing"
+    assert row["adapter_status"] == "input_invalid"
+    assert row["reason"] == "timebase_invalid"
 
 
 def test_qy_tied_recommendation_does_not_use_camera_name_tiebreak(
@@ -169,8 +312,8 @@ def test_qy_explicit_missing_or_ineligible_camera_never_falls_back(
     assert row["primary_camera"] == ""
     assert row["requested_primary_camera"] == "left_cam_left"
     assert row["adapter_status"] == "input_missing"
-    assert row["reason"] == "primary_camera_missing"
-    assert row["camera_recommendation_reason"] == "explicit_camera_ineligible"
+    assert row["reason"] == "primary_camera_2d_missing"
+    assert row["camera_recommendation_reason"] == "primary_camera_2d_missing"
 
 
 def test_qy_mapping_conflict_is_not_guessed_from_rows_or_video_count(

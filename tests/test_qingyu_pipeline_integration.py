@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 import copy
-import math
 
 import pandas as pd
 import pytest
@@ -17,6 +16,7 @@ from qc_common.schema import validate_qc_config
 from qc_common.suppliers import normalize_supplier
 from qc_common.module_registry import ModulePrerequisiteError
 from qc_pipeline.runners.precheck import PrecheckSession, precheck_fingerprint
+from tests.fixtures import solid_frame, write_test_video
 from tests.qingyu_fixtures import make_qy_episode, trajectory_rows
 from tools.run_qc_pipeline import contexts_from_manifest
 
@@ -53,6 +53,8 @@ def test_supplier_manifest_cli_accepts_qy_without_dr_only_arguments(
 ) -> None:
     root = tmp_path / "source" / "QY"
     make_qy_episode(root)
+    sam3_model = tmp_path / "models" / "sam3"
+    sam3_model.mkdir(parents=True)
     args = parse_args(
         [
             "--supplier",
@@ -63,19 +65,24 @@ def test_supplier_manifest_cli_accepts_qy_without_dr_only_arguments(
             str(tmp_path / "output"),
             "--primary-camera",
             "mid_cam_left",
+            "--sam3-model",
+            str(sam3_model),
         ]
     )
 
     assert args.supplier == "qy"
+    assert args.sam3_model == sam3_model
     assert run(
         supplier="qy",
         root=root,
         output_dir=tmp_path / "output",
         primary_camera="mid_cam_left",
+        sam3_model=sam3_model,
     ) == 0
-    assert (
-        tmp_path / "output" / "manifests" / "supplier_manifest_qy.csv"
-    ).is_file()
+    manifest = tmp_path / "output" / "manifests" / "supplier_manifest_qy.csv"
+    assert manifest.is_file()
+    row = pd.read_csv(manifest).iloc[0]
+    assert row["sam3_model_path"] == str(sam3_model)
 
 
 def test_qy_camera_selection_rejects_unknown_config_field() -> None:
@@ -120,7 +127,7 @@ def test_qy_precheck_fingerprint_has_isolated_adapter_contract(
     fingerprint = precheck_fingerprint(context, config)
 
     assert fingerprint["source_contract"]["supplier_adapter"] == (
-        "qingyu-hand-pose-precheck-v2"
+        "qingyu-hand-pose-precheck-v3"
     )
     assert set(fingerprint["sources"]) >= {
         "observations_2d",
@@ -159,6 +166,42 @@ def test_qy_supplier_data_audit_records_inventory_without_second_quality_pass(
     assert {
         issue["code"] for issue in raw["issues"]
     } >= {"joint_topology_unverified", "coordinate_system_schema_unverified"}
+
+
+def test_qy_derived_timebase_is_audited_as_missing_supplier_file_not_hard_failure(
+    tmp_path: Path,
+) -> None:
+    from acceptance_pull.supplier_audit import audit_supplier_data
+
+    root = tmp_path / "source" / "QY"
+    episode = make_qy_episode(root)
+    (episode / "timestamps" / "episode_timebase.json").unlink()
+    write_test_video(
+        episode / "videos" / "mid_cam_left.mp4",
+        [solid_frame(value, width=64, height=48) for value in (10, 20, 30, 40)],
+        fps=30.0,
+    )
+    manifest = write_qingyu_manifest(
+        build_qingyu_manifest(root, primary_camera="mid_cam_left"), tmp_path
+    )
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+
+    raw = audit_supplier_data(
+        context,
+        load_qc_acceptance_config().module_parameters("supplier_data_audit"),
+    )
+
+    assert raw["inventory"]["timebase"]["status"] == "missing"
+    assert "timebase" not in raw["missing_sources"]
+    assert raw["structured"]["timebase_source"] == (
+        "derived_from_video_and_observations_2d"
+    )
+    assert any(
+        issue["code"] == "supplier_timebase_missing_derived"
+        and issue["severity"] == "warn"
+        for issue in raw["issues"]
+    )
+    assert raw["decision"] == "warn"
 
 
 def test_qy_supplier_data_audit_rejects_incomplete_required_skeleton(
@@ -206,7 +249,7 @@ def test_qy_precheck_session_reads_trajectory_once_across_five_modules(
     assert results[0].verdict == "pass"
 
 
-def test_qy_unconfirmed_topology_only_runs_topology_agnostic_temporal_metrics(
+def test_qy_unconfirmed_topology_is_not_applicable_to_morphology_or_temporal(
     tmp_path: Path,
 ) -> None:
     context = _context_for_qy(tmp_path)
@@ -217,25 +260,17 @@ def test_qy_unconfirmed_topology_only_runs_topology_agnostic_temporal_metrics(
     temporal = session.run_module("keypoint_temporal")
 
     assert presence.verdict == "pass"
-    assert morphology.verdict == "warn"
-    assert morphology.evaluation["decision"] == "review"
-    assert morphology.evaluation["reason"] == "qy_joint_topology_unverified"
-    assert temporal.verdict == "pass"
-    assert temporal.evaluation["output_status"] == "valid"
-    assert temporal.evaluation["valid_frame_count"] == 2
-    assert temporal.evaluation["candidate_window_count"] == 0
-    valid_rows = [
-        result
-        for result in session._raw_results["keypoint_temporal"]
-        if result.metrics.get("temporal_output_valid") is True
-    ]
-    assert valid_rows
+    for result in (morphology, temporal):
+        assert result.verdict == "skipped"
+        assert result.evaluation["decision"] == "not_applicable"
+        assert result.evaluation["output_status"] == "not_applicable"
+        assert result.evaluation["reason"] == "qy_hand_topology_not_validated"
+        assert result.frame_exclusions == ()
+    assert temporal.evaluation["valid_frame_count"] == 0
+    assert temporal.evaluation["candidate_window_count"] == 1
     assert all(
-        result.metrics["joint_topology_status"] == "unverified"
-        and result.metrics["topology_dependent_metrics_status"] == "uncalibrated"
-        and math.isnan(result.metrics["joint_angle_change_deg_max"])
-        and math.isfinite(result.metrics["joint_displacement_m_max"])
-        for result in valid_rows
+        result.metrics.get("temporal_output_valid") is False
+        for result in session._raw_results["keypoint_temporal"]
     )
 
 

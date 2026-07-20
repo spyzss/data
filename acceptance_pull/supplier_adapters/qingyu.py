@@ -69,19 +69,25 @@ MANIFEST_COLUMNS = [
     "timebase_path",
     "semantic_path",
     "review_video_path",
+    "sam3_model_path",
     "primary_camera",
     "requested_primary_camera",
     "primary_camera_source",
     "primary_video_path",
     *[f"{camera}_video_path" for camera in QY_CAMERAS],
     "video_frame_count",
+    "video_width",
+    "video_height",
     "source_frame_count",
     "start_frame",
     "end_frame",
     "fps",
     "frame_coordinate_system",
     "timebase_status",
+    "timebase_source",
     "frame_mapping_status",
+    "frame_mapping_source",
+    "source_video_identity_assumed",
     "skeleton_2d_status",
     "skeleton_3d_status",
     "skeleton_3d_valid_row_count",
@@ -342,7 +348,7 @@ def _select_camera(
     if requested is not None:
         if requested not in QY_CAMERAS:
             raise ValueError(f"unsupported QY primary camera: {requested}")
-        if audits.get(requested, {}).get("eligible") is True:
+        if audits.get(requested, {}).get("explicit_camera_eligible") is True:
             selected_score = float(audits[requested]["score"])
             other_scores = sorted(
                 (score for camera, score in scored if camera != requested),
@@ -355,7 +361,16 @@ def _select_camera(
                 other_scores[0] if other_scores else None,
                 "explicit_camera_valid",
             )
-        return None, None, None, None, "explicit_camera_ineligible"
+        return (
+            None,
+            None,
+            None,
+            None,
+            str(
+                audits.get(requested, {}).get("reason")
+                or "explicit_camera_ineligible"
+            ),
+        )
     if not eligible:
         return None, None, None, None, "no_eligible_camera"
     scores = sorted((score for _, score in eligible), reverse=True)
@@ -390,6 +405,7 @@ def build_qingyu_manifest(
     primary_camera: str | None = None,
     camera_selection: Mapping[str, Any] | None = None,
     max_assets: int | None = None,
+    sam3_model: Path | None = None,
 ) -> list[dict[str, str]]:
     if max_assets is not None and max_assets < 1:
         raise ValueError("max_assets must be >= 1")
@@ -413,12 +429,22 @@ def build_qingyu_manifest(
             }
             for name, relative in _REQUIRED_PATHS.items()
         }
-        required_present = all(item["status"] == "present" for item in inventory.values())
+        required_present = all(
+            item["status"] == "present"
+            for name, item in inventory.items()
+            if name != "timebase"
+        )
         timebase: dict[str, dict[str, Any]] = {}
         timebase_error: str | None = None
         try:
             if paths["timebase"].is_file():
                 timebase = _parse_timebase(paths["timebase"], episode)
+                for record in timebase.values():
+                    record["timebase_source"] = "supplier_episode_timebase"
+                    record["frame_mapping_source"] = (
+                        "explicit_source_frame_index_to_video_frame"
+                    )
+                    record["source_video_identity_assumed"] = False
         except ValueError as exc:
             timebase_error = str(exc)
         video_paths = {
@@ -430,7 +456,21 @@ def build_qingyu_manifest(
         )
         camera_audits: dict[str, dict[str, Any]] = {}
         observations_error: str | None = None
-        if paths["observations_2d"].is_file():
+        if (
+            not paths["timebase"].is_file()
+            and paths["observations_2d"].is_file()
+        ):
+            try:
+                for camera in QY_CAMERAS:
+                    derived = session.derive_camera_timebase(
+                        camera=camera,
+                        video_path=video_paths[camera],
+                    )
+                    if derived is not None:
+                        timebase[camera] = derived
+            except ValueError as exc:
+                observations_error = str(exc)
+        if paths["observations_2d"].is_file() and observations_error is None:
             try:
                 for camera in QY_CAMERAS:
                     camera_audits[camera] = session.camera_coverage(
@@ -456,7 +496,7 @@ def build_qingyu_manifest(
                     }
                     for camera in QY_CAMERAS
                 }
-        else:
+        elif observations_error is None:
             camera_audits = {
                 camera: {
                     "camera": camera,
@@ -467,6 +507,26 @@ def build_qingyu_manifest(
                     "source_video_identity_assumed": False,
                     "score": None,
                     "reason": "observations_2d_missing",
+                }
+                for camera in QY_CAMERAS
+            }
+        else:
+            camera_audits = {
+                camera: {
+                    "camera": camera,
+                    "eligible": False,
+                    "explicit_camera_eligible": False,
+                    "video_available": video_paths[camera].is_file(),
+                    "timebase_status": (
+                        "derived"
+                        if timebase.get(camera, {}).get("timebase_source")
+                        == "derived_from_video_and_observations_2d"
+                        else "valid" if camera in timebase else "input_missing"
+                    ),
+                    "frame_mapping_status": "mapping_unverified",
+                    "source_video_identity_assumed": False,
+                    "score": None,
+                    "reason": "observations_2d_invalid",
                 }
                 for camera in QY_CAMERAS
             }
@@ -529,6 +589,9 @@ def build_qingyu_manifest(
         if observations_error is not None:
             adapter_status = "input_invalid"
             reason = "observations_2d_invalid"
+        elif timebase_error is not None:
+            adapter_status = "input_invalid"
+            reason = "timebase_invalid"
         elif trajectory_error is not None:
             adapter_status = "input_invalid"
             reason = "trajectory_3d_invalid"
@@ -537,13 +600,14 @@ def build_qingyu_manifest(
             reason = "coordinate_system_invalid"
         elif selected is None:
             adapter_status = "input_missing"
-            reason = "primary_camera_missing"
+            reason = (
+                recommendation_reason
+                if primary_camera is not None
+                else "primary_camera_missing"
+            )
         elif not required_present:
             adapter_status = "input_missing"
             reason = "required_file_missing"
-        elif timebase_error is not None:
-            adapter_status = "input_invalid"
-            reason = "timebase_invalid"
         elif skeleton_3d_status == "no_valid_output":
             adapter_status = "input_missing"
             reason = "no_valid_3d_skeleton"
@@ -581,9 +645,14 @@ def build_qingyu_manifest(
             "trajectory_3d_path": str(paths["trajectory_3d"]),
             "coordinate_system_path": str(paths["coordinate_system"]),
             "quality_path": str(paths["quality"]),
-            "timebase_path": str(paths["timebase"]),
+            "timebase_path": (
+                str(paths["timebase"]) if paths["timebase"].is_file() else ""
+            ),
             "semantic_path": str(paths["semantic"]),
             "review_video_path": str(paths["review_video"]),
+            "sam3_model_path": (
+                str(_logical_absolute(sam3_model)) if sam3_model is not None else ""
+            ),
             "primary_camera": selected or "",
             "requested_primary_camera": primary_camera or "",
             "primary_camera_source": selected_source or "",
@@ -595,6 +664,12 @@ def build_qingyu_manifest(
             "video_frame_count": (
                 str(selected_timebase["frames"]) if selected_timebase is not None else ""
             ),
+            "video_width": (
+                str(selected_timebase["width"]) if selected_timebase is not None else ""
+            ),
+            "video_height": (
+                str(selected_timebase["height"]) if selected_timebase is not None else ""
+            ),
             "source_frame_count": str(source_frame_count) if source_frame_count is not None else "",
             "start_frame": str(start_frame) if start_frame is not None else "",
             "end_frame": str(end_frame) if end_frame is not None else "",
@@ -602,12 +677,23 @@ def build_qingyu_manifest(
             "frame_coordinate_system": "source_inclusive",
             "timebase_status": (
                 "input_invalid" if timebase_error is not None else (
-                    "valid" if selected_timebase is not None else "input_missing"
+                    str(selected_audit.get("timebase_status") or "input_missing")
                 )
+            ),
+            "timebase_source": (
+                str(selected_timebase.get("timebase_source") or "")
+                if selected_timebase is not None
+                else ""
             ),
             "frame_mapping_status": str(
                 selected_audit.get("frame_mapping_status") or "mapping_unverified"
             ),
+            "frame_mapping_source": (
+                str(selected_timebase.get("frame_mapping_source") or "")
+                if selected_timebase is not None
+                else ""
+            ),
+            "source_video_identity_assumed": _json(False),
             "skeleton_2d_status": (
                 "valid"
                 if selected_audit.get("frame_mapping_status") == "verified"

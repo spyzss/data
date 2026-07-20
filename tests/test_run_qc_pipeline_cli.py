@@ -157,6 +157,74 @@ def test_csv_nan_optional_paths_stay_missing_in_canonical_manifest_identity(
     )
 
 
+def test_dr_heuristic_projection_mapping_is_explicit_runtime_metadata_only(
+    tmp_path: Path,
+) -> None:
+    from qc_common.manifest_metadata import manifest_metadata
+    from tools.run_qc_pipeline import apply_dr_heuristic_projection_mapping
+
+    context = AssetContext(
+        "dr__task-a",
+        tmp_path,
+        tmp_path / "quality_archive" / "dr__task-a.json",
+        {},
+        metadata={
+            "supplier": "dr",
+            "asset_id": "dr__task-a",
+            "calibration_status": "mapping_missing",
+            "manifest_row": {
+                "supplier": "dr",
+                "asset_id": "dr__task-a",
+                "calibration_status": "mapping_missing",
+            },
+        },
+    )
+    mapping = tmp_path / "deepreach_heuristic_head_projection_mapping.csv"
+    mapping.write_text(
+        "asset_id,projection_mode,head_hfov_deg,fx,fy,cx,cy,image_width,image_height,"
+        "calibration_status,projection_validation_status,distortion_applied,"
+        "camera_trajectory_applied,selected_by\n"
+        "dr__task-a,approx_pinhole_from_hfov,100,805.533,805.533,960,540,"
+        "1920,1080,heuristic,pending_visual_validation,false,false,"
+        "user_visual_confirmation\n",
+        encoding="utf-8",
+    )
+
+    updated = apply_dr_heuristic_projection_mapping([context], mapping)[0]
+
+    assert updated.metadata["projection_mode"] == "approx_pinhole_from_hfov"
+    assert updated.metadata["head_hfov_deg"] == 100.0
+    assert updated.metadata["calibration_status"] == "heuristic"
+    assert updated.metadata["selected_by"] == "user_visual_confirmation"
+    assert updated.metadata["dr_heuristic_projection_mapping_path"] == str(
+        mapping.resolve()
+    )
+    assert manifest_metadata(updated.metadata) == manifest_metadata(context.metadata)
+    assert updated.metadata["manifest_row"] == context.metadata["manifest_row"]
+
+
+def test_run_qc_pipeline_cli_accepts_explicit_dr_heuristic_mapping(
+    tmp_path: Path,
+) -> None:
+    from tools.run_qc_pipeline import build_parser
+
+    mapping = tmp_path / "mapping.csv"
+    args = build_parser().parse_args(
+        [
+            "--batch-root",
+            str(tmp_path),
+            "--manifest",
+            str(tmp_path / "manifest.csv"),
+            "--profile",
+            "supplier_evaluation",
+            "--dr-heuristic-projection-map",
+            str(mapping),
+        ]
+    )
+
+    assert args.dr_heuristic_projection_map == mapping
+
+
 def test_manifest_identity_uses_logical_symlink_path_while_access_path_resolves(
     tmp_path: Path,
 ) -> None:

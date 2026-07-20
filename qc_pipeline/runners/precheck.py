@@ -49,11 +49,15 @@ def _precheck_source_names(context: AssetContext) -> tuple[str, ...]:
         or ""
     ).lower()
     if supplier in {"qy", "qingyu"}:
-        return (
-            "observations_2d",
-            "trajectory_3d",
-            "coordinate_system",
-            "timebase",
+        return tuple(
+            name
+            for name in (
+                "observations_2d",
+                "trajectory_3d",
+                "coordinate_system",
+                "timebase",
+            )
+            if name in context.source_files
         )
     return tuple(
         name for name in ("hdf5", "parquet") if name in context.source_files
@@ -94,9 +98,11 @@ def precheck_fingerprint(
     if supplier in {"dr", "deepreach"}:
         source_contract["supplier_adapter"] = "deepreach-hdf5-precheck-v2"
     elif supplier in {"qy", "qingyu"}:
-        source_contract["supplier_adapter"] = "qingyu-hand-pose-precheck-v2"
+        source_contract["supplier_adapter"] = "qingyu-hand-pose-precheck-v3"
         source_contract["frame_mapping"] = "explicit-source-step-v1"
         source_contract["joint_topology"] = "unverified-no-anatomical-remap"
+        source_contract["timebase_source"] = context.metadata.get("timebase_source")
+        source_contract["sam3_candidate_policy"] = "qy-direct-2d-full-window-v1"
     fingerprint["source_contract"] = source_contract
     return fingerprint
 
@@ -352,19 +358,10 @@ def _run_module_on_clip(
         "qy",
         "qingyu",
     }
-    topology_unverified = (
-        str(getattr(clip, "joint_topology_status", "")) != "verified"
-    )
-    coordinate_unverified = (
-        str(getattr(clip, "metric_coordinate_status", ""))
-        != "verified_declared_camera_frame_meters_stable_reference"
-    )
-    if qy_supplier and (
-        (module == "keypoint_morphology" and topology_unverified)
-        or (module == "keypoint_temporal" and coordinate_unverified)
-    ):
+    if qy_supplier and module in {"keypoint_morphology", "keypoint_temporal"}:
         from qc_common.types import CheckResult
 
+        reason = "qy_hand_topology_not_validated"
         if module == "keypoint_morphology":
             raw = (
                 CheckResult(
@@ -372,12 +369,12 @@ def _run_module_on_clip(
                     episode_idx=int(getattr(clip, "episode_idx", 0)),
                     frame_idx=-1,
                     metrics={
-                        "morphology_verdict": "review",
+                        "morphology_verdict": "not_applicable",
                         "joint_topology_status": "unverified",
                     },
                     flag=None,
-                    reason="qy_joint_topology_unverified",
-                    severity="uncalibrated",
+                    reason=reason,
+                    severity=None,
                 ),
             )
             result = _adapt_module(
@@ -390,12 +387,15 @@ def _run_module_on_clip(
             )
             result = replace(
                 result,
+                verdict="skipped",
                 evaluation={
                     **dict(result.evaluation),
-                    "decision": "review",
-                    "output_status": "no_valid_output",
-                    "reason": "qy_joint_topology_unverified",
+                    "decision": "not_applicable",
+                    "output_status": "not_applicable",
+                    "reason": reason,
                 },
+                issues=(),
+                frame_exclusions=(),
             )
             return PrecheckModuleExecution(result, raw)
         source_frames = tuple(
@@ -412,24 +412,52 @@ def _run_module_on_clip(
                     "joint_topology_status": "unverified",
                 },
                 flag=None,
-                reason=(
-                    "qy_joint_topology_unverified"
-                    if module == "keypoint_morphology"
-                    else "qy_metric_coordinate_mapping_unverified"
-                ),
+                reason=reason,
                 severity="uncalibrated",
             )
             for source_frame in source_frames
         )
+        candidates: tuple[Mapping[str, Any], ...] = ()
+        if source_frames:
+            start_frame = min(source_frames)
+            end_frame = max(source_frames)
+            candidates = (
+                {
+                    "asset_id": context.asset_id,
+                    "coordinate_space": "source",
+                    "frame_coordinate_system": "source_inclusive",
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "peak_frame": (start_frame + end_frame) // 2,
+                    "hand_side": "both",
+                    "sam3_eligible": True,
+                    "trigger_reason": "qy_direct_2d_sampling",
+                    "review_type": "qy_direct_2d_containment",
+                },
+            )
         result = _adapt_module(
             context,
             config,
             module,
             raw,
-            (),
+            candidates,
             artifact_state="computed",
         )
-        return PrecheckModuleExecution(result, raw, ())
+        result = replace(
+            result,
+            verdict="skipped",
+            evaluation={
+                **dict(result.evaluation),
+                "decision": "not_applicable",
+                "output_status": "not_applicable",
+                "valid_frame_count": 0,
+                "uncalibrated_frame_count": len(source_frames),
+                "reason": reason,
+            },
+            issues=(),
+            frame_exclusions=(),
+        )
+        return PrecheckModuleExecution(result, raw, candidates)
 
     from precheck.runner import PrecheckRunner
     from qc_pipeline.adapters.precheck import precheck_config_from_unified
@@ -732,7 +760,7 @@ class PrecheckSession:
             if temporal_result is not None:
                 evaluation = temporal_result.evaluation
                 status = str(evaluation.get("output_status") or "")
-                if status in {"valid", "no_valid_output"}:
+                if status in {"valid", "no_valid_output", "not_applicable"}:
                     temporal_output = {
                         "schema_version": _TEMPORAL_OUTPUT_SCHEMA_VERSION,
                         "status": status,

@@ -53,6 +53,38 @@ class HeadProjectionValidation:
     trajectory_usage: str | None
 
 
+def approximate_head_calibration(
+    *,
+    width: int,
+    height: int,
+    horizontal_fov_deg: float,
+) -> Calibration:
+    """Build an explicitly heuristic pinhole model for head-overlay auditing."""
+    if width <= 0 or height <= 0:
+        raise ValueError("image width and height must be positive")
+    if not math.isfinite(horizontal_fov_deg) or not 0.0 < horizontal_fov_deg < 180.0:
+        raise ValueError("horizontal_fov_deg must be finite and between 0 and 180")
+    focal = float(width) / (
+        2.0 * math.tan(math.radians(float(horizontal_fov_deg)) / 2.0)
+    )
+    intrinsics = np.asarray(
+        [
+            [focal, 0.0, float(width) / 2.0],
+            [0.0, focal, float(height) / 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return Calibration(
+        status="heuristic",
+        camera_name="head",
+        intrinsics=intrinsics,
+        resolution=(int(width), int(height)),
+        source=f"approx_pinhole_from_hfov:{float(horizontal_fov_deg):g}",
+        reason="pending_visual_validation",
+    )
+
+
 def _number(value: Any) -> float | None:
     try:
         numeric = float(value)
@@ -547,6 +579,173 @@ def validate_head_projection_contract(
     )
 
 
+def validate_heuristic_head_projection_contract(
+    *,
+    hdf5_path: Path,
+    video_path: Path,
+    source_range: tuple[int, int] | None,
+    reference_dataset: str,
+    primary_camera: str,
+    metadata: Mapping[str, Any],
+) -> HeadProjectionValidation:
+    """Validate an explicitly user-selected approximate head pinhole contract."""
+    placeholder = Path("__heuristic_head_projection__")
+    required_contract = (
+        metadata.get("projection_mode") == "approx_pinhole_from_hfov"
+        and metadata.get("calibration_status") == "heuristic"
+        and metadata.get("projection_validation_status")
+        == "pending_visual_validation"
+        and metadata.get("selected_by") == "user_visual_confirmation"
+        and metadata.get("distortion_applied") in {False, 0, "false", "False"}
+        and metadata.get("camera_trajectory_applied")
+        in {False, 0, "false", "False"}
+        and primary_camera == "head"
+    )
+    if not required_contract:
+        return _blocked_projection(
+            status="calibration_unverified",
+            reason="heuristic_mapping_invalid",
+            calibration_path=placeholder,
+            trajectory_usage="not_applied",
+        )
+    width = _integer(metadata.get("image_width"))
+    height = _integer(metadata.get("image_height"))
+    hfov = _number(metadata.get("head_hfov_deg"))
+    supplied = tuple(
+        _number(metadata.get(name)) for name in ("fx", "fy", "cx", "cy")
+    )
+    if (
+        width is None
+        or height is None
+        or hfov is None
+        or any(value is None for value in supplied)
+    ):
+        return _blocked_projection(
+            status="calibration_unverified",
+            reason="heuristic_mapping_invalid",
+            calibration_path=placeholder,
+            trajectory_usage="not_applied",
+        )
+    try:
+        calibration = approximate_head_calibration(
+            width=width,
+            height=height,
+            horizontal_fov_deg=hfov,
+        )
+    except ValueError:
+        return _blocked_projection(
+            status="calibration_unverified",
+            reason="heuristic_mapping_invalid",
+            calibration_path=placeholder,
+            trajectory_usage="not_applied",
+        )
+    assert calibration.intrinsics is not None
+    expected = (
+        float(calibration.intrinsics[0, 0]),
+        float(calibration.intrinsics[1, 1]),
+        float(calibration.intrinsics[0, 2]),
+        float(calibration.intrinsics[1, 2]),
+    )
+    if not np.allclose(
+        np.asarray(supplied, dtype=np.float64),
+        np.asarray(expected, dtype=np.float64),
+        rtol=1e-9,
+        atol=1e-9,
+    ):
+        return _blocked_projection(
+            status="calibration_unverified",
+            reason="heuristic_intrinsics_mismatch",
+            calibration_path=placeholder,
+            trajectory_usage="not_applied",
+        )
+
+    import cv2
+    import h5py
+
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        if not capture.isOpened():
+            return _blocked_projection(
+                status="calibration_unverified",
+                reason="head_video_unreadable",
+                calibration_path=placeholder,
+                trajectory_usage="not_applied",
+            )
+        video_width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        video_height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        video_frame_count = int(round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+    finally:
+        capture.release()
+    video_resolution = (video_width, video_height)
+    if video_resolution != (width, height):
+        return _blocked_projection(
+            status="resolution_mismatch",
+            reason="heuristic_video_resolution_mismatch",
+            calibration_path=placeholder,
+            video_resolution=video_resolution,
+            frame_count=video_frame_count,
+            trajectory_usage="not_applied",
+        )
+    try:
+        with h5py.File(hdf5_path, "r") as handle:
+            if reference_dataset not in handle or not handle[reference_dataset].shape:
+                raise ValueError("reference_dataset_missing_or_invalid")
+            hdf5_frame_count = int(handle[reference_dataset].shape[0])
+            for side in ("left", "right"):
+                name = f"hand/{side}/joints3d"
+                if name not in handle or handle[name].shape != (hdf5_frame_count, 21, 3):
+                    raise ValueError(f"{name}_shape_invalid")
+            coordinate_frame = str(handle.attrs.get("coordinate_frame") or "").strip()
+            units = str(handle.attrs.get("units") or "").strip()
+    except (OSError, ValueError) as exc:
+        return _blocked_projection(
+            status="frame_alignment_unverified",
+            reason=str(exc),
+            calibration_path=placeholder,
+            video_resolution=video_resolution,
+            frame_count=video_frame_count,
+            trajectory_usage="not_applied",
+        )
+    if coordinate_frame and coordinate_frame != "head_camera":
+        return _blocked_projection(
+            status="transform_ambiguous",
+            reason="hdf5_coordinate_frame_not_head_camera",
+            calibration_path=placeholder,
+            video_resolution=video_resolution,
+            frame_count=hdf5_frame_count,
+            trajectory_usage="not_applied",
+        )
+    if units and units not in {"m", "meter", "meters"}:
+        return _blocked_projection(
+            status="transform_ambiguous",
+            reason="hdf5_units_not_meters",
+            calibration_path=placeholder,
+            video_resolution=video_resolution,
+            frame_count=hdf5_frame_count,
+            trajectory_usage="not_applied",
+        )
+    source_count = (
+        source_range[1] - source_range[0] if source_range is not None else None
+    )
+    if source_count != hdf5_frame_count or video_frame_count != hdf5_frame_count:
+        return _blocked_projection(
+            status="frame_alignment_unverified",
+            reason="hdf5_video_frame_count_mismatch",
+            calibration_path=placeholder,
+            video_resolution=video_resolution,
+            frame_count=hdf5_frame_count,
+            trajectory_usage="not_applied",
+        )
+    return HeadProjectionValidation(
+        status="heuristic_ready",
+        reason="user_selected_heuristic_pending_visual_validation",
+        calibration=calibration,
+        video_resolution=video_resolution,
+        frame_count=hdf5_frame_count,
+        trajectory_usage="not_applied",
+    )
+
+
 def project_dr_hands_for_frame(
     hdf5_path: Path,
     *,
@@ -556,11 +755,11 @@ def project_dr_hands_for_frame(
 ) -> dict[str, dict[str, Any]]:
     """Read one DR local HDF5 row and project both hands to head pixels."""
     if (
-        calibration.status != "verified"
+        calibration.status not in {"verified", "heuristic"}
         or calibration.intrinsics is None
         or calibration.resolution is None
     ):
-        raise ValueError("verified head calibration is required")
+        raise ValueError("verified or explicit heuristic head calibration is required")
     local_frame = int(source_frame) - int(clip_start_frame)
     if local_frame < 0:
         raise ValueError("source frame precedes clip start")
@@ -639,9 +838,11 @@ __all__ = [
     "HeadProjectionValidation",
     "TrajectoryLoad",
     "TrajectoryPose",
+    "approximate_head_calibration",
     "load_calibration",
     "load_trajectory",
     "project_hand",
     "project_dr_hands_for_frame",
     "validate_head_projection_contract",
+    "validate_heuristic_head_projection_contract",
 ]

@@ -15,10 +15,10 @@ from acceptance_pull.supplier_adapters.qingyu import (
 from qc_common.config import load_qc_acceptance_config
 from qc_common.module_registry import ModuleBlockedError
 from qc_pipeline.artifacts import artifact_for, write_run_config
-from qc_pipeline.runners.precheck import MODULES, precheck_fingerprint
+from qc_pipeline.runners.precheck import MODULES, PrecheckSession, precheck_fingerprint
 from qc_pipeline.runners.sam3_containment import runner
 from tests.fixtures import solid_frame, write_test_video
-from tests.qingyu_fixtures import make_qy_episode, observation_rows
+from tests.qingyu_fixtures import keypoints_2d, make_qy_episode, observation_rows
 from tools.run_qc_pipeline import contexts_from_manifest
 
 
@@ -36,14 +36,23 @@ class _FullMaskSegmenter:
         ]
 
 
-def _qy_context(tmp_path: Path, *, observations=None, camera_selection=None):
+def _qy_context(
+    tmp_path: Path,
+    *,
+    observations=None,
+    camera_selection=None,
+    without_timebase: bool = False,
+    video_values=(10, 20, 30, 40),
+):
     root = tmp_path / "source" / "QY"
     episode = make_qy_episode(root, observations=observations)
     write_test_video(
         episode / "videos" / "mid_cam_left.mp4",
-        [solid_frame(value, width=64, height=48) for value in (10, 20, 30, 40)],
+        [solid_frame(value, width=64, height=48) for value in video_values],
         fps=30.0,
     )
+    if without_timebase:
+        (episode / "timestamps" / "episode_timebase.json").unlink()
     rows = build_qingyu_manifest(
         root,
         primary_camera="mid_cam_left",
@@ -55,6 +64,8 @@ def _qy_context(tmp_path: Path, *, observations=None, camera_selection=None):
 
 
 def _write_precheck_gate(context, *, candidate_hand: str = "left") -> None:
+    assert context.source_range is not None
+    start_frame, end_frame_exclusive = context.source_range
     config = load_qc_acceptance_config()
     artifact = artifact_for(context, "precheck")
     artifact.directory.mkdir(parents=True, exist_ok=True)
@@ -65,8 +76,8 @@ def _write_precheck_gate(context, *, candidate_hand: str = "left") -> None:
                     "asset_id": context.asset_id,
                     "coordinate_space": "source",
                     "frame_coordinate_system": "source_inclusive",
-                    "start_frame": 100,
-                    "end_frame": 102,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame_exclusive - 1,
                     "hand_side": candidate_hand,
                     "sam3_eligible": True,
                 }
@@ -121,6 +132,119 @@ def test_qy_sam3_uses_direct_primary_camera_2d_and_explicit_video_frames(
         for name in rows[0]["inside_joint_names"]
     )
     assert rows[0]["joint_topology_status"] == "unverified_points_only"
+    assert segmenter.calls == 3
+
+
+def test_qy_sam3_uses_derived_timebase_and_reads_explicit_video_frames(
+    tmp_path: Path,
+) -> None:
+    context = _qy_context(tmp_path, without_timebase=True)
+    _write_precheck_gate(context)
+    segmenter = _FullMaskSegmenter()
+
+    runner(lambda: segmenter)(context, load_qc_acceptance_config())
+
+    rows = json.loads(
+        (
+            artifact_for(context, "sam3_containment").directory
+            / "frame_results.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert [row["source_frame_idx"] for row in rows] == [100, 101, 102]
+    assert [row["video_frame_idx"] for row in rows] == [0, 2, 3]
+    assert segmenter.calls == 3
+
+
+def test_qy_sam3_emits_five_overlays_for_review_bundle_contract(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        {
+            "camera": "mid_cam_left",
+            "video_frame": video_frame,
+            "source_frame_index": source_frame,
+            "timestamp": 1000.0 + offset / 30.0,
+            "hand/current_hand": hand,
+            "pred_keypoints_2d": keypoints_2d(offset / 10.0),
+        }
+        for offset, (source_frame, video_frame) in enumerate(
+            ((100, 0), (101, 1), (102, 2), (103, 4), (104, 5))
+        )
+        for hand in ("left", "right")
+    ]
+    context = _qy_context(
+        tmp_path,
+        observations=rows,
+        without_timebase=True,
+        video_values=(10, 20, 30, 40, 50, 60),
+    )
+    _write_precheck_gate(context)
+    segmenter = _FullMaskSegmenter()
+
+    runner(lambda: segmenter)(context, load_qc_acceptance_config())
+
+    artifact = artifact_for(context, "sam3_containment").directory
+    frame_rows = json.loads((artifact / "frame_results.json").read_text())
+    evidence = json.loads((artifact / "evidence_manifest.json").read_text())
+    assert sorted({row["source_frame_idx"] for row in frame_rows}) == [
+        100,
+        101,
+        102,
+        103,
+        104,
+    ]
+    assert len(evidence) == 5
+    assert segmenter.calls == 5
+
+
+def test_qy_topology_modules_are_not_applicable_but_direct_2d_sam3_runs(
+    tmp_path: Path,
+) -> None:
+    context = _qy_context(tmp_path, without_timebase=True)
+    config = load_qc_acceptance_config()
+    session = PrecheckSession(context, config)
+
+    morphology = session.run_module("keypoint_morphology")
+    temporal = session.run_module("keypoint_temporal")
+
+    for result in (morphology, temporal):
+        assert result.verdict == "skipped"
+        assert result.evaluation["decision"] == "not_applicable"
+        assert result.evaluation["reason"] == "qy_hand_topology_not_validated"
+        assert result.frame_exclusions == ()
+    precheck_dir = artifact_for(context, "precheck").directory
+    run_config = json.loads(
+        (precheck_dir / "run_config.json").read_text(encoding="utf-8")
+    )
+    assert run_config["temporal_output"] == {
+        "schema_version": "keypoint_temporal.output.v2",
+        "status": "not_applicable",
+        "valid_frame_count": 0,
+        "uncalibrated_frame_count": 3,
+        "reason": "qy_hand_topology_not_validated",
+    }
+    candidates = json.loads(
+        (precheck_dir / "candidate_windows.json").read_text(encoding="utf-8")
+    )
+    assert candidates == [
+        {
+            "asset_id": context.asset_id,
+            "coordinate_space": "source",
+            "frame_coordinate_system": "source_inclusive",
+            "start_frame": 100,
+            "end_frame": 102,
+            "peak_frame": 101,
+            "hand_side": "both",
+            "sam3_eligible": True,
+            "trigger_reason": "qy_direct_2d_sampling",
+            "review_type": "qy_direct_2d_containment",
+        }
+    ]
+
+    segmenter = _FullMaskSegmenter()
+    result = runner(lambda: segmenter)(context, config)
+
+    assert result.module == "sam3_containment"
     assert segmenter.calls == 3
 
 
