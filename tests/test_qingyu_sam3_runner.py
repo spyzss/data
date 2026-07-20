@@ -184,6 +184,41 @@ def test_qy_sam3_uses_derived_mapping_when_supplier_timebase_is_invalid(
     assert segmenter.calls == 3
 
 
+def test_qy_sam3_deduplicates_equivalent_same_hand_observations(
+    tmp_path: Path,
+) -> None:
+    rows = observation_rows()
+    rows.append(
+        {
+            **rows[0],
+            "status": "review",
+            "score": 0.5,
+            "pred_keypoints_2d": [
+                list(point) for point in rows[0]["pred_keypoints_2d"]
+            ],
+        }
+    )
+    context = _qy_context(
+        tmp_path,
+        observations=rows,
+        without_timebase=True,
+    )
+    _write_precheck_gate(context)
+    segmenter = _FullMaskSegmenter()
+
+    runner(lambda: segmenter)(context, load_qc_acceptance_config())
+
+    frame_rows = json.loads(
+        (
+            artifact_for(context, "sam3_containment").directory
+            / "frame_results.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert [row["source_frame_idx"] for row in frame_rows] == [100, 101, 102]
+    assert [row["video_frame_idx"] for row in frame_rows] == [0, 2, 3]
+    assert segmenter.calls == 3
+
+
 def test_qy_sam3_emits_five_overlays_for_review_bundle_contract(
     tmp_path: Path,
 ) -> None:

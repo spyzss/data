@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 import json
+import math
 from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 from typing import Any
 
 from qc_common.config import LoadedQcConfig
@@ -16,7 +18,12 @@ from qc_common.manifest_metadata import (
     manifest_metadata,
     normalized_manifest_text_metadata,
 )
-from qc_common.module_registry import ModuleInputError, ModulePrerequisiteError, ModuleRunner
+from qc_common.module_registry import (
+    ModuleBlockedError,
+    ModuleInputError,
+    ModulePrerequisiteError,
+    ModuleRunner,
+)
 from qc_common.types import ClipInputs
 from qc_pipeline.context import AssetContext
 
@@ -121,6 +128,32 @@ def _source_path(context: AssetContext, module: str, name: str) -> Path:
     if not path.is_file():
         raise ModulePrerequisiteError(module, f"existing source_files.{name}.path")
     return path
+
+
+def _is_qy_supplier(context: AssetContext) -> bool:
+    return str(
+        context.metadata.get("supplier")
+        or context.metadata.get("supplier_id")
+        or ""
+    ).lower() in {"qy", "qingyu"}
+
+
+def _validate_qy_precheck_inputs(context: AssetContext, module: str) -> None:
+    status = str(context.metadata.get("adapter_status") or "").lower()
+    reason = str(context.metadata.get("reason") or "qy_adapter_not_ready")
+    if status == "input_invalid":
+        raise ModuleBlockedError(module, f"qy_adapter_input_invalid:{reason}")
+    if not str(context.metadata.get("primary_camera") or "").strip():
+        raise ModulePrerequisiteError(module, f"QY primary_camera: {reason}")
+    if str(context.metadata.get("frame_mapping_status") or "") != "verified":
+        raise ModulePrerequisiteError(module, "QY verified frame mapping")
+    try:
+        fps = float(context.metadata.get("fps"))
+    except (TypeError, ValueError):
+        fps = float("nan")
+    if not math.isfinite(fps) or fps <= 0.0:
+        raise ModulePrerequisiteError(module, "QY finite positive fps")
+    _source_path(context, module, "video")
 
 
 def _source_relative_path(context: AssetContext) -> str:
@@ -232,6 +265,7 @@ def _load_clip(context: AssetContext, module: str) -> Any:
             raise ModuleInputError(module, str(exc)) from exc
 
     if supplier in {"qy", "qingyu"}:
+        _validate_qy_precheck_inputs(context, module)
         if source_range is None:
             raise ModulePrerequisiteError(module, "source_range for QY precheck")
         from acceptance_pull.supplier_adapters.qingyu_hand_pose import (
@@ -253,7 +287,7 @@ def _load_clip(context: AssetContext, module: str) -> Any:
         }
         try:
             return load_qingyu_clip(row, episode_idx=0)
-        except (OSError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             raise ModuleInputError(module, str(exc)) from exc
 
     if supplier == "jdt" or (
@@ -837,11 +871,32 @@ class PrecheckSession:
             result = self._apply_frame_survival(module, result)
             self._results[module] = result
             return result
+        if _is_qy_supplier(self.context) and module in {
+            "keypoint_morphology",
+            "keypoint_temporal",
+        }:
+            source_range = self.context.source_range
+            direct_2d_ready = bool(
+                str(self.context.metadata.get("primary_camera") or "").strip()
+                and self.context.metadata.get("frame_mapping_status") == "verified"
+            )
+            source_frames = (
+                tuple(range(source_range[0], source_range[1]))
+                if source_range is not None and direct_2d_ready
+                else ()
+            )
+            clip = SimpleNamespace(
+                episode_idx=0,
+                frame_indices=source_frames,
+                source_frame_indices=source_frames,
+            )
+        else:
+            clip = self._prepare_clip_for_module(module)
         execution = _run_module_on_clip(
             self.context,
             self.config,
             module,
-            self._prepare_clip_for_module(module),
+            clip,
         )
         if isinstance(execution, ModuleResult):
             result = self._apply_frame_survival(module, execution)

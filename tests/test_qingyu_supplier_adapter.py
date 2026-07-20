@@ -238,6 +238,83 @@ def test_qy_explicit_camera_is_not_rejected_by_auto_coverage_thresholds(
     assert coverage["explicit_camera_eligible"] is True
 
 
+def test_qy_repeated_mapping_pairs_and_equivalent_same_hand_rows_are_nonblocking(
+    tmp_path: Path,
+) -> None:
+    rows = observation_rows()
+    for original in (rows[0], rows[2]):
+        rows.append(
+            {
+                **original,
+                "status": "review",
+                "score": 0.5,
+                "pred_keypoints_2d": [
+                    list(point) for point in original["pred_keypoints_2d"]
+                ],
+            }
+        )
+    root, _ = _make_qy_without_supplier_timebase(
+        tmp_path,
+        observations=rows,
+    )
+
+    row = build_qingyu_manifest(
+        root,
+        primary_camera="mid_cam_left",
+        camera_selection={
+            "minimum_hand_coverage": 1.0,
+            "minimum_both_hand_coverage": 1.0,
+        },
+    )[0]
+
+    assert row["primary_camera"] == "mid_cam_left"
+    assert row["adapter_status"] == "ready"
+    assert row["frame_mapping_status"] == "verified"
+    coverage = json.loads(row["camera_coverage"])["mid_cam_left"]
+    assert coverage["unique_mapping_pair_count"] == 3
+    # Six normal hand rows plus two equivalent same-hand repeats share 3 pairs.
+    assert coverage["duplicate_mapping_count"] == 5
+    assert coverage["repeated_mapping_pair_count"] == 3
+    assert coverage["equivalent_duplicate_observation_count"] == 2
+    assert coverage["conflicting_same_hand_observation_count"] == 0
+    assert coverage["observation_status"] == "valid_deduplicated"
+    assert coverage["mapping_conflict_count"] == 0
+    assert coverage["mapping_warning"] == "repeated_identical_mapping_pairs"
+    assert coverage["explicit_camera_eligible"] is True
+
+
+def test_qy_conflicting_same_hand_observations_are_not_silently_selected(
+    tmp_path: Path,
+) -> None:
+    rows = observation_rows()
+    conflicting = {
+        **rows[0],
+        "pred_keypoints_2d": keypoints_2d(10.0),
+        "status": "ok",
+        "score": 1.0,
+    }
+    rows.append(conflicting)
+    root, _ = _make_qy_without_supplier_timebase(
+        tmp_path,
+        observations=rows,
+    )
+
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
+
+    assert row["primary_camera"] == ""
+    assert row["adapter_status"] == "input_invalid"
+    assert row["reason"] == "conflicting_same_hand_observations"
+    coverage = json.loads(row["camera_coverage"])["mid_cam_left"]
+    assert coverage["frame_mapping_status"] == "verified"
+    assert coverage["mapping_conflict_count"] == 0
+    assert coverage["observation_status"] == "input_invalid"
+    assert coverage["conflicting_same_hand_observation_count"] == 1
+
+    auto_row = build_qingyu_manifest(root)[0]
+    assert auto_row["adapter_status"] == "input_invalid"
+    assert auto_row["reason"] == "conflicting_same_hand_observations"
+
+
 @pytest.mark.parametrize(
     ("mutate", "expected_reason"),
     [
@@ -249,10 +326,13 @@ def test_qy_explicit_camera_is_not_rejected_by_auto_coverage_thresholds(
             "source_to_video_conflict",
         ),
         (
-            lambda rows: rows.__setitem__(
-                2,
-                {**rows[2], "source_frame_index": 101, "video_frame": rows[0]["video_frame"]},
-            ),
+            lambda rows: [
+                rows.__setitem__(
+                    index,
+                    {**rows[index], "video_frame": rows[0]["video_frame"]},
+                )
+                for index in (2, 3)
+            ],
             "video_to_source_conflict",
         ),
         (

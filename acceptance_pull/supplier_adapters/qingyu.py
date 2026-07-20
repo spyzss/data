@@ -601,14 +601,27 @@ def build_qingyu_manifest(
             adapter_status = "input_invalid"
             reason = "coordinate_system_invalid"
         elif selected is None:
+            requested_audit = (
+                camera_audits.get(primary_camera, {})
+                if primary_camera is not None
+                else {}
+            )
+            conflicting_observations = any(
+                audit.get("observation_status") == "input_invalid"
+                for audit in camera_audits.values()
+            )
             adapter_status = (
                 "input_invalid"
                 if timebase_error is not None
+                or requested_audit.get("observation_status") == "input_invalid"
+                or conflicting_observations
                 else "input_missing"
             )
             reason = (
                 recommendation_reason
                 if primary_camera is not None
+                else "conflicting_same_hand_observations"
+                if conflicting_observations
                 else "primary_camera_missing"
             )
         elif not required_present:

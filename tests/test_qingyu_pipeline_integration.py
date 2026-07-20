@@ -15,7 +15,7 @@ from acceptance_pull.supplier_adapters.qingyu import (
 from qc_common.config import load_qc_acceptance_config
 from qc_common.schema import validate_qc_config
 from qc_common.suppliers import normalize_supplier
-from qc_common.module_registry import ModulePrerequisiteError
+from qc_common.module_registry import ModuleBlockedError, ModulePrerequisiteError
 from qc_pipeline.runners.precheck import PrecheckSession, precheck_fingerprint
 from tests.fixtures import solid_frame, write_test_video
 from tests.qingyu_fixtures import make_qy_episode, trajectory_rows
@@ -313,6 +313,116 @@ def test_qy_unconfirmed_topology_is_not_applicable_to_morphology_or_temporal(
         result.metrics.get("temporal_output_valid") is False
         for result in session._raw_results["keypoint_temporal"]
     )
+
+
+def test_qy_invalid_adapter_blocks_precheck_without_float_none_runtime_error(
+    tmp_path: Path,
+) -> None:
+    from tests.qingyu_fixtures import keypoints_2d, observation_rows
+
+    root = tmp_path / "source" / "QY"
+    rows = observation_rows()
+    rows.append(
+        {
+            **rows[0],
+            "pred_keypoints_2d": keypoints_2d(10.0),
+        }
+    )
+    make_qy_episode(root, observations=rows)
+    manifest = write_qingyu_manifest(
+        build_qingyu_manifest(root, primary_camera="mid_cam_left"), tmp_path
+    )
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+    session = PrecheckSession(context, load_qc_acceptance_config())
+
+    with pytest.raises(
+        ModuleBlockedError,
+        match="conflicting_same_hand_observations",
+    ):
+        session.run_module("hdf5_text_info")
+
+    for module in ("keypoint_morphology", "keypoint_temporal"):
+        result = session.run_module(module)
+        assert result.verdict == "skipped"
+        assert result.evaluation["decision"] == "not_applicable"
+        assert result.evaluation["reason"] == "qy_hand_topology_not_validated"
+
+
+def test_qy_missing_primary_fps_or_video_blocks_precheck_precisely(
+    tmp_path: Path,
+) -> None:
+    context = _context_for_qy(tmp_path)
+    cases = (
+        (
+            {**dict(context.metadata), "primary_camera": ""},
+            dict(context.source_files),
+            "QY primary_camera",
+        ),
+        (
+            {**dict(context.metadata), "fps": None},
+            dict(context.source_files),
+            "QY finite positive fps",
+        ),
+        (
+            dict(context.metadata),
+            {
+                name: value
+                for name, value in context.source_files.items()
+                if name != "video"
+            },
+            "source_files.video.path",
+        ),
+    )
+
+    for metadata, source_files, expected in cases:
+        invalid_context = type(context)(
+            asset_id=context.asset_id,
+            batch_root=context.batch_root,
+            report_path=context.report_path,
+            source_files=source_files,
+            source_range=context.source_range,
+            metadata=metadata,
+        )
+        with pytest.raises(ModulePrerequisiteError, match=expected):
+            PrecheckSession(
+                invalid_context,
+                load_qc_acceptance_config(),
+            ).run_module("hdf5_text_info")
+
+
+def test_qy_valid_explicit_camera_reaches_video_quality(
+    tmp_path: Path,
+) -> None:
+    from qc_pipeline.runners.video_quality import run as run_video_quality
+    from tests.qingyu_fixtures import observation_rows
+
+    root = tmp_path / "source" / "QY"
+    rows = observation_rows()
+    for row in rows:
+        row["source_frame_index"] = {100: 0, 101: 1, 102: 2}[
+            row["source_frame_index"]
+        ]
+    episode = make_qy_episode(
+        root,
+        observations=rows,
+        trajectory=trajectory_rows(source_steps=(0, 1, 2)),
+    )
+    (episode / "timestamps" / "episode_timebase.json").unlink()
+    write_test_video(
+        episode / "videos" / "mid_cam_left.mp4",
+        [solid_frame(value, width=64, height=48) for value in (10, 20, 30, 40)],
+        fps=30.0,
+    )
+    manifest = write_qingyu_manifest(
+        build_qingyu_manifest(root, primary_camera="mid_cam_left"), tmp_path
+    )
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+
+    result = run_video_quality(context, load_qc_acceptance_config())
+
+    assert context.metadata["adapter_status"] == "ready"
+    assert context.source_files["video"]["path"].endswith("mid_cam_left.mp4")
+    assert result.module == "video_quality"
 
 
 def test_qy_supplier_inventory_rejects_directory_at_required_file_path(
