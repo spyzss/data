@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,9 @@ from .semantic_service import (
     TextEditRequest,
 )
 from .warn_service import WarnReviewService
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def jsonable(value: Any) -> Any:
@@ -216,10 +220,20 @@ class WorkbenchService:
                 ]
             try:
                 view = resolver(resolved_issue, context)
-            except Exception as exc:
+            except Exception:
                 # Evidence is optional in the task DTO.  Preserve the issue
                 # identifier and a stable error so the UI can show a retry.
-                result.append({"issue_id": issue.get("issue_id"), "generation_error": str(exc)})
+                LOGGER.exception(
+                    "Evidence clip generation failed for asset %s issue %s",
+                    asset_id,
+                    issue.get("issue_id"),
+                )
+                result.append(
+                    {
+                        "issue_id": issue.get("issue_id"),
+                        "generation_error": "clip_unavailable",
+                    }
+                )
                 continue
             result.append(jsonable(view))
         return result

@@ -178,7 +178,28 @@ def test_overlay_failure_degrades_in_integrated_task_but_keeps_clip(tmp_path: Pa
     assert task["task_type"] == "warn_review"
     assert task["evidence"][0]["clip_url"]
     assert task["evidence"][0]["overlay_url"] is None
-    assert "renderer unavailable" in task["evidence"][0]["generation_error"]
+    assert task["evidence"][0]["generation_error"] == "overlay_unavailable"
+    assert "renderer unavailable" not in json.dumps(task["evidence"])
+
+
+def test_clip_failure_exposes_stable_code_without_internal_exception(tmp_path: Path) -> None:
+    asset = build_file_asset(tmp_path, asset_id="asset-clip-error", hard_fail=False)
+    semantic = _semantic(asset)
+    semantic.complete(asset.asset_id, expected_revision=1, lease_token=LEASE)
+
+    def fail_clip(*_args: object) -> None:
+        raise RuntimeError(f"ffmpeg failed for {asset.video_path}")
+
+    workbench = WorkbenchService(
+        semantic,
+        WarnReviewService(reports={asset.asset_id: asset.report_path}, leases={asset.asset_id: LEASE}),
+        EvidenceService(asset.root / "cache", ffmpeg_runner=fail_clip),
+        asset_contexts={asset.asset_id: asset.context},
+    )
+    task = workbench.get_asset_task(asset.asset_id)
+
+    assert task["evidence"][0]["generation_error"] == "clip_unavailable"
+    assert str(asset.video_path) not in json.dumps(task["evidence"])
 
 
 def test_prepare_phase_failure_leaves_original_byte_identical(
