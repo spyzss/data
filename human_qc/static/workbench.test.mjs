@@ -13,6 +13,7 @@ import {
   WarnReviewAdapter,
   allSelectedIssuesReviewed,
   buildWarnIssueModel,
+  nextReviewIssueId,
   renderWarnMarkup,
 } from "./warn_adapter.js";
 import { WorkbenchApp, mutationControlsDisabled } from "./app.js";
@@ -221,6 +222,105 @@ test("warn model keeps machine reason metrics threshold and half-open evidence r
   assert.doesNotMatch(markup, /timeline-track|semantic-text-slot|boundary-handle/);
 });
 
+test("warn markup follows video-first rationale-then-decision flow", () => {
+  const markup = renderWarnMarkup(warnTask, "warn-1");
+  assert.match(markup, /class="warn-rationale"/);
+  assert.match(markup, /class="warn-decision"/);
+  assert.match(markup, /data-action="verdict-pass"/);
+  assert.match(markup, /data-action="verdict-fail"/);
+  assert.ok(markup.indexOf("warn-rationale") < markup.indexOf("warn-decision"));
+  assert.doesNotMatch(markup, /class="warn-layout"/);
+  assert.doesNotMatch(markup, /<pre data-machine-metrics>/);
+});
+
+test("warn evidence codes render safe reviewer copy", () => {
+  const degraded = structuredClone(warnTask);
+  degraded.evidence = [{ issue_id: "warn-1", generation_error: "clip_unavailable" }];
+  const markup = renderWarnMarkup(degraded, "warn-1");
+  assert.match(markup, /问题片段暂不可用/);
+  assert.doesNotMatch(markup, /ffmpeg|Command|\/private\//i);
+});
+
+test("warn markup renders every sampled SAM3 overlay image", () => {
+  const sampled = structuredClone(warnTask);
+  sampled.evidence[0].overlay_images = [
+    { frame: 120, url: "/evidence/frame-120.png" },
+    { frame: 144, url: "/evidence/frame-144.png" },
+    { frame: 188, url: "/evidence/frame-188.png" },
+  ];
+  const markup = renderWarnMarkup(sampled, "warn-1");
+  assert.equal((markup.match(/class="warn-overlay-sample"/g) || []).length, 3);
+  assert.ok(markup.indexOf("frame-120.png") < markup.indexOf("frame-188.png"));
+});
+
+test("sampled SAM3 overlay errors hide only the failed image and show safe fallback", () => {
+  let failedImageError = null;
+  const failedSample = { hidden: false };
+  const failedImage = {
+    hidden: false,
+    closest: () => failedSample,
+    addEventListener(type, handler) {
+      if (type === "error") failedImageError = handler;
+    },
+  };
+  const healthySample = { hidden: false };
+  const healthyImage = {
+    hidden: false,
+    closest: () => healthySample,
+    addEventListener() {},
+  };
+  const degradation = { hidden: true, textContent: "" };
+  const root = {
+    innerHTML: "",
+    querySelectorAll(selector) {
+      if (selector === '[data-action="select-issue"]') return [];
+      if (selector === "[data-warn-overlay-sample]") return [failedImage, healthyImage];
+      return [];
+    },
+    querySelector(selector) {
+      if (selector === "[data-overlay-sample-error]") return degradation;
+      return null;
+    },
+  };
+  const sampled = structuredClone(warnTask);
+  sampled.warn.issue_reviews = {};
+  sampled.evidence[0].overlay_images = [
+    { frame: 120, url: "/evidence/frame-120.png" },
+    { frame: 144, url: "/evidence/frame-144.png" },
+  ];
+  const video = {
+    src: "",
+    currentTime: -1,
+    dataset: {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const adapter = new WarnReviewAdapter({ video });
+
+  adapter.render(sampled, root);
+  assert.equal(typeof failedImageError, "function");
+  assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
+  failedImageError({ message: "/private/failed-frame.png" });
+
+  assert.equal(failedImage.hidden, true);
+  assert.equal(failedSample.hidden, true);
+  assert.equal(healthyImage.hidden, false);
+  assert.equal(healthySample.hidden, false);
+  assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
+  assert.equal(degradation.hidden, false);
+  assert.match(degradation.textContent, /骨架抽样图加载失败/);
+  assert.doesNotMatch(degradation.textContent, /private|failed-frame/i);
+  assert.match(renderWarnMarkup(warnTask, "warn-1"), /data-action="toggle-overlay"/);
+});
+
+test("reviewed warn advances to the next unresolved issue", () => {
+  const updated = structuredClone(warnTask);
+  updated.warn.issue_reviews = { "warn-1": { verdict: "pass" } };
+  assert.equal(nextReviewIssueId(updated, "warn-1"), "warn-2");
+  updated.warn.issue_reviews["warn-2"] = { verdict: "fail" };
+  assert.equal(nextReviewIssueId(updated, "warn-2"), "warn-2");
+});
+
 test("warn model converts inclusive canonical context end when evidence projection degrades", () => {
   const canonicalTask = structuredClone(warnTask);
   canonicalTask.evidence = [];
@@ -350,6 +450,14 @@ test("non-empty warn candidates do not auto-complete when selection is temporari
   assert.doesNotMatch(markup, /任务已完成|data-action="complete-warn"/);
 });
 
+test("status exposes the active task type on the app shell", () => {
+  const root = { dataset: {}, querySelector: () => null };
+  const app = new WorkbenchApp({ root });
+  app.task = warnTask;
+  app.renderStatus();
+  assert.equal(root.dataset.taskType, "warn_review");
+});
+
 test("configured warn evidence video hides the opaque media placeholder", () => {
   const video = {
     src: "",
@@ -420,38 +528,6 @@ test("rejected Pass or Fail saves are caught and shown in the warn error region"
   };
   assert.equal(await adapter.submitCurrentVerdict("pass"), null);
   assert.equal(visibleError.textContent, "lease expired");
-});
-
-test("overlay image load errors visibly degrade while preserving video evidence", () => {
-  let overlayErrorHandler = null;
-  const overlay = {
-    hidden: false,
-    addEventListener(type, handler) {
-      if (type === "error") overlayErrorHandler = handler;
-    },
-  };
-  const toggle = { checked: true, disabled: false, addEventListener() {} };
-  const degraded = { hidden: true, textContent: "" };
-  const root = {
-    innerHTML: "",
-    querySelectorAll: () => [],
-    querySelector(selector) {
-      if (selector === "[data-warn-overlay]") return overlay;
-      if (selector === '[data-action="toggle-overlay"]') return toggle;
-      if (selector === "[data-overlay-error]") return degraded;
-      return null;
-    },
-  };
-  const adapter = new WarnReviewAdapter();
-  adapter.render(warnTask, root);
-  assert.equal(typeof overlayErrorHandler, "function");
-  overlayErrorHandler();
-  assert.equal(overlay.hidden, true);
-  assert.equal(toggle.disabled, true);
-  assert.equal(toggle.checked, false);
-  assert.equal(degraded.hidden, false);
-  assert.match(degraded.textContent, /overlay.*加载失败/);
-  assert.match(root.innerHTML, /打开问题窗口视频/);
 });
 
 test("WorkbenchApp uses the issue-id verdict endpoint and server revision refresh", async () => {

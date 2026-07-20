@@ -283,6 +283,8 @@ export class WorkbenchApp {
 
   renderStatus() {
     if (!this.root) return;
+    const currentTaskType = this.task ? stageTypeForTask(this.task) : "";
+    if (this.root.dataset) this.root.dataset.taskType = currentTaskType || "idle";
     const set = (selector, value) => {
       const element = this.root.querySelector?.(selector);
       if (element) element.textContent = value;
@@ -297,7 +299,6 @@ export class WorkbenchApp {
     set("[data-text-count]", Number.isInteger(textCount) ? `${textCount} 次` : "—");
     const progress = this.root.querySelector?.("[data-progress]");
     if (progress && this.task) progress.textContent = this.task.task_type || "—";
-    const currentTaskType = this.task ? stageTypeForTask(this.task) : "";
     const taskLabels = {
       semantic_calibration: "Semantic",
       warn_review: "Warn Review",
@@ -307,12 +308,12 @@ export class WorkbenchApp {
     set("[data-task-kind]", taskLabels[currentTaskType] || "—");
     set("[data-stage-title]", {
       semantic_calibration: "语义时间轴校准",
-      warn_review: "Warn 问题人工复核",
+      warn_review: "Warn 复核",
       completed: "人工复核已完成",
       error: "任务处理失败",
     }[currentTaskType] || "人工复核");
     set("[data-inspector-note]", currentTaskType === "warn_review"
-      ? "机器原因、指标、阈值和证据均为只读；人工只提交 Pass/Fail 与原因。"
+      ? "观看问题片段后选择 Pass 或 Fail；机器信息仅供参考。"
       : "只允许拖动相邻任务之间的共享边界。每次修改先进入待确认状态。");
     const error = this.root.querySelector?.("[data-save-error]");
     if (error) {

@@ -39,12 +39,25 @@ HDF5 的闭区间结束帧显示为 `end - 1`。例如内部 `[241, 429)` 显示
 Warn 页面只展示 QC JSON 已选择的机器问题、问题区间、原因和可用 evidence。
 机器指标、阈值、原始 verdict 和 evidence 都不可编辑。
 
+当前任务选择策略为 `all_candidates`：进入人工阶段时，系统将完整机器候选池
+`candidate_issue_ids` 全量快照到 `selected_issue_ids`，并在 JSON 中记录
+`selection_policy=all_candidates`。`candidate_issue_ids` 始终保留完整候选池；
+`selected_issue_ids` 是本次人工任务快照，已有非空快照不会被自动覆盖。后续可以把
+策略替换为抽样、风险或预算选择，但不得因此删改候选池。
+
+证据区按问题类型展示：视频质量 Warn 只播放该问题帧区间的短片；SAM3 问题播放
+同一问题区间的原始短片，并展示已有的骨骼/掩码抽样 overlay PNG。系统不为 SAM3
+合成整段 overlay 视频，避免额外计算与存储开销。
+
 - Pass：认定该机器 Warn 可消解；
 - Fail：确认该机器 Warn 是真实失败；
 - 自动 hard fail：不能通过人工 Pass 改为通过。
 
 必须为所有 selected warn 选择 Pass 或 Fail 后才能完成资产。一个问题重复提交时
 以当前 revision 的最后一次服务端结果为准，并保留审计记录。
+
+完成状态以 JSON 的 `manual_review.state=completed`、`completed_at`、
+`issue_reviews` 和顶层 `overall_decision` 为准；系统不新增 `human_qc_pass` 标志位。
 
 ## 4. 冲突与恢复
 

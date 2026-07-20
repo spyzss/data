@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
+import logging
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,9 @@ from urllib.parse import quote
 from typing import Any
 
 from qc_pipeline.context import AssetContext
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class EvidenceError(RuntimeError):
@@ -28,6 +32,7 @@ class EvidenceView:
     end_frame_exclusive: int
     clip_url: str
     overlay_url: str | None
+    overlay_images: tuple[dict[str, object], ...]
     generation_error: str | None
 
     @property
@@ -44,7 +49,7 @@ class _Entry:
     start_frame: int
     end_frame_exclusive: int
     existing_clip: Path | None
-    existing_overlay: Path | None
+    existing_overlays: tuple[tuple[int, Path], ...]
 
 
 def _strict_frame(value: object, field: str) -> int:
@@ -151,22 +156,37 @@ class EvidenceService:
 
     def _existing_paths(
         self, issue: Mapping[str, Any], context: AssetContext
-    ) -> tuple[Path | None, Path | None]:
+    ) -> tuple[Path | None, tuple[tuple[int, Path], ...]]:
         clip: Path | None = None
-        overlay: Path | None = None
+        overlays: list[tuple[int, Path]] = []
         for row in self._evidence_rows(issue):
             raw_path = row.get("path", row.get("source_path"))
             if not isinstance(raw_path, str) or not raw_path:
                 continue
             kind = str(row.get("kind", row.get("evidence_type", ""))).lower()
+            if kind not in {
+                "clip",
+                "video_clip",
+                "issue_clip",
+                "overlay",
+                "skeleton_overlay",
+                "combined_overlay",
+            }:
+                continue
             path = self._inside(context.batch_root, raw_path, label="evidence path")
             if kind in {"clip", "video_clip", "issue_clip"}:
                 if path.is_file():
                     clip = path
             elif kind in {"overlay", "skeleton_overlay", "combined_overlay"}:
-                if path.is_file():
-                    overlay = path
-        return clip, overlay
+                frame = row.get("start_frame")
+                if (
+                    path.is_file()
+                    and isinstance(frame, int)
+                    and not isinstance(frame, bool)
+                    and frame >= 0
+                ):
+                    overlays.append((frame, path))
+        return clip, tuple(sorted(overlays, key=lambda item: (item[0], item[1].as_posix())))
 
     @staticmethod
     def _safe_name(value: str) -> str:
@@ -209,7 +229,9 @@ class EvidenceService:
         if output.is_file():
             return output
         output.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
+        temporary = output.with_name(
+            f".{output.stem}.{uuid.uuid4().hex}.tmp{output.suffix}"
+        )
         try:
             generator(temporary)
             if not temporary.is_file():
@@ -223,7 +245,7 @@ class EvidenceService:
         entry = self._entry(issue_id)
         if entry.existing_clip is not None:
             return entry.existing_clip
-        output, _ = self._cache_paths(entry)
+        output = self._cache_paths(entry)[0]
         command = [
             "ffmpeg",
             "-y",
@@ -264,8 +286,8 @@ class EvidenceService:
 
     def ensure_skeleton_overlay(self, issue_id: str) -> Path:
         entry = self._entry(issue_id)
-        if entry.existing_overlay is not None:
-            return entry.existing_overlay
+        if entry.existing_overlays:
+            return entry.existing_overlays[0][1]
         if self._overlay_renderer is None:
             raise EvidenceError("skeleton overlay renderer is not configured")
         output = self._cache_paths(entry)[1]
@@ -293,7 +315,7 @@ class EvidenceService:
             raise EvidenceError("issue is missing issue_id")
         source_path = self._source_path(asset_context)
         start, end = self._window(issue, asset_context)
-        clip, overlay = self._existing_paths(issue, asset_context)
+        clip, overlays = self._existing_paths(issue, asset_context)
         entry = _Entry(
             issue=deepcopy(dict(issue)),
             context=asset_context,
@@ -302,25 +324,34 @@ class EvidenceService:
             start_frame=start,
             end_frame_exclusive=end,
             existing_clip=clip,
-            existing_overlay=overlay,
+            existing_overlays=overlays,
         )
         self._entries[issue_id] = entry
         clip_path = self.ensure_issue_clip(issue_id)
-        overlay_url: str | None = None
+        overlay_images = tuple(
+            {"frame": frame, "url": self._url(path, asset_context)}
+            for frame, path in overlays
+        )
+        overlay_url = (
+            str(overlay_images[0]["url"])
+            if overlay_images
+            else None
+        )
         generation_error: str | None = None
-        if overlay is not None:
-            overlay_url = self._url(overlay, asset_context)
-        elif isinstance(issue.get("skeleton"), Mapping) and self._overlay_renderer is not None:
+        if not overlays and isinstance(issue.get("skeleton"), Mapping) and self._overlay_renderer is not None:
             try:
                 overlay_url = self._url(self.ensure_skeleton_overlay(issue_id), asset_context)
-            except Exception as exc:  # overlay is optional for human review
-                generation_error = str(exc)
+                overlay_images = ({"frame": start, "url": overlay_url},)
+            except Exception:  # overlay is optional for human review
+                LOGGER.exception("Skeleton overlay generation failed for issue %s", issue_id)
+                generation_error = "overlay_unavailable"
         return EvidenceView(
             issue_id=issue_id,
             start_frame=start,
             end_frame_exclusive=end,
             clip_url=self._url(clip_path, asset_context),
             overlay_url=overlay_url,
+            overlay_images=overlay_images,
             generation_error=generation_error,
         )
 

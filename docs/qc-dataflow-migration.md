@@ -79,7 +79,7 @@ profile 的流转差异：
   supplier_evaluation: hard fail -> 记录并继续
 -> semantic_consistency external
 -> candidate_issue_ids 为空：manual_review=not_required
--> candidate_issue_ids 非空：manual_review=queued
+-> candidate_issue_ids 非空：当前 all_candidates 策略全量写入 selected_issue_ids，manual_review=queued
 -> 最终 overall_decision=pass|fail
 -> 批次输出只投影 quality_archive/*.json
 ```

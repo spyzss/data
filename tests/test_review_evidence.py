@@ -54,7 +54,11 @@ def test_existing_clip_and_overlay_are_reused(tmp_path: Path) -> None:
     issue = _issue(
         evidence=[
             {"kind": "clip", "path": "evidence/warn-1.mp4"},
-            {"kind": "skeleton_overlay", "path": "evidence/warn-1.png"},
+            {
+                "kind": "skeleton_overlay",
+                "path": "evidence/warn-1.png",
+                "start_frame": 10,
+            },
         ]
     )
     calls = []
@@ -65,6 +69,9 @@ def test_existing_clip_and_overlay_are_reused(tmp_path: Path) -> None:
     view = service.resolve(issue, context)
     assert view.clip_url.endswith("evidence/warn-1.mp4")
     assert view.overlay_url is not None and view.overlay_url.endswith("evidence/warn-1.png")
+    assert view.overlay_images == (
+        {"frame": 10, "url": "/evidence/evidence/warn-1.png"},
+    )
     assert calls == []
 
 
@@ -87,6 +94,24 @@ def test_missing_clip_uses_half_open_window_and_cache_key(tmp_path: Path) -> Non
     assert "end_frame=20" in command
     assert "warn-1" in first.clip_url
     assert "10-20" in first.clip_url
+
+
+def test_generated_clip_temporary_path_keeps_mp4_suffix(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    issue = _issue()
+    observed: dict[str, Path] = {}
+
+    def generate(command, output: Path) -> None:
+        observed["command_output"] = Path(command[-1])
+        observed["callback_output"] = output
+        output.write_bytes(b"mp4")
+
+    service = EvidenceService(tmp_path / "cache", ffmpeg_runner=generate)
+    view = service.resolve(issue, context)
+
+    assert observed["command_output"].suffix == ".mp4"
+    assert observed["callback_output"].suffix == ".mp4"
+    assert view.clip_url.endswith(".mp4")
 
 
 def test_overlay_reads_only_window_and_limits_skeleton_points(tmp_path: Path) -> None:
@@ -135,7 +160,53 @@ def test_overlay_failure_keeps_clip_and_reports_generation_error(tmp_path: Path)
     view = service.resolve(_issue(skeleton={"frames": []}), context)
     assert view.clip_url
     assert view.overlay_url is None
-    assert "renderer unavailable" in (view.generation_error or "")
+    assert view.generation_error == "overlay_unavailable"
+    assert "renderer unavailable" not in json.dumps(view.__dict__)
+
+
+def test_sampled_overlay_images_are_preserved_in_frame_order(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    overlay_dir = tmp_path / "sam3" / "combined_overlays"
+    overlay_dir.mkdir(parents=True)
+    for frame in (188, 120, 144):
+        (overlay_dir / f"frame-{frame}.png").write_bytes(b"png")
+
+    def generate_clip(_command, output: Path) -> None:
+        output.write_bytes(b"raw-mp4")
+
+    service = EvidenceService(
+        tmp_path / "cache",
+        ffmpeg_runner=generate_clip,
+    )
+    view = service.resolve(
+        _issue(
+            module="sam3_containment",
+            evidence=[
+                {
+                    "kind": "combined_overlay",
+                    "path": "sam3/combined_overlays/frame-188.png",
+                    "start_frame": 188,
+                },
+                {
+                    "kind": "overlay",
+                    "path": "sam3/combined_overlays/frame-120.png",
+                    "start_frame": 120,
+                },
+                {
+                    "kind": "skeleton_overlay",
+                    "path": "sam3/combined_overlays/frame-144.png",
+                    "start_frame": 144,
+                },
+            ],
+        ),
+        context,
+    )
+
+    assert [row["frame"] for row in view.overlay_images] == [120, 144, 188]
+    assert all(row["url"].endswith(".png") for row in view.overlay_images)
+    assert view.clip_url.endswith(".mp4")
+    assert "overlay" not in view.clip_url
+    assert view.overlay_url == view.overlay_images[0]["url"]
 
 
 def test_evidence_path_escape_is_rejected(tmp_path: Path) -> None:
@@ -231,6 +302,7 @@ def test_workbench_joins_canonical_issue_evidence_and_converts_inclusive_context
             "end_frame_exclusive": 20,
             "clip_url": "/evidence/evidence/warn-1.mp4",
             "overlay_url": None,
+            "overlay_images": [],
             "generation_error": None,
         }
     ]

@@ -16,6 +16,7 @@ from qc_common.module_registry import (
     ModuleRegistry,
     ModuleUnavailableError,
 )
+from qc_common.manual_review import select_pending_manual_review_candidates
 from qc_common.report import (
     StaleReportRevisionError,
     load_asset_qc_report,
@@ -321,16 +322,18 @@ def run_asset(
             )
             continue
         if module_config.get("execution_kind") == "external":
-            if module_name == "manual_review" and not _manual_selected_issue_ids(report):
-                report = _record_empty_manual_review(
-                    context,
-                    config=config,
-                    profile=profile,
-                    report=report,
-                    expected_revision=expected_revision,
-                    now=timestamp,
-                )
-                continue
+            if module_name == "manual_review":
+                select_pending_manual_review_candidates(report)
+                if not _manual_selected_issue_ids(report):
+                    report = _record_empty_manual_review(
+                        context,
+                        config=config,
+                        profile=profile,
+                        report=report,
+                        expected_revision=expected_revision,
+                        now=timestamp,
+                    )
+                    continue
             report = record_awaiting_external(
                 context.report_path,
                 context=context,
@@ -555,6 +558,8 @@ def resume_after_external(
             "transition_revision": expected_revision + 1,
         }
     candidate["pipeline_state"] = pipeline_state
+    if next_module == "manual_review":
+        select_pending_manual_review_candidates(candidate)
     if incomplete:
         candidate["overall_decision"] = None
     elif next_module is None:

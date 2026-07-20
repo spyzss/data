@@ -19,6 +19,7 @@ import uuid
 from typing import Any
 
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report
+from qc_common.manual_review import select_pending_manual_review_candidates
 
 from .contracts import BoundaryEdit, BoundaryError, SegmentSnapshot, SubtaskSegment
 from .hdf5_commit import (
@@ -589,6 +590,7 @@ def _advance_pipeline_after_semantic(candidate: dict[str, Any]) -> None:
         pipeline["status"] = "awaiting_external"
         pipeline["next_module"] = "manual_review"
         candidate["pipeline_state"] = pipeline
+        select_pending_manual_review_candidates(candidate)
         return
 
     if not isinstance(manual, dict):

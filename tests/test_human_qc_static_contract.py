@@ -159,3 +159,27 @@ def test_static_application_has_no_hidden_machine_issue_mutation_endpoint() -> N
     assert "/issues/" not in app
     assert "issue.severity =" not in warn
     assert "issue.observed_value =" not in warn
+
+
+def test_warn_stage_has_complete_visual_and_responsive_css_contract() -> None:
+    css = _read("workbench.css")
+    required = {
+        '[data-task-type="warn_review"] .workspace-grid',
+        ".warn-review-head",
+        ".warn-rationale",
+        ".warn-metrics",
+        ".warn-overlay-gallery",
+        ".warn-overlay-sample",
+        ".warn-decision",
+        ".warn-verdict-actions",
+        '[data-action="verdict-pass"]',
+        '[data-action="verdict-fail"]',
+    }
+    assert all(selector in css for selector in required)
+    assert "@media (max-width: 700px)" in css
+
+
+def test_hidden_video_placeholder_never_covers_loaded_video() -> None:
+    css = _read("workbench.css")
+    assert ".video-placeholder[hidden]" in css
+    assert "display: none" in css

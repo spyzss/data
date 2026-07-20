@@ -299,12 +299,17 @@ flowchart TD
 
 - `manual_review.candidate_issue_ids=[]`：写 `required=false`、`state=not_required`，
   不做正常 Pass 样本抽检；
-- 非空：写 `required=true`、`state=queued`，逐条复核候选 issue；
+- 非空：当前 `all_candidates` 策略将完整候选池快照到 `selected_issue_ids`，写
+  `selection_policy=all_candidates`、`required=true`、`state=queued`；
 - 复核过程中使用 `in_progress`，全部写回后使用 `completed`；
 - acceptance hard fail 已停止时使用 `skipped_due_to_fail`，不创建人工任务。
 
 人工 verdict 只能补充 issue review 和统计，不得删除/改写机器 issue；人工确认 fail
 会进入 `human_confirmed_fail_issue_count` 和最终 fail 统计。
+
+`candidate_issue_ids` 始终是完整机器候选池，`selected_issue_ids` 是本次任务快照；
+已有非空快照不得覆盖。未来可以用抽样、风险或预算 selector 替换
+`all_candidates`，但候选池合同不变。
 
 ### 8.3 人工路由模块
 
@@ -327,6 +332,7 @@ source_files
   "state": "queued",
   "candidate_issue_ids": ["video_quality:fps_below_pass:001"],
   "selected_issue_ids": ["video_quality:fps_below_pass:001"],
+  "selection_policy": "all_candidates",
   "failures_for_batch_stats_issue_ids": [],
   "routing": {
     "policy": "warn_or_sample",
