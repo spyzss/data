@@ -25,7 +25,7 @@ revision 加一；过期 revision 返回 409，lease 冲突或过期返回 423�
 | `acceptance` | 立即停止 | 不创建 | 不创建 | fail |
 | `supplier_evaluation` | 保留机器 fail 并继续 | 按配置执行 | 复核适用 warn | 仍为 fail，人工 Pass 不得覆盖机器 fail |
 
-全 Pass 且没有 selected warn 时，Warn 阶段标记 `not_required` 并完成为 pass。
+没有 machine warn 候选时，Warn 阶段标记 `not_required` 并完成为 pass。
 
 ## 4. 语义校准合同
 
@@ -40,7 +40,11 @@ revision 加一；过期 revision 返回 409，lease 冲突或过期返回 423�
 
 ## 5. Warn 复核合同
 
-- 候选只来自当前 QC JSON 的 `manual_review.selected_issue_ids`。
+- `candidate_issue_ids` 保留完整机器候选池；`selected_issue_ids` 是当前人工任务快照。
+- 当前 `all_candidates` 策略在 selection 为空时全量快照候选，并记录
+  `selection_policy=all_candidates`；已有非空 selection 不覆盖。
+- policy seam 后续可换成抽样、风险或预算选择，但不得删改候选池。
+- 工作台只消费当前 QC JSON 的 `manual_review.selected_issue_ids`。
 - 人工 Pass 表示消解 warn；人工 Fail 表示确认 fail。
 - 人工记录写入 `manual_review.issue_reviews[issue_id]`，不得改写顶层机器 issue。
 - 所有 selected issue 必须有 verdict 才能完成；自动 hard fail 优先于人工结论。

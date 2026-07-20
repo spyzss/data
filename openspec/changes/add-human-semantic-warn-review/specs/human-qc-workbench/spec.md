@@ -14,11 +14,11 @@
 - **THEN** 不渲染时间轴拖动和 subtask 文字编辑器
 
 ### Requirement: Warn 任务展示最小相关证据
-视频类 warn MUST 默认播放 issue context 指定的起止帧片段。21 点骨骼问题 MUST 使用预生成或按需缓存的 overlay 片段，并限制为问题窗口；工作台不得默认为整段长视频实时生成全帧 overlay。
+视频类 warn MUST 默认播放 issue context 指定的起止帧片段。21 点骨骼问题 MUST 播放同一问题窗口的原始片段，并展示已有的抽样 overlay PNG；工作台不得合成整段 overlay 视频。
 
 #### Scenario: 打开骨骼连续性 Warn
 - **WHEN** issue 包含起止帧和 overlay evidence
-- **THEN** 播放器只加载对应问题窗口并显示 21 点 overlay
+- **THEN** 播放器只加载对应问题窗口并显示已有的 21 点抽样 overlay PNG
 - **THEN** 操作者可以查看 warn 原因和原始机器指标
 
 ### Requirement: 阶段按语义后 Warn 串行切换

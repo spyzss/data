@@ -8,6 +8,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from qc_common.schema import validate_asset_qc_report
+from qc_common.manual_review import select_pending_manual_review_candidates
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report, write_asset_qc_report
 from human_qc.report_updates import (
     initialize_manual_review,
@@ -138,6 +139,70 @@ def test_manual_selected_ids_must_be_candidate_subset() -> None:
 
     with pytest.raises(ValueError):
         validate_asset_qc_report(report)
+
+
+def test_manual_selection_policy_must_be_supported() -> None:
+    report = make_v2_report()
+    report["manual_review"] = make_manual_block(
+        state="queued",
+        candidate_issue_ids=["warn-1"],
+        selected_issue_ids=["warn-1"],
+    )
+    report["manual_review"]["selection_policy"] = "unknown_selector"
+
+    with pytest.raises(ValueError, match="selection_policy"):
+        validate_asset_qc_report(report)
+
+
+def test_pending_selection_preserves_existing_explicit_snapshot() -> None:
+    report = make_v2_report(status="running")
+    report["pipeline_state"]["next_module"] = "manual_review"
+    report["manual_review"] = make_manual_block(
+        state="queued",
+        candidate_issue_ids=["warn-1", "warn-2"],
+        selected_issue_ids=["warn-2"],
+    )
+
+    changed = select_pending_manual_review_candidates(report)
+
+    assert changed is False
+    assert report["manual_review"]["candidate_issue_ids"] == ["warn-1", "warn-2"]
+    assert report["manual_review"]["selected_issue_ids"] == ["warn-2"]
+    assert "selection_policy" not in report["manual_review"]
+
+
+def test_pending_all_candidates_selection_keeps_full_candidate_pool() -> None:
+    report = make_v2_report(status="running")
+    report["pipeline_state"]["next_module"] = "manual_review"
+    report["manual_review"] = make_manual_block(
+        state="not_evaluated",
+        candidate_issue_ids=["warn-2", "warn-1"],
+        selected_issue_ids=[],
+    )
+
+    changed = select_pending_manual_review_candidates(report)
+
+    assert changed is True
+    assert report["manual_review"]["candidate_issue_ids"] == ["warn-2", "warn-1"]
+    assert report["manual_review"]["selected_issue_ids"] == ["warn-2", "warn-1"]
+    assert report["manual_review"]["selection_policy"] == "all_candidates"
+    assert report["manual_review"]["required"] is True
+    assert report["manual_review"]["state"] == "queued"
+
+
+def test_selection_does_not_mutate_completed_review() -> None:
+    report = make_v2_report(status="completed")
+    report["pipeline_state"]["next_module"] = None
+    report["manual_review"] = make_manual_block(
+        state="not_required",
+        candidate_issue_ids=["warn-1"],
+        selected_issue_ids=[],
+    )
+
+    changed = select_pending_manual_review_candidates(report)
+
+    assert changed is False
+    assert report["manual_review"]["selected_issue_ids"] == []
 
 
 def test_valid_human_blocks_validate() -> None:

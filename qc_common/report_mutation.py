@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from qc_common.config import LoadedQcConfig
 from qc_common.manifest_metadata import manifest_metadata
+from qc_common.manual_review import select_pending_manual_review_candidates
 from qc_common.contracts import EvidenceRef, ModuleResult, RuntimeErrorRecord
 from qc_common.report import (
     StaleReportRevisionError,
@@ -814,6 +815,9 @@ def record_awaiting_external(
         raise ModuleOrderError(
             f"cannot await external module from status {pipeline_state.get('status')}"
         )
+
+    if module == "manual_review":
+        select_pending_manual_review_candidates(report)
 
     pipeline_state.update(
         {

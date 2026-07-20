@@ -8,6 +8,23 @@ warn 人工质检 SHALL 只为自动模块写入且被路由选中的 warn issue
 - **THEN** manual review 标记为 not_required
 - **THEN** 资产无需人工 Pass/Fail 即可进入最终完成流程
 
+### Requirement: 当前默认全量选择机器候选
+系统 SHALL 保留 `candidate_issue_ids` 作为完整机器候选池，并将
+`selected_issue_ids` 作为当前人工任务快照。当前 `all_candidates` 策略 MUST 在进入
+manual review 且 selection 为空时全量快照候选并记录 selection policy；已有非空
+selection MUST NOT 被覆盖。未来抽样、风险或预算策略 MAY 替换当前 selector，但
+MUST NOT 删除或改写候选池。
+
+#### Scenario: 非空候选进入人工复核
+- **WHEN** 语义阶段完成且有两个 machine warn candidates，当前 selection 为空
+- **THEN** 两个 candidate ID 都写入 `selected_issue_ids`
+- **THEN** `selection_policy` 为 `all_candidates`
+- **THEN** `candidate_issue_ids` 保持不变
+
+#### Scenario: 已存在显式任务快照
+- **WHEN** `selected_issue_ids` 已经非空并进入 manual review
+- **THEN** 自动 selector 不覆盖现有 selection
+
 ### Requirement: 人工结论是机器 Warn 的最终处置
 每个选中的 warn issue MUST 获得且只能获得一个最终人工 Pass 或 Fail。人工 Pass MUST 将该 issue 的 effective verdict 设为 pass；人工 Fail MUST 将 effective verdict 设为 fail。机器 verdict、指标、阈值和证据 MUST 保留且不得被人工结论删除或改写。
 

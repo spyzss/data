@@ -374,6 +374,14 @@ module.thresholds
 
 到达人工路由模块后，由人工策略统一决定：
 
+- 当前生产策略固定为 `all_candidates`：候选非空且尚无显式 selection 时，将完整
+  `candidate_issue_ids` 快照到 `selected_issue_ids`，并写
+  `selection_policy="all_candidates"`。
+- `candidate_issue_ids` 是完整机器候选池；`selected_issue_ids` 是当前人工任务快照。
+  已有非空 selection 不会被自动覆盖。
+- `all_candidates` 是当前默认，不是永久合同。后续可切换为抽样、风险或预算策略，
+  但不得删除或改写 `candidate_issue_ids`。
+
 - `required=false`：无候选或按抽样策略无需人工。
 - `required=true`：进入 `queued` / `in_progress` / `completed`；候选为空时必须是
   `state=not_required`，不做正常 Pass 样本抽检。
@@ -391,6 +399,9 @@ module.thresholds
 每个 selected issue 都有 Pass/Fail 后才能完成样本。刷新页面从服务端 QC JSON
 恢复状态；写入必须带 lease token 和 expected revision。lease 无效返回 423；
 revision 过期返回 409，复核员应刷新后重新确认，禁止覆盖新 revision。
+
+完成后不新增 `human_qc_pass`。消费者应联合读取
+`manual_review.state/completed_at/issue_reviews` 与顶层 `overall_decision`。
 
 ## 7. Video QC Block
 

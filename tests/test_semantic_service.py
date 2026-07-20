@@ -305,6 +305,9 @@ def test_complete_with_manual_candidates_advances_to_manual_review(tmp_path: Pat
     persisted = load_asset_qc_report(service.report_path(ASSET_ID))
     assert persisted is not None
     assert persisted["pipeline_state"]["next_module"] == "manual_review"
+    assert persisted["manual_review"]["candidate_issue_ids"] == ["warn-1"]
+    assert persisted["manual_review"]["selected_issue_ids"] == ["warn-1"]
+    assert persisted["manual_review"]["selection_policy"] == "all_candidates"
 
 
 @pytest.mark.parametrize("operation", ["get", "confirm", "complete"])

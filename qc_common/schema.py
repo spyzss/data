@@ -197,6 +197,12 @@ def _validate_manual_review(block: Mapping[str, Any]) -> None:
 
     candidate_ids = block.get("candidate_issue_ids", [])
     selected_ids = block.get("selected_issue_ids", [])
+    selection_policy = block.get("selection_policy")
+    if selection_policy is not None and selection_policy != "all_candidates":
+        _human_validation_error(
+            "manual_review.selection_policy",
+            "must be 'all_candidates' when present",
+        )
     if not _is_string_sequence(candidate_ids) or any(
         not isinstance(item, str) or not item for item in candidate_ids
     ):
