@@ -12,6 +12,7 @@
 
 - Use the existing workbench video element; do not add a second player or a frontend framework.
 - Warn uses a vertical order: video, review reason/evidence, PASS/FAIL.
+- SAM3/skeleton Warns play only the issue frame interval and prefer a continuous skeleton-overlay clip; raw issue clips are the fallback.
 - Machine fields remain read-only; only human reason and verdict are mutable.
 - Never expose command lines, absolute paths, or Python exception text in the task DTO or browser.
 - Preserve `asset_qc_report.v2`: `manual_review.state`, `manual_review.issue_reviews`, `manual_review.completed_at`, `pipeline_state`, and `overall_decision` remain authoritative.
@@ -23,6 +24,7 @@
 ## File Structure
 
 - Modify `human_qc/evidence.py`: preserve media suffixes for atomic generation and emit stable overlay failure codes.
+- Create `human_qc/skeleton_overlay_video.py`: render an issue-bounded MP4 with both hands' joints and bone edges from the canonical HDF5/video sources.
 - Modify `human_qc/workbench_service.py`: sanitize clip-generation failures before creating the browser task DTO.
 - Modify `human_qc/static/app.js`: expose the active task type to CSS and update Warn-specific workbench chrome.
 - Modify `human_qc/static/warn_adapter.js`: render one focused Warn in the approved vertical information order and advance to the next unresolved issue.
@@ -41,11 +43,12 @@
 - Modify: `tests/test_review_evidence.py`
 - Modify: `tests/test_human_qc_recovery.py`
 - Modify: `human_qc/evidence.py`
+- Create: `human_qc/skeleton_overlay_video.py`
 - Modify: `human_qc/workbench_service.py`
 
 **Interfaces:**
 - Consumes: `EvidenceService.resolve(issue: Mapping[str, Any], asset_context: AssetContext) -> EvidenceView`
-- Produces: `EvidenceView.generation_error` values of `None` or `"overlay_unavailable"`; workbench fallback rows use `"clip_unavailable"`.
+- Produces: `render_skeleton_overlay_video(issue, context, output, start_frame, end_frame_exclusive) -> None`; for SAM3/skeleton issues `EvidenceView.clip_url` points to the continuous overlay MP4 when rendering succeeds and to the raw bounded MP4 on degradation. `EvidenceView.generation_error` is `None` or `"overlay_unavailable"`; workbench fallback rows use `"clip_unavailable"`.
 
 - [ ] **Step 1: Write the failing MP4 temporary-path regression test**
 
@@ -112,7 +115,37 @@ Run: `.venv/bin/python -m pytest tests/test_human_qc_recovery.py -k 'overlay_fai
 
 Expected: FAIL because raw exception strings are currently projected.
 
-- [ ] **Step 5: Preserve the final suffix in atomic generation**
+- [ ] **Step 5: Write the failing bounded skeleton-overlay video tests**
+
+Create tests that use a short real video fixture and minimal HDF5 transforms. Capture the renderer's visited frame indexes and assert it processes exactly the half-open issue window:
+
+```python
+def test_sam3_review_clip_overlays_only_the_issue_interval(tmp_path: Path) -> None:
+    context = _context_with_video_and_hdf5(tmp_path, frame_count=12, fps=6)
+    visited: list[int] = []
+
+    render_skeleton_overlay_video(
+        {"module": "sam3_containment", "issue_id": "sam3-1"},
+        context,
+        tmp_path / "overlay.mp4",
+        3,
+        8,
+        on_frame=visited.append,
+    )
+
+    assert visited == [3, 4, 5, 6, 7]
+    assert (tmp_path / "overlay.mp4").is_file()
+```
+
+Add an EvidenceService test whose injected overlay-video renderer writes an MP4 and assert a SAM3 issue receives the overlay URL as `clip_url`; add a failure case asserting the raw bounded clip remains the `clip_url` with `generation_error == "overlay_unavailable"`.
+
+- [ ] **Step 6: Run overlay video tests and verify RED**
+
+Run: `.venv/bin/python -m pytest tests/test_review_evidence.py -k 'skeleton_overlay_video or sam3_review_clip' -q`
+
+Expected: FAIL because no continuous overlay-video renderer or preferred-clip selection exists.
+
+- [ ] **Step 7: Preserve the final suffix in atomic generation**
 
 Change the temporary name in `_atomic_generate`:
 
@@ -124,7 +157,27 @@ temporary = output.with_name(
 
 This creates paths ending in `.mp4` or `.png`, so FFmpeg and image renderers can infer the intended format before `os.replace` publishes the final file.
 
-- [ ] **Step 6: Replace browser-facing exception strings with stable codes**
+- [ ] **Step 8: Implement the bounded skeleton-overlay renderer**
+
+Create `human_qc/skeleton_overlay_video.py` with a focused renderer that:
+
+- validates `source_files.video.path` and `source_files.hdf5.path` inside `batch_root`;
+- opens the source video and HDF5 once;
+- visits only `range(start_frame, end_frame_exclusive)`;
+- projects both 21-point hands using the canonical HDF5 camera transform/intrinsic convention already exercised by `tools/build_video_review_clips.py`;
+- draws joint markers and bone edges for every readable frame;
+- writes a browser-playable H.264/yuv420p MP4 atomically;
+- raises a typed renderer error without returning paths or commands to the browser.
+
+Allow an optional `on_frame: Callable[[int], None] | None` test hook, called after a frame is successfully drawn. Do not draw skeletons for non-SAM3/non-skeleton Warn modules.
+
+- [ ] **Step 9: Prefer overlay clips for SAM3 and raw clips on degradation**
+
+Add an `overlay_video_renderer` dependency to `EvidenceService`. After creating the raw bounded clip, invoke it only when `issue.module == "sam3_containment"` or the issue explicitly declares skeleton evidence. Cache the overlay MP4 under a distinct deterministic filename. Return its URL as `clip_url` when successful; on renderer failure retain the raw clip URL and set `generation_error = "overlay_unavailable"`.
+
+Wire `tools/serve_human_qc_workbench.py` to construct `EvidenceService` with `render_skeleton_overlay_video`, so the default local/production launcher exercises the same behavior as tests.
+
+- [ ] **Step 10: Replace browser-facing exception strings with stable codes**
 
 In `EvidenceService.resolve`, log the overlay exception server-side and set:
 
@@ -143,16 +196,16 @@ result.append({
 
 Use module loggers created with `logging.getLogger(__name__)`; exception details may appear in server logs but never in the DTO.
 
-- [ ] **Step 7: Run evidence tests and verify GREEN**
+- [ ] **Step 11: Run evidence tests and verify GREEN**
 
 Run: `.venv/bin/python -m pytest tests/test_review_evidence.py tests/test_human_qc_recovery.py -q`
 
 Expected: all tests pass and no DTO assertion contains internal paths or exception messages.
 
-- [ ] **Step 8: Commit the evidence repair**
+- [ ] **Step 12: Commit the evidence repair**
 
 ```bash
-git add human_qc/evidence.py human_qc/workbench_service.py tests/test_review_evidence.py tests/test_human_qc_recovery.py
+git add human_qc/evidence.py human_qc/skeleton_overlay_video.py human_qc/workbench_service.py tools/serve_human_qc_workbench.py tests/test_review_evidence.py tests/test_human_qc_recovery.py
 git commit -m "fix(human-qc): harden warn evidence generation"
 ```
 
