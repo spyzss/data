@@ -100,6 +100,35 @@ def test_http_success_and_bad_payload_statuses() -> None:
         thread.join(timeout=2)
 
 
+def test_http_serves_sampled_sam3_overlay_evidence(tmp_path) -> None:
+    overlay = tmp_path / "sam3" / "combined_overlays" / "frame-10.png"
+    overlay.parent.mkdir(parents=True)
+    overlay.write_bytes(b"sampled-sam3-overlay")
+    facade = FakeFacade()
+    facade.lease_store = LeaseStore()
+    server = create_http_server(
+        "127.0.0.1",
+        0,
+        facade,
+        evidence_root=tmp_path,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port)
+        connection.request("GET", "/evidence/sam3/combined_overlays/frame-10.png")
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "image/png"
+        assert body == b"sampled-sam3-overlay"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_http_lease_and_mutation_delegate() -> None:
     facade = FakeFacade()
     server = _server(facade)

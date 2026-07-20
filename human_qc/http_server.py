@@ -439,7 +439,14 @@ def create_http_server(
     server.evidence_allowed_prefixes = frozenset(
         evidence_allowed_prefixes
         if evidence_allowed_prefixes is not None
-        else (".human_qc_evidence", "evidence", "clips", "overlays", "qc_evidence")
+        else (
+            ".human_qc_evidence",
+            "evidence",
+            "clips",
+            "overlays",
+            "qc_evidence",
+            "sam3",
+        )
     )
     return server
 
