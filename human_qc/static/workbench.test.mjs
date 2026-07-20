@@ -253,6 +253,66 @@ test("warn markup renders every sampled SAM3 overlay image", () => {
   assert.ok(markup.indexOf("frame-120.png") < markup.indexOf("frame-188.png"));
 });
 
+test("sampled SAM3 overlay errors hide only the failed image and show safe fallback", () => {
+  let failedImageError = null;
+  const failedSample = { hidden: false };
+  const failedImage = {
+    hidden: false,
+    closest: () => failedSample,
+    addEventListener(type, handler) {
+      if (type === "error") failedImageError = handler;
+    },
+  };
+  const healthySample = { hidden: false };
+  const healthyImage = {
+    hidden: false,
+    closest: () => healthySample,
+    addEventListener() {},
+  };
+  const degradation = { hidden: true, textContent: "" };
+  const root = {
+    innerHTML: "",
+    querySelectorAll(selector) {
+      if (selector === '[data-action="select-issue"]') return [];
+      if (selector === "[data-warn-overlay-sample]") return [failedImage, healthyImage];
+      return [];
+    },
+    querySelector(selector) {
+      if (selector === "[data-overlay-sample-error]") return degradation;
+      return null;
+    },
+  };
+  const sampled = structuredClone(warnTask);
+  sampled.warn.issue_reviews = {};
+  sampled.evidence[0].overlay_images = [
+    { frame: 120, url: "/evidence/frame-120.png" },
+    { frame: 144, url: "/evidence/frame-144.png" },
+  ];
+  const video = {
+    src: "",
+    currentTime: -1,
+    dataset: {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const adapter = new WarnReviewAdapter({ video });
+
+  adapter.render(sampled, root);
+  assert.equal(typeof failedImageError, "function");
+  assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
+  failedImageError({ message: "/private/failed-frame.png" });
+
+  assert.equal(failedImage.hidden, true);
+  assert.equal(failedSample.hidden, true);
+  assert.equal(healthyImage.hidden, false);
+  assert.equal(healthySample.hidden, false);
+  assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
+  assert.equal(degradation.hidden, false);
+  assert.match(degradation.textContent, /骨架抽样图加载失败/);
+  assert.doesNotMatch(degradation.textContent, /private|failed-frame/i);
+  assert.match(renderWarnMarkup(warnTask, "warn-1"), /data-action="toggle-overlay"/);
+});
+
 test("reviewed warn advances to the next unresolved issue", () => {
   const updated = structuredClone(warnTask);
   updated.warn.issue_reviews = { "warn-1": { verdict: "pass" } };

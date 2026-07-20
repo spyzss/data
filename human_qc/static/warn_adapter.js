@@ -160,7 +160,7 @@ export function renderWarnMarkup(task, issueId = null) {
     overlay_unavailable: "骨架 overlay 暂不可用，仍可使用问题视频完成判断。",
   }[model.generationError] ?? "";
   const overlays = model.overlayImages.length
-    ? `<div class="warn-overlay-gallery" aria-label="SAM3 骨架抽样图">${model.overlayImages.map((item) => `<a class="warn-overlay-sample" href="${escapeHtml(item.url)}" target="_blank" rel="noopener"><img src="${escapeHtml(item.url)}" alt="${escapeHtml(model.issueId)} 骨架抽样帧 ${escapeHtml(item.frame ?? "—")}"><span>帧 ${escapeHtml(item.frame ?? "—")}</span></a>`).join("")}</div>`
+    ? `<div class="warn-overlay-gallery" aria-label="SAM3 骨架抽样图">${model.overlayImages.map((item) => `<a class="warn-overlay-sample" href="${escapeHtml(item.url)}" target="_blank" rel="noopener"><img data-warn-overlay-sample src="${escapeHtml(item.url)}" alt="${escapeHtml(model.issueId)} 骨架抽样帧 ${escapeHtml(item.frame ?? "—")}"><span>帧 ${escapeHtml(item.frame ?? "—")}</span></a>`).join("")}</div>`
     : "";
   const legacyOverlay = !model.overlayImages.length && model.overlayUrl
     ? `<label class="warn-overlay-toggle"><input type="checkbox" data-action="toggle-overlay">显示单帧骨架图</label><img class="warn-overlay" data-warn-overlay src="${escapeHtml(model.overlayUrl)}" alt="${escapeHtml(model.issueId)} 骨架图" hidden>`
@@ -183,7 +183,7 @@ export function renderWarnMarkup(task, issueId = null) {
         <div><dt>证据窗口</dt><dd data-evidence-window>${escapeHtml(windowLabel)} <small>[start, end)</small></dd></div>
       </dl>
       <dl class="warn-metrics" data-machine-metrics>${metrics}</dl>
-      <div class="warn-evidence">${clip}${evidenceMessage ? `<p class="warn-evidence-degraded" role="status">${escapeHtml(evidenceMessage)}</p>` : ""}${overlays}${legacyOverlay}<div class="warn-evidence-degraded" data-overlay-error role="status" hidden></div></div>
+      <div class="warn-evidence">${clip}${evidenceMessage ? `<p class="warn-evidence-degraded" role="status">${escapeHtml(evidenceMessage)}</p>` : ""}${overlays}${legacyOverlay}<div class="warn-evidence-degraded" data-overlay-sample-error role="status" hidden></div><div class="warn-evidence-degraded" data-overlay-error role="status" hidden></div></div>
     </section>
     <section class="warn-decision">
         <label class="warn-reason"><span>人工判定原因（可选）</span><textarea data-review-reason>${escapeHtml(previousReason)}</textarea></label>
@@ -235,6 +235,9 @@ export class WarnReviewAdapter {
       if (overlay) overlay.hidden = !event.currentTarget.checked;
     });
     root.querySelector?.("[data-warn-overlay]")?.addEventListener("error", () => this.handleOverlayError());
+    root.querySelectorAll?.("[data-warn-overlay-sample]").forEach((image) => {
+      image.addEventListener("error", () => this.handleOverlaySampleError(image));
+    });
     root.querySelector?.('[data-action="verdict-pass"]')?.addEventListener("click", () => this.submitCurrentVerdict("pass"));
     root.querySelector?.('[data-action="verdict-fail"]')?.addEventListener("click", () => this.submitCurrentVerdict("fail"));
     root.querySelector?.('[data-action="complete-warn"]')?.addEventListener("click", () => {
@@ -323,6 +326,17 @@ export class WarnReviewAdapter {
     if (degraded) {
       degraded.hidden = false;
       degraded.textContent = "骨架图片加载失败，仍可使用问题视频完成判断。";
+    }
+  }
+
+  handleOverlaySampleError(image) {
+    if (image) image.hidden = true;
+    const sample = image?.closest?.(".warn-overlay-sample");
+    if (sample) sample.hidden = true;
+    const degraded = this.root?.querySelector?.("[data-overlay-sample-error]");
+    if (degraded) {
+      degraded.hidden = false;
+      degraded.textContent = "部分骨架抽样图加载失败，仍可使用其他抽样图和问题视频完成判断。";
     }
   }
 
