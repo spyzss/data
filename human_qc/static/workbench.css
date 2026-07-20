@@ -68,6 +68,7 @@ h2 { font-size: 20px; }
 .video-stage { position: relative; min-height: 310px; display: grid; place-items: center; background: #14233a; overflow: hidden; }
 .video-stage video { display: block; width: 100%; max-height: 520px; object-fit: contain; }
 .video-placeholder { position: absolute; inset: 0; display: grid; place-content: center; gap: 11px; text-align: center; color: #aebbd0; font-size: 13px; background: radial-gradient(circle at 50% 44%, #2d4668 0, #17273e 42%, #111e31 100%); }
+.video-placeholder[hidden] { display: none; }
 .play-glyph { display: grid; place-items: center; width: 53px; height: 53px; margin: auto; border: 1px solid #879bbb; border-radius: 100%; color: #e8effb; font-size: 16px; }
 .transport-row { display: flex; align-items: center; gap: 9px; padding: 12px 17px; }
 .icon-button, .play-button { min-width: 32px; height: 29px; color: var(--muted); font-size: 11px; }

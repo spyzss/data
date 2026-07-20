@@ -177,3 +177,9 @@ def test_warn_stage_has_complete_visual_and_responsive_css_contract() -> None:
     }
     assert all(selector in css for selector in required)
     assert "@media (max-width: 700px)" in css
+
+
+def test_hidden_video_placeholder_never_covers_loaded_video() -> None:
+    css = _read("workbench.css")
+    assert ".video-placeholder[hidden]" in css
+    assert "display: none" in css
