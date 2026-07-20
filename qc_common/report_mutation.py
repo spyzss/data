@@ -809,15 +809,17 @@ def record_awaiting_external(
         raise ModuleOrderError(
             f"expected current module {pipeline_state.get('next_module')}, got {module}"
         )
-    if pipeline_state.get("status") == "awaiting_external":
-        return report
-    if pipeline_state.get("status") not in {"pending", "running"}:
+    pipeline_status = pipeline_state.get("status")
+    if pipeline_status not in {"pending", "running", "awaiting_external"}:
         raise ModuleOrderError(
-            f"cannot await external module from status {pipeline_state.get('status')}"
+            f"cannot await external module from status {pipeline_status}"
         )
 
-    if module == "manual_review":
+    selection_changed = module == "manual_review" and bool(
         select_pending_manual_review_candidates(report)
+    )
+    if pipeline_status == "awaiting_external" and not selection_changed:
+        return report
 
     pipeline_state.update(
         {

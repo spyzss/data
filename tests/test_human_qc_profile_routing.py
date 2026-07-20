@@ -309,6 +309,63 @@ def test_direct_manual_stage_selects_all_before_exposing_external_task(
     assert resumed.report["manual_review"]["selection_policy"] == "all_candidates"
 
 
+def test_restart_repairs_awaiting_manual_empty_selection_revision_safely(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    config = _config(
+        tmp_path,
+        ["auto", "semantic_consistency", "manual_review", "tail"],
+    )
+    registry = _registry(auto_issues=(_warn_issue(),))
+    semantic_pending = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=registry,
+    )
+    manual_pending = resume_after_external(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        completed_module="semantic_consistency",
+        expected_revision=semantic_pending.report["report_revision"],
+        registry=registry,
+    )
+    assert manual_pending.status == "awaiting_external"
+    report = load_asset_qc_report(context.report_path)
+    assert report is not None
+    assert report["pipeline_state"]["status"] == "awaiting_external"
+    assert report["pipeline_state"]["next_module"] == "manual_review"
+    report["manual_review"]["selected_issue_ids"] = []
+    report["manual_review"].pop("selection_policy", None)
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    recovery_revision = report["report_revision"]
+
+    recovered = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=registry,
+    )
+
+    assert recovered.status == "awaiting_external"
+    assert recovered.report["report_revision"] == recovery_revision + 1
+    assert recovered.report["manual_review"]["selected_issue_ids"] == ["warn-1"]
+    assert recovered.report["manual_review"]["selection_policy"] == "all_candidates"
+    persisted = load_asset_qc_report(context.report_path)
+    assert persisted == recovered.report
+
+    replayed = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=registry,
+    )
+    assert replayed.report["report_revision"] == recovered.report["report_revision"]
+    assert load_asset_qc_report(context.report_path) == recovered.report
+
+
 def test_terminal_external_completion_replay_is_rejected_without_write(
     tmp_path: Path,
 ) -> None:
