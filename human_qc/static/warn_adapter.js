@@ -76,10 +76,11 @@ const frameWindow = (issue, evidence) => {
   };
 };
 
-const jsonText = (value) => {
-  if (!value || !Object.keys(value).length) return "—";
+const displayValue = (value) => {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
   try {
-    return JSON.stringify(value, null, 2);
+    return JSON.stringify(value);
   } catch {
     return String(value);
   }
@@ -103,6 +104,12 @@ export function buildWarnIssueModel(task, issueId) {
     window: frameWindow(issue, evidence),
     clipUrl: typeof evidence.clip_url === "string" ? evidence.clip_url : null,
     overlayUrl: typeof evidence.overlay_url === "string" ? evidence.overlay_url : null,
+    overlayImages: (Array.isArray(evidence.overlay_images) ? evidence.overlay_images : [])
+      .filter((item) => item && typeof item.url === "string")
+      .map((item) => ({
+        frame: Number.isInteger(item.frame) ? item.frame : null,
+        url: item.url,
+      })),
     generationError: typeof evidence.generation_error === "string" ? evidence.generation_error : null,
     review: objectOrEmpty(task?.warn?.issue_reviews?.[selectedIssueId]),
   };
@@ -112,6 +119,14 @@ export function allSelectedIssuesReviewed(task) {
   const ids = selectedIds(task);
   const reviews = objectOrEmpty(task?.warn?.issue_reviews);
   return ids.length > 0 && ids.every((issueId) => ["pass", "fail"].includes(reviews[issueId]?.verdict));
+}
+
+export function nextReviewIssueId(task, currentIssueId = null) {
+  const ids = selectedIds(task);
+  const reviews = objectOrEmpty(task?.warn?.issue_reviews);
+  const unresolved = ids.find((id) => !["pass", "fail"].includes(reviews[id]?.verdict));
+  if (unresolved) return unresolved;
+  return ids.includes(String(currentIssueId)) ? String(currentIssueId) : ids.at(-1) ?? null;
 }
 
 export function renderWarnMarkup(task, issueId = null) {
@@ -138,39 +153,46 @@ export function renderWarnMarkup(task, issueId = null) {
   const windowLabel = Number.isInteger(model.window.startFrame) && Number.isInteger(model.window.endFrameExclusive)
     ? `${model.window.startFrame}–${model.window.endFrameExclusive - 1}`
     : "—";
-  const overlay = model.overlayUrl
-    ? `<label class="warn-overlay-toggle"><input type="checkbox" data-action="toggle-overlay">显示骨架 overlay</label><img class="warn-overlay" data-warn-overlay src="${escapeHtml(model.overlayUrl)}" alt="${escapeHtml(model.issueId)} 骨架 overlay" hidden>`
-    : '<label class="warn-overlay-toggle"><input type="checkbox" data-action="toggle-overlay" disabled>没有可用 overlay</label>';
-  const degradationMessage = model.generationError
-    ? `overlay 生成失败，已保留原始视频：${model.generationError}`
+  const metrics = Object.entries(model.metrics).map(([name, value]) => `<div><dt>${escapeHtml(name)}</dt><dd>${escapeHtml(displayValue(value))}</dd></div>`).join("")
+    || "<div><dt>指标</dt><dd>—</dd></div>";
+  const evidenceMessage = {
+    clip_unavailable: "问题片段暂不可用，正在使用原视频定位问题区间。",
+    overlay_unavailable: "骨架 overlay 暂不可用，仍可使用问题视频完成判断。",
+  }[model.generationError] ?? "";
+  const overlays = model.overlayImages.length
+    ? `<div class="warn-overlay-gallery" aria-label="SAM3 骨架抽样图">${model.overlayImages.map((item) => `<a class="warn-overlay-sample" href="${escapeHtml(item.url)}" target="_blank" rel="noopener"><img src="${escapeHtml(item.url)}" alt="${escapeHtml(model.issueId)} 骨架抽样帧 ${escapeHtml(item.frame ?? "—")}"><span>帧 ${escapeHtml(item.frame ?? "—")}</span></a>`).join("")}</div>`
     : "";
-  const degradation = `<div class="warn-evidence-degraded" data-overlay-error role="status"${degradationMessage ? "" : " hidden"}>${escapeHtml(degradationMessage)}</div>`;
+  const legacyOverlay = !model.overlayImages.length && model.overlayUrl
+    ? `<label class="warn-overlay-toggle"><input type="checkbox" data-action="toggle-overlay">显示单帧骨架图</label><img class="warn-overlay" data-warn-overlay src="${escapeHtml(model.overlayUrl)}" alt="${escapeHtml(model.issueId)} 骨架图" hidden>`
+    : "";
   const clip = model.clipUrl
-    ? `<a class="warn-clip-link" href="${escapeHtml(model.clipUrl)}" target="_blank" rel="noopener">打开问题窗口视频</a>`
-    : '<span class="warn-clip-unavailable">问题窗口视频暂不可用</span>';
+    ? `<a class="warn-clip-link" href="${escapeHtml(model.clipUrl)}" target="_blank" rel="noopener">在新窗口打开问题片段</a>`
+    : '<span class="warn-clip-unavailable">问题片段暂不可用</span>';
   const previousReason = String(model.review.reason ?? "");
   const completeDisabled = allSelectedIssuesReviewed(task) ? "" : " disabled";
   return `<section class="warn-review" data-selected-issue-id="${escapeHtml(model.issueId)}">
-    <div class="warn-progress"><span>Warn 人工复核</span><strong>${reviewedCount} / ${ids.length}</strong></div>
-    <div class="warn-layout">
+    <header class="warn-review-head">
+      <div class="warn-progress"><span>Warn 人工复核</span><strong>${reviewedCount} / ${ids.length}</strong></div>
       <nav class="warn-issue-list" aria-label="待复核问题">${issueButtons}</nav>
-      <article class="warn-issue-detail">
-        <header><span class="warn-code">${escapeHtml(model.code)}</span><strong>${escapeHtml(model.issueId)}</strong></header>
-        <dl class="warn-machine-fields">
-          <div><dt>机器原因</dt><dd data-machine-reason>${escapeHtml(model.reason)}</dd></div>
-          <div><dt>机器指标</dt><dd><pre data-machine-metrics>${escapeHtml(jsonText(model.metrics))}</pre></dd></div>
-          <div><dt>机器阈值</dt><dd data-machine-threshold>${escapeHtml(threshold)}</dd></div>
-          <div><dt>证据窗口</dt><dd data-evidence-window>${escapeHtml(windowLabel)} <small>[start, end)</small></dd></div>
-        </dl>
-        <div class="warn-evidence">${clip}${overlay}${degradation}</div>
+    </header>
+    <section class="warn-rationale">
+      <header><span class="warn-code">${escapeHtml(model.code)}</span><strong>${escapeHtml(model.issueId)}</strong></header>
+      <dl class="warn-machine-fields">
+        <div><dt>机器原因</dt><dd data-machine-reason>${escapeHtml(model.reason)}</dd></div>
+        <div><dt>机器阈值</dt><dd data-machine-threshold>${escapeHtml(threshold)}</dd></div>
+        <div><dt>证据窗口</dt><dd data-evidence-window>${escapeHtml(windowLabel)} <small>[start, end)</small></dd></div>
+      </dl>
+      <dl class="warn-metrics" data-machine-metrics>${metrics}</dl>
+      <div class="warn-evidence">${clip}${evidenceMessage ? `<p class="warn-evidence-degraded" role="status">${escapeHtml(evidenceMessage)}</p>` : ""}${overlays}${legacyOverlay}<div class="warn-evidence-degraded" data-overlay-error role="status" hidden></div></div>
+    </section>
+    <section class="warn-decision">
         <label class="warn-reason"><span>人工判定原因（可选）</span><textarea data-review-reason>${escapeHtml(previousReason)}</textarea></label>
         <div class="warn-verdict-actions">
           <button type="button" data-action="verdict-pass" data-mutation-control>Pass</button>
           <button type="button" data-action="verdict-fail" data-mutation-control>Fail</button>
         </div>
-      </article>
-    </div>
-    <div class="warn-error" role="alert" aria-live="polite"></div>
+      <div class="warn-error" role="alert" aria-live="polite"></div>
+    </section>
     <div class="warn-complete-row"><button type="button" data-action="complete-warn" data-mutation-control${completeDisabled}>完成 Warn 复核</button></div>
   </section>`;
 }
@@ -191,9 +213,15 @@ export class WarnReviewAdapter {
     this.task = task;
     this.root = root;
     const ids = selectedIds(task);
-    if (!ids.includes(this.selectedIssueId)) {
-      const preferred = task?.warn?.selected_issue_id;
-      this.selectedIssueId = ids.includes(preferred) ? preferred : ids[0] ?? null;
+    const preferred = task?.warn?.selected_issue_id;
+    const currentIssueId = ids.includes(this.selectedIssueId)
+      ? this.selectedIssueId
+      : (ids.includes(preferred) ? preferred : ids[0] ?? null);
+    const currentReview = objectOrEmpty(task?.warn?.issue_reviews?.[currentIssueId]);
+    if (["pass", "fail"].includes(currentReview.verdict)) {
+      this.selectedIssueId = nextReviewIssueId(task, currentIssueId);
+    } else {
+      this.selectedIssueId = currentIssueId;
     }
     const markup = renderWarnMarkup(task, this.selectedIssueId);
     if (!root) return this.selectedIssueId ? buildWarnIssueModel(task, this.selectedIssueId) : null;
@@ -294,7 +322,7 @@ export class WarnReviewAdapter {
     }
     if (degraded) {
       degraded.hidden = false;
-      degraded.textContent = "overlay 图片加载失败，已保留原始视频证据。";
+      degraded.textContent = "骨架图片加载失败，仍可使用问题视频完成判断。";
     }
   }
 
