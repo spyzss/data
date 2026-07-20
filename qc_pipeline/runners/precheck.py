@@ -105,9 +105,13 @@ def precheck_fingerprint(
     if supplier in {"dr", "deepreach"}:
         source_contract["supplier_adapter"] = "deepreach-hdf5-precheck-v2"
     elif supplier in {"qy", "qingyu"}:
-        source_contract["supplier_adapter"] = "qingyu-hand-pose-precheck-v3"
+        source_contract["supplier_adapter"] = "qingyu-hand-pose-precheck-v4"
         source_contract["frame_mapping"] = "explicit-source-step-v1"
         source_contract["joint_topology"] = "unverified-no-anatomical-remap"
+        source_contract["observation_canonicalization"] = (
+            "stable-first-structurally-valid-v1"
+        )
+        source_contract["supplier_quality_policy"] = "ignored-for-acceptance-v1"
         source_contract["timebase_source"] = context.metadata.get("timebase_source")
         source_contract["sam3_candidate_policy"] = "qy-direct-2d-full-window-v1"
     fingerprint["source_contract"] = source_contract
@@ -392,6 +396,21 @@ def _run_module_on_clip(
         "qy",
         "qingyu",
     }
+    if qy_supplier and module == "quality_hand":
+        result = ModuleResult(
+            module="quality_hand",
+            verdict="skipped",
+            evaluation={
+                "decision": "not_applicable",
+                "output_status": "not_applicable",
+                "reason": "supplier_quality_signal_ignored_by_policy",
+            },
+            metrics={
+                "supplier_quality_policy": "ignored_for_acceptance",
+            },
+            runtime={"artifact_state": "computed"},
+        )
+        return PrecheckModuleExecution(result, ())
     if qy_supplier and module in {"keypoint_morphology", "keypoint_temporal"}:
         from qc_common.types import CheckResult
 
@@ -872,6 +891,7 @@ class PrecheckSession:
             self._results[module] = result
             return result
         if _is_qy_supplier(self.context) and module in {
+            "quality_hand",
             "keypoint_morphology",
             "keypoint_temporal",
         }:

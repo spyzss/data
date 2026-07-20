@@ -69,6 +69,17 @@ def run(context: AssetContext, config: LoadedQcConfig) -> ModuleResult:
             "declared_missing_sources": declared_missing_sources,
         },
     )
+    supplier = str(
+        context.metadata.get("supplier")
+        or context.metadata.get("supplier_id")
+        or ""
+    ).lower()
+    if supplier in {"qy", "qingyu"}:
+        fingerprint["supplier_contract"] = {
+            "quality_source_policy": (
+                "inventory_only_ignored_for_acceptance_v1"
+            )
+        }
     fingerprint["output_schema_version"] = _RAW_OUTPUT_SCHEMA_VERSION
     fingerprint_sha256 = canonical_sha256(fingerprint)
     artifact = artifact_for(context, "supplier_data_audit")

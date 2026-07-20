@@ -117,20 +117,16 @@ def _topology_agnostic_keypoints(points: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
-def _observation_priority(row: Mapping[str, Any]) -> tuple[int, float, int]:
-    status_priority = {
-        "ok": 3,
-        "valid": 3,
-        "pass": 3,
-        "review": 2,
-        "warn": 1,
-    }
-    score = row.get("score")
-    return (
-        status_priority.get(str(row.get("status") or "").lower(), 0),
-        float(score) if score is not None else float("-inf"),
-        -int(row["row_index"]),
-    )
+def _observation_identity(row: Mapping[str, Any]) -> tuple[int, Any, str]:
+    """Return a supplier-signal-free stable source-row identity."""
+    row_index = row.get("row_index")
+    if isinstance(row_index, (int, np.integer)) and not isinstance(
+        row_index, bool
+    ):
+        index_key: tuple[int, Any] = (0, int(row_index))
+    else:
+        index_key = (1, str(row_index))
+    return (*index_key, str(row.get("obs_id") or ""))
 
 
 def _equivalent_observation(
@@ -158,47 +154,71 @@ def _equivalent_observation(
     )
 
 
-def _deduplicate_observations(
+def _canonicalize_observations(
     records: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int, int]:
-    """Deduplicate only equivalent rows for the same camera-frame hand.
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Choose one transport row per camera/source/video/hand group.
 
-    Mapping repeats across left/right hands are deliberately unrelated to this
-    grouping.  A group containing different strict points or timestamps is
-    rejected as a whole so no conflicting observation is selected silently.
+    Supplier status, reason, visibility, and score are audit metadata only.
+    Selection is stable source-row identity order and does not assert that the
+    selected candidate is visually correct.
     """
-    grouped: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, int, int, str], list[dict[str, Any]]] = {}
     for row in records:
+        camera = row.get("camera")
         source_frame = row.get("source_frame_index")
         video_frame = row.get("video_frame")
         hand = row.get("hand")
         if (
-            source_frame is None
+            not camera
+            or source_frame is None
             or video_frame is None
             or hand not in QY_HANDS
             or row.get("points") is None
-            or row.get("timestamp") is None
         ):
             continue
         grouped.setdefault(
-            (int(source_frame), int(video_frame), str(hand)), []
+            (str(camera), int(source_frame), int(video_frame), str(hand)), []
         ).append(row)
 
     selected: list[dict[str, Any]] = []
     equivalent_duplicate_count = 0
     conflicting_group_count = 0
+    multirow_group_count = 0
+    excluded_alternative_count = 0
     for key in sorted(grouped):
-        rows = grouped[key]
+        rows = sorted(grouped[key], key=_observation_identity)
         reference = rows[0]
-        if not all(
+        alternatives = rows[1:]
+        if alternatives:
+            multirow_group_count += 1
+            excluded_alternative_count += len(alternatives)
+        equivalent_duplicate_count += sum(
             _equivalent_observation(reference, candidate)
-            for candidate in rows[1:]
+            for candidate in alternatives
+        )
+        if any(
+            not _equivalent_observation(reference, candidate)
+            for candidate in alternatives
         ):
             conflicting_group_count += 1
-            continue
-        selected.append(max(rows, key=_observation_priority))
-        equivalent_duplicate_count += len(rows) - 1
-    return selected, equivalent_duplicate_count, conflicting_group_count
+        selected.append(
+            {
+                **reference,
+                "candidate_count": len(rows),
+                "selection_method": (
+                    "stable_first_structurally_valid_observation"
+                ),
+            }
+        )
+    return selected, {
+        "equivalent_duplicate_observation_count": (
+            equivalent_duplicate_count
+        ),
+        "conflicting_same_hand_observation_count": conflicting_group_count,
+        "same_hand_multirow_group_count": multirow_group_count,
+        "excluded_alternative_observation_count": excluded_alternative_count,
+    }
 
 
 class QingyuHandPoseSession:
@@ -257,16 +277,27 @@ class QingyuHandPoseSession:
         for row_index, row in frame.iterrows():
             points = _strict_points(row.get("pred_keypoints_2d"), (21, 2))
             finite_joint_count = 21 if points is not None else 0
+            if isinstance(row_index, (int, np.integer)) and not isinstance(
+                row_index, bool
+            ):
+                original_row_index: int | str = int(row_index)
+            else:
+                original_row_index = str(row_index)
             records.append(
                 {
-                    "row_index": int(row_index),
+                    "row_index": original_row_index,
+                    "obs_id": _text(row.get("obs_id")) or None,
                     "camera": _text(row.get("camera")),
                     "hand": _hand(row.get(hand_column)) if hand_column else None,
                     "video_frame": _integer(row.get("video_frame")),
                     "source_frame_index": _integer(row.get("source_frame_index")),
                     "timestamp": _finite_float(row.get("timestamp")),
                     "status": _text(row.get("status")).lower(),
+                    "reason": _text(row.get("reason")) or None,
                     "score": _finite_float(row.get("score")),
+                    "visibility": _finite_float(row.get("visibility")),
+                    "quality_hand": row.get("quality_hand"),
+                    "quality_score": _finite_float(row.get("quality_score")),
                     "points": points,
                     "finite_joint_count": finite_joint_count,
                     "shape_valid": points is not None,
@@ -482,15 +513,13 @@ class QingyuHandPoseSession:
             for row in mapping_rows
             if row["hand"] in QY_HANDS and row["points"] is not None
         ]
-        (
-            deduplicated_rows,
-            equivalent_duplicate_count,
-            conflicting_observation_count,
-        ) = _deduplicate_observations(observation_rows)
+        selected_rows, observation_audit = _canonicalize_observations(
+            observation_rows
+        )
         by_hand = {
             hand: {
                 int(row["source_frame_index"])
-                for row in deduplicated_rows
+                for row in selected_rows
                 if row["hand"] == hand
             }
             for hand in QY_HANDS
@@ -499,25 +528,17 @@ class QingyuHandPoseSession:
         right_coverage = len(by_hand["right"]) / source_count
         minimum_hand_coverage = min(left_coverage, right_coverage)
         both_hand_coverage = len(by_hand["left"] & by_hand["right"]) / source_count
-        normalized_observation_count = max(
-            row_count - equivalent_duplicate_count,
-            0,
-        )
         finite_joint_count = sum(
-            int(row["finite_joint_count"]) for row in deduplicated_rows
+            int(row["finite_joint_count"]) for row in records
         )
         valid_joint_ratio = (
-            finite_joint_count / (normalized_observation_count * 21)
-            if normalized_observation_count
+            finite_joint_count / (row_count * 21)
+            if row_count
             else 0.0
         )
-        normalized_mapping_count = max(
-            len(mapping_rows) - equivalent_duplicate_count,
-            0,
-        )
         timeline_match_ratio = (
-            normalized_mapping_count / normalized_observation_count
-            if normalized_observation_count
+            len(mapping_rows) / row_count
+            if row_count
             else 0.0
         )
         invalid_mapping_count = (
@@ -533,11 +554,16 @@ class QingyuHandPoseSession:
             and unique_pair_count > 0
         )
         observation_status = (
-            "input_invalid"
-            if conflicting_observation_count
-            else "valid_deduplicated"
-            if equivalent_duplicate_count
+            "valid_deduplicated"
+            if observation_audit["excluded_alternative_observation_count"]
             else "valid"
+            if selected_rows
+            else "input_missing"
+        )
+        observation_warning = (
+            "multiple_raw_observation_candidates_require_visual_adjudication"
+            if observation_audit["same_hand_multirow_group_count"]
+            else None
         )
         weights = config["weights"]
         score = (
@@ -549,9 +575,7 @@ class QingyuHandPoseSession:
         eligible = bool(
             video_available
             and mapping_verified
-            and invalid_shape_count == 0
-            and invalid_hand_count == 0
-            and conflicting_observation_count == 0
+            and bool(selected_rows)
             and minimum_hand_coverage
             >= float(config["minimum_hand_coverage"])
             and both_hand_coverage
@@ -563,17 +587,12 @@ class QingyuHandPoseSession:
         explicit_camera_eligible = bool(
             video_available
             and mapping_verified
-            and invalid_shape_count == 0
-            and invalid_hand_count == 0
-            and conflicting_observation_count == 0
-            and bool(deduplicated_rows)
+            and bool(selected_rows)
         )
         if not records:
             reason = "primary_camera_2d_missing"
         elif not video_available:
             reason = "primary_video_missing"
-        elif invalid_shape_count == row_count:
-            reason = "no_valid_2d_points"
         elif source_conflict_count:
             reason = "source_to_video_conflict"
         elif video_conflict_count:
@@ -586,12 +605,27 @@ class QingyuHandPoseSession:
             reason = "timestamp_mapping_invalid"
         elif missing_mapping_count:
             reason = "frame_mapping_missing"
-        elif invalid_hand_count:
+        elif not selected_rows and invalid_shape_count == row_count:
+            reason = "no_valid_2d_points"
+        elif not selected_rows and invalid_hand_count == row_count:
             reason = "hand_identity_invalid"
-        elif conflicting_observation_count:
-            reason = "conflicting_same_hand_observations"
+        elif not selected_rows:
+            reason = "no_usable_2d_observations"
         else:
             reason = "eligible" if eligible else "minimum_qualification_not_met"
+        selected_provenance = [
+            {
+                "camera": str(item["camera"]),
+                "source_frame_index": int(item["source_frame_index"]),
+                "video_frame": int(item["video_frame"]),
+                "hand": str(item["hand"]),
+                "selected_obs_id": item.get("obs_id"),
+                "original_row_index": item["row_index"],
+                "candidate_count": int(item["candidate_count"]),
+                "selection_method": str(item["selection_method"]),
+            }
+            for item in selected_rows
+        ]
         result.update(
             {
                 "video_frame_count": video_frames,
@@ -632,17 +666,38 @@ class QingyuHandPoseSession:
                     if duplicate_count
                     else None
                 ),
-                "deduplicated_observation_row_count": len(deduplicated_rows),
+                "raw_observation_row_count": row_count,
+                "usable_observation_row_count": len(observation_rows),
+                "unusable_observation_row_count": row_count
+                - len(observation_rows),
+                "deduplicated_observation_row_count": len(selected_rows),
+                "deterministic_selected_observation_count": len(selected_rows),
+                "missing_frame_hand_observation_count": max(
+                    source_count * len(QY_HANDS) - len(selected_rows),
+                    0,
+                ),
                 "equivalent_duplicate_observation_count": (
-                    equivalent_duplicate_count
+                    observation_audit[
+                        "equivalent_duplicate_observation_count"
+                    ]
                 ),
                 "conflicting_same_hand_observation_count": (
-                    conflicting_observation_count
+                    observation_audit[
+                        "conflicting_same_hand_observation_count"
+                    ]
                 ),
+                "same_hand_multirow_group_count": observation_audit[
+                    "same_hand_multirow_group_count"
+                ],
+                "excluded_alternative_observation_count": observation_audit[
+                    "excluded_alternative_observation_count"
+                ],
                 "observation_status": observation_status,
-                "observation_deduplication_policy": (
-                    "equivalent_strict_points_and_timestamp_then_status_score_row_index"
+                "observation_warning": observation_warning,
+                "observation_canonicalization_policy": (
+                    "stable_first_structurally_valid_observation"
                 ),
+                "selected_observation_provenance": selected_provenance,
                 "source_to_video_mapping": {
                     str(source): video
                     for source, video in sorted(global_source_to_video.items())
@@ -834,10 +889,7 @@ class QingyuHandPoseSession:
                 },
             },
         )
-        if (
-            audit["frame_mapping_status"] != "verified"
-            or audit.get("observation_status") == "input_invalid"
-        ):
+        if audit["frame_mapping_status"] != "verified":
             return {}
         records = [
             row
@@ -847,19 +899,37 @@ class QingyuHandPoseSession:
             and row["points"] is not None
             and row["source_frame_index"] is not None
             and row["video_frame"] is not None
-            and row["timestamp"] is not None
         ]
-        deduplicated, _, conflicts = _deduplicate_observations(records)
-        if conflicts:
-            return {}
-        return {
-            (int(row["source_frame_index"]), str(row["hand"])): {
+        selected, _observation_audit = _canonicalize_observations(records)
+        index: dict[tuple[int, str], dict[str, Any]] = {}
+        for row in selected:
+            key = (int(row["source_frame_index"]), str(row["hand"]))
+            if key in index:
+                raise ValueError(
+                    "QY canonical observation selection produced a duplicate "
+                    f"source-frame/hand key: {key}"
+                )
+            index[key] = {
                 "video_frame": int(row["video_frame"]),
-                "timestamp": float(row["timestamp"]),
+                "timestamp": (
+                    float(row["timestamp"])
+                    if row.get("timestamp") is not None
+                    else None
+                ),
                 "keypoints_2d": np.asarray(row["points"], dtype=np.float32),
+                "selected_obs_id": row.get("obs_id"),
+                "original_row_index": row["row_index"],
+                "candidate_count": int(row["candidate_count"]),
+                "selection_method": str(row["selection_method"]),
+                "supplier_observation_metadata": {
+                    "status": row.get("status") or None,
+                    "reason": row.get("reason"),
+                    "score": row.get("score"),
+                    "visibility": row.get("visibility"),
+                    "quality_score": row.get("quality_score"),
+                },
             }
-            for row in deduplicated
-        }
+        return index
 
     def build_clip(
         self,

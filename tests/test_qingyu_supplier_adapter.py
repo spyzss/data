@@ -236,6 +236,7 @@ def test_qy_explicit_camera_is_not_rejected_by_auto_coverage_thresholds(
     coverage = json.loads(row["camera_coverage"])["mid_cam_left"]
     assert coverage["eligible"] is False
     assert coverage["explicit_camera_eligible"] is True
+    assert coverage["missing_frame_hand_observation_count"] == 3
 
 
 def test_qy_repeated_mapping_pairs_and_equivalent_same_hand_rows_are_nonblocking(
@@ -283,16 +284,24 @@ def test_qy_repeated_mapping_pairs_and_equivalent_same_hand_rows_are_nonblocking
     assert coverage["explicit_camera_eligible"] is True
 
 
-def test_qy_conflicting_same_hand_observations_are_not_silently_selected(
+def test_qy_multiple_same_hand_raw_candidates_use_stable_transport_selection(
     tmp_path: Path,
 ) -> None:
     rows = observation_rows()
     conflicting = {
         **rows[0],
         "pred_keypoints_2d": keypoints_2d(10.0),
-        "status": "ok",
-        "score": 1.0,
+        "status": "active",
+        "reason": "supplier_active",
+        "score": 0.01,
+        "obs_id": "alternative",
     }
+    rows[0].update(
+        status="ambiguous",
+        reason="supplier_ambiguous",
+        score=0.99,
+        obs_id="first",
+    )
     rows.append(conflicting)
     root, _ = _make_qy_without_supplier_timebase(
         tmp_path,
@@ -301,18 +310,103 @@ def test_qy_conflicting_same_hand_observations_are_not_silently_selected(
 
     row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
 
-    assert row["primary_camera"] == ""
-    assert row["adapter_status"] == "input_invalid"
-    assert row["reason"] == "conflicting_same_hand_observations"
+    assert row["primary_camera"] == "mid_cam_left"
+    assert row["adapter_status"] == "ready"
+    assert row["reason"] == "ready"
+    assert row["skeleton_2d_status"] == "valid"
     coverage = json.loads(row["camera_coverage"])["mid_cam_left"]
     assert coverage["frame_mapping_status"] == "verified"
     assert coverage["mapping_conflict_count"] == 0
-    assert coverage["observation_status"] == "input_invalid"
+    assert coverage["observation_status"] == "valid_deduplicated"
     assert coverage["conflicting_same_hand_observation_count"] == 1
+    assert coverage["same_hand_multirow_group_count"] == 1
+    assert coverage["deterministic_selected_observation_count"] == 6
+    assert coverage["excluded_alternative_observation_count"] == 1
+    assert coverage["observation_warning"] == (
+        "multiple_raw_observation_candidates_require_visual_adjudication"
+    )
+    selected = next(
+        item
+        for item in coverage["selected_observation_provenance"]
+        if item["source_frame_index"] == 100 and item["hand"] == "left"
+    )
+    assert selected == {
+        "camera": "mid_cam_left",
+        "source_frame_index": 100,
+        "video_frame": 0,
+        "hand": "left",
+        "selected_obs_id": "first",
+        "original_row_index": 0,
+        "candidate_count": 2,
+        "selection_method": "stable_first_structurally_valid_observation",
+    }
 
-    auto_row = build_qingyu_manifest(root)[0]
-    assert auto_row["adapter_status"] == "input_invalid"
-    assert auto_row["reason"] == "conflicting_same_hand_observations"
+    session = QingyuHandPoseSession(
+        observations_path=(
+            root
+            / "category__packing"
+            / "task_pack_box"
+            / "episode_000001"
+            / "hand_pose"
+            / "observations_2d.parquet"
+        )
+    )
+    direct = session.direct_2d_index(
+        camera="mid_cam_left",
+        start_frame=100,
+        end_frame=102,
+        video_frame_count=4,
+        timestamp_start=1_776_064_789.6437788,
+        timestamp_end=1_776_064_789.7437788,
+        fps=30.0,
+    )
+    chosen = direct[(100, "left")]
+    assert chosen["selected_obs_id"] == "first"
+    assert chosen["candidate_count"] == 2
+    assert chosen["selection_method"] == (
+        "stable_first_structurally_valid_observation"
+    )
+    assert np.array_equal(chosen["keypoints_2d"], np.asarray(keypoints_2d()))
+
+
+def test_qy_transport_selection_uses_stored_row_identity_after_reordering(
+    tmp_path: Path,
+) -> None:
+    rows = observation_rows(source_frames=(100,), hands=("left",))
+    first = {
+        **rows[0],
+        "pred_keypoints_2d": keypoints_2d(1.0),
+        "obs_id": "row-20",
+        "status": "rejected",
+        "score": 0.0,
+    }
+    second = {
+        **rows[0],
+        "pred_keypoints_2d": keypoints_2d(2.0),
+        "obs_id": "row-10",
+        "status": "active",
+        "score": 1.0,
+    }
+    observations_path = tmp_path / "observations.parquet"
+    pd.DataFrame([first, second], index=[20, 10]).to_parquet(observations_path)
+    session = QingyuHandPoseSession(observations_path=observations_path)
+
+    direct = session.direct_2d_index(
+        camera="mid_cam_left",
+        start_frame=100,
+        end_frame=100,
+        video_frame_count=1,
+        timestamp_start=first["timestamp"],
+        timestamp_end=first["timestamp"],
+        fps=30.0,
+    )
+
+    assert direct[(100, "left")]["original_row_index"] == 10
+    assert direct[(100, "left")]["selected_obs_id"] == "row-10"
+    assert np.array_equal(
+        direct[(100, "left")]["keypoints_2d"],
+        np.asarray(keypoints_2d(2.0)),
+    )
 
 
 @pytest.mark.parametrize(
@@ -357,7 +451,16 @@ def test_qy_derived_timebase_reports_precise_mapping_failures(
     row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
 
     assert row["primary_camera"] == ""
-    assert row["adapter_status"] == "input_missing"
+    assert row["adapter_status"] == (
+        "input_invalid"
+        if expected_reason
+        in {
+            "source_to_video_conflict",
+            "video_to_source_conflict",
+            "video_frame_out_of_range",
+        }
+        else "input_missing"
+    )
     assert row["reason"] == expected_reason
     assert row["camera_recommendation_reason"] == expected_reason
 
@@ -791,12 +894,15 @@ def test_qy_2d_requires_exact_finite_21_by_2(tmp_path: Path) -> None:
     rows[0]["pred_keypoints_2d"] = keypoints_2d()[:20]
     make_qy_episode(root, observations=rows)
 
-    row = build_qingyu_manifest(root)[0]
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
 
     coverage = json.loads(row["camera_coverage"])["mid_cam_left"]
     assert coverage["invalid_shape_row_count"] == 1
-    assert coverage["eligible"] is False
-    assert row["primary_camera"] == ""
+    assert coverage["unusable_observation_row_count"] == 1
+    assert coverage["usable_observation_row_count"] == 5
+    assert coverage["explicit_camera_eligible"] is True
+    assert row["primary_camera"] == "mid_cam_left"
+    assert row["adapter_status"] == "ready"
 
 
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
@@ -809,12 +915,47 @@ def test_qy_2d_nonfinite_joint_is_ineligible(
     rows[0]["pred_keypoints_2d"][0][0] = bad_value
     make_qy_episode(root, observations=rows)
 
-    row = build_qingyu_manifest(root)[0]
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
 
     coverage = json.loads(row["camera_coverage"])["mid_cam_left"]
     assert coverage["invalid_shape_row_count"] == 1
-    assert coverage["eligible"] is False
+    assert coverage["unusable_observation_row_count"] == 1
+    assert coverage["explicit_camera_eligible"] is True
+    assert row["primary_camera"] == "mid_cam_left"
+    assert row["adapter_status"] == "ready"
+
+
+def test_qy_selected_camera_with_no_usable_2d_observations_is_input_missing(
+    tmp_path: Path,
+) -> None:
+    rows = observation_rows()
+    for item in rows:
+        item["pred_keypoints_2d"] = keypoints_2d()[:20]
+    root, _ = _make_qy_without_supplier_timebase(tmp_path, observations=rows)
+
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
+
+    assert row["primary_camera"] == ""
     assert row["adapter_status"] == "input_missing"
+    assert row["reason"] == "no_valid_2d_points"
+    coverage = json.loads(row["camera_coverage"])["mid_cam_left"]
+    assert coverage["usable_observation_row_count"] == 0
+    assert coverage["deterministic_selected_observation_count"] == 0
+
+
+def test_qy_missing_supplier_quality_file_does_not_block_adapter(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "QY"
+    episode = make_qy_episode(root)
+    (episode / "hand_pose" / "quality.json").unlink()
+
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
+
+    assert row["primary_camera"] == "mid_cam_left"
+    assert row["adapter_status"] == "ready"
+    inventory = json.loads(row["file_inventory"])
+    assert inventory["quality"]["status"] == "missing"
 
 
 def test_qy_manifest_identity_keeps_logical_symlink_paths(

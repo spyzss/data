@@ -432,7 +432,7 @@ def build_qingyu_manifest(
         required_present = all(
             item["status"] == "present"
             for name, item in inventory.items()
-            if name != "timebase"
+            if name not in {"quality", "timebase"}
         )
         timebase: dict[str, dict[str, Any]] = {}
         timebase_error: str | None = None
@@ -606,22 +606,23 @@ def build_qingyu_manifest(
                 if primary_camera is not None
                 else {}
             )
-            conflicting_observations = any(
-                audit.get("observation_status") == "input_invalid"
-                for audit in camera_audits.values()
-            )
             adapter_status = (
                 "input_invalid"
                 if timebase_error is not None
-                or requested_audit.get("observation_status") == "input_invalid"
-                or conflicting_observations
+                or requested_audit.get("reason")
+                in {
+                    "source_to_video_conflict",
+                    "video_to_source_conflict",
+                    "source_frame_out_of_range",
+                    "video_frame_out_of_range",
+                    "timestamp_mapping_invalid",
+                    "frame_mapping_missing",
+                }
                 else "input_missing"
             )
             reason = (
                 recommendation_reason
                 if primary_camera is not None
-                else "conflicting_same_hand_observations"
-                if conflicting_observations
                 else "primary_camera_missing"
             )
         elif not required_present:

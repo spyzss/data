@@ -15,7 +15,7 @@ from acceptance_pull.supplier_adapters.qingyu import (
 from qc_common.config import load_qc_acceptance_config
 from qc_common.schema import validate_qc_config
 from qc_common.suppliers import normalize_supplier
-from qc_common.module_registry import ModuleBlockedError, ModulePrerequisiteError
+from qc_common.module_registry import ModulePrerequisiteError
 from qc_pipeline.runners.precheck import PrecheckSession, precheck_fingerprint
 from tests.fixtures import solid_frame, write_test_video
 from tests.qingyu_fixtures import make_qy_episode, trajectory_rows
@@ -128,7 +128,13 @@ def test_qy_precheck_fingerprint_has_isolated_adapter_contract(
     fingerprint = precheck_fingerprint(context, config)
 
     assert fingerprint["source_contract"]["supplier_adapter"] == (
-        "qingyu-hand-pose-precheck-v3"
+        "qingyu-hand-pose-precheck-v4"
+    )
+    assert fingerprint["source_contract"]["observation_canonicalization"] == (
+        "stable-first-structurally-valid-v1"
+    )
+    assert fingerprint["source_contract"]["supplier_quality_policy"] == (
+        "ignored-for-acceptance-v1"
     )
     assert set(fingerprint["sources"]) >= {
         "observations_2d",
@@ -315,7 +321,7 @@ def test_qy_unconfirmed_topology_is_not_applicable_to_morphology_or_temporal(
     )
 
 
-def test_qy_invalid_adapter_blocks_precheck_without_float_none_runtime_error(
+def test_qy_multiple_raw_candidates_do_not_block_supported_precheck(
     tmp_path: Path,
 ) -> None:
     from tests.qingyu_fixtures import keypoints_2d, observation_rows
@@ -335,17 +341,93 @@ def test_qy_invalid_adapter_blocks_precheck_without_float_none_runtime_error(
     context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
     session = PrecheckSession(context, load_qc_acceptance_config())
 
-    with pytest.raises(
-        ModuleBlockedError,
-        match="conflicting_same_hand_observations",
-    ):
-        session.run_module("hdf5_text_info")
+    assert context.metadata["adapter_status"] == "ready"
+    assert context.metadata["primary_camera"] == "mid_cam_left"
+    assert session.run_module("hdf5_text_info").module == "hdf5_text_info"
 
     for module in ("keypoint_morphology", "keypoint_temporal"):
         result = session.run_module(module)
         assert result.verdict == "skipped"
         assert result.evaluation["decision"] == "not_applicable"
         assert result.evaluation["reason"] == "qy_hand_topology_not_validated"
+
+
+def test_qy_quality_hand_is_policy_skipped_even_when_supplier_quality_exists(
+    tmp_path: Path,
+) -> None:
+    context = _context_for_qy(tmp_path)
+    session = PrecheckSession(context, load_qc_acceptance_config())
+
+    result = session.run_module("quality_hand")
+
+    assert result.verdict == "skipped"
+    assert result.evaluation == {
+        "decision": "not_applicable",
+        "output_status": "not_applicable",
+        "reason": "supplier_quality_signal_ignored_by_policy",
+    }
+    assert result.issues == ()
+
+
+def test_qy_missing_supplier_quality_does_not_change_quality_module_semantics(
+    tmp_path: Path,
+) -> None:
+    from acceptance_pull.supplier_audit import audit_supplier_data
+
+    root = tmp_path / "source" / "QY"
+    episode = make_qy_episode(root)
+    (episode / "hand_pose" / "quality.json").unlink()
+    manifest = write_qingyu_manifest(
+        build_qingyu_manifest(root, primary_camera="mid_cam_left"), tmp_path
+    )
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+
+    result = PrecheckSession(
+        context, load_qc_acceptance_config()
+    ).run_module("quality_hand")
+    supplier_audit = audit_supplier_data(
+        context,
+        load_qc_acceptance_config().module_parameters("supplier_data_audit"),
+    )
+
+    assert context.metadata["adapter_status"] == "ready"
+    assert context.source_files["quality"]["path"].endswith(
+        "hand_pose/quality.json"
+    )
+    assert not (
+        context.batch_root / context.source_files["quality"]["path"]
+    ).exists()
+    assert result.verdict == "skipped"
+    assert result.evaluation["reason"] == (
+        "supplier_quality_signal_ignored_by_policy"
+    )
+    assert supplier_audit["inventory"]["quality"]["status"] == "missing"
+    assert "quality" not in supplier_audit["missing_sources"]
+    assert not any(
+        issue.get("source_name") == "quality"
+        for issue in supplier_audit["issues"]
+    )
+
+
+def test_qy_supplier_audit_fingerprint_records_ignored_quality_policy(
+    tmp_path: Path,
+) -> None:
+    from qc_pipeline.artifacts import artifact_for
+    from qc_pipeline.runners.supplier_data_audit import run
+
+    context = _context_for_qy(tmp_path)
+
+    run(context, load_qc_acceptance_config())
+
+    run_config = json.loads(
+        (
+            artifact_for(context, "supplier_data_audit").directory
+            / "run_config.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert run_config["fingerprint"]["supplier_contract"] == {
+        "quality_source_policy": "inventory_only_ignored_for_acceptance_v1"
+    }
 
 
 def test_qy_missing_primary_fps_or_video_blocks_precheck_precisely(

@@ -1301,10 +1301,14 @@ def runner(
             }
         if qy_inputs is not None:
             fingerprint_extra["qy_direct_2d_contract"] = {
-                "adapter_version": "qy-direct-2d-sam3-v2",
+                "adapter_version": "qy-direct-2d-sam3-v3",
                 "primary_camera": qy_inputs.primary_camera,
                 "frame_mapping": "explicit_source_frame_index_to_video_frame",
                 "joint_topology": "unverified_points_only",
+                "observation_canonicalization": (
+                    "stable_first_structurally_valid_observation"
+                ),
+                "supplier_quality_policy": "ignored_for_acceptance",
                 "timebase_source": context.metadata.get("timebase_source"),
                 "source_frame_count": int(
                     qy_inputs.timebase["source_frame_count"]

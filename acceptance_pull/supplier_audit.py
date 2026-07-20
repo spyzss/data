@@ -163,6 +163,7 @@ def audit_supplier_data(
         for source_name, item in inventory.items()
         if item["status"] != "present"
         and not (source_name == "timebase" and derived_qy_timebase)
+        and not (supplier == "qy" and source_name == "quality")
     ]
     if supplier == "qy":
         mapping_status = (
@@ -214,7 +215,7 @@ def audit_supplier_data(
                 }
             )
         for source_name, item in inventory.items():
-            if item["status"] == "wrong_type":
+            if item["status"] == "wrong_type" and source_name != "quality":
                 issues.append(
                     {
                         "code": "required_source_wrong_type",

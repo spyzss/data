@@ -219,6 +219,39 @@ def test_qy_sam3_deduplicates_equivalent_same_hand_observations(
     assert segmenter.calls == 3
 
 
+def test_qy_sam3_accepts_multiple_raw_candidates_without_supplier_ranking(
+    tmp_path: Path,
+) -> None:
+    rows = observation_rows()
+    rows[0].update(status="ambiguous", score=0.01, obs_id="first")
+    rows.append(
+        {
+            **rows[0],
+            "status": "active",
+            "score": 1.0,
+            "obs_id": "higher-supplier-score",
+            "pred_keypoints_2d": keypoints_2d(10.0),
+        }
+    )
+    context = _qy_context(
+        tmp_path,
+        observations=rows,
+        without_timebase=True,
+    )
+    _write_precheck_gate(context)
+    segmenter = _FullMaskSegmenter()
+
+    result = runner(lambda: segmenter)(
+        context,
+        load_qc_acceptance_config(),
+    )
+
+    assert context.metadata["adapter_status"] == "ready"
+    assert context.metadata["primary_camera"] == "mid_cam_left"
+    assert result.module == "sam3_containment"
+    assert segmenter.calls == 3
+
+
 def test_qy_sam3_emits_five_overlays_for_review_bundle_contract(
     tmp_path: Path,
 ) -> None:
