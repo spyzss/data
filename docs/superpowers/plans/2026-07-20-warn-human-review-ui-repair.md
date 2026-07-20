@@ -12,7 +12,7 @@
 
 - Use the existing workbench video element; do not add a second player or a frontend framework.
 - Warn uses a vertical order: video, review reason/evidence, PASS/FAIL.
-- SAM3/skeleton Warns play only the issue frame interval and prefer a continuous skeleton-overlay clip; raw issue clips are the fallback.
+- Every Warn plays only the raw issue-frame clip. SAM3/skeleton Warns show the existing sampled skeleton/mask overlay images below the video and never synthesize a continuous overlay video.
 - Machine fields remain read-only; only human reason and verdict are mutable.
 - Never expose command lines, absolute paths, or Python exception text in the task DTO or browser.
 - Preserve `asset_qc_report.v2`: `manual_review.state`, `manual_review.issue_reviews`, `manual_review.completed_at`, `pipeline_state`, and `overall_decision` remain authoritative.
@@ -24,7 +24,6 @@
 ## File Structure
 
 - Modify `human_qc/evidence.py`: preserve media suffixes for atomic generation and emit stable overlay failure codes.
-- Create `human_qc/skeleton_overlay_video.py`: render an issue-bounded MP4 with both hands' joints and bone edges from the canonical HDF5/video sources.
 - Modify `human_qc/workbench_service.py`: sanitize clip-generation failures before creating the browser task DTO.
 - Modify `human_qc/static/app.js`: expose the active task type to CSS and update Warn-specific workbench chrome.
 - Modify `human_qc/static/warn_adapter.js`: render one focused Warn in the approved vertical information order and advance to the next unresolved issue.
@@ -43,12 +42,11 @@
 - Modify: `tests/test_review_evidence.py`
 - Modify: `tests/test_human_qc_recovery.py`
 - Modify: `human_qc/evidence.py`
-- Create: `human_qc/skeleton_overlay_video.py`
 - Modify: `human_qc/workbench_service.py`
 
 **Interfaces:**
 - Consumes: `EvidenceService.resolve(issue: Mapping[str, Any], asset_context: AssetContext) -> EvidenceView`
-- Produces: `render_skeleton_overlay_video(issue, context, output, start_frame, end_frame_exclusive) -> None`; for SAM3/skeleton issues `EvidenceView.clip_url` points to the continuous overlay MP4 when rendering succeeds and to the raw bounded MP4 on degradation. `EvidenceView.generation_error` is `None` or `"overlay_unavailable"`; workbench fallback rows use `"clip_unavailable"`.
+- Produces: `EvidenceView.clip_url` for the raw bounded issue MP4 and ordered `overlay_urls` for every existing SAM3 sampled overlay image. `EvidenceView.generation_error` is `None` or `"overlay_unavailable"`; workbench fallback rows use `"clip_unavailable"`.
 
 - [ ] **Step 1: Write the failing MP4 temporary-path regression test**
 
@@ -115,35 +113,21 @@ Run: `.venv/bin/python -m pytest tests/test_human_qc_recovery.py -k 'overlay_fai
 
 Expected: FAIL because raw exception strings are currently projected.
 
-- [ ] **Step 5: Write the failing bounded skeleton-overlay video tests**
+- [ ] **Step 5: Write the failing sampled-overlay collection test**
 
-Create tests that use a short real video fixture and minimal HDF5 transforms. Capture the renderer's visited frame indexes and assert it processes exactly the half-open issue window:
+Create three existing SAM3 overlay PNG evidence rows with distinct frame indexes and assert the task projection retains all three in frame order while `clip_url` remains the raw bounded MP4:
 
 ```python
-def test_sam3_review_clip_overlays_only_the_issue_interval(tmp_path: Path) -> None:
-    context = _context_with_video_and_hdf5(tmp_path, frame_count=12, fps=6)
-    visited: list[int] = []
-
-    render_skeleton_overlay_video(
-        {"module": "sam3_containment", "issue_id": "sam3-1"},
-        context,
-        tmp_path / "overlay.mp4",
-        3,
-        8,
-        on_frame=visited.append,
-    )
-
-    assert visited == [3, 4, 5, 6, 7]
-    assert (tmp_path / "overlay.mp4").is_file()
+assert [row["frame"] for row in view.overlay_images] == [120, 144, 188]
+assert all(row["url"].endswith(".png") for row in view.overlay_images)
+assert view.clip_url.endswith(".mp4")
 ```
 
-Add an EvidenceService test whose injected overlay-video renderer writes an MP4 and assert a SAM3 issue receives the overlay URL as `clip_url`; add a failure case asserting the raw bounded clip remains the `clip_url` with `generation_error == "overlay_unavailable"`.
+- [ ] **Step 6: Run the sampled-overlay test and verify RED**
 
-- [ ] **Step 6: Run overlay video tests and verify RED**
+Run: `.venv/bin/python -m pytest tests/test_review_evidence.py -k 'sampled_overlay' -q`
 
-Run: `.venv/bin/python -m pytest tests/test_review_evidence.py -k 'skeleton_overlay_video or sam3_review_clip' -q`
-
-Expected: FAIL because no continuous overlay-video renderer or preferred-clip selection exists.
+Expected: FAIL because the current evidence resolver retains only one overlay path.
 
 - [ ] **Step 7: Preserve the final suffix in atomic generation**
 
@@ -157,27 +141,11 @@ temporary = output.with_name(
 
 This creates paths ending in `.mp4` or `.png`, so FFmpeg and image renderers can infer the intended format before `os.replace` publishes the final file.
 
-- [ ] **Step 8: Implement the bounded skeleton-overlay renderer**
+- [ ] **Step 8: Retain every sampled overlay image**
 
-Create `human_qc/skeleton_overlay_video.py` with a focused renderer that:
+Replace the single existing-overlay slot with an ordered collection containing URL and representative frame. Filter evidence to image kinds `overlay`, `skeleton_overlay`, and `combined_overlay`, keep only files inside the batch root, sort by `start_frame`, and never invoke a dynamic overlay-video renderer. Preserve the first image as `overlay_url` only for backward compatibility; new UI code consumes the full collection.
 
-- validates `source_files.video.path` and `source_files.hdf5.path` inside `batch_root`;
-- opens the source video and HDF5 once;
-- visits only `range(start_frame, end_frame_exclusive)`;
-- projects both 21-point hands using the canonical HDF5 camera transform/intrinsic convention already exercised by `tools/build_video_review_clips.py`;
-- draws joint markers and bone edges for every readable frame;
-- writes a browser-playable H.264/yuv420p MP4 atomically;
-- raises a typed renderer error without returning paths or commands to the browser.
-
-Allow an optional `on_frame: Callable[[int], None] | None` test hook, called after a frame is successfully drawn. Do not draw skeletons for non-SAM3/non-skeleton Warn modules.
-
-- [ ] **Step 9: Prefer overlay clips for SAM3 and raw clips on degradation**
-
-Add an `overlay_video_renderer` dependency to `EvidenceService`. After creating the raw bounded clip, invoke it only when `issue.module == "sam3_containment"` or the issue explicitly declares skeleton evidence. Cache the overlay MP4 under a distinct deterministic filename. Return its URL as `clip_url` when successful; on renderer failure retain the raw clip URL and set `generation_error = "overlay_unavailable"`.
-
-Wire `tools/serve_human_qc_workbench.py` to construct `EvidenceService` with `render_skeleton_overlay_video`, so the default local/production launcher exercises the same behavior as tests.
-
-- [ ] **Step 10: Replace browser-facing exception strings with stable codes**
+- [ ] **Step 9: Replace browser-facing exception strings with stable codes**
 
 In `EvidenceService.resolve`, log the overlay exception server-side and set:
 
@@ -196,16 +164,16 @@ result.append({
 
 Use module loggers created with `logging.getLogger(__name__)`; exception details may appear in server logs but never in the DTO.
 
-- [ ] **Step 11: Run evidence tests and verify GREEN**
+- [ ] **Step 10: Run evidence tests and verify GREEN**
 
 Run: `.venv/bin/python -m pytest tests/test_review_evidence.py tests/test_human_qc_recovery.py -q`
 
 Expected: all tests pass and no DTO assertion contains internal paths or exception messages.
 
-- [ ] **Step 12: Commit the evidence repair**
+- [ ] **Step 11: Commit the evidence repair**
 
 ```bash
-git add human_qc/evidence.py human_qc/skeleton_overlay_video.py human_qc/workbench_service.py tools/serve_human_qc_workbench.py tests/test_review_evidence.py tests/test_human_qc_recovery.py
+git add human_qc/evidence.py human_qc/workbench_service.py tests/test_review_evidence.py tests/test_human_qc_recovery.py
 git commit -m "fix(human-qc): harden warn evidence generation"
 ```
 
@@ -219,7 +187,7 @@ git commit -m "fix(human-qc): harden warn evidence generation"
 - Modify: `human_qc/static/app.js`
 
 **Interfaces:**
-- Consumes: task DTO fields `warn.selected_issue_ids`, `warn.issue_reviews`, `evidence[].generation_error`, and the shared `[data-video]` element.
+- Consumes: task DTO fields `warn.selected_issue_ids`, `warn.issue_reviews`, `evidence[].generation_error`, `evidence[].overlay_images`, and the shared `[data-video]` element.
 - Produces: `nextReviewIssueId(task, currentIssueId) -> string | null` and a vertical `.warn-review` DOM with `.warn-rationale` before `.warn-decision`.
 
 - [ ] **Step 1: Write failing vertical-markup tests**
@@ -248,6 +216,22 @@ test("warn evidence codes render safe reviewer copy", () => {
   const markup = renderWarnMarkup(degraded, "warn-1");
   assert.match(markup, /问题片段暂不可用/);
   assert.doesNotMatch(markup, /ffmpeg|Command|\/private\//i);
+});
+```
+
+Add an overlay-gallery assertion:
+
+```javascript
+test("warn markup renders every sampled SAM3 overlay image", () => {
+  const sampled = structuredClone(warnTask);
+  sampled.evidence[0].overlay_images = [
+    { frame: 120, url: "/evidence/frame-120.png" },
+    { frame: 144, url: "/evidence/frame-144.png" },
+    { frame: 188, url: "/evidence/frame-188.png" },
+  ];
+  const markup = renderWarnMarkup(sampled, "warn-1");
+  assert.equal((markup.match(/class="warn-overlay-sample"/g) || []).length, 3);
+  assert.ok(markup.indexOf("frame-120.png") < markup.indexOf("frame-188.png"));
 });
 ```
 
@@ -283,7 +267,7 @@ export function nextReviewIssueId(task, currentIssueId = null) {
 }
 ```
 
-In `render`, advance only when the current issue has a persisted verdict. Map evidence codes to reviewer-safe copy:
+In `render`, advance only when the current issue has a persisted verdict. Map evidence codes to reviewer-safe copy and render every `overlay_images` entry as a frame-labelled thumbnail linking to the original image:
 
 ```javascript
 const evidenceMessage = {
@@ -355,6 +339,8 @@ def test_warn_stage_has_complete_visual_and_responsive_css_contract() -> None:
         ".warn-review-head",
         ".warn-rationale",
         ".warn-metrics",
+        ".warn-overlay-gallery",
+        ".warn-overlay-sample",
         ".warn-decision",
         ".warn-verdict-actions",
         '[data-action="verdict-pass"]',
@@ -377,6 +363,7 @@ Add CSS that:
 - changes the Warn workspace grid to one column and hides the semantic inspector;
 - gives the video stage a restrained orange evidence border;
 - lays out the rationale as a two-column reason/evidence region;
+- renders SAM3 sampled overlay images as a compact, horizontally scrollable thumbnail strip with frame labels and full-image links;
 - renders PASS and FAIL as equal-height, full-width decision targets;
 - styles textarea, progress, safe degradation notice, completion control, focus-visible, hover, selected, loading, and disabled states;
 - uses the existing typography, surfaces, and spacing variables instead of introducing a second design system.
