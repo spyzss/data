@@ -17,7 +17,6 @@ from human_qc.evidence import EvidenceService  # noqa: E402
 from human_qc.http_server import create_http_server  # noqa: E402
 from human_qc.lease import LeaseStore  # noqa: E402
 from human_qc.semantic_service import SemanticCalibrationService  # noqa: E402
-from human_qc.skeleton_overlay_video import render_skeleton_overlay_video  # noqa: E402
 from human_qc.warn_service import WarnReviewService  # noqa: E402
 from human_qc.workbench_service import WorkbenchService  # noqa: E402
 from qc_common.config import load_qc_acceptance_config  # noqa: E402
@@ -154,10 +153,7 @@ def build_workbench_service(
     }
     semantic = SemanticCalibrationService(assets=assets, reports=reports)
     warn = WarnReviewService(reports=reports)
-    evidence = EvidenceService(
-        batch_root / ".human_qc_evidence",
-        overlay_video_renderer=render_skeleton_overlay_video,
-    )
+    evidence = EvidenceService(batch_root / ".human_qc_evidence")
     config = load_qc_acceptance_config()
     service = WorkbenchService(
         semantic,

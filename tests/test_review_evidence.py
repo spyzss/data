@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import h5py
-import numpy as np
 import pytest
 
 from human_qc.evidence import EvidenceError, EvidenceService
@@ -12,7 +10,6 @@ from human_qc.warn_service import WarnReviewService
 from human_qc.workbench_service import WorkbenchService
 from qc_common.contracts import EvidenceRef, Issue
 from qc_pipeline.context import AssetContext
-from tests.fixtures import solid_frame, write_test_video
 from tests.qc_report_fixtures import make_v2_report
 
 
@@ -43,67 +40,6 @@ def _issue(**overrides):
     return value
 
 
-def _context_with_video_and_hdf5(
-    tmp_path: Path, *, frame_count: int, fps: float
-) -> AssetContext:
-    video = tmp_path / "video" / "clip.mp4"
-    write_test_video(
-        video,
-        [solid_frame(30 + frame_index, width=64, height=48) for frame_index in range(frame_count)],
-        fps=fps,
-    )
-    hdf5_path = tmp_path / "source" / "clip.hdf5"
-    hdf5_path.parent.mkdir(parents=True)
-    base_names = (
-        "Hand",
-        "ThumbKnuckle",
-        "ThumbIntermediateBase",
-        "ThumbIntermediateTip",
-        "ThumbTip",
-        "IndexFingerKnuckle",
-        "IndexFingerIntermediateBase",
-        "IndexFingerIntermediateTip",
-        "IndexFingerTip",
-        "MiddleFingerKnuckle",
-        "MiddleFingerIntermediateBase",
-        "MiddleFingerIntermediateTip",
-        "MiddleFingerTip",
-        "RingFingerKnuckle",
-        "RingFingerIntermediateBase",
-        "RingFingerIntermediateTip",
-        "RingFingerTip",
-        "LittleFingerKnuckle",
-        "LittleFingerIntermediateBase",
-        "LittleFingerIntermediateTip",
-        "LittleFingerTip",
-    )
-    with h5py.File(hdf5_path, "w") as handle:
-        camera = np.repeat(np.eye(4, dtype=np.float64)[None, :, :], frame_count, axis=0)
-        handle.create_dataset("transforms/camera", data=camera)
-        handle.create_dataset(
-            "camera/intrinsic",
-            data=np.array([[40.0, 0.0, 32.0], [0.0, 40.0, 24.0], [0.0, 0.0, 1.0]]),
-        )
-        for hand_index, side in enumerate(("left", "right")):
-            for joint_index, name in enumerate(base_names):
-                transforms = camera.copy()
-                transforms[:, 0, 3] = (-0.45 if hand_index == 0 else 0.15) + 0.025 * joint_index
-                transforms[:, 1, 3] = -0.2 + 0.02 * (joint_index % 5)
-                transforms[:, 2, 3] = 2.0
-                handle.create_dataset(f"transforms/{side}{name}", data=transforms)
-    return AssetContext(
-        asset_id=ASSET_ID,
-        batch_root=tmp_path,
-        report_path=tmp_path / "quality_archive" / f"{ASSET_ID}.json",
-        source_files={
-            "video": {"path": video.relative_to(tmp_path).as_posix()},
-            "hdf5": {"path": hdf5_path.relative_to(tmp_path).as_posix()},
-        },
-        source_range=(0, frame_count),
-        metadata={"fps": fps},
-    )
-
-
 def test_evidence_module_is_missing_before_implementation() -> None:
     assert EvidenceService is not None
 
@@ -118,7 +54,11 @@ def test_existing_clip_and_overlay_are_reused(tmp_path: Path) -> None:
     issue = _issue(
         evidence=[
             {"kind": "clip", "path": "evidence/warn-1.mp4"},
-            {"kind": "skeleton_overlay", "path": "evidence/warn-1.png"},
+            {
+                "kind": "skeleton_overlay",
+                "path": "evidence/warn-1.png",
+                "start_frame": 10,
+            },
         ]
     )
     calls = []
@@ -129,6 +69,9 @@ def test_existing_clip_and_overlay_are_reused(tmp_path: Path) -> None:
     view = service.resolve(issue, context)
     assert view.clip_url.endswith("evidence/warn-1.mp4")
     assert view.overlay_url is not None and view.overlay_url.endswith("evidence/warn-1.png")
+    assert view.overlay_images == (
+        {"frame": 10, "url": "/evidence/evidence/warn-1.png"},
+    )
     assert calls == []
 
 
@@ -221,69 +164,49 @@ def test_overlay_failure_keeps_clip_and_reports_generation_error(tmp_path: Path)
     assert "renderer unavailable" not in json.dumps(view.__dict__)
 
 
-def test_sam3_review_clip_overlays_only_the_issue_interval(tmp_path: Path) -> None:
-    from human_qc.skeleton_overlay_video import render_skeleton_overlay_video
+def test_sampled_overlay_images_are_preserved_in_frame_order(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    overlay_dir = tmp_path / "sam3" / "combined_overlays"
+    overlay_dir.mkdir(parents=True)
+    for frame in (188, 120, 144):
+        (overlay_dir / f"frame-{frame}.png").write_bytes(b"png")
 
-    context = _context_with_video_and_hdf5(tmp_path, frame_count=12, fps=6)
-    visited: list[int] = []
+    def generate_clip(_command, output: Path) -> None:
+        output.write_bytes(b"raw-mp4")
 
-    render_skeleton_overlay_video(
-        {"module": "sam3_containment", "issue_id": "sam3-1"},
+    service = EvidenceService(
+        tmp_path / "cache",
+        ffmpeg_runner=generate_clip,
+    )
+    view = service.resolve(
+        _issue(
+            module="sam3_containment",
+            evidence=[
+                {
+                    "kind": "combined_overlay",
+                    "path": "sam3/combined_overlays/frame-188.png",
+                    "start_frame": 188,
+                },
+                {
+                    "kind": "overlay",
+                    "path": "sam3/combined_overlays/frame-120.png",
+                    "start_frame": 120,
+                },
+                {
+                    "kind": "skeleton_overlay",
+                    "path": "sam3/combined_overlays/frame-144.png",
+                    "start_frame": 144,
+                },
+            ],
+        ),
         context,
-        tmp_path / "overlay.mp4",
-        3,
-        8,
-        on_frame=visited.append,
     )
 
-    assert visited == [3, 4, 5, 6, 7]
-    assert (tmp_path / "overlay.mp4").is_file()
-
-
-def test_sam3_review_clip_prefers_generated_overlay_video(tmp_path: Path) -> None:
-    context = _context(tmp_path)
-    observed: dict[str, object] = {}
-
-    def generate_clip(_command, output: Path) -> None:
-        output.write_bytes(b"raw-mp4")
-
-    def render_overlay_video(issue, renderer_context, output: Path, start: int, end: int) -> None:
-        observed.update(issue=issue, context=renderer_context, start=start, end=end, output=output)
-        output.write_bytes(b"overlay-mp4")
-
-    service = EvidenceService(
-        tmp_path / "cache",
-        ffmpeg_runner=generate_clip,
-        overlay_video_renderer=render_overlay_video,
-    )
-    view = service.resolve(_issue(module="sam3_containment"), context)
-
+    assert [row["frame"] for row in view.overlay_images] == [120, 144, 188]
+    assert all(row["url"].endswith(".png") for row in view.overlay_images)
     assert view.clip_url.endswith(".mp4")
-    assert "overlay" in view.clip_url
-    assert view.generation_error is None
-    assert observed["context"] is context
-    assert (observed["start"], observed["end"]) == (10, 20)
-
-
-def test_sam3_review_clip_falls_back_to_raw_clip_when_overlay_fails(tmp_path: Path) -> None:
-    context = _context(tmp_path)
-
-    def generate_clip(_command, output: Path) -> None:
-        output.write_bytes(b"raw-mp4")
-
-    def fail_overlay_video(*_args: object) -> None:
-        raise RuntimeError("private renderer command and path")
-
-    service = EvidenceService(
-        tmp_path / "cache",
-        ffmpeg_runner=generate_clip,
-        overlay_video_renderer=fail_overlay_video,
-    )
-    view = service.resolve(_issue(module="sam3_containment"), context)
-
     assert "overlay" not in view.clip_url
-    assert view.clip_url.endswith(".mp4")
-    assert view.generation_error == "overlay_unavailable"
+    assert view.overlay_url == view.overlay_images[0]["url"]
 
 
 def test_evidence_path_escape_is_rejected(tmp_path: Path) -> None:
@@ -379,6 +302,7 @@ def test_workbench_joins_canonical_issue_evidence_and_converts_inclusive_context
             "end_frame_exclusive": 20,
             "clip_url": "/evidence/evidence/warn-1.mp4",
             "overlay_url": None,
+            "overlay_images": [],
             "generation_error": None,
         }
     ]
