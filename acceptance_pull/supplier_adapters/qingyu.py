@@ -447,6 +447,11 @@ def build_qingyu_manifest(
                     record["source_video_identity_assumed"] = False
         except ValueError as exc:
             timebase_error = str(exc)
+            inventory["timebase"] = {
+                **inventory["timebase"],
+                "status": "input_invalid",
+                "reason": timebase_error,
+            }
         video_paths = {
             camera: episode / "videos" / f"{camera}.mp4" for camera in QY_CAMERAS
         }
@@ -457,7 +462,7 @@ def build_qingyu_manifest(
         camera_audits: dict[str, dict[str, Any]] = {}
         observations_error: str | None = None
         if (
-            not paths["timebase"].is_file()
+            (not paths["timebase"].is_file() or timebase_error is not None)
             and paths["observations_2d"].is_file()
         ):
             try:
@@ -589,9 +594,6 @@ def build_qingyu_manifest(
         if observations_error is not None:
             adapter_status = "input_invalid"
             reason = "observations_2d_invalid"
-        elif timebase_error is not None:
-            adapter_status = "input_invalid"
-            reason = "timebase_invalid"
         elif trajectory_error is not None:
             adapter_status = "input_invalid"
             reason = "trajectory_3d_invalid"
@@ -599,7 +601,11 @@ def build_qingyu_manifest(
             adapter_status = "input_invalid"
             reason = "coordinate_system_invalid"
         elif selected is None:
-            adapter_status = "input_missing"
+            adapter_status = (
+                "input_invalid"
+                if timebase_error is not None
+                else "input_missing"
+            )
             reason = (
                 recommendation_reason
                 if primary_camera is not None
@@ -676,9 +682,10 @@ def build_qingyu_manifest(
             "fps": str(selected_timebase["fps"]) if selected_timebase is not None else "",
             "frame_coordinate_system": "source_inclusive",
             "timebase_status": (
-                "input_invalid" if timebase_error is not None else (
-                    str(selected_audit.get("timebase_status") or "input_missing")
-                )
+                str(selected_audit.get("timebase_status") or "input_missing")
+                if selected is not None
+                else "input_invalid" if timebase_error is not None
+                else "input_missing"
             ),
             "timebase_source": (
                 str(selected_timebase.get("timebase_source") or "")

@@ -42,6 +42,7 @@ def _qy_context(
     observations=None,
     camera_selection=None,
     without_timebase: bool = False,
+    invalid_timebase: bool = False,
     video_values=(10, 20, 30, 40),
 ):
     root = tmp_path / "source" / "QY"
@@ -53,6 +54,11 @@ def _qy_context(
     )
     if without_timebase:
         (episode / "timestamps" / "episode_timebase.json").unlink()
+    elif invalid_timebase:
+        timebase_path = episode / "timestamps" / "episode_timebase.json"
+        payload = json.loads(timebase_path.read_text(encoding="utf-8"))
+        payload["episode_id"] = "mismatched_supplier_episode"
+        timebase_path.write_text(json.dumps(payload), encoding="utf-8")
     rows = build_qingyu_manifest(
         root,
         primary_camera="mid_cam_left",
@@ -152,6 +158,29 @@ def test_qy_sam3_uses_derived_timebase_and_reads_explicit_video_frames(
     )
     assert [row["source_frame_idx"] for row in rows] == [100, 101, 102]
     assert [row["video_frame_idx"] for row in rows] == [0, 2, 3]
+    assert segmenter.calls == 3
+
+
+def test_qy_sam3_uses_derived_mapping_when_supplier_timebase_is_invalid(
+    tmp_path: Path,
+) -> None:
+    context = _qy_context(tmp_path, invalid_timebase=True)
+    _write_precheck_gate(context)
+    segmenter = _FullMaskSegmenter()
+
+    runner(lambda: segmenter)(context, load_qc_acceptance_config())
+
+    rows = json.loads(
+        (
+            artifact_for(context, "sam3_containment").directory
+            / "frame_results.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert [row["source_frame_idx"] for row in rows] == [100, 101, 102]
+    assert [row["video_frame_idx"] for row in rows] == [0, 2, 3]
+    assert context.metadata["timebase_source"] == (
+        "derived_from_video_and_observations_2d"
+    )
     assert segmenter.calls == 3
 
 

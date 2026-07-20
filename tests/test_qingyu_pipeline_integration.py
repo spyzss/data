@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import copy
+import json
 
 import pandas as pd
 import pytest
@@ -202,6 +203,46 @@ def test_qy_derived_timebase_is_audited_as_missing_supplier_file_not_hard_failur
         for issue in raw["issues"]
     )
     assert raw["decision"] == "warn"
+
+
+def test_qy_invalid_supplier_timebase_is_preserved_when_derived_contract_is_valid(
+    tmp_path: Path,
+) -> None:
+    from acceptance_pull.supplier_audit import audit_supplier_data
+
+    root = tmp_path / "source" / "QY"
+    episode = make_qy_episode(root)
+    timebase_path = episode / "timestamps" / "episode_timebase.json"
+    payload = json.loads(timebase_path.read_text(encoding="utf-8"))
+    payload["episode_id"] = "mismatched_supplier_episode"
+    timebase_path.write_text(json.dumps(payload), encoding="utf-8")
+    write_test_video(
+        episode / "videos" / "mid_cam_left.mp4",
+        [solid_frame(value, width=64, height=48) for value in (10, 20, 30, 40)],
+        fps=30.0,
+    )
+    manifest = write_qingyu_manifest(
+        build_qingyu_manifest(root, primary_camera="mid_cam_left"), tmp_path
+    )
+    context = contexts_from_manifest(manifest, batch_root=tmp_path)[0]
+
+    raw = audit_supplier_data(
+        context,
+        load_qc_acceptance_config().module_parameters("supplier_data_audit"),
+    )
+
+    assert raw["mapping_status"] == "verified"
+    assert raw["structured"]["timebase_status"] == "derived"
+    assert raw["structured"]["timebase_source"] == (
+        "derived_from_video_and_observations_2d"
+    )
+    issue = next(
+        issue
+        for issue in raw["issues"]
+        if issue["code"] == "supplier_timebase_invalid_derived"
+    )
+    assert issue["severity"] == "warn"
+    assert "does not match" in issue["observed_value"]
 
 
 def test_qy_supplier_data_audit_rejects_incomplete_required_skeleton(

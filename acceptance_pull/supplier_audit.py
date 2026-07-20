@@ -78,6 +78,22 @@ def _inventory_entry(context: AssetContext, source_name: str) -> dict[str, Any]:
     }
 
 
+def _manifest_inventory_entry(
+    context: AssetContext,
+    source_name: str,
+) -> dict[str, Any]:
+    value = context.metadata.get("file_inventory")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(value, Mapping):
+        return {}
+    entry = value.get(source_name)
+    return dict(entry) if isinstance(entry, Mapping) else {}
+
+
 def audit_supplier_data(
     context: AssetContext,
     parameters: Mapping[str, Any],
@@ -171,7 +187,24 @@ def audit_supplier_data(
         for source_name in missing
     ]
     if supplier == "qy":
-        if derived_qy_timebase:
+        supplier_timebase = _manifest_inventory_entry(context, "timebase")
+        supplier_timebase_status = str(
+            supplier_timebase.get("status") or ""
+        )
+        if supplier_timebase_status == "input_invalid":
+            issues.append(
+                {
+                    "code": (
+                        "supplier_timebase_invalid_derived"
+                        if derived_qy_timebase
+                        else "supplier_timebase_invalid"
+                    ),
+                    "severity": "warn" if derived_qy_timebase else "fail",
+                    "source_name": "timebase",
+                    "observed_value": supplier_timebase.get("reason"),
+                }
+            )
+        elif derived_qy_timebase and inventory["timebase"]["status"] != "present":
             issues.append(
                 {
                     "code": "supplier_timebase_missing_derived",

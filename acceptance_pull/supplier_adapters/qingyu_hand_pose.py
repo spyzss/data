@@ -10,6 +10,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from acceptance_pull.supplier_adapters.structured_audit import (
+    audit_video_metadata,
+)
 from qc_common.types import ClipInputs
 
 
@@ -130,6 +133,7 @@ class QingyuHandPoseSession:
         self._observation_records: tuple[dict[str, Any], ...] | None = None
         self._trajectory_audit: dict[str, Any] | None = None
         self._trajectory_index: dict[tuple[int, str], dict[str, Any]] | None = None
+        self._timebase_derivation_failures: dict[str, str] = {}
 
     @property
     def observations(self) -> pd.DataFrame:
@@ -208,8 +212,6 @@ class QingyuHandPoseSession:
         remains the explicit mapping carried by each observations_2d row.
         Conflicts are audited by :meth:`camera_coverage` rather than repaired.
         """
-        import cv2
-
         records = [
             row for row in self._parsed_observations() if row["camera"] == camera
         ]
@@ -223,20 +225,25 @@ class QingyuHandPoseSession:
             for row in records
             if row["timestamp"] is not None
         ]
-        if not records or not source_frames or not timestamps or not video_path.is_file():
+        if not records:
+            self._timebase_derivation_failures[camera] = (
+                "primary_camera_2d_missing"
+            )
             return None
-        capture = cv2.VideoCapture(str(video_path))
-        try:
-            if not capture.isOpened():
-                return None
-            frames = int(round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
-            width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-            height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-            fps = float(capture.get(cv2.CAP_PROP_FPS))
-        finally:
-            capture.release()
-        if frames < 1 or width < 1 or height < 1 or not math.isfinite(fps) or fps <= 0:
+        if not source_frames or not timestamps:
+            self._timebase_derivation_failures[camera] = "frame_mapping_missing"
             return None
+        video_metadata = audit_video_metadata(video_path)
+        if video_metadata.get("status") != "pass":
+            self._timebase_derivation_failures[camera] = str(
+                video_metadata.get("reason") or "video_metadata_invalid"
+            )
+            return None
+        frames = int(video_metadata["frame_count"])
+        width = int(video_metadata["width"])
+        height = int(video_metadata["height"])
+        fps = float(video_metadata["fps"])
+        self._timebase_derivation_failures.pop(camera, None)
         start = min(source_frames)
         end = max(source_frames)
         return {
@@ -300,7 +307,10 @@ class QingyuHandPoseSession:
             elif not video_available:
                 reason = "primary_video_missing"
             else:
-                reason = "video_metadata_invalid_or_timebase_missing"
+                reason = self._timebase_derivation_failures.get(
+                    camera,
+                    "video_metadata_invalid_or_timebase_missing",
+                )
             result.update(
                 {
                     "video_frame_count": None,

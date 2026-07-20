@@ -45,6 +45,30 @@ def _make_qy_without_supplier_timebase(
     return root, episode
 
 
+def _make_qy_with_invalid_supplier_timebase(
+    tmp_path: Path,
+    *,
+    observations: list[dict] | None = None,
+    valid_video: bool = True,
+) -> tuple[Path, Path]:
+    root = tmp_path / "QY"
+    episode = make_qy_episode(root, observations=observations)
+    timebase_path = episode / "timestamps" / "episode_timebase.json"
+    payload = json.loads(timebase_path.read_text(encoding="utf-8"))
+    payload["episode_id"] = "mismatched_supplier_episode"
+    timebase_path.write_text(json.dumps(payload), encoding="utf-8")
+    if valid_video:
+        write_test_video(
+            episode / "videos" / "mid_cam_left.mp4",
+            [
+                solid_frame(value, width=64, height=48)
+                for value in (10, 20, 30, 40)
+            ],
+            fps=30.0,
+        )
+    return root, episode
+
+
 def test_qy_explicit_camera_derives_timebase_from_video_and_explicit_mapping(
     tmp_path: Path,
 ) -> None:
@@ -84,6 +108,109 @@ def test_qy_explicit_camera_derives_timebase_from_video_and_explicit_mapping(
         "101": 2,
         "102": 3,
     }
+
+
+def test_qy_invalid_supplier_timebase_uses_verified_derived_effective_timebase(
+    tmp_path: Path,
+) -> None:
+    root, episode = _make_qy_with_invalid_supplier_timebase(tmp_path)
+
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
+
+    assert row["primary_camera"] == "mid_cam_left"
+    assert row["primary_camera_source"] == "explicit_config"
+    assert row["primary_video_path"] == str(
+        episode / "videos" / "mid_cam_left.mp4"
+    )
+    assert row["adapter_status"] == "ready"
+    assert row["reason"] == "ready"
+    assert row["timebase_status"] == "derived"
+    assert row["timebase_source"] == (
+        "derived_from_video_and_observations_2d"
+    )
+    assert row["frame_mapping_status"] == "verified"
+    assert row["frame_mapping_source"] == (
+        "explicit_source_frame_index_to_video_frame"
+    )
+    assert row["source_video_identity_assumed"] == "false"
+    assert row["timebase_path"] == str(
+        episode / "timestamps" / "episode_timebase.json"
+    )
+    inventory = json.loads(row["file_inventory"])
+    assert inventory["timebase"]["status"] == "input_invalid"
+    assert "does not match" in inventory["timebase"]["reason"]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_reason"),
+    [
+        (
+            lambda rows: rows.__setitem__(
+                1,
+                {
+                    **rows[1],
+                    "source_frame_index": rows[0]["source_frame_index"],
+                    "video_frame": 1,
+                },
+            ),
+            "source_to_video_conflict",
+        ),
+        (
+            lambda rows: rows.__setitem__(
+                0, {**rows[0], "video_frame": 99}
+            ),
+            "video_frame_out_of_range",
+        ),
+    ],
+)
+def test_qy_invalid_supplier_timebase_does_not_hide_derived_mapping_failure(
+    tmp_path: Path,
+    mutate,
+    expected_reason: str,
+) -> None:
+    rows = observation_rows()
+    mutate(rows)
+    root, _ = _make_qy_with_invalid_supplier_timebase(
+        tmp_path,
+        observations=rows,
+    )
+
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
+
+    assert row["primary_camera"] == ""
+    assert row["adapter_status"] == "input_invalid"
+    assert row["reason"] == expected_reason
+    assert row["camera_recommendation_reason"] == expected_reason
+    inventory = json.loads(row["file_inventory"])
+    assert inventory["timebase"]["status"] == "input_invalid"
+
+
+def test_qy_invalid_supplier_timebase_reports_precise_video_probe_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cv2
+
+    class ClosedCapture:
+        def isOpened(self) -> bool:
+            return False
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _path: ClosedCapture())
+    root, _ = _make_qy_with_invalid_supplier_timebase(
+        tmp_path,
+        valid_video=False,
+    )
+
+    row = build_qingyu_manifest(root, primary_camera="mid_cam_left")[0]
+
+    assert row["primary_camera"] == ""
+    assert row["adapter_status"] == "input_invalid"
+    assert row["reason"] == "video_unreadable"
+    coverage = json.loads(row["camera_coverage"])["mid_cam_left"]
+    assert coverage["reason"] == "video_unreadable"
 
 
 def test_qy_explicit_camera_is_not_rejected_by_auto_coverage_thresholds(
@@ -257,7 +384,10 @@ def test_qy_timebase_episode_identity_mismatch_is_not_accepted(
     assert row["primary_camera"] == ""
     assert row["timebase_status"] == "input_invalid"
     assert row["adapter_status"] == "input_invalid"
-    assert row["reason"] == "timebase_invalid"
+    assert row["reason"] == "video_unreadable"
+    inventory = json.loads(row["file_inventory"])
+    assert inventory["timebase"]["status"] == "input_invalid"
+    assert "does not match" in inventory["timebase"]["reason"]
 
 
 def test_qy_duplicate_timebase_camera_is_invalid_even_if_first_is_not_ok(
@@ -278,7 +408,10 @@ def test_qy_duplicate_timebase_camera_is_invalid_even_if_first_is_not_ok(
     assert row["frame_mapping_status"] == "mapping_unverified"
     assert row["primary_camera"] == ""
     assert row["adapter_status"] == "input_invalid"
-    assert row["reason"] == "timebase_invalid"
+    assert row["reason"] == "video_unreadable"
+    inventory = json.loads(row["file_inventory"])
+    assert inventory["timebase"]["status"] == "input_invalid"
+    assert "duplicate" in inventory["timebase"]["reason"]
 
 
 def test_qy_tied_recommendation_does_not_use_camera_name_tiebreak(
