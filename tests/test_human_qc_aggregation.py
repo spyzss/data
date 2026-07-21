@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from qc_reporting.aggregate import aggregate_projection
+from qc_common.projection import project_manual_review_counts
 from qc_reporting.projection import (
     BatchProjection,
     project_human_review_rows,
@@ -117,6 +118,19 @@ def test_human_projection_reads_only_canonical_human_blocks() -> None:
             },
         },
     )
+
+
+def test_manual_review_projection_counts_unreviewed_early_fail_warns() -> None:
+    projected = project_manual_review_counts(
+        {
+            "selected_issue_ids": ["warn-1", "warn-2", "warn-3"],
+            "issue_reviews": {"warn-1": _review("fail")},
+        }
+    )
+
+    assert projected["human_reviewed_warn_count"] == 1
+    assert projected["human_confirmed_fail_count"] == 1
+    assert projected["unreviewed_selected_warn_count"] == 2
 
 
 def test_quality_archive_projection_preserves_machine_warn_and_human_rows(

@@ -5,6 +5,8 @@ from pathlib import Path
 
 from qc_reporting.migration import reconcile_legacy_outputs
 from qc_reporting.projection import project_quality_archive
+from qc_common.report_migration import migrate_v1_to_v2
+from qc_common.schema import validate_asset_qc_report
 from tests.qc_report_fixtures import make_v1_video_report, make_v2_report
 
 
@@ -82,3 +84,40 @@ def test_migration_reconciliation_returns_only_differences_in_stable_order(
     assert [row["legacy_path"] for row in differences] == [str(missing)]
     assert differences[0]["difference_type"] == "legacy_asset_missing_in_qc_json"
     assert differences[0]["authoritative_source"] == "asset_qc_json"
+
+
+def test_v1_migration_marks_only_fully_reviewed_completed_manual_reports() -> None:
+    completed = make_v1_video_report()
+    completed["manual_review"].update(
+        {
+            "state": "completed",
+            "candidate_issue_ids": ["warn-1"],
+            "selected_issue_ids": ["warn-1"],
+            "selected_issue_id": "warn-1",
+            "issue_reviews": {"warn-1": {"verdict": "pass"}},
+            "completed_at": "2026-07-15T00:00:00Z",
+        }
+    )
+    incomplete = make_v1_video_report()
+    incomplete["manual_review"].update(
+        {
+            "state": "completed",
+            "candidate_issue_ids": ["warn-1", "warn-2"],
+            "selected_issue_ids": ["warn-1", "warn-2"],
+            "issue_reviews": {"warn-1": {"verdict": "fail"}},
+            "completed_at": "2026-07-15T00:00:00Z",
+        }
+    )
+
+    migrated_completed = migrate_v1_to_v2(
+        completed, config_reference=completed["qc_config"]
+    )
+    migrated_incomplete = migrate_v1_to_v2(
+        incomplete, config_reference=incomplete["qc_config"]
+    )
+
+    assert migrated_completed["manual_review"]["completion_mode"] == "all_reviewed"
+    assert migrated_completed["manual_review"]["failure_reason"] is None
+    assert "completion_mode" not in migrated_incomplete["manual_review"]
+    assert "failure_reason" not in migrated_incomplete["manual_review"]
+    validate_asset_qc_report(migrated_incomplete)
