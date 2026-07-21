@@ -72,6 +72,12 @@ _CORE_TEMPORAL_METRICS = (
     "joint_acceleration_m_s2_max",
     "joint_displacement_m_max",
 )
+_STANDARDIZED_TEMPORAL_METRIC_BY_NATIVE = {
+    "joint_angle_change_deg_max": "joint_angle_change_standardized_deg_max",
+    "rotation_delta_max": "rotation_delta_standardized_max",
+    "joint_acceleration_m_s2_max": "joint_acceleration_standardized_m_s2_max",
+    "joint_displacement_m_max": "joint_displacement_standardized_m_max",
+}
 
 _MORPHOLOGY_OBSERVED_METRIC = {
     "palm_scale_too_small": "palm_scale_m",
@@ -986,6 +992,15 @@ def _temporal_row_failures(
         else set()
     )
 
+    def observed_metric_name(metric: str) -> str:
+        standardized = _STANDARDIZED_TEMPORAL_METRIC_BY_NATIVE[metric]
+        return (
+            standardized
+            if row.metrics.get("decision_metric_source") == "standardized_30hz"
+            and standardized in row.metrics
+            else metric
+        )
+
     def failure(
         alias: str,
         side: str,
@@ -995,11 +1010,26 @@ def _temporal_row_failures(
         boundary: Any,
     ) -> _NormalizedFailure:
         rule = _temporal_rule(config, alias)
+        use_standardized_lineage = (
+            row.metrics.get("decision_metric_source") == "standardized_30hz"
+        )
         lineage = temporal_transition_lineage(
             target_frame=row.frame_idx,
-            pair_start_frame=row.metrics.get("temporal_pair_start_frame"),
-            pair_end_frame=row.metrics.get("temporal_pair_end_frame"),
-            attribution=row.metrics.get("temporal_transition_attribution"),
+            pair_start_frame=(
+                row.metrics.get("standardized_temporal_pair_start_frame")
+                if use_standardized_lineage
+                else row.metrics.get("temporal_pair_start_frame")
+            ),
+            pair_end_frame=(
+                row.metrics.get("standardized_temporal_pair_end_frame")
+                if use_standardized_lineage
+                else row.metrics.get("temporal_pair_end_frame")
+            ),
+            attribution=(
+                row.metrics.get("standardized_temporal_transition_attribution")
+                if use_standardized_lineage
+                else row.metrics.get("temporal_transition_attribution")
+            ),
         )
         return _NormalizedFailure(
             side, row.frame_idx, _rule_verdict(rule), str(rule["rule_id"]),
@@ -1011,7 +1041,7 @@ def _temporal_row_failures(
 
     ratios: dict[str, float] = {}
     for metric in tokens:
-        observed = row.metrics.get(metric)
+        observed = row.metrics.get(observed_metric_name(metric))
         threshold = parameters.get(f"{metric}_threshold")
         if (
             isinstance(observed, Real)
@@ -1050,8 +1080,8 @@ def _temporal_row_failures(
             operator = ">="
             boundary: Any = hard_count
         elif strongest_metric in ratios:
-            metric = strongest_metric
-            observed = row.metrics.get(strongest_metric)
+            metric = observed_metric_name(strongest_metric)
+            observed = row.metrics.get(metric)
             operator = ">"
             boundary = parameters[f"{strongest_metric}_threshold"]
         else:
@@ -1091,12 +1121,13 @@ def _temporal_row_failures(
             tokens,
             key=lambda metric: ratios.get(metric, -math.inf),
         )
-        observed = row.metrics.get(strongest_metric)
+        metric = observed_metric_name(strongest_metric)
+        observed = row.metrics.get(metric)
         return (
             failure(
                 "threshold",
                 "both",
-                strongest_metric,
+                metric,
                 observed,
                 ">",
                 parameters[f"{strongest_metric}_threshold"],

@@ -87,6 +87,16 @@ def _integer(value: Any, name: str) -> int:
     return int(numeric)
 
 
+def _optional_positive_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) and numeric > 0.0 else None
+
+
 def _range(row: dict[str, Any], start_column: str, end_column: str) -> tuple[int, int]:
     start = _integer(row.get(start_column), start_column)
     end = _integer(row.get(end_column), end_column)
@@ -356,7 +366,7 @@ def load_jdt_clip(
         quality_hand=None,
         instruction=text_label.get("language_instruction", ""),
         text_label=text_label,
-        fps=float(row.get("fps") or 30.0),
+        fps=_optional_positive_float(row.get("fps")),
     )
     setattr(clip, "leftcam_left_kp2d", left_2d)
     setattr(clip, "leftcam_right_kp2d", right_2d)
@@ -470,6 +480,8 @@ def _result_in_source_coordinates(
     """Map a local result and its temporal pair lineage to source frames."""
     if result.frame_idx < 0:
         return result
+    if result.metrics.get("frame_coordinate_system") == "source_inclusive":
+        return result
     local_target = int(result.frame_idx)
     source_target = clip_start_frame + local_target
     metrics = dict(result.metrics)
@@ -489,6 +501,75 @@ def _result_in_source_coordinates(
                 bool,
             ):
                 metrics[key] = clip_start_frame + int(value)
+    standardized_end = metrics.get("standardized_temporal_pair_end_frame")
+    standardized_anchor = metrics.get("anchor_source_frame")
+    standardized_is_local = (
+        isinstance(standardized_end, (int, np.integer))
+        and not isinstance(standardized_end, bool)
+        and int(standardized_end) == local_target
+    ) or (
+        isinstance(standardized_anchor, (int, np.integer))
+        and not isinstance(standardized_anchor, bool)
+        and int(standardized_anchor) == local_target
+    )
+    native_end = metrics.get("native_temporal_pair_end_frame")
+    native_is_local = (
+        isinstance(native_end, (int, np.integer))
+        and not isinstance(native_end, bool)
+        and int(native_end) == local_target
+    )
+    source_value = metrics.get("source_frame_idx")
+    if (
+        isinstance(source_value, (int, np.integer))
+        and not isinstance(source_value, bool)
+        and int(source_value) == local_target
+    ):
+        metrics["source_frame_idx"] = clip_start_frame + int(source_value)
+    for key in ("anchor_source_frame",):
+        value = metrics.get(key)
+        if (
+            standardized_is_local
+            and isinstance(value, (int, np.integer))
+            and not isinstance(value, bool)
+        ):
+            metrics[key] = clip_start_frame + int(value)
+    if standardized_is_local:
+        for key in (
+            "standardized_temporal_pair_start_frame",
+            "standardized_temporal_pair_end_frame",
+        ):
+            value = metrics.get(key)
+            if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+                metrics[key] = clip_start_frame + int(value)
+    if native_is_local:
+        for key in (
+            "native_temporal_pair_start_frame",
+            "native_temporal_pair_end_frame",
+        ):
+            value = metrics.get(key)
+            if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+                metrics[key] = clip_start_frame + int(value)
+    for key in ("evidence_source_frames",):
+        values = metrics.get(key)
+        if standardized_is_local and isinstance(values, list) and all(
+            isinstance(value, (int, np.integer)) and not isinstance(value, bool)
+            for value in values
+        ):
+            metrics[key] = [clip_start_frame + int(value) for value in values]
+    sampling_audit = metrics.get("temporal_sampling_audit")
+    if isinstance(sampling_audit, dict):
+        mapping = sampling_audit.get("source_frame_mapping")
+        if isinstance(mapping, list) and all(
+            isinstance(value, (int, np.integer)) and not isinstance(value, bool)
+            for value in mapping
+        ):
+            metrics["temporal_sampling_audit"] = {
+                **sampling_audit,
+                "source_frame_mapping": [
+                    clip_start_frame + int(value) for value in mapping
+                ],
+            }
+    metrics["frame_coordinate_system"] = "source_inclusive"
     return replace(result, frame_idx=source_target, metrics=metrics)
 
 
@@ -724,6 +805,7 @@ def run_manifest_precheck(
     new_results: list[dict[str, Any]] = []
     new_aggregates: list[dict[str, Any]] = []
     new_windows: list[dict[str, Any]] = []
+    temporal_sampling_by_asset: dict[str, dict[str, Any]] = {}
     failures: list[dict[str, Any]] = []
     jdt_cache: dict[Path, pd.DataFrame] = {}
     completed = 0
@@ -804,7 +886,22 @@ def run_manifest_precheck(
                             "error": str(exc),
                         }
                     )
-            new_results.extend(_result_records(results, clip))
+            result_records = _result_records(results, clip)
+            new_results.extend(result_records)
+            temporal_sampling = next(
+                (
+                    record["metrics"]["temporal_sampling_audit"]
+                    for record in result_records
+                    if isinstance(record.get("metrics"), dict)
+                    and isinstance(
+                        record["metrics"].get("temporal_sampling_audit"),
+                        dict,
+                    )
+                ),
+                None,
+            )
+            if isinstance(temporal_sampling, dict):
+                temporal_sampling_by_asset[asset_id] = dict(temporal_sampling)
             new_aggregates.extend(_aggregate_records(results, clip))
             new_windows.extend(mapped_candidates)
             completed += 1
@@ -875,6 +972,14 @@ def run_manifest_precheck(
             "skeleton_quality_score.keypoint_presence_invalid"
         ),
         "supplier_quality_signal": "not_provided",
+        "temporal_output_schema_version": "keypoint_temporal.output.v3",
+        "decision_metric_source": (
+            "standardized_30hz"
+            if config.skeleton_quality_score.temporal_decision_timebase
+            == "standardized"
+            else "native_source_fps"
+        ),
+        "temporal_sampling_by_asset": temporal_sampling_by_asset,
         "precheck_config": asdict(config),
     }
     _write_json(output_dir / "run_config.json", snapshot)

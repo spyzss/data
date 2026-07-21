@@ -1119,7 +1119,42 @@ def test_completed_session_publishes_canonical_precheck_artifact(
                 ),
                 {},
             ),
-            check_results=(CheckResult(module, 0, -1, {}, False, "ok"),),
+            check_results=(
+                CheckResult(
+                    module,
+                    0,
+                    -1,
+                    (
+                        {
+                            "temporal_sampling_audit": {
+                                "source_fps": 59.987,
+                                "temporal_target_hz": 30.0,
+                                "timestamp_source": "frame_index_source_fps",
+                                "sampling_method": "nearest_monotonic_no_reuse",
+                                "source_frame_count": 10,
+                                "standardized_sample_count": 5,
+                                "duplicate_source_frame_drop_count": 0,
+                                "invalid_timestamp_count": 0,
+                                "non_monotonic_timestamp_count": 0,
+                                "temporal_gap_break_count": 0,
+                                "decision_metric_source": "standardized_30hz",
+                                "native_metric_source": "source_fps",
+                                "native_metric_field_names": [
+                                    "joint_displacement_m_max"
+                                ],
+                                "standardized_metric_field_names": [
+                                    "joint_displacement_standardized_m_max"
+                                ],
+                                "source_frame_mapping": [0, 2, 4, 6, 8],
+                            }
+                        }
+                        if module == "keypoint_temporal"
+                        else {}
+                    ),
+                    False,
+                    "ok",
+                ),
+            ),
             candidate_windows=tuple(candidates),
         )
 
@@ -1148,17 +1183,37 @@ def test_completed_session_publishes_canonical_precheck_artifact(
     ]
     assert run_config["outcome"] == "completed"
     assert run_config["fingerprint"]["implementation_version"] == (
-        "precheck-session-v7-calibrated-temporal-validity"
+        "precheck-session-v8-standardized-temporal-timebase"
     )
     assert run_config["fingerprint"]["temporal_output_schema_version"] == (
-        "keypoint_temporal.output.v2"
+        "keypoint_temporal.output.v3"
     )
     assert run_config["temporal_output"] == {
-        "schema_version": "keypoint_temporal.output.v2",
+        "schema_version": "keypoint_temporal.output.v3",
         "status": "valid",
         "valid_frame_count": 1,
         "uncalibrated_frame_count": 0,
         "reason": "calibrated_temporal_output",
+    }
+    assert run_config["temporal_sampling"] == {
+        "source_fps": 59.987,
+        "temporal_target_hz": 30.0,
+        "timestamp_source": "frame_index_source_fps",
+        "sampling_method": "nearest_monotonic_no_reuse",
+        "source_frame_count": 10,
+        "standardized_sample_count": 5,
+        "duplicate_source_frame_drop_count": 0,
+        "invalid_timestamp_count": 0,
+        "non_monotonic_timestamp_count": 0,
+        "temporal_gap_break_count": 0,
+        "decision_metric_source": "standardized_30hz",
+        "native_metric_source": "source_fps",
+        "native_metric_field_names": ["joint_displacement_m_max"],
+        "standardized_metric_field_names": [
+            "joint_displacement_standardized_m_max"
+        ],
+        "source_frame_mapping": [0, 2, 4, 6, 8],
+        "schema_version": "keypoint_temporal.output.v3",
     }
 
 
@@ -1203,7 +1258,7 @@ def test_temporal_success_publishes_empty_candidate_list(
     assert json.loads(candidate_path.read_text()) == []
     run_config = json.loads((candidate_path.parent / "run_config.json").read_text())
     assert run_config["temporal_output"] == {
-        "schema_version": "keypoint_temporal.output.v2",
+        "schema_version": "keypoint_temporal.output.v3",
         "status": "valid",
         "valid_frame_count": 4,
         "uncalibrated_frame_count": 1,
@@ -1270,7 +1325,7 @@ def test_no_valid_temporal_output_is_published_for_sam3_gate(
         ).read_text()
     )
     assert run_config["temporal_output"] == {
-        "schema_version": "keypoint_temporal.output.v2",
+        "schema_version": "keypoint_temporal.output.v3",
         "status": "no_valid_output",
         "valid_frame_count": 0,
         "uncalibrated_frame_count": 3,

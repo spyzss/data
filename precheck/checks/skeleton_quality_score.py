@@ -28,6 +28,13 @@ GEOMETRY_METRIC_NAMES = (
     "joint_displacement_m_max",
 )
 
+STANDARDIZED_GEOMETRY_METRIC_BY_NATIVE = {
+    "joint_angle_change_deg_max": "joint_angle_change_standardized_deg_max",
+    "rotation_delta_max": "rotation_delta_standardized_max",
+    "joint_acceleration_m_s2_max": "joint_acceleration_standardized_m_s2_max",
+    "joint_displacement_m_max": "joint_displacement_standardized_m_max",
+}
+
 SKELETON_VERDICT_CODES = {
     "invalid": 0.0,
     "review": 1.0,
@@ -146,6 +153,9 @@ class SkeletonQualityScoreCheck(BaseCheck):
             config.get("candidate_merge_overlapping_only", True)
         )
         self.pass_threshold = float(config.get("pass_threshold", 0.90))
+        self.temporal_decision_timebase = str(
+            config.get("temporal_decision_timebase", "standardized")
+        )
         self.temporal_check = KeypointTemporalCheck(config)
         self.candidate_windows: list[dict[str, Any]] = []
 
@@ -182,10 +192,21 @@ class SkeletonQualityScoreCheck(BaseCheck):
                 projection_metrics,
             )
             ratios = self.metric_ratios(metric_values)
+            pair_eligibility_field = (
+                "standardized_temporal_pair_eligible"
+                if self.temporal_decision_timebase == "standardized"
+                else "temporal_pair_eligible"
+            )
             temporal_output_valid = bool(
-                temporal_result.metrics.get("temporal_pair_eligible", False)
+                temporal_result.metrics.get(pair_eligibility_field, False)
             ) and len(missing_metrics) < len(GEOMETRY_METRIC_NAMES)
-            if temporal_output_valid:
+            if bool(presence_metrics.get("keypoint_presence_invalid", 0.0)):
+                verdict = "invalid"
+                needs_mask_review = False
+                needs_rotation_review = False
+                source = "keypoint_presence"
+                severity = "fail"
+            elif temporal_output_valid:
                 (
                     verdict,
                     needs_mask_review,
@@ -218,16 +239,30 @@ class SkeletonQualityScoreCheck(BaseCheck):
                     episode_idx=clip.episode_idx,
                     frame_idx=temporal_result.frame_idx,
                     metrics={
-                        "joint_angle_change_deg_max": metric_values[
-                            "joint_angle_change_deg_max"
-                        ],
-                        "rotation_delta_max": metric_values["rotation_delta_max"],
-                        "joint_acceleration_m_s2_max": metric_values[
-                            "joint_acceleration_m_s2_max"
-                        ],
-                        "joint_displacement_m_max": metric_values[
-                            "joint_displacement_m_max"
-                        ],
+                        **{
+                            name: float(temporal_result.metrics.get(name, math.nan))
+                            for name in GEOMETRY_METRIC_NAMES
+                        },
+                        **{
+                            standardized: float(
+                                temporal_result.metrics.get(standardized, math.nan)
+                            )
+                            for standardized in STANDARDIZED_GEOMETRY_METRIC_BY_NATIVE.values()
+                        },
+                        "decision_metric_values": dict(metric_values),
+                        "decision_metric_source": (
+                            "standardized_30hz"
+                            if self.temporal_decision_timebase == "standardized"
+                            else "native_source_fps"
+                        ),
+                        "native_metric_source": temporal_result.metrics.get(
+                            "native_metric_source",
+                            "source_fps",
+                        ),
+                        "standardized_metric_source": temporal_result.metrics.get(
+                            "standardized_metric_source",
+                            "standardized_30hz",
+                        ),
                         "joint_angle_change_deg_penalty": penalties[
                             "joint_angle_change_deg_max"
                         ],
@@ -284,15 +319,34 @@ class SkeletonQualityScoreCheck(BaseCheck):
                         **{
                             key: temporal_result.metrics[key]
                             for key in (
-                                "temporal_pair_start_frame",
-                                "temporal_pair_end_frame",
-                                "temporal_transition_attribution",
+                                "standardized_sample_selected",
+                                "standardized_sample_index",
+                                "anchor_local_frame",
+                                "anchor_source_frame",
+                                "anchor_timestamp_seconds",
+                                "evidence_local_frames",
+                                "evidence_source_frames",
+                                "evidence_timestamps",
+                                "actual_dt_seconds",
+                                "actual_velocity_time_delta_seconds",
+                                "standardized_acceleration_time_delta_method",
+                                "temporal_target_hz",
+                                "timestamp_source",
+                                "sampling_method",
+                                "standardized_temporal_pair_eligible",
+                                "standardized_temporal_triple_eligible",
+                                "standardized_temporal_pair_skip_reason",
+                                "standardized_temporal_pair_start_frame",
+                                "standardized_temporal_pair_end_frame",
+                                "standardized_temporal_transition_attribution",
+                                "temporal_sampling_audit",
                                 "joint_position_abs_m_max",
                                 "joint_position_finite_coordinate_count",
                                 "joint_position_nonfinite_coordinate_count",
                             )
                             if key in temporal_result.metrics
                         },
+                        **self.decision_lineage_metrics(temporal_result.metrics),
                         **presence_metrics,
                         **palm_orientation_metrics,
                         **projection_metrics,
@@ -324,10 +378,52 @@ class SkeletonQualityScoreCheck(BaseCheck):
         return results
 
     def geometry_metric_values(self, metrics: dict[str, float]) -> dict[str, float]:
+        field_names = (
+            STANDARDIZED_GEOMETRY_METRIC_BY_NATIVE
+            if self.temporal_decision_timebase == "standardized"
+            else {name: name for name in GEOMETRY_METRIC_NAMES}
+        )
         return {
-            name: float(metrics.get(name, math.nan))
+            name: float(metrics.get(field_names[name], math.nan))
             for name in GEOMETRY_METRIC_NAMES
         }
+
+    def decision_lineage_metrics(
+        self,
+        metrics: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.temporal_decision_timebase == "standardized":
+            start = metrics.get("standardized_temporal_pair_start_frame")
+            end = metrics.get("standardized_temporal_pair_end_frame")
+            attribution = metrics.get(
+                "standardized_temporal_transition_attribution"
+            )
+        else:
+            start = metrics.get("temporal_pair_start_frame")
+            end = metrics.get("temporal_pair_end_frame")
+            attribution = metrics.get("temporal_transition_attribution")
+        payload: dict[str, Any] = {}
+        if start is not None and end is not None:
+            payload.update(
+                {
+                    "temporal_pair_start_frame": start,
+                    "temporal_pair_end_frame": end,
+                    "temporal_transition_attribution": attribution,
+                }
+            )
+        native_start = metrics.get("temporal_pair_start_frame")
+        native_end = metrics.get("temporal_pair_end_frame")
+        if native_start is not None and native_end is not None:
+            payload.update(
+                {
+                    "native_temporal_pair_start_frame": native_start,
+                    "native_temporal_pair_end_frame": native_end,
+                    "native_temporal_transition_attribution": metrics.get(
+                        "temporal_transition_attribution"
+                    ),
+                }
+            )
+        return payload
 
     def exceeded_thresholds(self, metric_values: dict[str, float]) -> list[str]:
         thresholds = self.thresholds()
@@ -788,18 +884,24 @@ class SkeletonQualityScoreCheck(BaseCheck):
         if bool(metrics.get("keypoint_presence_invalid", 0.0)):
             return None
         exceeded = set(metrics.get("which_thresholds_exceeded", []))
+        acceleration_value = self.decision_metric_value(
+            metrics,
+            "joint_acceleration_m_s2_max",
+        )
+        displacement_value = self.decision_metric_value(
+            metrics,
+            "joint_displacement_m_max",
+        )
         acceleration_seed = (
             "joint_acceleration_m_s2_max" in exceeded
-            and float(metrics.get("joint_acceleration_m_s2_max", 0.0))
-            > self.joint_acceleration_m_s2_max_threshold
+            and acceleration_value > self.joint_acceleration_m_s2_max_threshold
         )
         displacement_seed = (
             "joint_displacement_m_max" in exceeded
-            and float(metrics.get("joint_displacement_m_max", 0.0))
-            > self.joint_displacement_m_max_threshold
+            and displacement_value > self.joint_displacement_m_max_threshold
         )
         multi_signal_seed = len(exceeded.intersection(GEOMETRY_METRIC_NAMES)) >= 2
-        rotation_delta = float(metrics.get("rotation_delta_max", 0.0) or 0.0)
+        rotation_delta = self.decision_metric_value(metrics, "rotation_delta_max")
         extreme_rotation_seed = (
             self.rotation_delta_extreme_review_threshold is not None
             and math.isfinite(rotation_delta)
@@ -861,6 +963,21 @@ class SkeletonQualityScoreCheck(BaseCheck):
             "priority_score": self.temporal_seed_priority_score(metrics, reasons),
         }
 
+    @staticmethod
+    def decision_metric_value(metrics: dict[str, Any], name: str) -> float:
+        decision_values = metrics.get("decision_metric_values")
+        if isinstance(decision_values, dict) and name in decision_values:
+            value = decision_values[name]
+        elif metrics.get("decision_metric_source") == "standardized_30hz":
+            value = metrics.get(STANDARDIZED_GEOMETRY_METRIC_BY_NATIVE[name])
+        else:
+            value = metrics.get(name)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return math.nan
+        return numeric if math.isfinite(numeric) else math.nan
+
     def temporal_seed_priority_score(
         self,
         metrics: dict[str, Any],
@@ -921,12 +1038,16 @@ class SkeletonQualityScoreCheck(BaseCheck):
         clip: ClipInputs,
         run: dict[str, Any],
     ) -> dict[str, Any]:
+        min_frame = clip.frame_idx_at(0) if clip.num_frames else 0
         max_frame = clip.frame_idx_at(clip.num_frames - 1) if clip.num_frames else 0
         seed_run_start = int(run["seed_run_start"])
         seed_run_end = int(run["seed_run_end"])
         return {
             **run,
-            "start_frame": max(0, seed_run_start - self.candidate_pre_context_frames),
+            "start_frame": max(
+                min_frame,
+                seed_run_start - self.candidate_pre_context_frames,
+            ),
             "end_frame": min(max_frame, seed_run_end + self.candidate_post_context_frames),
         }
 
@@ -1025,6 +1146,11 @@ class SkeletonQualityScoreCheck(BaseCheck):
             "joint_displacement_m_max",
             "joint_acceleration_m_s2_max",
             "joint_angle_change_deg_max",
+            "rotation_delta_standardized_max",
+            "joint_displacement_standardized_m_max",
+            "joint_acceleration_standardized_m_s2_max",
+            "joint_angle_change_standardized_deg_max",
+            "decision_metric_source",
             "palm_camera_angle_deg_max",
             "left_palm_camera_angle_deg",
             "right_palm_camera_angle_deg",
@@ -1052,12 +1178,16 @@ class SkeletonQualityScoreCheck(BaseCheck):
     ) -> list[dict[str, Any]]:
         if not triggers:
             return []
+        min_frame = clip.frame_idx_at(0) if clip.num_frames else 0
         max_frame = clip.frame_idx_at(clip.num_frames - 1) if clip.num_frames else 0
         sorted_triggers = sorted(triggers, key=lambda item: item["frame_idx"])
         windows: list[dict[str, Any]] = []
         active: dict[str, Any] | None = None
         for trigger in sorted_triggers:
-            start = max(0, int(trigger["frame_idx"]) - self.candidate_pre_context_frames)
+            start = max(
+                min_frame,
+                int(trigger["frame_idx"]) - self.candidate_pre_context_frames,
+            )
             end = min(max_frame, int(trigger["frame_idx"]) + self.candidate_post_context_frames)
             if active is None or start > active["end_frame"] + self.candidate_merge_gap_frames:
                 if active is not None:

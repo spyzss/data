@@ -100,7 +100,7 @@ def _write_precheck_gate(context, *, candidate_hand: str = "left") -> None:
         metadata={
             "completed_modules": list(MODULES),
             "temporal_output": {
-                "schema_version": "keypoint_temporal.output.v2",
+                "schema_version": "keypoint_temporal.output.v3",
                 "status": "valid",
                 "valid_frame_count": 2,
                 "uncalibrated_frame_count": 1,
@@ -314,7 +314,7 @@ def test_qy_topology_modules_are_not_applicable_but_direct_2d_sam3_runs(
         (precheck_dir / "run_config.json").read_text(encoding="utf-8")
     )
     assert run_config["temporal_output"] == {
-        "schema_version": "keypoint_temporal.output.v2",
+        "schema_version": "keypoint_temporal.output.v3",
         "status": "not_applicable",
         "valid_frame_count": 0,
         "uncalibrated_frame_count": 3,

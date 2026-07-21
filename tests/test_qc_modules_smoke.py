@@ -238,6 +238,22 @@ def test_supplier_hdf5_loader_without_transforms(tmp_path: Path) -> None:
     }
 
 
+def test_supplier_hdf5_loader_does_not_invent_missing_fps(tmp_path: Path) -> None:
+    import h5py
+
+    path = tmp_path / "missing_fps.h5"
+    with h5py.File(path, "w") as handle:
+        transforms = handle.create_group("transforms")
+        transforms.create_dataset(
+            "leftHand",
+            data=np.repeat(np.eye(4, dtype=np.float32)[None, :, :], 3, axis=0),
+        )
+
+    clip = load_supplier_hdf5_clip(path, episode_idx=14)
+
+    assert clip.fps is None
+
+
 def test_supplier_hdf5_loader_mano_joints3d_schema(tmp_path: Path) -> None:
     import h5py
 

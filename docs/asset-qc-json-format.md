@@ -36,7 +36,7 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
   "schema_version": "asset_qc_report.v2",
   "qc_config": {
     "schema_version": "qc_acceptance_config_schema.v2",
-    "config_version": "qc_acceptance_v2.3.0",
+    "config_version": "qc_acceptance_v2.4.0",
     "config_name": "acceptance_gate",
     "config_path": "configs/qc_acceptance.yaml",
     "config_hash": "sha256:<64 lowercase hex characters>"
@@ -160,7 +160,7 @@ review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 ```json
 {
   "schema_version": "qc_acceptance_config_schema.v2",
-  "config_version": "qc_acceptance_v2.3.0",
+  "config_version": "qc_acceptance_v2.4.0",
   "config_name": "acceptance_gate",
   "config_path": "configs/qc_acceptance.yaml",
   "config_hash": "sha256:..."

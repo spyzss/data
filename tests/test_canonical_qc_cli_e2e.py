@@ -164,7 +164,9 @@ def test_canonical_config_active_alias_matches_immutable_validated_snapshot() ->
     }
     assert loaded.source_gate_rule_id not in registered_qc_rule_ids
     assert loaded.path == alias.resolve()
-    assert loaded.qc_config_path == (ROOT / "configs/qc_acceptance.yaml").resolve()
+    assert loaded.qc_config_path == (
+        ROOT / "configs/qc_acceptance/qc_acceptance_v2.3.0.yaml"
+    ).resolve()
 
 
 def test_canonical_config_rejects_runtime_version_and_qc_hash_drift(tmp_path: Path) -> None:

@@ -20,6 +20,10 @@ class KeypointTemporalConfig:
     project_2d: bool = True
     min_angle_degrees: float = 5.0
     max_angle_degrees: float = 175.0
+    temporal_decision_timebase: str = "standardized"
+    temporal_target_hz: float = 30.0
+    temporal_timestamp_source: str = "auto"
+    temporal_max_gap_factor: float = 3.0
 
 
 @dataclass
@@ -76,6 +80,10 @@ class SkeletonQualityScoreConfig:
     rotation_delta_max_threshold: float = 0.45
     joint_acceleration_m_s2_max_threshold: float = 15.0
     joint_displacement_m_max_threshold: float = 0.05
+    temporal_decision_timebase: str = "standardized"
+    temporal_target_hz: float = 30.0
+    temporal_timestamp_source: str = "auto"
+    temporal_max_gap_factor: float = 3.0
     decision_mode: str = "any_threshold"
     hard_exceeded_metric_count: int = 3
     strong_acceleration_ratio: float = 2.5

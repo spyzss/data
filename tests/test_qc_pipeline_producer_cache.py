@@ -109,6 +109,7 @@ def test_failed_video_recompute_preserves_previous_valid_artifact(
     [
         "precheck-session-v5-frame-survival-metadata",
         "precheck-session-v6-calibrated-temporal-output",
+        "precheck-session-v7-calibrated-temporal-validity",
     ],
 )
 def test_precheck_legacy_artifact_is_not_reused_by_current_session(

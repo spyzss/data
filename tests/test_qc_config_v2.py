@@ -22,7 +22,7 @@ def _write_config(tmp_path: Path, raw: dict[str, object]) -> Path:
 def test_default_config_is_v2_snapshot_with_two_profiles() -> None:
     loaded = load_qc_acceptance_config()
     assert loaded.schema_version == "qc_acceptance_config_schema.v2"
-    assert loaded.config_version == "qc_acceptance_v2.3.0"
+    assert loaded.config_version == "qc_acceptance_v2.4.0"
     assert loaded.default_profile == "acceptance"
     assert loaded.execution_profile("acceptance")["fail_action"] == "stop"
     assert loaded.execution_profile("supplier_evaluation")["fail_action"] == "record_and_continue"
@@ -71,7 +71,7 @@ def test_default_config_is_v2_snapshot_with_two_profiles() -> None:
 
 def test_active_config_matches_immutable_v2_snapshot() -> None:
     assert Path("configs/qc_acceptance.yaml").read_bytes() == Path(
-        "configs/qc_acceptance/qc_acceptance_v2.3.0.yaml"
+        "configs/qc_acceptance/qc_acceptance_v2.4.0.yaml"
     ).read_bytes()
     assert (
         hashlib.sha256(Path("configs/qc_acceptance/qc_acceptance_v1.1.0.yaml").read_bytes()).hexdigest()
@@ -106,6 +106,25 @@ def test_temporal_no_valid_output_rule_is_versioned() -> None:
         "rule_id": "keypoint_temporal.no_valid_output",
         "verdict": "warn",
     }
+
+
+def test_temporal_decision_timebase_is_explicit_and_schema_validated(
+    tmp_path: Path,
+) -> None:
+    parameters = load_qc_acceptance_config().module_parameters(
+        "keypoint_temporal"
+    )
+    assert parameters["temporal_decision_timebase"] == "standardized"
+    assert parameters["temporal_target_hz"] == 30.0
+    assert parameters["temporal_timestamp_source"] == "auto"
+    assert parameters["temporal_max_gap_factor"] == 3.0
+
+    raw = copy.deepcopy(load_qc_acceptance_config().raw)
+    raw["modules"]["keypoint_temporal"]["parameters"][
+        "temporal_timestamp_source"
+    ] = "guessed"
+    with pytest.raises(ValueError, match="temporal_timestamp_source"):
+        load_qc_acceptance_config(_write_config(tmp_path, raw))
 
 
 def test_v2_schema_requires_supplier_data_audit_module() -> None:

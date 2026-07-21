@@ -860,6 +860,43 @@ def test_temporal_non_strong_row_without_candidate_is_warn() -> None:
     assert result.issues[0].rule_id == "keypoint_temporal.skeleton_quality_score"
 
 
+def test_temporal_issue_reports_standardized_observed_metric_and_lineage() -> None:
+    row = CheckResult(
+        "skeleton_quality_score",
+        0,
+        104,
+        {
+            "temporal_output_valid": True,
+            "decision_metric_source": "standardized_30hz",
+            "skeleton_verdict": "suspect",
+            "which_thresholds_exceeded": ["joint_acceleration_m_s2_max"],
+            "joint_acceleration_m_s2_max": 1_000.0,
+            "joint_acceleration_standardized_m_s2_max": 16.0,
+            "standardized_temporal_pair_start_frame": 102,
+            "standardized_temporal_pair_end_frame": 104,
+            "standardized_temporal_transition_attribution": "target_frame",
+        },
+        True,
+        "standardized temporal threshold exceeded",
+        severity="warn",
+    )
+
+    result = adapt_keypoint_temporal(
+        asset_id="a",
+        source_relative_path="parquet/a.parquet",
+        results=[row],
+        candidate_windows=[],
+        config=loaded_test_config(),
+    )
+
+    assert result.verdict == "warn"
+    issue = result.issues[0]
+    assert issue.metric == "joint_acceleration_standardized_m_s2_max"
+    assert issue.observed_value == 16.0
+    assert issue.context["temporal_pair_start_frame"] == 102
+    assert issue.context["temporal_pair_end_frame"] == 104
+
+
 def test_raw_uncalibrated_temporal_rows_are_review_not_pass() -> None:
     rows = [
         CheckResult(

@@ -305,6 +305,7 @@ def test_jdt_adapter_reshapes_3d_and_preserves_cam_left_2d(tmp_path: Path) -> No
     assert clip.text_label["language_instruction"] == "instruction-3"
     assert getattr(clip, "primary_camera") == "observation.images.cam_left"
     assert getattr(clip, "morphology_status") == "not_ready_topology"
+    assert clip.fps is None
 
 
 def test_text_integrity_prefers_nonempty_manifest_scene_and_task() -> None:
@@ -672,6 +673,13 @@ def test_manifest_precheck_outputs_source_frame_mapping_and_candidate_windows(
         == "skeleton_quality_score.keypoint_presence_invalid"
     )
     assert run_config["topology_status"] == "not_ready_topology"
+    assert run_config["temporal_output_schema_version"] == (
+        "keypoint_temporal.output.v3"
+    )
+    temporal_sampling = run_config["temporal_sampling_by_asset"]["dr-range"]
+    assert temporal_sampling["decision_metric_source"] == "standardized_30hz"
+    assert temporal_sampling["temporal_target_hz"] == 30.0
+    assert temporal_sampling["source_frame_mapping"] == list(range(3, 11))
     for filename in (
         "check_results.json",
         "check_results.parquet",
@@ -708,6 +716,48 @@ def test_source_result_mapping_does_not_double_shift_existing_pair_lineage() -> 
     assert mapped.frame_idx == 51
     assert mapped.metrics["temporal_pair_start_frame"] == 50
     assert mapped.metrics["temporal_pair_end_frame"] == 51
+
+
+def test_standardized_source_lineage_maps_once_and_preserves_local_evidence() -> None:
+    from qc_common.types import CheckResult
+    from tools.run_manifest_precheck import _result_in_source_coordinates
+
+    local = CheckResult(
+        "skeleton_quality_score",
+        0,
+        4,
+        {
+            "anchor_local_frame": 4,
+            "anchor_source_frame": 4,
+            "evidence_local_frames": [0, 2, 4],
+            "evidence_source_frames": [0, 2, 4],
+            "standardized_temporal_pair_start_frame": 2,
+            "standardized_temporal_pair_end_frame": 4,
+            "temporal_sampling_audit": {
+                "source_frame_mapping": [0, 2, 4],
+            },
+        },
+        False,
+        "local standardized lineage",
+        severity="pass",
+    )
+
+    mapped = _result_in_source_coordinates(local, clip_start_frame=100)
+    mapped_twice = _result_in_source_coordinates(mapped, clip_start_frame=100)
+
+    assert mapped.frame_idx == 104
+    assert mapped.metrics["anchor_local_frame"] == 4
+    assert mapped.metrics["anchor_source_frame"] == 104
+    assert mapped.metrics["evidence_local_frames"] == [0, 2, 4]
+    assert mapped.metrics["evidence_source_frames"] == [100, 102, 104]
+    assert mapped.metrics["standardized_temporal_pair_start_frame"] == 102
+    assert mapped.metrics["standardized_temporal_pair_end_frame"] == 104
+    assert mapped.metrics["temporal_sampling_audit"]["source_frame_mapping"] == [
+        100,
+        102,
+        104,
+    ]
+    assert mapped_twice.metrics == mapped.metrics
 
 
 def test_candidate_window_maps_local_boundaries_to_source_once() -> None:

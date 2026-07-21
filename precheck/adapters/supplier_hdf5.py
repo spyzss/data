@@ -82,8 +82,10 @@ def load_supplier_hdf5_clip(
                 if key in handle.attrs:
                     discovered_fps = float(handle.attrs[key])
                     break
-        if discovered_fps is None:
-            discovered_fps = 30.0
+        if discovered_fps is not None and (
+            not np.isfinite(discovered_fps) or discovered_fps <= 0.0
+        ):
+            discovered_fps = None
 
     if keypoints:
         num_frames = int(next(iter(keypoints.values())).shape[0])

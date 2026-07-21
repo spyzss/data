@@ -86,7 +86,7 @@ SAM3 只读取本轮 precheck 写出的 `module_outputs/<asset_id>/precheck/cand
 
 DR 与 Potentia 的 `supplier_evaluation` 通过独立 `supplier_data_audit` producer 接入。DR 默认一个 task 一个 asset，并在同一 manifest 行保留 head/left_wrist/right_wrist 三路视频。DR HDF5 manifest 要求通过 CLI/config 显式选择 reference dataset；当前仓库不替供应商猜默认值，云端确认正式契约后可明确选择 `timestamp`。`joints3d` 是必需 dataset，`valid` 是 optional hand-level validity；存在时必须与 reference 等长，缺失时以 finite joint values 建立 validity。DR precheck fingerprint 额外记录 `deepreach-hdf5-precheck-v2`，防止复用旧 adapter artifact，同时不改 JD 的 v7 identity。Potentia 的 package 只是运输分区，一个 task 目录一个 asset。CSV timestamp 必须通过 `s/ms/us/ns` 或单一显式 scale 归一化为秒；标定缩放无法解释时默认 review，只有供应商配置明确为 `fail` 才升级。supplier audit 只做文件、CSV、IMU、标定和轨迹结构审计，不修改 precheck/video 原始输出，也不生成第二套文本 verdict。
 
-当前 cache identity 为 `precheck-session-v7-calibrated-temporal-validity` 和 `supplier-data-audit-producer-v3`；外层仍是 `qc_producer_run_config.v1`，并分别记录 temporal output schema 与 supplier audit raw schema identity。
+当前 cache identity 为 `precheck-session-v8-standardized-temporal-timebase` 和 `supplier-data-audit-producer-v3`；外层仍是 `qc_producer_run_config.v1`。Temporal output schema 为 `keypoint_temporal.output.v3`：原生 FPS 相邻帧指标仅作诊断保留，score 和 candidate window 使用按 timestamp（无 timestamp 时按 source frame / resolved FPS）最近且不重复采样的 30 Hz standardized metrics。Run config 同时记录 sample→source-frame lineage 和异常时间戳计数； supplier audit 仍独立记录 raw schema identity。
 
 云端小样本构建、pipeline、projection overlay 和状态审计命令见 `docs/dr_potentia_supplier_evaluation_cloud_smoke_zh.md`。
 

@@ -115,12 +115,14 @@ def load_canonical_qc_config(path: Path | None = None) -> LoadedCanonicalQcConfi
     if qc_hash != expected_qc_hash or qc_version != expected_qc_version:
         matches = []
         for candidate in sorted((root / "configs/qc_acceptance").glob("*.yaml")):
-            payload, candidate_hash, candidate_version = qc_identity(candidate)
+            candidate_payload, candidate_hash, candidate_version = qc_identity(
+                candidate
+            )
             if (
                 candidate_hash == expected_qc_hash
                 and candidate_version == expected_qc_version
             ):
-                matches.append((candidate, payload))
+                matches.append((candidate, candidate_payload))
         if len(matches) != 1:
             raise ValueError(
                 "configured QC snapshot identity does not match any immutable snapshot"

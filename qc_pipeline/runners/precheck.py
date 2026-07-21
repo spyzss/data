@@ -35,8 +35,8 @@ MODULES = (
     "keypoint_morphology",
     "keypoint_temporal",
 )
-_IMPLEMENTATION_VERSION = "precheck-session-v7-calibrated-temporal-validity"
-_TEMPORAL_OUTPUT_SCHEMA_VERSION = "keypoint_temporal.output.v2"
+_IMPLEMENTATION_VERSION = "precheck-session-v8-standardized-temporal-timebase"
+_TEMPORAL_OUTPUT_SCHEMA_VERSION = "keypoint_temporal.output.v3"
 _FRAME_SURVIVAL_MODULES = frozenset(
     {"keypoint_presence", "keypoint_morphology", "keypoint_temporal"}
 )
@@ -844,6 +844,21 @@ class PrecheckSession:
             }
             if temporal_output is not None:
                 metadata["temporal_output"] = temporal_output
+            temporal_sampling = next(
+                (
+                    row.metrics.get("temporal_sampling_audit")
+                    for row in self._raw_results.get("keypoint_temporal", ())
+                    if isinstance(
+                        row.metrics.get("temporal_sampling_audit"), Mapping
+                    )
+                ),
+                None,
+            )
+            if isinstance(temporal_sampling, Mapping):
+                metadata["temporal_sampling"] = {
+                    **dict(temporal_sampling),
+                    "schema_version": _TEMPORAL_OUTPUT_SCHEMA_VERSION,
+                }
             write_run_config(
                 staging,
                 producer="precheck",
