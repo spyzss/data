@@ -18,6 +18,16 @@ class _BatchFeature(dict):
         return self[name]
 
 
+class _FakeBaseModelOutputWithPooling:
+    def __init__(self, *, pooler_output) -> None:
+        self.pooler_output = pooler_output
+
+
+class CLIPTextModelOutput:
+    def __init__(self, *, text_embeds) -> None:
+        self.text_embeds = text_embeds
+
+
 class _FakeProcessor:
     def __init__(self, resolution: int, *, center_masks: bool = False) -> None:
         self.image_processor = SimpleNamespace(
@@ -141,6 +151,8 @@ class _TaggedModelBase(_FakeModel):
         pooled = np.asarray(input_ids[:, :1, None], dtype=np.float32)
         if self.output_kind == "model_output":
             return SimpleNamespace(pooler_output=pooled)
+        if self.output_kind == "clip_text_model_output":
+            return CLIPTextModelOutput(text_embeds=pooled)
         return pooled
 
     def _record_forward(self, *, vision_embeds, pooled, attention_mask):
@@ -311,7 +323,7 @@ def _contract_backend(
         device="cuda",
         requested_resolution=None,
         effective_resolution=(resolution, resolution),
-        model_output_factory=SimpleNamespace,
+        model_output_factory=_FakeBaseModelOutputWithPooling,
         transformers_version="test-transformers",
     )
     return backend, model, processor
@@ -373,6 +385,25 @@ def test_model_output_forward_contract_can_wrap_tensor_feature_output() -> None:
 
     assert model.pair_orders == [[(0, 0), (0, 1)]]
     assert model.text_feature_calls == 1
+
+
+def test_clip_text_model_output_uses_text_embeds_and_standard_forward_wrapper() -> None:
+    backend, model, _processor = _contract_backend(
+        32,
+        forward_contract="model_output",
+        output_kind="clip_text_model_output",
+    )
+
+    backend.segment_batch(
+        [np.zeros((32, 32, 3), dtype=np.uint8)],
+        ["q0", "q1"],
+        {},
+    )
+
+    assert model.pair_orders == [[(0, 0), (0, 1)]]
+    assert backend.source_text_embedding_type.endswith(".CLIPTextModelOutput")
+    assert backend.source_pooled_field == "text_embeds"
+    assert backend.forward_wrapper_type.endswith("._FakeBaseModelOutputWithPooling")
 
 
 def test_tensor_forward_contract_accepts_pooled_tensor() -> None:
@@ -595,6 +626,9 @@ def test_outputs_record_actual_resolution_agreement_timing_and_coverage(
     assert run_config["artifacts"]["overlays_saved"] is False
     assert run_config["transformers_version"] == "unavailable"
     assert run_config["text_embedding_output_type"] == "types.SimpleNamespace"
+    assert run_config["source_text_embedding_type"] == "types.SimpleNamespace"
+    assert run_config["source_pooled_field"] == "pooler_output"
+    assert run_config["forward_wrapper_type"] is None
     assert run_config["text_embedding_forward_contract"] == "tensor"
     assert run_config["text_embedding_pooler_shape"] == [5, 4, 3]
     assert run_config["expanded_attention_mask_shape"]["baseline/batch_2"] == [

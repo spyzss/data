@@ -68,7 +68,8 @@ class CachedTextEmbedding:
 
     pooled_tensor: Any
     attention_mask: Any
-    output_type: str
+    source_type: str
+    pooled_field: str
     model_output_factory: Callable[..., Any] | None
 
 
@@ -143,6 +144,10 @@ def _move_to_device(value: Any, device: str) -> Any:
 def _qualified_type_name(value: Any) -> str:
     value_type = type(value)
     return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _qualified_symbol_name(value: Any) -> str:
+    return f"{value.__module__}.{value.__qualname__}"
 
 
 def _installed_transformers_version() -> str:
@@ -267,6 +272,9 @@ class HuggingFaceSam3BatchBackend:
         self.text_embedding_forward_contract = _text_embedding_forward_contract(
             model
         )
+        self.source_text_embedding_type: str | None = None
+        self.source_pooled_field: str | None = None
+        self.forward_wrapper_type: str | None = None
         self.text_embedding_output_type: str | None = None
         self.text_embedding_pooler_shape: tuple[int, ...] | None = None
         self.expanded_attention_mask_shapes: list[tuple[int, ...]] = []
@@ -336,24 +344,36 @@ class HuggingFaceSam3BatchBackend:
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs.get("attention_mask"),
             )
-        has_pooler_output = hasattr(output, "pooler_output")
-        pooled_tensor = output.pooler_output if has_pooler_output else output
+        if getattr(output, "pooler_output", None) is not None:
+            pooled_tensor = output.pooler_output
+            pooled_field = "pooler_output"
+        elif getattr(output, "text_embeds", None) is not None:
+            pooled_tensor = output.text_embeds
+            pooled_field = "text_embeds"
+        else:
+            pooled_tensor = output
+            pooled_field = "tensor"
         _batch_size(pooled_tensor)
         output_factory: Callable[..., Any] | None = None
         if self.text_embedding_forward_contract == "base_model_output_with_pooling":
-            if has_pooler_output:
-                output_factory = type(output)
-            else:
-                output_factory = (
-                    self._model_output_factory or _default_model_output_factory()
-                )
+            output_factory = (
+                self._model_output_factory or _default_model_output_factory()
+            )
         cached = CachedTextEmbedding(
             pooled_tensor=pooled_tensor,
             attention_mask=inputs.get("attention_mask"),
-            output_type=_qualified_type_name(output),
+            source_type=_qualified_type_name(output),
+            pooled_field=pooled_field,
             model_output_factory=output_factory,
         )
-        self.text_embedding_output_type = cached.output_type
+        self.source_text_embedding_type = cached.source_type
+        self.source_pooled_field = cached.pooled_field
+        self.forward_wrapper_type = (
+            _qualified_symbol_name(output_factory)
+            if output_factory is not None
+            else None
+        )
+        self.text_embedding_output_type = cached.source_type
         self.text_embedding_pooler_shape = tuple(
             int(value) for value in pooled_tensor.shape
         )
@@ -793,6 +813,9 @@ def benchmark_jdt_sam3_throughput(
         current_text_metadata = {
             "transformers_version": backend.transformers_version,
             "text_embedding_output_type": backend.text_embedding_output_type,
+            "source_text_embedding_type": backend.source_text_embedding_type,
+            "source_pooled_field": backend.source_pooled_field,
+            "forward_wrapper_type": backend.forward_wrapper_type,
             "text_embedding_forward_contract": (
                 backend.text_embedding_forward_contract
             ),
