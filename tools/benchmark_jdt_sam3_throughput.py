@@ -8,12 +8,17 @@ formal exhaustive producer, its artifacts, or its resume/checkpoint contract.
 from __future__ import annotations
 
 import argparse
+import ast
 from dataclasses import dataclass
+import dis
 import gc
+import inspect
+from importlib.metadata import PackageNotFoundError, version as package_version
 import json
 import math
 from pathlib import Path
 import sys
+import textwrap
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -55,6 +60,16 @@ class BatchSegmentationOutput:
     preprocess_seconds: float
     inference_seconds: float
     postprocess_seconds: float
+
+
+@dataclass(frozen=True)
+class CachedTextEmbedding:
+    """Canonical pooled tensor plus the runtime container needed by forward."""
+
+    pooled_tensor: Any
+    attention_mask: Any
+    output_type: str
+    model_output_factory: Callable[..., Any] | None
 
 
 def _to_numpy(value: Any) -> np.ndarray:
@@ -125,6 +140,60 @@ def _move_to_device(value: Any, device: str) -> Any:
     return value.to(device) if hasattr(value, "to") else value
 
 
+def _qualified_type_name(value: Any) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _installed_transformers_version() -> str:
+    try:
+        return package_version("transformers")
+    except PackageNotFoundError:
+        return "unavailable"
+
+
+def _text_embedding_forward_contract(model: Any) -> str:
+    """Detect the model's text-embedding contract once during initialization."""
+    forward = getattr(model, "forward", None) or getattr(model, "__call__")
+    target = inspect.unwrap(forward)
+    try:
+        instructions = list(dis.get_instructions(target))
+    except (TypeError, ValueError):
+        instructions = []
+    for index, instruction in enumerate(instructions):
+        if instruction.opname != "LOAD_FAST" or instruction.argval != "text_embeds":
+            continue
+        nearby = instructions[index + 1 : index + 5]
+        if any(
+            item.opname in {"LOAD_ATTR", "LOAD_METHOD"}
+            and item.argval == "pooler_output"
+            for item in nearby
+        ):
+            return "base_model_output_with_pooling"
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(target)))
+    except (IndentationError, OSError, SyntaxError, TypeError):
+        tree = None
+    if tree is not None:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute) or node.attr != "pooler_output":
+                continue
+            if isinstance(node.value, ast.Name) and node.value.id == "text_embeds":
+                return "base_model_output_with_pooling"
+    return "tensor"
+
+
+def _default_model_output_factory() -> Callable[..., Any]:
+    try:
+        from transformers.modeling_outputs import BaseModelOutputWithPooling
+    except ImportError as exc:  # pragma: no cover - real runtime dependency
+        raise RuntimeError(
+            "SAM3 forward requires BaseModelOutputWithPooling but transformers "
+            "modeling outputs are unavailable"
+        ) from exc
+    return BaseModelOutputWithPooling
+
+
 def _positive_resolution(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -179,6 +248,8 @@ class HuggingFaceSam3BatchBackend:
         device: str,
         requested_resolution: int | None,
         effective_resolution: tuple[int, int] | None = None,
+        model_output_factory: Callable[..., Any] | None = None,
+        transformers_version: str | None = None,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -188,7 +259,17 @@ class HuggingFaceSam3BatchBackend:
         self.effective_resolution = effective_resolution or _runtime_resolution(
             processor, model
         )
-        self._text_cache: dict[tuple[str, ...], tuple[Any, Any]] = {}
+        self._text_cache: dict[tuple[str, ...], CachedTextEmbedding] = {}
+        self._model_output_factory = model_output_factory
+        self.transformers_version = (
+            transformers_version or _installed_transformers_version()
+        )
+        self.text_embedding_forward_contract = _text_embedding_forward_contract(
+            model
+        )
+        self.text_embedding_output_type: str | None = None
+        self.text_embedding_pooler_shape: tuple[int, ...] | None = None
+        self.expanded_attention_mask_shapes: list[tuple[int, ...]] = []
         self.vision_forward_call_count = 0
         self.model_forward_call_count = 0
 
@@ -242,7 +323,7 @@ class HuggingFaceSam3BatchBackend:
             return int(cuda.max_memory_allocated())
         return 0
 
-    def _text_features(self, queries: Sequence[str]) -> tuple[Any, Any]:
+    def _text_features(self, queries: Sequence[str]) -> CachedTextEmbedding:
         key = tuple(str(query) for query in queries)
         cached = self._text_cache.get(key)
         if cached is not None:
@@ -255,14 +336,45 @@ class HuggingFaceSam3BatchBackend:
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs.get("attention_mask"),
             )
-        embeddings = getattr(output, "pooler_output", output)
-        cached = (embeddings, inputs.get("attention_mask"))
+        has_pooler_output = hasattr(output, "pooler_output")
+        pooled_tensor = output.pooler_output if has_pooler_output else output
+        _batch_size(pooled_tensor)
+        output_factory: Callable[..., Any] | None = None
+        if self.text_embedding_forward_contract == "base_model_output_with_pooling":
+            if has_pooler_output:
+                output_factory = type(output)
+            else:
+                output_factory = (
+                    self._model_output_factory or _default_model_output_factory()
+                )
+        cached = CachedTextEmbedding(
+            pooled_tensor=pooled_tensor,
+            attention_mask=inputs.get("attention_mask"),
+            output_type=_qualified_type_name(output),
+            model_output_factory=output_factory,
+        )
+        self.text_embedding_output_type = cached.output_type
+        self.text_embedding_pooler_shape = tuple(
+            int(value) for value in pooled_tensor.shape
+        )
         self._text_cache[key] = cached
         return cached
 
     def prime_queries(self, queries: Sequence[str]) -> None:
         """Build the fixed prompt embedding once, outside measured frame batches."""
         self._text_features(queries)
+
+    def reset_expanded_attention_mask_shapes(self) -> None:
+        self.expanded_attention_mask_shapes.clear()
+
+    def _forward_text_embedding(
+        self, cached: CachedTextEmbedding, repeated_tensor: Any
+    ) -> Any:
+        if self.text_embedding_forward_contract == "tensor":
+            return repeated_tensor
+        if cached.model_output_factory is None:
+            raise RuntimeError("missing BaseModelOutputWithPooling factory")
+        return cached.model_output_factory(pooler_output=repeated_tensor)
 
     def segment_batch(
         self,
@@ -305,17 +417,24 @@ class HuggingFaceSam3BatchBackend:
         self._synchronize()
         inference_started = time.perf_counter()
         with self.torch.no_grad():
-            text_embeds, attention_mask = self._text_features(queries)
+            cached_text = self._text_features(queries)
             vision_embeds = self.model.get_vision_features(pixel_values=pixel_values)
             self.vision_forward_call_count += 1
             paired_vision = _repeat_frame_batch(
                 vision_embeds, query_count, frame_count
             )
-            paired_text = _tile_query_batch(
-                text_embeds, frame_count, query_count
+            paired_pooled_text = _tile_query_batch(
+                cached_text.pooled_tensor, frame_count, query_count
             )
             paired_attention = _tile_query_batch(
-                attention_mask, frame_count, query_count
+                cached_text.attention_mask, frame_count, query_count
+            )
+            if paired_attention is not None:
+                self.expanded_attention_mask_shapes.append(
+                    tuple(int(value) for value in paired_attention.shape)
+                )
+            paired_text = self._forward_text_embedding(
+                cached_text, paired_pooled_text
             )
             outputs = self.model(
                 vision_embeds=paired_vision,
@@ -657,6 +776,8 @@ def benchmark_jdt_sam3_throughput(
     baseline_hands: list[dict[str, Any]] | None = None
     baseline_frames: list[dict[str, Any]] | None = None
     baseline_resolution: tuple[int, int] | None = None
+    text_runtime_metadata: dict[str, Any] | None = None
+    expanded_attention_shapes: dict[str, list[list[int]]] = {}
 
     for requested_label, requested_resolution in resolutions:
         model_load_started = time.perf_counter()
@@ -669,6 +790,22 @@ def benchmark_jdt_sam3_throughput(
         query_embedding_started = time.perf_counter()
         backend.prime_queries(queries)
         query_embedding_seconds = time.perf_counter() - query_embedding_started
+        current_text_metadata = {
+            "transformers_version": backend.transformers_version,
+            "text_embedding_output_type": backend.text_embedding_output_type,
+            "text_embedding_forward_contract": (
+                backend.text_embedding_forward_contract
+            ),
+            "text_embedding_pooler_shape": list(
+                backend.text_embedding_pooler_shape or ()
+            ),
+        }
+        if text_runtime_metadata is None:
+            text_runtime_metadata = current_text_metadata
+        elif current_text_metadata != text_runtime_metadata:
+            raise RuntimeError(
+                "text embedding runtime contract changed between resolutions"
+            )
 
         resolution_started = time.perf_counter()
         resized_frames = [
@@ -693,6 +830,7 @@ def benchmark_jdt_sam3_throughput(
             for chunk in _chunks(resized_frames[:warmup_count], batch_size):
                 backend.segment_batch(chunk, queries, sam3_config)
 
+            backend.reset_expanded_attention_mask_shapes()
             backend.reset_peak_memory()
             start_model_calls = backend.model_forward_call_count
             start_vision_calls = backend.vision_forward_call_count
@@ -708,6 +846,13 @@ def benchmark_jdt_sam3_throughput(
                 postprocess_seconds += output.postprocess_seconds
             if len(masks_by_frame) != len(requests):
                 raise ValueError("SAM3 batch output did not preserve frame coverage")
+            shape_key = f"{requested_label}/batch_{batch_size}"
+            expanded_attention_shapes[shape_key] = [
+                list(shape)
+                for shape in dict.fromkeys(
+                    backend.expanded_attention_mask_shapes
+                )
+            ]
 
             scoring_started = time.perf_counter()
             hand_rows, frame_rows = _score_configuration(
@@ -786,6 +931,18 @@ def benchmark_jdt_sam3_throughput(
                     ),
                     "model_load_seconds": model_load_seconds,
                     "query_embedding_seconds": query_embedding_seconds,
+                    "text_embedding_output_type": (
+                        backend.text_embedding_output_type
+                    ),
+                    "text_embedding_forward_contract": (
+                        backend.text_embedding_forward_contract
+                    ),
+                    "text_embedding_pooler_shape": json.dumps(
+                        list(backend.text_embedding_pooler_shape or ())
+                    ),
+                    "expanded_attention_mask_shape": json.dumps(
+                        expanded_attention_shapes[shape_key]
+                    ),
                 }
             )
 
@@ -799,6 +956,7 @@ def benchmark_jdt_sam3_throughput(
     assert baseline_hands is not None
     assert baseline_frames is not None
     assert baseline_resolution is not None
+    assert text_runtime_metadata is not None
     pd.DataFrame(result_rows).to_csv(output_dir / "benchmark_results.csv", index=False)
     _write_json(
         output_dir / "benchmark_results.json",
@@ -841,6 +999,8 @@ def benchmark_jdt_sam3_throughput(
             "source_frame_coverage_valid": source_frame_coverage_valid,
         },
         "artifacts": {"raw_masks_saved": False, "overlays_saved": False},
+        **text_runtime_metadata,
+        "expanded_attention_mask_shape": expanded_attention_shapes,
     }
     _write_json(output_dir / "run_config.json", run_config)
     return {
