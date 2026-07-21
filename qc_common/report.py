@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from qc_common.report_migration import migrate_v1_to_v2
-from qc_common.schema import validate_asset_qc_report
+from qc_common.schema import ReportValidationError, validate_asset_qc_report
 
 
 class StaleReportRevisionError(RuntimeError):
@@ -96,6 +96,19 @@ def write_asset_qc_report(
             raise ValueError(
                 f"report_revision must be {expected_revision + 1}, got {next_revision}"
             )
+
+        manual = report_to_write.get("manual_review")
+        if (
+            report_to_write.get("schema_version") == "asset_qc_report.v2"
+            and isinstance(manual, Mapping)
+            and manual.get("state") == "completed"
+        ):
+            for field in ("completion_mode", "failure_reason"):
+                if field not in manual:
+                    raise ReportValidationError(
+                        "asset QC report validation failed at "
+                        f"manual_review.{field}: is required when writing completed v2"
+                    )
 
         validate_asset_qc_report(report_to_write)
         payload = json.dumps(report_to_write, ensure_ascii=False, indent=2).encode(

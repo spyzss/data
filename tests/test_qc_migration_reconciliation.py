@@ -104,6 +104,7 @@ def test_v1_migration_marks_only_fully_reviewed_completed_manual_reports() -> No
             "state": "completed",
             "candidate_issue_ids": ["warn-1", "warn-2"],
             "selected_issue_ids": ["warn-1", "warn-2"],
+            "selected_issue_id": "warn-1",
             "issue_reviews": {"warn-1": {"verdict": "fail"}},
             "completed_at": "2026-07-15T00:00:00Z",
         }
@@ -121,3 +122,24 @@ def test_v1_migration_marks_only_fully_reviewed_completed_manual_reports() -> No
     assert "completion_mode" not in migrated_incomplete["manual_review"]
     assert "failure_reason" not in migrated_incomplete["manual_review"]
     validate_asset_qc_report(migrated_incomplete)
+
+
+def test_v1_migration_marks_fully_reviewed_fail_as_early_fail() -> None:
+    completed = make_v1_video_report()
+    completed["manual_review"].update(
+        {
+            "state": "completed",
+            "candidate_issue_ids": ["warn-1", "warn-2"],
+            "selected_issue_ids": ["warn-1", "warn-2"],
+            "selected_issue_id": "warn-2",
+            "issue_reviews": {
+                "warn-1": {"verdict": "pass"},
+                "warn-2": {"verdict": "fail"},
+            },
+            "completed_at": "2026-07-15T00:00:00Z",
+        }
+    )
+
+    migrated = migrate_v1_to_v2(completed, config_reference=completed["qc_config"])
+
+    assert migrated["manual_review"]["completion_mode"] == "early_fail"
