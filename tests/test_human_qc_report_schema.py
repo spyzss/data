@@ -197,6 +197,36 @@ def test_write_rejects_legacy_completed_v2_without_canonical_fields(
         write_asset_qc_report(tmp_path / "quality_archive" / "legacy.json", report, 0)
 
 
+def test_write_allows_completed_publisher_reviews_without_warn_completion_fields(
+    tmp_path: Path,
+) -> None:
+    report = make_v2_report()
+    report["manual_review"] = {
+        "required": True,
+        "state": "completed",
+        "candidate_issue_ids": ["warn-1"],
+        "selected_issue_ids": ["warn-1"],
+        "failures_for_batch_stats_issue_ids": [],
+        "reviews": [
+            {
+                "review_id": "review-000001",
+                "issue_id": "warn-1",
+                "reviewer": "reviewer-001",
+                "reviewed_at": "2026-07-15T00:00:00Z",
+                "verdict": "accept_issue",
+                "asset_action": "accept_with_risk",
+                "comment": "已核验",
+                "evidence_paths": [],
+            }
+        ],
+    }
+    path = tmp_path / "quality_archive" / "publisher.json"
+
+    write_asset_qc_report(path, report, 0)
+
+    assert load_asset_qc_report(path) == report
+
+
 def test_completed_early_fail_records_canonical_failure_reason() -> None:
     report = make_v2_report()
     report["manual_review"] = make_manual_block(

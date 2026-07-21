@@ -58,3 +58,4 @@ hf-cache/
 outputs/
 *_outputs.tar.gz
 test_*_batch/quality_archive/
+.superpowers/sdd/
