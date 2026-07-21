@@ -205,12 +205,7 @@ def _validate_manual_review(block: Mapping[str, Any]) -> None:
         # Canonical Publisher reports use the formal review-record array. The
         # publisher validates its stronger record semantics separately.
         return
-    if state == "completed" and "completion_mode" not in block:
-        # A historical completed block has no way to distinguish an
-        # all-reviewed completion from an early-fail completion.  Keep it
-        # readable; migration canonicalizes only records that prove the
-        # all-reviewed invariant.
-        return
+    legacy_completed = state == "completed" and "completion_mode" not in block
     is_human_block = bool(human_fields.intersection(block))
     if not is_human_block:
         return
@@ -306,6 +301,11 @@ def _validate_manual_review(block: Mapping[str, Any]) -> None:
             _human_validation_error(
                 "manual_review.completed_at", "is required when state is completed"
             )
+        if legacy_completed:
+            # Historical completed records predate completion_mode and
+            # failure_reason. They remain readable, but still have to meet
+            # the established candidate/selection/review/completed-at shape.
+            return
         if completion_mode == "early_fail":
             if not any(
                 review.get("verdict") == "fail" for review in reviews.values()
@@ -319,6 +319,14 @@ def _validate_manual_review(block: Mapping[str, Any]) -> None:
                 _human_validation_error(
                     "manual_review.issue_reviews",
                     "completed all_reviewed review must cover every selected issue ID",
+                )
+            if any(
+                reviews[issue_id].get("verdict") != "pass"
+                for issue_id in selected_set
+            ):
+                _human_validation_error(
+                    "manual_review.completion_mode",
+                    "all_reviewed requires every selected review to be Pass",
                 )
         else:
             _human_validation_error(

@@ -45,7 +45,21 @@ def migrate_v1_to_v2(
     if has_all_selected_reviews:
         manual.setdefault("selected_issue_id", None)
         manual.setdefault("completed_at", None)
-        manual.setdefault("completion_mode", "all_reviewed")
+        selected_reviews = [issue_reviews[issue_id] for issue_id in selected_ids]
+        if all(
+            isinstance(review, Mapping) and review.get("verdict") == "pass"
+            for review in selected_reviews
+        ):
+            completion_mode = "all_reviewed"
+        elif any(
+            isinstance(review, Mapping) and review.get("verdict") == "fail"
+            for review in selected_reviews
+        ):
+            completion_mode = "early_fail"
+        else:
+            completion_mode = None
+        if completion_mode is not None:
+            manual.setdefault("completion_mode", completion_mode)
         manual.setdefault("failure_reason", None)
     elif manual.get("state") != "completed":
         manual.setdefault("selected_issue_ids", [])

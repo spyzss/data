@@ -130,6 +130,73 @@ def test_completed_manual_review_requires_every_selected_verdict() -> None:
         validate_asset_qc_report(report)
 
 
+def test_completed_all_reviewed_rejects_a_fail_verdict() -> None:
+    report = make_v2_report()
+    report["manual_review"] = make_manual_block(
+        state="completed",
+        candidate_issue_ids=["warn-1", "warn-2"],
+        selected_issue_ids=["warn-1", "warn-2"],
+        issue_reviews={
+            "warn-1": make_review("pass"),
+            "warn-2": make_review("fail"),
+        },
+        completed_at="2026-07-15T00:00:00Z",
+    )
+    report["manual_review"]["completion_mode"] = "all_reviewed"
+
+    with pytest.raises(ReportValidationError, match="completion_mode"):
+        validate_asset_qc_report(report)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_path"),
+    [
+        ("selected_issue_ids", ["warn-2"], "selected_issue_ids"),
+        ("issue_reviews", {"warn-1": {"verdict": "unknown"}}, "verdict"),
+        ("completed_at", None, "completed_at"),
+    ],
+)
+def test_legacy_completed_review_still_enforces_existing_structure(
+    field: str,
+    value: object,
+    error_path: str,
+) -> None:
+    report = make_v2_report()
+    report["manual_review"] = make_manual_block(
+        state="completed",
+        candidate_issue_ids=["warn-1"],
+        selected_issue_ids=["warn-1"],
+        issue_reviews={"warn-1": make_review("pass")},
+        completed_at="2026-07-15T00:00:00Z",
+    )
+    report["manual_review"][field] = value
+
+    with pytest.raises(ReportValidationError, match=error_path):
+        validate_asset_qc_report(report)
+
+
+@pytest.mark.parametrize("missing_field", ["completion_mode", "failure_reason"])
+def test_write_rejects_legacy_completed_v2_without_canonical_fields(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    report = make_v2_report()
+    report["manual_review"] = make_manual_block(
+        state="completed",
+        candidate_issue_ids=["warn-1"],
+        selected_issue_ids=["warn-1"],
+        issue_reviews={"warn-1": make_review("pass")},
+        completed_at="2026-07-15T00:00:00Z",
+    )
+    report["manual_review"].update(
+        {"completion_mode": "all_reviewed", "failure_reason": None}
+    )
+    del report["manual_review"][missing_field]
+
+    with pytest.raises(ReportValidationError, match=missing_field):
+        write_asset_qc_report(tmp_path / "quality_archive" / "legacy.json", report, 0)
+
+
 def test_completed_early_fail_records_canonical_failure_reason() -> None:
     report = make_v2_report()
     report["manual_review"] = make_manual_block(
@@ -413,6 +480,8 @@ def test_initialize_human_blocks_and_update_once_preserve_machine_payload(
                 "issue_reviews": {"warn-1": make_review("pass")},
                 "state": "completed",
                 "completed_at": "2026-07-15T00:00:00Z",
+                "completion_mode": "all_reviewed",
+                "failure_reason": None,
             }
         )
         candidate["pipeline_state"].update(
