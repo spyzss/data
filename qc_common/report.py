@@ -102,6 +102,7 @@ def write_asset_qc_report(
             report_to_write.get("schema_version") == "asset_qc_report.v2"
             and isinstance(manual, Mapping)
             and manual.get("state") == "completed"
+            and not ("reviews" in manual and "issue_reviews" not in manual)
         ):
             for field in ("completion_mode", "failure_reason"):
                 if field not in manual:
