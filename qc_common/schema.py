@@ -12,6 +12,9 @@ class ReportValidationError(ValueError):
     """Raised when an asset QC report violates its versioned contract."""
 
 
+_COMPLETION_MODES = frozenset({"all_reviewed", "early_fail"})
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -34,6 +37,27 @@ def _human_validation_error(path: str, message: str) -> None:
 
 def _is_string_sequence(value: object) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+
+def _validate_failure_reason(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping) or value.get("mode") != "manual":
+        _human_validation_error("manual_review.failure_reason", "must use manual mode")
+    codes = value.get("reason_codes")
+    if (
+        not _is_string_sequence(codes)
+        or any(not isinstance(code, str) or not code for code in codes)
+        or len(set(codes)) != len(codes)
+    ):
+        _human_validation_error(
+            "manual_review.failure_reason.reason_codes", "must contain unique codes"
+        )
+    other = str(value.get("other_text") or "").strip()
+    if "other" in codes and not other:
+        _human_validation_error(
+            "manual_review.failure_reason.other_text", "is required for other"
+        )
 
 
 def _validate_pending_snapshot(
@@ -181,6 +205,12 @@ def _validate_manual_review(block: Mapping[str, Any]) -> None:
         # Canonical Publisher reports use the formal review-record array. The
         # publisher validates its stronger record semantics separately.
         return
+    if state == "completed" and "completion_mode" not in block:
+        # A historical completed block has no way to distinguish an
+        # all-reviewed completion from an early-fail completion.  Keep it
+        # readable; migration canonicalizes only records that prove the
+        # all-reviewed invariant.
+        return
     is_human_block = bool(human_fields.intersection(block))
     if not is_human_block:
         return
@@ -262,20 +292,48 @@ def _validate_manual_review(block: Mapping[str, Any]) -> None:
             )
 
     completed_at = block.get("completed_at")
+    completion_mode = block.get("completion_mode")
+    if "completion_mode" in block and completion_mode not in _COMPLETION_MODES | {None}:
+        _human_validation_error(
+            "manual_review.completion_mode",
+            "must be null, 'all_reviewed', or 'early_fail'",
+        )
+    if "failure_reason" in block:
+        _validate_failure_reason(block.get("failure_reason"))
+
     if state == "completed":
         if not isinstance(completed_at, str) or not completed_at:
             _human_validation_error(
                 "manual_review.completed_at", "is required when state is completed"
             )
-        if not selected_set.issubset(review_ids):
+        if completion_mode == "early_fail":
+            if not any(
+                review.get("verdict") == "fail" for review in reviews.values()
+            ):
+                _human_validation_error(
+                    "manual_review.completion_mode",
+                    "early_fail requires at least one Fail review",
+                )
+        elif completion_mode == "all_reviewed":
+            if not selected_set.issubset(review_ids):
+                _human_validation_error(
+                    "manual_review.issue_reviews",
+                    "completed all_reviewed review must cover every selected issue ID",
+                )
+        else:
             _human_validation_error(
-                "manual_review.issue_reviews",
-                "completed review must cover every selected issue ID",
+                "manual_review.completion_mode",
+                "must be set when completed",
             )
-    elif completed_at is not None:
-        _human_validation_error(
-            "manual_review.completed_at", "must be null before completion"
-        )
+    else:
+        if completed_at is not None:
+            _human_validation_error(
+                "manual_review.completed_at", "must be null before completion"
+            )
+        if completion_mode is not None:
+            _human_validation_error(
+                "manual_review.completion_mode", "must be null before completion"
+            )
 
 
 def _validate_human_blocks(report: Mapping[str, Any]) -> None:

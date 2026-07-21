@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Sequence
 from typing import Any, Mapping
 
 
@@ -25,13 +26,34 @@ def migrate_v1_to_v2(
     migrated.setdefault("issues", [])
     migrated.setdefault("runtime_errors", [])
     manual = migrated.setdefault("manual_review", {})
+    if not isinstance(manual, dict):
+        raise ValueError("manual_review must be an object")
     manual.setdefault("state", "not_evaluated")
     manual.setdefault("candidate_issue_ids", [])
     manual.setdefault("failures_for_batch_stats_issue_ids", [])
-    manual.setdefault("selected_issue_ids", [])
-    manual.setdefault("selected_issue_id", None)
-    manual.setdefault("issue_reviews", {})
-    manual.setdefault("completed_at", None)
+    selected_ids = manual.get("selected_issue_ids")
+    issue_reviews = manual.get("issue_reviews")
+    is_selected_sequence = isinstance(selected_ids, Sequence) and not isinstance(
+        selected_ids, (str, bytes, bytearray)
+    )
+    has_all_selected_reviews = (
+        manual.get("state") == "completed"
+        and is_selected_sequence
+        and isinstance(issue_reviews, Mapping)
+        and set(selected_ids).issubset(issue_reviews)
+    )
+    if has_all_selected_reviews:
+        manual.setdefault("selected_issue_id", None)
+        manual.setdefault("completed_at", None)
+        manual.setdefault("completion_mode", "all_reviewed")
+        manual.setdefault("failure_reason", None)
+    elif manual.get("state") != "completed":
+        manual.setdefault("selected_issue_ids", [])
+        manual.setdefault("selected_issue_id", None)
+        manual.setdefault("issue_reviews", {})
+        manual.setdefault("completed_at", None)
+        manual.setdefault("completion_mode", None)
+        manual.setdefault("failure_reason", None)
     semantic = migrated.setdefault("semantic_calibration", {})
     if not isinstance(semantic, dict):
         raise ValueError("semantic_calibration must be an object")

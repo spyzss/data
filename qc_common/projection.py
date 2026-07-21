@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,32 @@ class ProjectionConfig:
     image_width: int
     image_height: int
     border_margin_px: float = 20.0
+
+
+def project_manual_review_counts(
+    manual_review: Mapping[str, Any],
+) -> dict[str, int]:
+    """Project selected Warn-review outcome counts from one report block."""
+
+    selected_ids = manual_review.get("selected_issue_ids", ())
+    reviews = manual_review.get("issue_reviews", {})
+    if not isinstance(selected_ids, (list, tuple)):
+        raise ValueError("manual_review.selected_issue_ids must be a sequence")
+    if not isinstance(reviews, Mapping):
+        raise ValueError("manual_review.issue_reviews must be an object")
+
+    selected_set = set(selected_ids)
+    reviewed_ids = selected_set.intersection(reviews)
+    confirmed_fail_count = sum(
+        isinstance(reviews[issue_id], Mapping)
+        and reviews[issue_id].get("verdict") == "fail"
+        for issue_id in reviewed_ids
+    )
+    return {
+        "human_reviewed_warn_count": len(reviewed_ids),
+        "human_confirmed_fail_count": confirmed_fail_count,
+        "unreviewed_selected_warn_count": len(selected_set - reviewed_ids),
+    }
 
 
 def apply_rigid_transform(

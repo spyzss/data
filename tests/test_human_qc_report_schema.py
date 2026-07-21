@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-from qc_common.schema import validate_asset_qc_report
+from qc_common.schema import ReportValidationError, validate_asset_qc_report
 from qc_common.manual_review import select_pending_manual_review_candidates
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report, write_asset_qc_report
 from human_qc.report_updates import (
@@ -124,8 +124,87 @@ def test_completed_manual_review_requires_every_selected_verdict() -> None:
         issue_reviews={"warn-1": make_review("pass")},
         completed_at="2026-07-15T00:00:00Z",
     )
+    report["manual_review"]["completion_mode"] = "all_reviewed"
 
     with pytest.raises(ValueError):
+        validate_asset_qc_report(report)
+
+
+def test_completed_early_fail_records_canonical_failure_reason() -> None:
+    report = make_v2_report()
+    report["manual_review"] = make_manual_block(
+        state="completed",
+        candidate_issue_ids=["warn-1", "warn-2", "warn-3"],
+        selected_issue_ids=["warn-1", "warn-2", "warn-3"],
+        issue_reviews={"warn-1": make_review("fail")},
+        completed_at="2026-07-15T00:00:00Z",
+    )
+    report["manual_review"].update(
+        {
+            "completion_mode": "early_fail",
+            "failure_reason": {
+                "mode": "manual",
+                "reason_codes": ["occlusion", "other"],
+                "other_text": "手被工具完全遮挡",
+            },
+        }
+    )
+
+    validate_asset_qc_report(report)
+
+    assert report["manual_review"]["completion_mode"] == "early_fail"
+    assert report["manual_review"]["failure_reason"] == {
+        "mode": "manual",
+        "reason_codes": ["occlusion", "other"],
+        "other_text": "手被工具完全遮挡",
+    }
+
+
+@pytest.mark.parametrize(
+    ("completion_mode", "failure_reason", "issue_reviews", "error_path"),
+    [
+        (
+            "early_fail",
+            {"mode": "manual", "reason_codes": ["other"], "other_text": "  "},
+            {"warn-1": make_review("fail")},
+            "failure_reason.other_text",
+        ),
+        (
+            "early_fail",
+            None,
+            {"warn-1": make_review("pass")},
+            "completion_mode",
+        ),
+        (
+            "all_reviewed",
+            None,
+            {"warn-1": make_review("pass")},
+            "issue_reviews",
+        ),
+    ],
+)
+def test_completed_manual_review_rejects_invalid_completion_contract(
+    completion_mode: str,
+    failure_reason: dict | None,
+    issue_reviews: dict,
+    error_path: str,
+) -> None:
+    report = make_v2_report()
+    report["manual_review"] = make_manual_block(
+        state="completed",
+        candidate_issue_ids=["warn-1", "warn-2"],
+        selected_issue_ids=["warn-1", "warn-2"],
+        issue_reviews=issue_reviews,
+        completed_at="2026-07-15T00:00:00Z",
+    )
+    report["manual_review"].update(
+        {
+            "completion_mode": completion_mode,
+            "failure_reason": failure_reason,
+        }
+    )
+
+    with pytest.raises(ReportValidationError, match=error_path):
         validate_asset_qc_report(report)
 
 
