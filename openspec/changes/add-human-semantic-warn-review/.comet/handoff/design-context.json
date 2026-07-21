@@ -1,0 +1,18 @@
+{
+  "change": "add-human-semantic-warn-review",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "8ae05893aee75bbaf34c255c673e096a054a56f5ebf27a937ea633e5e1154d96",
+  "files": [
+    { "path": "openspec/changes/add-human-semantic-warn-review/proposal.md", "sha256": "118f10c3656c48194fdd7be26203ae0c2fa9eba0c6f8996904448e85006ae542" },
+    { "path": "openspec/changes/add-human-semantic-warn-review/design.md", "sha256": "f13f279074fe5877cf9eb5bd6a988896a7b9bd7099bc741a6c79cff086648b6b" },
+    { "path": "openspec/changes/add-human-semantic-warn-review/tasks.md", "sha256": "6be267b90ea24a9ef8440f5ac7745be79093553dde8844a35043c665c58531b9" },
+    { "path": "openspec/changes/add-human-semantic-warn-review/specs/human-qc-workbench/spec.md", "sha256": "30323ccb073bd364f773d012d12ef65a587e574736cf1aa6d3a58b332b1ef252" },
+    { "path": "openspec/changes/add-human-semantic-warn-review/specs/qc-json-batch-aggregation/spec.md", "sha256": "c885a64e0ad3a6d49f2f638851a90be99ea8e1d9c4ffb42c8c39169f523c380c" },
+    { "path": "openspec/changes/add-human-semantic-warn-review/specs/qc-pipeline-execution/spec.md", "sha256": "c3d98d5a42565483052880ea650b26374fbdf8f7353d14b83b7806cfcaad5aa7" },
+    { "path": "openspec/changes/add-human-semantic-warn-review/specs/semantic-calibration/spec.md", "sha256": "d16415fe4ea1c7c63ae26ca8381a66d1a9e32524f0b4bc99a093441c823078f6" },
+    { "path": "openspec/changes/add-human-semantic-warn-review/specs/warn-human-review/spec.md", "sha256": "73b7fe7739c49e1ab3a5777bfc00c8db7a77d9aca7e88c8270725ea36c7be85c" }
+  ]
+}

@@ -38,3 +38,39 @@
 - [x] 6.2 测试全 Pass 跳过人工质检、warn 人工 Pass、warn 人工 Fail 和多 warn 未完成四类流程
 - [x] 6.3 测试浏览器刷新、并发 reviewer stale revision、overlay 生成失败和 HDF5 原子写入失败
 - [x] 6.4 运行全量测试并验证每份最终 QC JSON 可独立生成资产质量报告
+
+## 7. Warn 完成与原因合同重构
+
+- [ ] 7.1 扩展 QC JSON Schema，加入 `completion_mode`、资产级 `failure_reason`、未查看 selected issue 兼容和审计约束
+- [ ] 7.2 以测试驱动改造 Warn service，支持 `all_reviewed`、`early_fail`、完成前修改 verdict、人工原因覆盖和 Other 必填
+- [ ] 7.3 更新批次投影，仅统计实际 issue review，并单独统计 early-fail 后未查看 Warn
+- [ ] 7.4 为旧报告添加兼容读取与显式迁移测试，已完成历史报告保持只读
+
+## 8. 模块切割与流水线门禁反转
+
+- [ ] 8.1 将语义领域代码、API、静态页面和启动入口迁入独立 `semantic_calibration` 包
+- [ ] 8.2 将 `human_qc` 收敛为 Warn-only，移除对语义 Service、adapter、DOM 和 HDF5 API 的运行时依赖
+- [ ] 8.3 调整 pipeline 为自动 QC → Warn 人工复核 → 语义校准，并覆盖无候选、全 Pass、early Fail 和自动 hard-fail profile 场景
+- [ ] 8.4 保留自动 lease/revision 并为两个独立服务验证路由与依赖边界
+
+## 9. 整段视频与 Warning 时间轴
+
+- [ ] 9.1 提供安全原视频 URL、FPS、总帧数、规范化半开区间、阈值提示和原因选项 DTO，并支持 HTTP Range
+- [ ] 9.2 以 ES modules 拆分 `WarnReviewApp`、`VideoController`、`WarningTimeline` 和 `ReviewPanel`
+- [ ] 9.3 实现真实帧宽度、重叠合并、窄色块、可进入弹层、色块跳起始帧和可拖动蓝色时间针
+- [ ] 9.4 实现视频聚焦后的左右键逐帧、六档倍速持久化、唯一当前帧和视频/判定状态分离
+- [ ] 9.5 实现同时命中 Warning 的确定 Pass 顺序、已通过标志、已判定项修改和底部完成/资产导航
+- [ ] 9.6 实现人工原因先选后 Fail、多选取消、Other 输入框和直接资产切换丢弃未提交草稿
+
+## 10. SAM3 区间连续 Overlay
+
+- [ ] 10.1 扩展 evidence worker，只对 SAM3 问题帧并集生成连续 overlay，并去重重叠帧
+- [ ] 10.2 实现基于源视频、区间、模型/config 和 renderer 版本的有界缓存、异步状态和失败恢复
+- [ ] 10.3 在浏览器中将无控制条 overlay 层与原视频的播放、暂停、seek、逐帧和倍速同步
+- [ ] 10.4 只预加载当前和下一个 overlay，并仅在非 ready 时锁定对应 SAM3 Warning
+
+## 11. 验证与文档同步
+
+- [ ] 11.1 增加 Python、Node、DOM、API 和浏览器测试，覆盖 120–181 重叠区间与 early-fail 完整流程
+- [ ] 11.2 同步 PRD、JSON 格式、reviewer guide 和启动说明中的 Warn 前置流转与新操作规则
+- [ ] 11.3 运行 Python/Node 全量测试、OpenSpec strict 验证、静态资源验收和 `git diff --check`
