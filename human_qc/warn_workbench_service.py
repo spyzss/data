@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 import math
 from pathlib import Path
 import re
@@ -24,6 +25,24 @@ from .warn_service import WarnReviewService, WarnRevisionError, WarnStateError
 
 
 _STABLE_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}").fullmatch
+_UNSAFE_PUBLIC_TEXT = re.compile(
+    r"[/\\]|(?:command|cmd)\s*[:=]|\b(?:ffmpeg|traceback|stack\s+trace)\b",
+    re.IGNORECASE,
+).search
+_MANUAL_REVIEW_STATES = frozenset(
+    {
+        "not_evaluated",
+        "queued",
+        "in_progress",
+        "completed",
+        "not_required",
+        "skipped_due_to_fail",
+    }
+)
+_COMPLETION_MODES = frozenset({"all_reviewed", "early_fail"})
+_THRESHOLD_OPERATORS = frozenset({"<", "<=", ">", ">=", "==", "!="})
+_REVIEW_VERDICTS = frozenset({"pass", "fail", "warn"})
+_AUDIT_ACTIONS = frozenset({"resubmitted", "failure_reason_changed"})
 
 
 class InvalidIssueRangeError(WarnStateError):
@@ -137,12 +156,28 @@ class WarnIssueDto:
 
 
 @dataclass(frozen=True)
+class ReviewAuditDto:
+    action: Literal["resubmitted", "failure_reason_changed"]
+    issue_id: str | None
+    reviewed_at: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "action": self.action,
+            "issue_id": self.issue_id,
+            "reviewed_at": self.reviewed_at,
+        }
+
+
+@dataclass(frozen=True)
 class WarnTaskDto:
     asset_id: str
     report_revision: int
     manual_review_state: str
     completion_mode: str | None
     failure_reason: dict[str, object] | None
+    review_audit: tuple[ReviewAuditDto, ...]
+    can_complete: bool
     video: VideoDto
     issues: tuple[WarnIssueDto, ...]
     reason_options: tuple[ReasonOptionDto, ...]
@@ -155,6 +190,8 @@ class WarnTaskDto:
             "manual_review_state": self.manual_review_state,
             "completion_mode": self.completion_mode,
             "failure_reason": self.failure_reason,
+            "review_audit": [entry.to_dict() for entry in self.review_audit],
+            "can_complete": self.can_complete,
             "video": self.video.to_dict(),
             "issues": [issue.to_dict() for issue in self.issues],
             "reason_options": [option.to_dict() for option in self.reason_options],
@@ -228,17 +265,37 @@ def normalize_issue_range(
     return FrameRangeDto(start, end)
 
 
-def _safe_text(value: object, *, fallback: str | None = None) -> str | None:
+def _safe_code(value: object) -> str | None:
+    return value if isinstance(value, str) and _STABLE_CODE(value) else None
+
+
+def _safe_display_text(value: object, *, fallback: str | None = None) -> str | None:
     if not isinstance(value, str):
         return fallback
-    normalized = value.strip()
-    if not normalized:
+    normalized = " ".join(value.strip().split())
+    if (
+        not normalized
+        or len(normalized) > 128
+        or _UNSAFE_PUBLIC_TEXT(normalized) is not None
+    ):
         return fallback
-    return normalized[:256]
+    return normalized
+
+
+def _safe_timestamp(value: object) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
 
 
 def _safe_scalar(value: object) -> object | None:
-    if value is None or isinstance(value, (str, bool, int)):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
@@ -246,7 +303,9 @@ def _safe_scalar(value: object) -> object | None:
         result: list[object] = []
         for item in value:
             safe = _safe_scalar(item)
-            if isinstance(item, (Mapping, list, tuple)) or (item is not None and safe is None):
+            if isinstance(item, (Mapping, list, tuple)) or (
+                item is not None and safe is None
+            ):
                 return None
             result.append(safe)
         return result
@@ -256,12 +315,12 @@ def _safe_scalar(value: object) -> object | None:
 def _threshold(issue: Mapping[str, Any]) -> dict[str, object] | None:
     configured = issue.get("threshold")
     if isinstance(configured, Mapping):
-        operator = _safe_text(configured.get("operator"))
+        operator = configured.get("operator")
         value = _safe_scalar(configured.get("value"))
     else:
-        operator = _safe_text(issue.get("operator"))
+        operator = issue.get("operator")
         value = _safe_scalar(issue.get("boundary_value"))
-    if operator is None or value is None:
+    if operator not in _THRESHOLD_OPERATORS or value is None:
         return None
     return {"operator": operator, "value": value}
 
@@ -270,36 +329,82 @@ def _review(value: object) -> dict[str, object] | None:
     if not isinstance(value, Mapping):
         return None
     result: dict[str, object] = {}
-    for field in (
-        "verdict",
-        "effective_verdict",
-        "machine_verdict",
-        "reason",
-        "reviewer",
-        "reviewed_at",
-    ):
-        safe = _safe_text(value.get(field))
-        if safe is not None:
-            result[field] = safe
+    for field in ("verdict", "effective_verdict", "machine_verdict"):
+        raw = value.get(field)
+        if raw in _REVIEW_VERDICTS:
+            result[field] = raw
+    reason = _safe_code(value.get("reason"))
+    if reason is not None:
+        result["reason"] = reason
+    reviewer = _safe_display_text(value.get("reviewer"))
+    if reviewer is not None:
+        result["reviewer"] = reviewer
+    reviewed_at = _safe_timestamp(value.get("reviewed_at"))
+    if reviewed_at is not None:
+        result["reviewed_at"] = reviewed_at
     return result or None
 
 
 def _failure_reason(value: object) -> dict[str, object] | None:
     if not isinstance(value, Mapping):
         return None
+    if value.get("mode") != "manual":
+        return None
     raw_codes = value.get("reason_codes")
     if isinstance(raw_codes, (str, bytes, bytearray)) or not isinstance(
         raw_codes, Sequence
     ):
         return None
-    codes = [code for code in (_safe_text(item) for item in raw_codes) if code]
-    if not codes:
+    codes = [_safe_code(item) for item in raw_codes]
+    allowed_codes = {option.code for option in REASON_OPTIONS}
+    if not codes or any(code is None or code not in allowed_codes for code in codes):
+        return None
+    other_text = _safe_display_text(value.get("other_text"))
+    if "other" in codes and other_text is None:
         return None
     return {
-        "mode": _safe_text(value.get("mode"), fallback="manual"),
+        "mode": "manual",
         "reason_codes": codes,
-        "other_text": _safe_text(value.get("other_text")),
+        "other_text": other_text,
     }
+
+
+def _manual_state(value: object) -> str:
+    if not isinstance(value, str) or value not in _MANUAL_REVIEW_STATES:
+        raise WarnStateError("invalid manual review state")
+    return value
+
+
+def _completion_mode(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in _COMPLETION_MODES:
+        raise WarnStateError("invalid manual review completion mode")
+    return value
+
+
+def _review_audit(
+    value: object, selected_issue_ids: set[str]
+) -> tuple[ReviewAuditDto, ...]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        return ()
+    result: list[ReviewAuditDto] = []
+    for entry in value:
+        if not isinstance(entry, Mapping):
+            continue
+        action = entry.get("action")
+        if not isinstance(action, str) or action not in _AUDIT_ACTIONS:
+            continue
+        issue_id = entry.get("issue_id")
+        if issue_id is not None and (
+            not isinstance(issue_id, str) or issue_id not in selected_issue_ids
+        ):
+            continue
+        reviewed_at = _safe_timestamp(entry.get("reviewed_at"))
+        if reviewed_at is None:
+            continue
+        result.append(ReviewAuditDto(action, issue_id, reviewed_at))  # type: ignore[arg-type]
+    return tuple(result)
 
 
 class WarnWorkbenchService:
@@ -417,6 +522,28 @@ class WarnWorkbenchService:
             return LeaseDto(True, None, None, "lease_invalid")
         return LeaseDto(False, lease.token, lease.expires_at, None)
 
+    @classmethod
+    def _can_complete(cls, report: Mapping[str, Any]) -> bool:
+        if not cls._is_editable(report):
+            return False
+        manual = cls._manual(report)
+        selected = manual.get("selected_issue_ids")
+        reviews = manual.get("issue_reviews")
+        if not isinstance(selected, (list, tuple)) or not selected:
+            return False
+        if not isinstance(reviews, Mapping):
+            return False
+        selected_reviews = [reviews.get(issue_id) for issue_id in selected]
+        if any(
+            isinstance(review, Mapping) and review.get("verdict") == "fail"
+            for review in selected_reviews
+        ):
+            return True
+        return all(
+            isinstance(review, Mapping) and review.get("verdict") == "pass"
+            for review in selected_reviews
+        )
+
     def _overlay(
         self,
         asset_id: str,
@@ -492,18 +619,18 @@ class WarnWorkbenchService:
             if issue is None:
                 raise WarnStateError(f"selected issue {issue_id} is missing from report")
             frame_range = normalize_issue_range(issue, total_frames)
-            code = _safe_text(issue.get("code"), fallback=issue_id) or issue_id
+            code = _safe_code(issue.get("code")) or _safe_code(issue_id) or "issue"
             result.append(
                 WarnIssueDto(
                     id=issue_id,
                     display_name=(
-                        _safe_text(issue.get("display_name"))
-                        or _safe_text(issue.get("title"))
+                        _safe_display_text(issue.get("display_name"))
+                        or _safe_display_text(issue.get("title"))
                         or code
                     ),
                     frame_range=frame_range,
                     default_reason=(
-                        _safe_text(issue.get("default_reason"))
+                        _safe_display_text(issue.get("default_reason"))
                         or code
                     ),
                     threshold=_threshold(issue),
@@ -528,12 +655,21 @@ class WarnWorkbenchService:
         revision = report.get("report_revision", 0)
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             raise WarnStateError("report_revision must be a non-negative integer")
+        manual_state = _manual_state(manual.get("state", "not_evaluated"))
+        completion_mode = _completion_mode(manual.get("completion_mode"))
+        selected = manual.get("selected_issue_ids")
+        if not isinstance(selected, (list, tuple)) or any(
+            not isinstance(item, str) or not item for item in selected
+        ):
+            raise WarnStateError("manual_review.selected_issue_ids must contain strings")
         dto = WarnTaskDto(
             asset_id=asset_id,
             report_revision=revision,
-            manual_review_state=str(manual.get("state", "not_evaluated")),
-            completion_mode=_safe_text(manual.get("completion_mode")),
+            manual_review_state=manual_state,
+            completion_mode=completion_mode,
             failure_reason=_failure_reason(manual.get("failure_reason")),
+            review_audit=_review_audit(manual.get("review_audit"), set(selected)),
+            can_complete=self._can_complete(report),
             video=VideoDto(
                 f"/media/assets/{quote(asset_id, safe='')}/source",
                 source.fps,
@@ -660,6 +796,7 @@ __all__ = [
     "OverlayDto",
     "REASON_OPTIONS",
     "ReasonOptionDto",
+    "ReviewAuditDto",
     "VideoDto",
     "WarnIssueDto",
     "WarnTaskDto",

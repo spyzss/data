@@ -374,6 +374,141 @@ def test_source_media_supports_full_and_strict_single_ranges(tmp_path: Path) -> 
         _stop(server, thread)
 
 
+def test_source_media_head_is_bodyless_for_full_range_and_416(tmp_path: Path) -> None:
+    from tests.test_human_qc_workbench import _service
+
+    service, _, _, context = _service(tmp_path)
+    source = context.batch_root / context.source_files["video"]["path"]
+    size = source.stat().st_size
+    server, thread = _running_server(service)
+    try:
+        status, headers, body = _request_raw(
+            server, "HEAD", "/media/assets/asset-1/source"
+        )
+        assert status == 200
+        assert body == b""
+        assert headers["Content-Length"] == str(size)
+        assert headers["Accept-Ranges"] == "bytes"
+
+        status, headers, body = _request_raw(
+            server,
+            "HEAD",
+            "/media/assets/asset-1/source",
+            headers={"Range": "bytes=0-99"},
+        )
+        assert status == 206
+        assert body == b""
+        assert headers["Content-Length"] == "100"
+        assert headers["Content-Range"] == f"bytes 0-99/{size}"
+
+        status, headers, body = _request_raw(
+            server,
+            "HEAD",
+            "/media/assets/asset-1/source",
+            headers={"Range": "bytes=0-1,4-5"},
+        )
+        assert status == 416
+        assert body == b""
+        assert headers["Content-Range"] == f"bytes */{size}"
+        assert headers["Content-Type"].startswith("application/json")
+    finally:
+        _stop(server, thread)
+
+
+def test_known_route_unsupported_method_is_json_405_and_unknown_is_404() -> None:
+    facade = FakeFacade()
+    server, thread = _running_server(facade)
+    try:
+        status, headers, value = _request_json(
+            server, "PUT", "/api/warn/assets/asset-1/complete", {}
+        )
+        assert status == 405
+        assert headers["Content-Type"].startswith("application/json")
+        assert headers["Allow"] == "POST"
+        assert value["error"]["code"] == "method_not_allowed"
+
+        status, headers, value = _request_json(
+            server, "BREW", "/api/warn/assets/asset-1/complete", {}
+        )
+        assert status == 405
+        assert headers["Content-Type"].startswith("application/json")
+        assert value["error"]["code"] == "method_not_allowed"
+
+        status, headers, value = _request_json(
+            server, "PUT", "/api/warn/assets/asset-1/not-a-route", {}
+        )
+        assert status == 404
+        assert headers["Content-Type"].startswith("application/json")
+        assert value["error"]["code"] == "not_found"
+    finally:
+        _stop(server, thread)
+
+
+def test_hard_reload_recovers_fixed_reviewer_lease_via_opaque_session(
+    tmp_path: Path,
+) -> None:
+    from tests.test_human_qc_workbench import _service
+
+    service, _, _, _ = _service(tmp_path)
+    server, thread = _running_server(service)
+    try:
+        fixed_session = "a" * 32
+        status, headers, first = _request_json(
+            server,
+            "GET",
+            "/api/warn/assets/asset-1/task",
+            headers={"Cookie": f"warn_reviewer_session={fixed_session}"},
+        )
+        assert status == 200
+        token = first["task"]["lease"]["token"]
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        assert token not in cookie
+        assert "alice" not in cookie
+        assert fixed_session not in cookie
+
+        status, _, reloaded = _request_json(
+            server,
+            "GET",
+            "/api/warn/assets/asset-1/task",
+            headers={"Cookie": cookie},
+        )
+        assert status == 200
+        assert reloaded["task"]["lease"]["read_only"] is False
+        assert reloaded["task"]["lease"]["token"] == token
+    finally:
+        _stop(server, thread)
+
+
+def test_source_replacement_between_catalog_and_stream_is_rejected(tmp_path: Path) -> None:
+    from tests.test_human_qc_workbench import _service
+
+    service, _, _, context = _service(tmp_path)
+    source = context.batch_root / context.source_files["video"]["path"]
+
+    class ReplacingSourceFacade:
+        def __getattr__(self, name: str):
+            return getattr(service, name)
+
+        def source_media(self, asset_id: str):
+            resource = service.source_media(asset_id)
+            replacement = source.with_suffix(".replacement")
+            replacement.write_bytes(b"z" * resource.size)
+            replacement.replace(source)
+            return resource
+
+    server, thread = _running_server(ReplacingSourceFacade())
+    try:
+        status, headers, value = _request_json(
+            server, "GET", "/media/assets/asset-1/source"
+        )
+        assert status == 404
+        assert headers["Content-Type"].startswith("application/json")
+        assert value["error"]["code"] == "source_video_unavailable"
+        assert "z" * 32 not in json.dumps(value)
+    finally:
+        _stop(server, thread)
+
+
 def test_overlay_media_is_allowlisted_per_asset(tmp_path: Path) -> None:
     from tests.test_human_qc_workbench import _service
 

@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from http import HTTPStatus
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
 from pathlib import Path
+import re
+import secrets
+from threading import RLock
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -20,6 +24,7 @@ from .media import (
     MediaUnavailableError,
     RangeNotSatisfiable,
     iter_file_chunks,
+    open_verified_media,
     parse_byte_range,
 )
 from .warn_service import WarnLeaseError, WarnRevisionError, WarnStateError
@@ -39,12 +44,16 @@ _SAFE_MESSAGES = {
     "invalid_issue_range": "a selected issue has an invalid frame range",
     "lease_held": "the asset is currently read-only",
     "lease_invalid": "the reviewer lease is invalid or expired",
+    "method_not_allowed": "the requested method is not allowed",
     "not_found": "the requested resource was not found",
     "range_not_satisfiable": "the requested byte range is not satisfiable",
     "source_video_unavailable": "the source video is unavailable",
     "stale_revision": "the report revision is stale",
     "state_conflict": "the task cannot accept this operation",
 }
+
+_SESSION_COOKIE = "warn_reviewer_session"
+_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{20,128}").fullmatch
 
 
 def _decoded_parts(path: str) -> tuple[str, ...] | None:
@@ -61,6 +70,50 @@ def _decoded_parts(path: str) -> tuple[str, ...] | None:
             return None
         result.append(value)
     return tuple(result)
+
+
+def _allowed_methods(parts: tuple[str, ...] | None) -> tuple[str, ...] | None:
+    if parts == ("api", "warn", "assets"):
+        return ("GET",)
+    if (
+        parts is not None
+        and len(parts) == 5
+        and parts[:3] == ("api", "warn", "assets")
+        and parts[4] == "task"
+    ):
+        return ("GET",)
+    if (
+        parts is not None
+        and len(parts) == 4
+        and parts[:2] == ("media", "assets")
+        and parts[3] == "source"
+    ):
+        return ("GET", "HEAD")
+    if (
+        parts is not None
+        and len(parts) == 5
+        and parts[:2] == ("media", "assets")
+        and parts[3] == "overlays"
+    ):
+        return ("GET", "HEAD")
+    if (
+        parts is not None
+        and len(parts) >= 5
+        and parts[:3] == ("api", "warn", "assets")
+    ):
+        route = parts[4:]
+        if route in {
+            ("lease", "acquire"),
+            ("lease", "renew"),
+            ("lease", "release"),
+            ("complete",),
+        } or (
+            len(route) == 3
+            and route[0] == "issues"
+            and route[2] == "verdict"
+        ):
+            return ("POST",)
+    return None
 
 
 def _error_details(exc: Exception) -> tuple[int, str]:
@@ -114,13 +167,30 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
             if any("token" in key.lower() for key in query):
                 self._send_error(HTTPStatus.BAD_REQUEST, "bad_request", asset_id)
                 return
-            token = self.headers.get("X-Reviewer-Lease")
+            token, session_id, from_session = self._task_lease_credentials(asset_id)
             try:
                 task = self.server.service.get_asset_task(asset_id, lease_token=token)
+                lease = task.get("lease")
+                if (
+                    from_session
+                    and isinstance(lease, Mapping)
+                    and lease.get("code") == "lease_invalid"
+                ):
+                    task = self.server.service.get_asset_task(asset_id)
             except Exception as exc:
                 self._handle_exception(exc, asset_id)
                 return
-            self._send_json(self._task_response(task))
+            session_header = self._remember_task_lease(
+                asset_id, task, session_id=session_id
+            )
+            self._send_json(
+                self._task_response(task),
+                headers=(
+                    {"Set-Cookie": session_header}
+                    if session_header is not None
+                    else None
+                ),
+            )
             return
         if (
             parts is not None
@@ -153,7 +223,40 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
         if not raw_path.startswith(("/api/", "/media/", "/evidence/")):
             if self._serve_static():
                 return
-        self._send_error(HTTPStatus.NOT_FOUND, "not_found", None)
+        self._send_route_error(parts)
+
+    def do_HEAD(self) -> None:  # noqa: N802 - stdlib hook name.
+        parts = _decoded_parts(self.path)
+        if (
+            parts is not None
+            and len(parts) == 4
+            and parts[:2] == ("media", "assets")
+            and parts[3] == "source"
+        ):
+            asset_id = parts[2]
+            try:
+                self._serve_media(
+                    self.server.service.source_media(asset_id), send_body=False
+                )
+            except Exception as exc:
+                self._handle_exception(exc, asset_id, head_only=True)
+            return
+        if (
+            parts is not None
+            and len(parts) == 5
+            and parts[:2] == ("media", "assets")
+            and parts[3] == "overlays"
+        ):
+            asset_id, overlay_id = parts[2], parts[4]
+            try:
+                self._serve_media(
+                    self.server.service.overlay_media(asset_id, overlay_id),
+                    send_body=False,
+                )
+            except Exception as exc:
+                self._handle_exception(exc, asset_id, head_only=True)
+            return
+        self._send_route_error(parts, head_only=True)
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib hook name.
         parts = _decoded_parts(self.path)
@@ -165,7 +268,7 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
             else None
         )
         if asset_id is None:
-            self._send_error(HTTPStatus.NOT_FOUND, "not_found", None)
+            self._send_route_error(parts)
             return
         route = parts[4:]
         is_verdict = (
@@ -177,7 +280,7 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
             ("lease", "release"),
             ("complete",),
         } and not is_verdict:
-            self._send_error(HTTPStatus.NOT_FOUND, "not_found", asset_id)
+            self._send_route_error(parts, asset_id=asset_id)
             return
         try:
             payload = self._read_json()
@@ -228,6 +331,104 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._handle_exception(exc, asset_id)
 
+    def do_PUT(self) -> None:  # noqa: N802 - stdlib hook name.
+        self._send_route_error(_decoded_parts(self.path))
+
+    def do_PATCH(self) -> None:  # noqa: N802 - stdlib hook name.
+        self._send_route_error(_decoded_parts(self.path))
+
+    def do_DELETE(self) -> None:  # noqa: N802 - stdlib hook name.
+        self._send_route_error(_decoded_parts(self.path))
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 - stdlib hook name.
+        self._send_route_error(_decoded_parts(self.path))
+
+    def _task_lease_credentials(
+        self, asset_id: str
+    ) -> tuple[str | None, str | None, bool]:
+        header_token = self.headers.get("X-Reviewer-Lease")
+        if header_token is not None:
+            return header_token, self._session_id(), False
+        session_id = self._session_id()
+        if session_id is None:
+            return None, None, False
+        with self.server.lease_sessions_lock:
+            token = self.server.lease_sessions.get(session_id, {}).get(asset_id)
+        return token, session_id, token is not None
+
+    def _session_id(self) -> str | None:
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        cookie = SimpleCookie()
+        try:
+            cookie.load(raw)
+        except CookieError:
+            return None
+        morsel = cookie.get(_SESSION_COOKIE)
+        value = morsel.value if morsel is not None else None
+        return value if isinstance(value, str) and _SESSION_ID(value) else None
+
+    def _remember_task_lease(
+        self,
+        asset_id: str,
+        task: Mapping[str, Any],
+        *,
+        session_id: str | None,
+    ) -> str | None:
+        lease = task.get("lease")
+        if not isinstance(lease, Mapping) or lease.get("read_only") is not False:
+            return None
+        token = lease.get("token")
+        if not isinstance(token, str) or not token:
+            return None
+        with self.server.lease_sessions_lock:
+            if session_id is None or session_id not in self.server.lease_sessions:
+                session_id = secrets.token_urlsafe(32)
+            self.server.lease_sessions.setdefault(session_id, {})[asset_id] = token
+        return (
+            f"{_SESSION_COOKIE}={session_id}; HttpOnly; SameSite=Strict; "
+            "Path=/api/warn/"
+        )
+
+    def send_error(
+        self,
+        code: int,
+        message: str | None = None,
+        explain: str | None = None,
+    ) -> None:
+        """Replace BaseHTTPRequestHandler's HTML 501 for unknown methods."""
+
+        del message, explain
+        if code == HTTPStatus.NOT_IMPLEMENTED:
+            self._send_route_error(_decoded_parts(self.path))
+            return
+        self._send_error(code, "internal_error", None)
+
+    def _send_route_error(
+        self,
+        parts: tuple[str, ...] | None,
+        *,
+        asset_id: str | None = None,
+        head_only: bool = False,
+    ) -> None:
+        allowed = _allowed_methods(parts)
+        if allowed is None:
+            self._send_error(
+                HTTPStatus.NOT_FOUND,
+                "not_found",
+                asset_id,
+                head_only=head_only,
+            )
+            return
+        self._send_error(
+            HTTPStatus.METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            asset_id,
+            headers={"Allow": ", ".join(allowed)},
+            head_only=head_only,
+        )
+
     def _read_json(self) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length")
         try:
@@ -267,46 +468,51 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
         if current != expected_revision:
             raise StaleReportRevisionError("stale_revision")
 
-    def _serve_media(self, resource: MediaResource) -> None:
-        try:
-            byte_range = parse_byte_range(self.headers.get("Range"), resource.size)
-        except RangeNotSatisfiable:
-            self._send_error(
-                HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
-                "range_not_satisfiable",
-                None,
-                headers={
-                    "Accept-Ranges": "bytes",
-                    "Content-Range": f"bytes */{resource.size}",
-                },
-            )
-            return
-        if byte_range is None:
-            start, length, status = 0, resource.size, HTTPStatus.OK
-            content_range = None
-        else:
-            start = byte_range.start
-            length = byte_range.length
-            status = HTTPStatus.PARTIAL_CONTENT
-            content_range = (
-                f"bytes {byte_range.start}-{byte_range.end_inclusive}/{resource.size}"
-            )
-        self.send_response(status)
-        self.send_header("Content-Type", resource.mime_type)
-        self.send_header("Content-Length", str(length))
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Cache-Control", "no-store")
-        if content_range is not None:
-            self.send_header("Content-Range", content_range)
-        if resource.etag is not None:
-            self.send_header("ETag", json.dumps(resource.etag))
-        self.end_headers()
-        try:
-            with resource.path.open("rb") as source:
+    def _serve_media(
+        self, resource: MediaResource, *, send_body: bool = True
+    ) -> None:
+        with open_verified_media(resource) as source:
+            try:
+                byte_range = parse_byte_range(self.headers.get("Range"), resource.size)
+            except RangeNotSatisfiable:
+                self._send_error(
+                    HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
+                    "range_not_satisfiable",
+                    None,
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Content-Range": f"bytes */{resource.size}",
+                    },
+                    head_only=not send_body,
+                )
+                return
+            if byte_range is None:
+                start, length, status = 0, resource.size, HTTPStatus.OK
+                content_range = None
+            else:
+                start = byte_range.start
+                length = byte_range.length
+                status = HTTPStatus.PARTIAL_CONTENT
+                content_range = (
+                    f"bytes {byte_range.start}-{byte_range.end_inclusive}/{resource.size}"
+                )
+            self.send_response(status)
+            self.send_header("Content-Type", resource.mime_type)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Cache-Control", "no-store")
+            if content_range is not None:
+                self.send_header("Content-Range", content_range)
+            if resource.etag is not None:
+                self.send_header("ETag", json.dumps(resource.etag))
+            self.end_headers()
+            if not send_body:
+                return
+            try:
                 for chunk in iter_file_chunks(source, start=start, length=length):
                     self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            return
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
     def _serve_static(self) -> bool:
         root = self.server.static_root
@@ -337,9 +543,15 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         return True
 
-    def _handle_exception(self, exc: Exception, asset_id: str | None) -> None:
+    def _handle_exception(
+        self,
+        exc: Exception,
+        asset_id: str | None,
+        *,
+        head_only: bool = False,
+    ) -> None:
         status, code = _error_details(exc)
-        self._send_error(status, code, asset_id)
+        self._send_error(status, code, asset_id, head_only=head_only)
 
     def _send_error(
         self,
@@ -348,6 +560,7 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
         asset_id: str | None,
         *,
         headers: Mapping[str, str] | None = None,
+        head_only: bool = False,
     ) -> None:
         current_revision: int | None = None
         if asset_id is not None:
@@ -366,6 +579,7 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
             },
             status=status,
             headers=headers,
+            head_only=head_only,
         )
 
     def _send_json(
@@ -374,6 +588,7 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
         *,
         status: int | HTTPStatus = HTTPStatus.OK,
         headers: Mapping[str, str] | None = None,
+        head_only: bool = False,
     ) -> None:
         body = json.dumps(
             value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
@@ -385,7 +600,8 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
         for name, header_value in (headers or {}).items():
             self.send_header(name, header_value)
         self.end_headers()
-        self.wfile.write(body)
+        if not head_only:
+            self.wfile.write(body)
 
     @staticmethod
     def _task_response(task: Mapping[str, Any]) -> dict[str, Any]:
@@ -398,6 +614,8 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
 class HumanQcHttpServer(ThreadingHTTPServer):
     service: Any
     static_root: Path | None
+    lease_sessions: dict[str, dict[str, str]]
+    lease_sessions_lock: RLock
 
 
 def create_http_server(
@@ -414,6 +632,8 @@ def create_http_server(
     del evidence_root, evidence_allowed_prefixes
     server = HumanQcHttpServer((host, port), HumanQcRequestHandler)
     server.service = service
+    server.lease_sessions = {}
+    server.lease_sessions_lock = RLock()
     default_root = Path(__file__).resolve().parent / "static"
     server.static_root = (
         Path(static_root).resolve()

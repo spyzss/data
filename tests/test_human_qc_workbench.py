@@ -159,6 +159,8 @@ def test_warn_task_is_an_explicit_safe_projection_in_selected_order(tmp_path: Pa
         "manual_review_state",
         "completion_mode",
         "failure_reason",
+        "review_audit",
+        "can_complete",
         "video",
         "issues",
         "reason_options",
@@ -231,6 +233,106 @@ def test_warn_task_is_an_explicit_safe_projection_in_selected_order(tmp_path: Pa
         assert forbidden not in serialized
     assert reloaded["lease"]["token"] == token
     assert len(probe_calls) == 1
+
+
+def test_warn_task_rejects_unknown_public_state_values(tmp_path: Path) -> None:
+    from human_qc.media import MediaCatalog
+    from human_qc.warn_workbench_service import WarnWorkbenchService
+
+    report = _report()
+    report["manual_review"]["state"] = "/private/run traceback command=ffmpeg"
+    context = _context(tmp_path, report)
+    service = WarnWorkbenchService(
+        reviewer="alice",
+        asset_contexts={"asset-1": context},
+        media_catalog=MediaCatalog(
+            {"asset-1": context},
+            probe=lambda _path: {"fps": 30.0, "total_frames": 1800},
+        ),
+    )
+
+    with pytest.raises(WarnStateError, match="invalid manual review state"):
+        service.get_asset_task("asset-1")
+
+
+def test_warn_task_replaces_untrusted_issue_text_with_stable_codes(
+    tmp_path: Path,
+) -> None:
+    report = _report()
+    report["issues"][0].update(
+        {
+            "display_name": "/private/display traceback",
+            "default_reason": "command=ffmpeg /private/source.mp4",
+            "operator": "command=cat /private/token",
+            "boundary_value": "traceback /private/value",
+        }
+    )
+    report["manual_review"]["issue_reviews"]["warn-1"].update(
+        {
+            "reason": "command=ffmpeg /private/reason",
+            "reviewer": "/private/reviewer",
+            "reviewed_at": "traceback /private/time",
+        }
+    )
+    report["manual_review"]["failure_reason"] = {
+        "mode": "command=ffmpeg",
+        "reason_codes": ["/private/failure"],
+        "other_text": "traceback /private/other",
+    }
+    service, _, _, context = _service(tmp_path)
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    task = service.get_asset_task("asset-1")
+
+    issue = next(item for item in task["issues"] if item["id"] == "warn-1")
+    assert issue["display_name"] == "blur"
+    assert issue["default_reason"] == "blur"
+    assert issue["threshold"] is None
+    assert issue["review"] == {
+        "verdict": "fail",
+        "effective_verdict": "fail",
+        "machine_verdict": "warn",
+    }
+    assert task["failure_reason"] is None
+    serialized = json.dumps(task, ensure_ascii=False).lower()
+    for forbidden in ("/private", "command=", "ffmpeg", "traceback"):
+        assert forbidden not in serialized
+
+
+def test_warn_task_projects_minimal_audit_and_server_completion_gate(
+    tmp_path: Path,
+) -> None:
+    report = _report()
+    report["manual_review"]["review_audit"] = [
+        {
+            "action": "resubmitted",
+            "issue_id": "warn-1",
+            "previous": {"reason": "/private/secret", "command": "ffmpeg"},
+            "previous_failure_reason": {"traceback": "/private/trace"},
+            "reviewed_at": "2026-07-22T00:01:00+00:00",
+        },
+        {
+            "action": "/private/unknown",
+            "issue_id": "warn-2",
+            "reviewed_at": "traceback",
+        },
+    ]
+    service, _, _, context = _service(tmp_path)
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    task = service.get_asset_task("asset-1")
+
+    assert task["can_complete"] is True
+    assert task["review_audit"] == [
+        {
+            "action": "resubmitted",
+            "issue_id": "warn-1",
+            "reviewed_at": "2026-07-22T00:01:00+00:00",
+        }
+    ]
+    serialized = json.dumps(task, ensure_ascii=False).lower()
+    for forbidden in ("/private", "command", "ffmpeg", "traceback", "previous"):
+        assert forbidden not in serialized
 
 
 def test_task_load_lease_collision_is_safe_read_only(tmp_path: Path) -> None:
