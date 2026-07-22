@@ -2,7 +2,7 @@
 
 本文是 reviewer、批次统计和运维的操作合同。当前 canonical 版本为
 `asset_qc_report.v2` + `qc_acceptance_config_schema.v2`，配置版本为
-`qc_acceptance_v2.0.0`。
+`qc_acceptance_v2.5.0`。
 
 ## 1. 目标目录与唯一事实源
 
@@ -11,7 +11,7 @@
 ```text
 <batch>/quality_archive/<asset_id>.json
 configs/qc_acceptance.yaml
-configs/qc_acceptance/qc_acceptance_v2.0.0.yaml
+configs/qc_acceptance/qc_acceptance_v2.5.0.yaml
 schemas/asset_qc_report.v2.schema.json
 schemas/qc_acceptance_config.v2.schema.json
 ```
@@ -27,7 +27,7 @@ CSV、XLSX、Markdown、Parquet、cache、ledger event、overlay 和其他 sidec
 
 ```yaml
 schema_version: qc_acceptance_config_schema.v2
-config_version: qc_acceptance_v2.0.0
+config_version: qc_acceptance_v2.5.0
 config_name: acceptance_gate
 execution_profiles:
   acceptance:

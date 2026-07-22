@@ -895,7 +895,7 @@ def test_dual_cli_records_inputs_config_and_audit_only_thresholds(
 
     assert exit_code == 0
     run_config = json.loads((output_dir / "run_config.json").read_text())
-    assert run_config["config_reference"]["config_version"] == "qc_acceptance_v2.4.0"
+    assert run_config["config_reference"]["config_version"] == "qc_acceptance_v2.5.0"
     assert run_config["frame_universe_definition"] == (
         "manifest_inclusive_source_frames"
     )

@@ -34,8 +34,8 @@ pipeline:
   - video_quality
   - supplier_data_audit
   - sam3_containment
-  - manual_review
   - semantic_consistency
+  - manual_review
   - duplicate_check
   - content_validity
   - effective_duration

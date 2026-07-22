@@ -13,9 +13,9 @@ source_gate:
       rule_id: canonical.source_gate.contract_failure
       severity: fail
 qc:
-  config_path: configs/qc_acceptance.yaml
-  config_version: qc_acceptance_v2.4.0
-  config_sha256: sha256:116a55628683e731bce09b416ec0ecb3034aa55b3acf8a2f0412d0caf8e1f894
+  config_path: configs/qc_acceptance/qc_acceptance_v2.5.0.yaml
+  config_version: qc_acceptance_v2.5.0
+  config_sha256: sha256:2fe4ad0865693e02eacecca01285e64108fd0ba7967c3661bf77e3002b731355
   profiles: [acceptance, supplier_evaluation]
 publisher:
   output_format: lerobot_v3
