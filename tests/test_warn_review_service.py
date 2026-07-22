@@ -160,6 +160,216 @@ def test_selected_issue_requires_verdict_before_complete(tmp_path: Path) -> None
     assert completed.overall_decision == "fail"
 
 
+def test_first_fail_can_complete_without_reviewing_remaining_selected_issues(
+    tmp_path: Path,
+) -> None:
+    service = _service(
+        tmp_path,
+        candidates=["warn-1", "warn-2"],
+        selected=["warn-1", "warn-2"],
+        issues=[_issue("warn-1"), _issue("warn-2")],
+    )
+    reviewed = service.submit_verdict(
+        ASSET_ID,
+        "warn-1",
+        "fail",
+        "confirmed machine warning",
+        expected_revision=1,
+        lease_token=LEASE,
+    )
+
+    completed = service.complete(
+        ASSET_ID,
+        expected_revision=reviewed.report_revision,
+        lease_token=LEASE,
+        completion_mode="early_fail",
+    )
+
+    report = load_asset_qc_report(service.report_path(ASSET_ID))
+    assert report is not None
+    assert completed.state == "completed"
+    assert set(report["manual_review"]["issue_reviews"]) == {"warn-1"}
+    assert report["manual_review"]["completion_mode"] == "early_fail"
+    assert report["semantic_calibration"]["state"] == "skipped_due_to_fail"
+    assert report["pipeline_state"]["status"] == "stopped"
+    assert report["pipeline_state"]["next_module"] is None
+    assert report["overall_decision"] == "fail"
+
+
+def test_last_fail_changed_to_pass_recloses_early_fail_gate(tmp_path: Path) -> None:
+    service = _service(
+        tmp_path,
+        candidates=["warn-1", "warn-2"],
+        selected=["warn-1", "warn-2"],
+        issues=[_issue("warn-1"), _issue("warn-2")],
+    )
+    failed = service.submit_verdict(
+        ASSET_ID, "warn-1", "fail", None, expected_revision=1, lease_token=LEASE
+    )
+    reopened = service.submit_verdict(
+        ASSET_ID,
+        "warn-1",
+        "pass",
+        None,
+        expected_revision=failed.report_revision,
+        lease_token=LEASE,
+    )
+
+    with pytest.raises(WarnStateError, match="early_fail|selected issue|completion"):
+        service.complete(
+            ASSET_ID,
+            expected_revision=reopened.report_revision,
+            lease_token=LEASE,
+            completion_mode="early_fail",
+        )
+    with pytest.raises(WarnStateError, match="selected issue|completion"):
+        service.complete(
+            ASSET_ID,
+            expected_revision=reopened.report_revision,
+            lease_token=LEASE,
+        )
+
+    last = service.submit_verdict(
+        ASSET_ID,
+        "warn-2",
+        "pass",
+        None,
+        expected_revision=reopened.report_revision,
+        lease_token=LEASE,
+    )
+    service.complete(
+        ASSET_ID,
+        expected_revision=last.report_revision,
+        lease_token=LEASE,
+    )
+    report = load_asset_qc_report(service.report_path(ASSET_ID))
+    assert report is not None
+    assert report["manual_review"]["completion_mode"] == "all_reviewed"
+
+
+def test_manual_reasons_replace_all_machine_default_reasons(tmp_path: Path) -> None:
+    first_issue = _issue("warn-1")
+    first_issue["context"] = {"reason": "machine blur"}
+    second_issue = _issue("warn-2")
+    second_issue["context"] = {"reason": "machine occlusion"}
+    service = _service(
+        tmp_path,
+        candidates=["warn-1", "warn-2"],
+        selected=["warn-1", "warn-2"],
+        issues=[first_issue, second_issue],
+    )
+    manual_reason = {
+        "reason_codes": [" occlusion ", "other", "occlusion", " "],
+        "other_text": "  repeated tool obstruction  ",
+    }
+
+    reviewed = service.submit_verdict(
+        ASSET_ID,
+        "warn-1",
+        "fail",
+        None,
+        expected_revision=1,
+        lease_token=LEASE,
+        failure_reason=manual_reason,
+    )
+    service.complete(
+        ASSET_ID,
+        expected_revision=reviewed.report_revision,
+        lease_token=LEASE,
+        completion_mode="early_fail",
+        failure_reason=manual_reason,
+    )
+
+    report = load_asset_qc_report(service.report_path(ASSET_ID))
+    assert report is not None
+    assert report["manual_review"]["failure_reason"] == {
+        "mode": "manual",
+        "reason_codes": ["occlusion", "other"],
+        "other_text": "repeated tool obstruction",
+    }
+    assert [issue["context"]["reason"] for issue in report["issues"]] == [
+        "machine blur",
+        "machine occlusion",
+    ]
+
+
+def test_other_reason_requires_non_empty_text_on_verdict_and_complete(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    invalid_reason = {"reason_codes": ["other"], "other_text": "   "}
+
+    with pytest.raises(WarnStateError, match="other_text"):
+        service.submit_verdict(
+            ASSET_ID,
+            "warn-1",
+            "fail",
+            None,
+            expected_revision=1,
+            lease_token=LEASE,
+            failure_reason=invalid_reason,
+        )
+    assert service.get_task(ASSET_ID).report_revision == 1
+
+    reviewed = service.submit_verdict(
+        ASSET_ID, "warn-1", "fail", None, expected_revision=1, lease_token=LEASE
+    )
+    with pytest.raises(WarnStateError, match="other_text"):
+        service.complete(
+            ASSET_ID,
+            expected_revision=reviewed.report_revision,
+            lease_token=LEASE,
+            completion_mode="early_fail",
+            failure_reason=invalid_reason,
+        )
+    assert service.get_task(ASSET_ID).report_revision == reviewed.report_revision
+
+
+def test_completed_asset_rejects_verdict_changes(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    reviewed = service.submit_verdict(
+        ASSET_ID, "warn-1", "fail", None, expected_revision=1, lease_token=LEASE
+    )
+    completed = service.complete(
+        ASSET_ID,
+        expected_revision=reviewed.report_revision,
+        lease_token=LEASE,
+        completion_mode="early_fail",
+    )
+
+    with pytest.raises(WarnStateError, match="terminal"):
+        service.submit_verdict(
+            ASSET_ID,
+            "warn-1",
+            "pass",
+            None,
+            expected_revision=completed.report_revision,
+            lease_token=LEASE,
+        )
+
+
+def test_all_reviewed_completion_writes_canonical_fields_and_semantic_handoff(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    reviewed = service.submit_verdict(
+        ASSET_ID, "warn-1", "pass", None, expected_revision=1, lease_token=LEASE
+    )
+
+    service.complete(
+        ASSET_ID,
+        expected_revision=reviewed.report_revision,
+        lease_token=LEASE,
+    )
+
+    report = load_asset_qc_report(service.report_path(ASSET_ID))
+    assert report is not None
+    assert report["manual_review"]["completion_mode"] == "all_reviewed"
+    assert report["manual_review"]["failure_reason"] is None
+    assert report["pipeline_state"]["status"] == "awaiting_external"
+    assert report["pipeline_state"]["next_module"] == "semantic_consistency"
+
+
 def test_resubmission_audits_previous_review_and_increments_once(tmp_path: Path) -> None:
     service = _service(tmp_path)
     first = service.submit_verdict(
@@ -174,6 +384,43 @@ def test_resubmission_audits_previous_review_and_increments_once(tmp_path: Path)
     assert report is not None
     assert report["manual_review"]["issue_reviews"]["warn-1"]["verdict"] == "fail"
     assert report["manual_review"]["review_audit"][0]["previous"]["verdict"] == "pass"
+
+
+def test_resubmission_audits_previous_asset_failure_reason(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    first_reason = {"reason_codes": ["occlusion"], "other_text": None}
+    second_reason = {"reason_codes": ["other"], "other_text": "camera blocked"}
+    first = service.submit_verdict(
+        ASSET_ID,
+        "warn-1",
+        "fail",
+        None,
+        expected_revision=1,
+        lease_token=LEASE,
+        failure_reason=first_reason,
+    )
+    service.submit_verdict(
+        ASSET_ID,
+        "warn-1",
+        "fail",
+        None,
+        expected_revision=first.report_revision,
+        lease_token=LEASE,
+        failure_reason=second_reason,
+    )
+
+    report = load_asset_qc_report(service.report_path(ASSET_ID))
+    assert report is not None
+    assert report["manual_review"]["review_audit"][0]["previous_failure_reason"] == {
+        "mode": "manual",
+        "reason_codes": ["occlusion"],
+        "other_text": None,
+    }
+    assert report["manual_review"]["failure_reason"] == {
+        "mode": "manual",
+        "reason_codes": ["other"],
+        "other_text": "camera blocked",
+    }
 
 
 @pytest.mark.parametrize("issue_id", ["unknown", "candidate-not-selected"])
