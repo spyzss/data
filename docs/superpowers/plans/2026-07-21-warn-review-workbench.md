@@ -262,7 +262,7 @@ git commit -m "refactor(qc): place warn review before semantic calibration"
 - Exposes only `/api/semantic/...` routes.
 - Depends on `qc_common`; never imports `human_qc`.
 
-- [ ] **Step 1: Write failing import-boundary and route tests**
+- [x] **Step 1: Write failing import-boundary and route tests**
 
 Add tests that import every module under both packages, inspect imports, and assert:
 
@@ -275,7 +275,7 @@ assert request(semantic_server, "GET", "/api/semantic/assets").status == 200
 
 Retain all existing shared-boundary, pending-edit and HDF5 atomicity assertions under the new package imports.
 
-- [ ] **Step 2: Run tests and verify Red**
+- [x] **Step 2: Run tests and verify Red**
 
 ```bash
 pytest -q tests/test_semantic_service.py tests/test_shared_timeline.py tests/test_hdf5_semantic_commit.py tests/test_semantic_calibration_http_server.py
@@ -283,7 +283,7 @@ pytest -q tests/test_semantic_service.py tests/test_shared_timeline.py tests/tes
 
 Expected: FAIL because `semantic_calibration` does not exist.
 
-- [ ] **Step 3: Move the semantic implementation and build the dedicated entrypoint**
+- [x] **Step 3: Move the semantic implementation and build the dedicated entrypoint**
 
 Move the existing semantic-only modules and adapter with `git mv`, update imports to `semantic_calibration.*`, and keep shared lease primitives either duplicated behind the same contract or moved into a neutral `qc_common` module. The server route table must be explicit:
 
@@ -304,7 +304,7 @@ SEMANTIC_ROUTES = {
 
 The semantic task projection must call `semantic_eligibility()` before returning task data or accepting a write.
 
-- [ ] **Step 4: Run semantic regression tests and verify Green**
+- [x] **Step 4: Run semantic regression tests and verify Green**
 
 Run the Step 2 command plus:
 
@@ -314,11 +314,56 @@ node --test semantic_calibration/static/*.test.mjs
 
 Expected: all PASS.
 
-- [ ] **Step 5: Commit Task 4**
+- [x] **Step 5: Commit Task 4**
 
 ```bash
 git add semantic_calibration tools/serve_semantic_calibration.py human_qc tests/test_semantic_service.py tests/test_shared_timeline.py tests/test_hdf5_semantic_commit.py tests/test_semantic_calibration_http_server.py openspec/changes/add-human-semantic-warn-review/tasks.md
 git commit -m "refactor(semantic): split calibration into independent service"
+```
+
+### Task 4A: 完成 early-fail 未查看 Warn 的正式批次投影
+
+**OpenSpec mapping:** `7.3 更新批次投影，仅统计实际 issue review，并单独统计 early-fail 后未查看 Warn`
+
+**Files:**
+- Modify: `qc_reporting/projection.py`
+- Modify: `qc_reporting/aggregate.py`
+- Modify: `qc_reporting/export.py`
+- Modify: `tests/test_human_qc_aggregation.py`
+- Modify: `tests/test_human_qc_reporting_outputs.py`
+- Modify when RED proves it needed: `tests/test_qc_reporting_entrypoints.py`
+
+**Interfaces:**
+- Preserve only actual `manual_review.issue_reviews` as reviewed results; never synthesize a verdict for early-fail unviewed issues.
+- Project `selected_issue_ids` and `completion_mode` into revision-scoped human-review rows.
+- Count `unreviewed_selected_warn_issues` only for terminal, completed `early_fail` reports, after current-revision de-duplication and intersecting with current machine-Warn issues.
+- Add the metric to all formal aggregate formats; do not introduce Feishu/Lark scope.
+
+- [ ] **Step 1: Write failing early-fail aggregation and export tests**
+
+Cover a three-selected/one-Fail early-fail report, an in-progress report that must not count as terminal unviewed, latest-revision de-duplication, invalid selected/review relations, and formal CSV/Parquet/XLSX/Markdown parity.
+
+- [ ] **Step 2: Run aggregation tests and verify Red**
+
+```bash
+pytest -q tests/test_human_qc_aggregation.py tests/test_human_qc_reporting_outputs.py tests/test_qc_reporting_projection.py tests/test_qc_reporting_aggregate.py
+```
+
+Expected: FAIL because the formal projection drops selected IDs/completion mode and the aggregate/export do not publish the metric.
+
+- [ ] **Step 3: Implement formal early-fail projection and aggregate contract**
+
+Keep the source-of-truth fields in the human-review row, calculate the derived count only after terminal/latest-revision gating, emit both the descriptive internal key and formal `unreviewed_selected_warn_issues` alias, and make every formal exporter require the new metric.
+
+- [ ] **Step 4: Run focused aggregation/export tests and verify Green**
+
+Run the Step 2 command plus any CLI entrypoint coverage added by RED. Expected: all PASS.
+
+- [ ] **Step 5: Commit Task 4A**
+
+```bash
+git add qc_reporting/projection.py qc_reporting/aggregate.py qc_reporting/export.py tests/test_human_qc_aggregation.py tests/test_human_qc_reporting_outputs.py tests/test_qc_reporting_entrypoints.py openspec/changes/add-human-semantic-warn-review/tasks.md
+git commit -m "feat(reporting): count early-fail unreviewed warns"
 ```
 
 ### Task 5: 建立 Warn-only DTO、媒体 API 和自动 Lease
