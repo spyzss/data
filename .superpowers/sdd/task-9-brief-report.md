@@ -926,3 +926,74 @@ pending/generating，未变成超额 ready/failed terminal。
 .venv/bin/python -m pytest -q
 # 1872 passed, 1 skipped in 114.20s
 ```
+
+---
+
+# Task 9C live-render-fence eviction follow-up
+
+## 状态与范围
+
+DONE
+
+本轮只修复最终审查唯一 Important：terminal victim 的 owner lease 已过期，但独立执行
+单元仍持有 OS render fence 时，eviction 不得删除该 job。只修改
+`human_qc/overlay_worker.py`、`tests/test_sam3_overlay_worker.py` 和本报告；未触碰
+Task 10、runner、recipe、launcher、HTTP、browser、OpenSpec、主计划或 `.comet`。
+
+基线：`ea000a9adf8feb1d784bef2e4e91afe299a4d273`。本轮独立提交 SHA 以最终任务
+回报中的 `git rev-parse HEAD` 为准。
+
+## Root cause 与锁序
+
+上一轮 `_remove_terminal_victim()` 已在 root -> victim key 下重读 terminal status、
+live owner 与 pin，但将 expired owner 等同于“没有活跃执行单元”。CPU-bound renderer 的
+heartbeat 可能已过期，而独立进程仍持 `.render.fence` 的 `LOCK_EX`；旧实现随后直接
+`rmtree()`，删除仍在使用的 manifest/media/fence，并按过期快照扣减 cache accounting。
+
+修复后 render fence 抽为 path-based `_path_render_fence()`：
+
+- 普通 renderer 继续以 blocking 模式持锁整个渲染生命周期；
+- eviction 已持 root -> victim key 后，以 `LOCK_NB` 尝试同一 fence，并把 fence 持有到
+  `_safe_remove_job()` 完成；
+- fence busy 时立即返回 `False`，root lock 不等待 renderer；
+- fence path open/flock/unlock/close 任一 `OSError` 都 fail closed，不删除、不扣账；
+- fence 释放后，下一轮相同 eviction 才允许删除。
+
+锁序为 root -> victim key -> nonblocking render fence。renderer 从不在持 fence 时获取
+root，retry 仍不获取 root，因此没有 key/fence -> root 反序。
+
+## TDD RED / GREEN
+
+先只新增 8 个参数化 cases：
+
+- 直接 `_remove_terminal_victim()`：ready/failed 两种 terminal；
+- `_evict_for()` / `_evict_failed_for()` × ready/failed victim 四种组合；
+- `.render.fence` 为目录导致 path open 异常：ready/failed 两种 terminal。
+
+真实锁测试先验证 owner lease 已确实过期，再由 spawn 独立进程持
+`.render.fence` `LOCK_EX`。RED 结果 `8 failed in 0.82s`：旧实现八项均立即返回
+`True` 并删除目录；期望为持锁/路径异常时 `False` 且目录保留，释放/修复 fence 后
+`True` 且目录删除。
+
+最小实现后同一选择 `8 passed in 0.73s`；与上一轮双 worker Barrier 竞态和既有
+expired-owner recovery fence 合跑 `11 passed in 0.91s`。新 8-case 选择连续 5 轮均为
+`8 passed`（单轮 0.53-0.70s），worker 全文件 `45 passed in 2.31s`。
+
+## 最终验证
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py \
+  tests/test_sam3_overlay_worker.py tests/test_review_evidence.py \
+  tests/test_qc_pipeline_sam3_runner.py tests/test_canonical_qc_runner_bridge.py \
+  tests/test_human_qc_media.py
+# 187 passed in 5.75s
+
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_workbench.py tests/test_human_qc_http_server.py \
+  tests/test_canonical_video_probe.py
+# 110 passed in 5.89s
+
+.venv/bin/python -m pytest -q
+# 1880 passed, 1 skipped in 113.76s
+```

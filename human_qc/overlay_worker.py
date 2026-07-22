@@ -955,17 +955,18 @@ class BoundedOverlayWorker:
             yield acquired
 
     @contextmanager
-    def _render_fence(self, request: OverlayRequest, *, blocking: bool = True):
-        """Fence one key's renderer for its complete CPU-bound lifetime.
+    def _path_render_fence(
+        self,
+        fence_path: Path,
+        *,
+        blocking: bool,
+        create_parent: bool,
+    ):
+        """Acquire one path-based renderer fence with caller-selected blocking."""
 
-        Unlike ``_key_lock``, this file lock remains held while rendering and
-        is released by the OS when an owning process dies.  It never guards a
-        root-wide publication or another key.
-        """
-
-        job_dir = self._job_dir(request)
-        job_dir.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(self._render_fence_path(request), os.O_CREAT | os.O_RDWR, 0o600)
+        if create_parent:
+            fence_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(fence_path, os.O_CREAT | os.O_RDWR, 0o600)
         acquired = True
         try:
             try:
@@ -990,6 +991,22 @@ class BoundedOverlayWorker:
                     pass
             finally:
                 os.close(descriptor)
+
+    @contextmanager
+    def _render_fence(self, request: OverlayRequest, *, blocking: bool = True):
+        """Fence one key's renderer for its complete CPU-bound lifetime.
+
+        Unlike ``_key_lock``, this file lock remains held while rendering and
+        is released by the OS when an owning process dies.  It never guards a
+        root-wide publication or another key.
+        """
+
+        with self._path_render_fence(
+            self._render_fence_path(request),
+            blocking=blocking,
+            create_parent=True,
+        ) as acquired:
+            yield acquired
 
     @contextmanager
     def _root_publish_lock(self, request: OverlayRequest):
@@ -1139,7 +1156,17 @@ class BoundedOverlayWorker:
                 return False
             if expected_status == "ready" and self._has_live_pin(root, job_dir.name):
                 return False
-            return self._safe_remove_job(root, job_dir)
+            try:
+                with self._path_render_fence(
+                    job_dir / _RENDER_FENCE_NAME,
+                    blocking=False,
+                    create_parent=False,
+                ) as fence_acquired:
+                    if not fence_acquired:
+                        return False
+                    return self._safe_remove_job(root, job_dir)
+            except OSError:
+                return False
 
     def _discard_job_media(self, request: OverlayRequest) -> None:
         """Remove every material media product from a non-ready job."""

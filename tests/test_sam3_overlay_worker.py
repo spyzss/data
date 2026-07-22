@@ -80,6 +80,39 @@ def _hold_render_fence_while_cpu_bound(
         os.close(descriptor)
 
 
+def _write_terminal_job_with_expired_owner(request: object, status: str) -> Path:
+    job_dir = request.cache_root / request.cache_key.digest
+    job_dir.mkdir(parents=True)
+    (job_dir / ".generation.lock").touch()
+    (job_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "key_digest": request.cache_key.digest,
+                "status": status,
+                "segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = time.time()
+    (job_dir / ".generation.owner.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "process_incarnation": "expired-render-owner",
+                "token": "expired-render-token",
+                "pid": 99999,
+                "host": "unreachable-remote-host",
+                "heartbeat_at": now - 10.0,
+                "lease_expires_at": now - 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return job_dir
+
+
 class RecordingRenderer:
     def __init__(self) -> None:
         self.frames: list[int] = []
@@ -1226,6 +1259,197 @@ def test_expired_owner_marker_is_not_recovered_while_a_separate_process_holds_th
         if process.is_alive():
             process.terminate()
             process.join(timeout=3.0)
+        worker.shutdown()
+
+
+@pytest.mark.parametrize("terminal_status", ("ready", "failed"))
+def test_terminal_victim_is_not_removed_while_an_independent_renderer_holds_its_fence(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=RecordingRenderer(),
+    )
+    job_dir = _write_terminal_job_with_expired_owner(request, terminal_status)
+    process_context = multiprocessing.get_context("spawn")
+    started = process_context.Event()
+    release = process_context.Event()
+    process = process_context.Process(
+        target=_hold_render_fence_while_cpu_bound,
+        args=(str(job_dir / ".render.fence"), started, release),
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=0)
+    process.start()
+    try:
+        assert started.wait(3.0)
+        with worker._job_directory_lock(job_dir, create=False) as acquired:
+            assert acquired
+            assert not worker._owner_path_is_live_locked(
+                job_dir / ".generation.owner.json"
+            )
+
+        before = time.monotonic()
+        with worker._root_publish_lock(request):
+            removed_while_rendering = worker._remove_terminal_victim(
+                request.cache_root,
+                job_dir,
+                expected_status=terminal_status,
+            )
+        elapsed = time.monotonic() - before
+        survived_while_rendering = job_dir.is_dir()
+
+        release.set()
+        process.join(timeout=3.0)
+        assert process.exitcode == 0
+        removed_after_release: bool | None = None
+        if job_dir.is_dir():
+            with worker._root_publish_lock(request):
+                removed_after_release = worker._remove_terminal_victim(
+                    request.cache_root,
+                    job_dir,
+                    expected_status=terminal_status,
+                )
+
+        assert (
+            removed_while_rendering,
+            survived_while_rendering,
+            elapsed < 1.0,
+            removed_after_release,
+            job_dir.exists(),
+        ) == (False, True, True, True, False)
+    finally:
+        release.set()
+        process.join(timeout=3.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=3.0)
+        worker.shutdown()
+
+
+@pytest.mark.parametrize("eviction_helper", ("ready", "failed"))
+@pytest.mark.parametrize("terminal_status", ("ready", "failed"))
+def test_eviction_helpers_keep_a_terminal_victim_while_its_render_fence_is_held(
+    tmp_path: Path,
+    eviction_helper: str,
+    terminal_status: str,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    victim_request = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "9" * 64,
+    )
+    current_request = _request(
+        tmp_path,
+        intervals=((2, 3),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "a" * 64,
+    )
+    job_dir = _write_terminal_job_with_expired_owner(
+        victim_request,
+        terminal_status,
+    )
+    process_context = multiprocessing.get_context("spawn")
+    started = process_context.Event()
+    release = process_context.Event()
+    process = process_context.Process(
+        target=_hold_render_fence_while_cpu_bound,
+        args=(str(job_dir / ".render.fence"), started, release),
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=0)
+    process.start()
+    try:
+        assert started.wait(3.0)
+        victim_size = worker._job_footprint(job_dir)
+        assert victim_size is not None and victim_size > 0
+        worker._max_cache_bytes = victim_size
+        if eviction_helper == "ready":
+            worker._max_ready_jobs = 1
+
+        def evict() -> bool:
+            if eviction_helper == "ready":
+                return worker._evict_for(current_request, victim_size)
+            return worker._evict_failed_for(current_request, victim_size)
+
+        before = time.monotonic()
+        with worker._root_publish_lock(current_request):
+            blocked_result = evict()
+        elapsed = time.monotonic() - before
+        survived_while_rendering = job_dir.is_dir()
+
+        release.set()
+        process.join(timeout=3.0)
+        assert process.exitcode == 0
+        allowed_result: bool | None = None
+        if job_dir.is_dir():
+            with worker._root_publish_lock(current_request):
+                allowed_result = evict()
+
+        assert (
+            blocked_result,
+            survived_while_rendering,
+            elapsed < 1.0,
+            allowed_result,
+            job_dir.exists(),
+        ) == (False, True, True, True, False)
+    finally:
+        release.set()
+        process.join(timeout=3.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=3.0)
+        worker.shutdown()
+
+
+@pytest.mark.parametrize("terminal_status", ("ready", "failed"))
+def test_terminal_victim_fence_path_error_fails_closed(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=RecordingRenderer(),
+    )
+    job_dir = _write_terminal_job_with_expired_owner(request, terminal_status)
+    fence_path = job_dir / ".render.fence"
+    fence_path.mkdir()
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=0)
+    try:
+        with worker._root_publish_lock(request):
+            blocked_result = worker._remove_terminal_victim(
+                request.cache_root,
+                job_dir,
+                expected_status=terminal_status,
+            )
+        survived_fence_error = job_dir.is_dir()
+
+        allowed_result: bool | None = None
+        if survived_fence_error:
+            fence_path.rmdir()
+            fence_path.touch()
+            with worker._root_publish_lock(request):
+                allowed_result = worker._remove_terminal_victim(
+                    request.cache_root,
+                    job_dir,
+                    expected_status=terminal_status,
+                )
+
+        assert (
+            blocked_result,
+            survived_fence_error,
+            allowed_result,
+            job_dir.exists(),
+        ) == (False, True, True, False)
+    finally:
         worker.shutdown()
 
 
