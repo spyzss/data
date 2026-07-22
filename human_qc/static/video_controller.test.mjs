@@ -219,6 +219,22 @@ test("a direct video click grants frame-step focus without stealing a reason-inp
 });
 
 
+test("pointerup restores video-region ownership after the native video focus default", () => {
+  const { controller, documentRef, root, video } = createController();
+  controller.setMedia(canonicalVideo({ total_frames: 200 }));
+
+  root.dispatch("pointerdown", { target: video });
+  documentRef.activeElement = video;
+  root.dispatch("blur", { target: root });
+  root.dispatch("pointerup", { target: video });
+
+  assert.equal(documentRef.activeElement, root);
+  const stepped = root.dispatch("keydown", { key: "ArrowRight", target: root });
+  assert.equal(stepped.defaultPrevented, true);
+  assert.equal(controller.currentFrame, 1);
+});
+
+
 test("uses the exact fixed rate ladder, persists only the selected numeric rate, and keeps it across assets", () => {
   const storage = new FakeStorage();
   const { controller, video } = createController({ storage });

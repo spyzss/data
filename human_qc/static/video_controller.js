@@ -248,6 +248,13 @@ export class VideoController {
       // shortcut.  Descendant form controls keep their native focus behavior.
       if (event.target === this.root || event.target === this.video) this.focus();
     });
+    this._listen(this.root, "pointerup", (event) => {
+      // Real browsers can apply the native <video> focus default after
+      // pointerdown.  Restore the declared keyboard owner once that default
+      // has settled, so clicking the video has the same frame-step behavior as
+      // the controller's explicit focus API.
+      if (event.target === this.root || event.target === this.video) this.focus();
+    });
     this._listen(this.root, "keydown", (event) => this.handleKeydown(event));
   }
 

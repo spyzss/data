@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from human_qc.evidence import EvidenceService
+from human_qc.media import MediaCatalog
 from semantic_calibration.application import SemanticCalibrationApplication
 from semantic_calibration.service import PendingEditError, SemanticCalibrationService
 from human_qc.warn_service import (
@@ -19,6 +20,7 @@ from human_qc.warn_service import (
     reduce_overall_decision,
 )
 from human_qc.workbench_service import WorkbenchService
+from human_qc.warn_workbench_service import WarnWorkbenchService
 from qc_common.report import load_asset_qc_report, write_asset_qc_report
 from qc_pipeline.context import AssetContext
 from qc_reporting.aggregate import aggregate_projection
@@ -156,7 +158,11 @@ def build_file_asset(
     video_path.parent.mkdir()
     video_path.write_bytes(b"fixture-video-bytes")
 
-    windows = {"warn-left": (5, 15), "warn-right": (45, 55)}
+    windows = {
+        "warn-left": (5, 15),
+        "warn-mid": (15, 25),
+        "warn-right": (45, 55),
+    }
     warn_issues = [
         _warn_issue(issue_id, *windows[issue_id]) for issue_id in machine_warn_ids
     ]
@@ -535,3 +541,71 @@ def test_evidence_fixture_contains_half_open_video_window_and_21_point_skeleton(
     assert all(len(frame["points"]) == 21 for frame in captured["issue"]["skeleton"]["frames"])
     assert "start_frame=5" in " ".join(calls[0])
     assert "end_frame=15" in " ".join(calls[0])
+
+
+def test_warn_facade_modification_then_early_fail_keeps_unreviewed_warns_unwritten(
+    tmp_path: Path,
+) -> None:
+    """The durable Warn facade remains the sole truth through an early fail."""
+
+    asset = build_file_asset(
+        tmp_path,
+        asset_id="asset-early-fail",
+        selected_warn_ids=("warn-left", "warn-mid", "warn-right"),
+        machine_warn_ids=("warn-left", "warn-mid", "warn-right"),
+        hard_fail=False,
+        profile="supplier_evaluation",
+    )
+    media = MediaCatalog(
+        {asset.asset_id: asset.context},
+        probe=lambda _path: {"fps": 30.0, "total_frames": 90},
+    )
+    facade = WarnWorkbenchService(
+        reviewer="alice",
+        asset_contexts={asset.asset_id: asset.context},
+        media_catalog=media,
+        profile="supplier_evaluation",
+    )
+    task = facade.get_asset_task(asset.asset_id)
+    lease = task["lease"]["token"]
+    assert lease is not None
+
+    passed = facade.warn_verdict(
+        asset.asset_id,
+        issue_id="warn-left",
+        verdict="pass",
+        expected_revision=task["report_revision"],
+        lease_token=lease,
+    )
+    failure_reason = {
+        "mode": "manual",
+        "reason_codes": ["occlusion", "other"],
+        "other_text": "手被工具完全遮挡",
+    }
+    modified = facade.warn_verdict(
+        asset.asset_id,
+        issue_id="warn-left",
+        verdict="fail",
+        expected_revision=passed["report_revision"],
+        lease_token=lease,
+        failure_reason=failure_reason,
+    )
+    completed = facade.warn_complete(
+        asset.asset_id,
+        expected_revision=modified["report_revision"],
+        lease_token=lease,
+        completion_mode="early_fail",
+        failure_reason=failure_reason,
+    )
+
+    assert completed["manual_review_state"] == "completed"
+    report = load_asset_qc_report(asset.report_path)
+    assert report is not None
+    manual = report["manual_review"]
+    assert set(manual["issue_reviews"]) == {"warn-left"}
+    assert manual["issue_reviews"]["warn-left"]["verdict"] == "fail"
+    assert manual["completion_mode"] == "early_fail"
+    assert manual["failure_reason"] == failure_reason
+    assert manual["review_audit"][-1]["action"] == "resubmitted"
+    assert report["semantic_calibration"]["state"] == "skipped_due_to_fail"
+    assert report["pipeline_state"]["status"] == "stopped"

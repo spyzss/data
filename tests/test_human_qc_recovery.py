@@ -9,6 +9,8 @@ from threading import Thread
 import pytest
 
 from human_qc.evidence import EvidenceService
+from human_qc.media import MediaCatalog
+from human_qc.warn_workbench_service import WarnWorkbenchService
 from semantic_calibration.application import SemanticCalibrationApplication
 from semantic_calibration.hdf5_commit import Hdf5CommitError
 from semantic_calibration.http_server import create_http_server as create_semantic_http_server
@@ -18,7 +20,7 @@ from semantic_calibration.service import (
     SemanticCalibrationService,
     StaleSemanticRevisionError,
 )
-from human_qc.warn_service import WarnReviewService
+from human_qc.warn_service import WarnReviewService, WarnRevisionError
 from human_qc.workbench_service import WorkbenchService
 from qc_common.report import load_asset_qc_report
 from tests.test_human_qc_end_to_end import NOW, build_file_asset
@@ -148,6 +150,77 @@ def test_expired_workbench_lease_blocks_mutation_without_report_write(tmp_path: 
             lease_token=lease.token,
         )
     assert asset.report_path.read_bytes() == before
+
+
+def test_warn_facade_restart_restores_review_and_rejects_stale_or_expired_writes(
+    tmp_path: Path,
+) -> None:
+    """A reload reads the saved decision; invalid writes never touch its report."""
+
+    asset = build_file_asset(
+        tmp_path,
+        asset_id="asset-warn-recovery",
+        selected_warn_ids=("warn-left", "warn-mid", "warn-right"),
+        machine_warn_ids=("warn-left", "warn-mid", "warn-right"),
+        hard_fail=False,
+    )
+    clock = Clock()
+    leases = LeaseStore(clock=clock)
+    media = MediaCatalog(
+        {asset.asset_id: asset.context},
+        probe=lambda _path: {"fps": 30.0, "total_frames": 90},
+    )
+    first = WarnWorkbenchService(
+        reviewer="alice",
+        asset_contexts={asset.asset_id: asset.context},
+        lease_store=leases,
+        media_catalog=media,
+        lease_ttl_seconds=2,
+    )
+    task = first.get_asset_task(asset.asset_id)
+    token = task["lease"]["token"]
+    assert isinstance(token, str)
+    updated = first.warn_verdict(
+        asset.asset_id,
+        issue_id="warn-left",
+        verdict="pass",
+        expected_revision=task["report_revision"],
+        lease_token=token,
+    )
+
+    restarted = WarnWorkbenchService(
+        reviewer="alice",
+        asset_contexts={asset.asset_id: asset.context},
+        lease_store=leases,
+        media_catalog=media,
+        lease_ttl_seconds=2,
+    )
+    restored = restarted.get_asset_task(asset.asset_id, lease_token=token)
+    assert restored["report_revision"] == updated["report_revision"]
+    assert restored["issues"][0]["review"]["verdict"] == "pass"
+
+    before_stale = asset.report_path.read_bytes()
+    with pytest.raises(WarnRevisionError, match="stale_revision"):
+        restarted.warn_verdict(
+            asset.asset_id,
+            issue_id="warn-mid",
+            verdict="pass",
+            expected_revision=task["report_revision"],
+            lease_token=token,
+        )
+    assert asset.report_path.read_bytes() == before_stale
+
+    clock.advance(3)
+    before_expired = asset.report_path.read_bytes()
+    with pytest.raises(LeaseTokenError, match="expired"):
+        restarted.warn_verdict(
+            asset.asset_id,
+            issue_id="warn-mid",
+            verdict="pass",
+            expected_revision=updated["report_revision"],
+            lease_token=token,
+        )
+    assert asset.report_path.read_bytes() == before_expired
 
 
 def test_overlay_failure_degrades_in_integrated_task_but_keeps_clip(tmp_path: Path) -> None:

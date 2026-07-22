@@ -15,7 +15,7 @@ from semantic_calibration.service import (
 )
 from human_qc.warn_service import WarnReviewService
 from human_qc.workbench_service import WorkbenchService
-from qc_common.config import LoadedQcConfig
+from qc_common.config import LoadedQcConfig, load_qc_acceptance_config
 from qc_common.contracts import Issue, ModuleResult
 from qc_common.module_registry import ModuleRegistry
 from qc_common.report import (
@@ -138,6 +138,21 @@ def test_semantic_eligibility_is_derived_only_from_persisted_manual_terminal_sta
     assert eligibility(
         {"manual_review": {"state": "completed", "completion_mode": None}}
     ) == "blocked"
+
+
+def test_active_release_config_keeps_sam3_manual_and_semantic_in_order() -> None:
+    """The deployed config (and byte-identical release snapshot) owns this handoff."""
+
+    config = load_qc_acceptance_config()
+    modules = config.pipeline_modules
+    sam3 = modules.index("sam3_containment")
+    manual = modules.index("manual_review")
+    semantic = modules.index("semantic_consistency")
+
+    assert sam3 < manual < semantic
+    assert config.module_config("sam3_containment")["implementation"] == "sam3_containment.manifest"
+    assert config.module_config("manual_review")["execution_kind"] == "external"
+    assert config.module_config("semantic_consistency")["execution_kind"] == "external"
 
 
 def test_no_warn_skips_manual_before_exposing_semantic(tmp_path: Path) -> None:

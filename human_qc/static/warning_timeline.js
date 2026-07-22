@@ -338,6 +338,10 @@ export class WarningTimeline {
 
     const popover = this.document.createElement("div");
     popover.className = "warning-timeline__popover";
+    // The popover belongs to the track rather than the timeline section.  It
+    // can then sit just below its source block without covering the playhead
+    // (which must remain freely draggable after an overlap has been viewed).
+    popover.style.left = `${group.leftPercent}%`;
     popover.hidden = true;
     popover.setAttribute?.("role", "dialog");
     popover.setAttribute?.("aria-label", "重叠 Warn 选择");
@@ -405,6 +409,10 @@ export class WarningTimeline {
       state.focusInPopover = false;
       this._schedulePopoverClose(state);
     });
+    // The popover is visually anchored inside the track so that it can remain
+    // enterable without covering the playhead.  Its choice rows are seek
+    // controls, never free-track drag starts.
+    this._listen(popover, "pointerdown", (event) => event.stopPropagation?.());
     this._listen(block, "keydown", (event) => this._handleBlockKeydown(state, event));
     for (const row of rows) {
       this._listen(row, "keydown", (event) => this._handlePopoverRowKeydown(state, event));
@@ -412,7 +420,7 @@ export class WarningTimeline {
     this._listen(block, "pointerdown", (event) => event.stopPropagation?.());
     this._listen(block, "click", () => this.seekToFrame(group.warnings[0].startFrame));
     track.append(block);
-    element.append(popover);
+    track.append(popover);
   }
 
   _handleBlockKeydown(state, event) {

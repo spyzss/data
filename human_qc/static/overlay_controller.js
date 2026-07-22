@@ -14,6 +14,18 @@ const segmentKey = (segment) => `${segment.start}:${segment.end}`;
 
 const asFrame = (time, fps) => Math.max(0, Math.round(Number(time) * fps) || 0);
 
+const sourceMatches = (video, url) => {
+  if (typeof url !== "string" || !url) return false;
+  const assigned = typeof video?.src === "string" ? video.src : "";
+  if (assigned === url) return true;
+  try {
+    const base = video?.ownerDocument?.baseURI ?? globalThis.document?.baseURI ?? "http://localhost/";
+    return new URL(assigned, base).href === new URL(url, base).href;
+  } catch {
+    return false;
+  }
+};
+
 const safePause = (video) => {
   try { video.pause?.(); } catch { /* media teardown is best effort */ }
 };
@@ -210,7 +222,9 @@ export class OverlayController {
 
   _onCanPlay() {
     const segment = this.current;
-    if (this.destroyed || !segment || this.overlayVideo.src !== segment.url) return;
+    // Native HTMLVideoElement.src is normalized to an absolute URL, while the
+    // canonical Warn DTO intentionally carries a same-origin relative route.
+    if (this.destroyed || !segment || !sourceMatches(this.overlayVideo, segment.url)) return;
     this.loaded.add(segment.key);
     this.failed.delete(segment.key);
     this.syncFromBase({ hard: true });

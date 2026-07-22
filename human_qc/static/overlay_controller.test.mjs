@@ -117,3 +117,22 @@ test("it mirrors base media events without adding keyboard ownership and cleans 
   assert.equal(overlay.listenerCount("canplay"), 0);
   assert.equal(overlay.src, "");
 });
+
+
+test("it accepts the absolute URL exposed by a real browser after assigning a relative overlay route", () => {
+  const base = new FakeVideo();
+  const overlay = new FakeVideo();
+  let assigned = "";
+  Object.defineProperty(overlay, "src", {
+    configurable: true,
+    get: () => assigned ? `http://127.0.0.1:4321${assigned}` : "",
+    set: (value) => { assigned = String(value); },
+  });
+  overlay.ownerDocument = { baseURI: "http://127.0.0.1:4321/" };
+  const controller = new OverlayController({ baseVideo: base, overlayVideo: overlay, fps: 30 });
+  controller.setEvidence(evidence());
+  controller.updateForFrame(142);
+  overlay.dispatch("canplay");
+
+  assert.equal(overlay.hidden, false);
+});
