@@ -93,6 +93,23 @@ def _acceptance_frame_budget_stop_module(report: Mapping[str, Any]) -> str | Non
     return module if isinstance(module, str) and module else None
 
 
+def _manual_skipped_by_acceptance_frame_budget(report: Mapping[str, Any]) -> bool:
+    execution = report.get("execution")
+    module_states = (
+        execution.get("module_states") if isinstance(execution, Mapping) else None
+    )
+    manual_state = (
+        module_states.get("manual_review")
+        if isinstance(module_states, Mapping)
+        else None
+    )
+    return (
+        isinstance(manual_state, Mapping)
+        and manual_state.get("state")
+        == "not_run_due_to_acceptance_frame_budget"
+    )
+
+
 def _record_empty_manual_review(
     context: AssetContext,
     *,
@@ -165,6 +182,63 @@ def _record_empty_manual_review(
             else "pass"
         )
     )
+    candidate["report_revision"] = expected_revision + 1
+    write_asset_qc_report(
+        context.report_path,
+        candidate,
+        expected_revision=expected_revision,
+        profile=profile,
+    )
+    return candidate
+
+
+def _record_acceptance_frame_budget_semantic_skip(
+    context: AssetContext,
+    *,
+    config: LoadedQcConfig,
+    profile: str,
+    report: Mapping[str, Any],
+    expected_revision: int,
+    now: str,
+) -> dict[str, Any]:
+    """Skip both external human stages after the acceptance frame budget fires."""
+
+    candidate = copy.deepcopy(dict(report))
+    manual = candidate.get("manual_review")
+    if not isinstance(manual, dict):
+        raise ValueError("manual_review must be an object")
+    manual["state"] = "skipped_due_to_fail"
+    manual.pop("orchestrator_resume_required", None)
+    mark_semantic_skipped_due_to_fail(candidate)
+
+    execution = candidate.get("execution")
+    if not isinstance(execution, dict):
+        raise ValueError("execution must be an object")
+    module_states = execution.setdefault("module_states", {})
+    if not isinstance(module_states, dict):
+        raise ValueError("execution.module_states must be an object")
+    module_states["semantic_consistency"] = {
+        "state": "not_run_due_to_acceptance_frame_budget",
+        "reason": "insufficient_remaining_frames",
+    }
+    execution["updated_at"] = now
+
+    next_module = _successor(config.pipeline_modules, "semantic_consistency")
+    pipeline = candidate.get("pipeline_state")
+    if not isinstance(pipeline, dict):
+        raise ValueError("pipeline_state must be an object")
+    completed = next_module is None
+    pipeline.update(
+        {
+            "status": "completed" if completed else "running",
+            "last_completed_module": "semantic_consistency",
+            "next_module": next_module,
+            "stop_reason": None,
+        }
+    )
+    if completed:
+        pipeline.pop("external_resume", None)
+    candidate["overall_decision"] = "fail" if completed else None
     candidate["report_revision"] = expected_revision + 1
     write_asset_qc_report(
         context.report_path,
@@ -340,6 +414,21 @@ def run_asset(
                     continue
             elif module_name == "semantic_consistency":
                 eligibility = semantic_eligibility(report)
+                if (
+                    eligibility != "ready"
+                    and profile == "acceptance"
+                    and budget_stop_module is not None
+                    and _manual_skipped_by_acceptance_frame_budget(report)
+                ):
+                    report = _record_acceptance_frame_budget_semantic_skip(
+                        context,
+                        config=config,
+                        profile=profile,
+                        report=report,
+                        expected_revision=expected_revision,
+                        now=timestamp,
+                    )
+                    continue
                 if eligibility != "ready":
                     raise ValueError(
                         "semantic_consistency requires completed or not-required "

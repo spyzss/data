@@ -325,6 +325,71 @@ def test_semantic_task_is_blocked_while_manual_review_is_incomplete(tmp_path: Pa
     assert service.report_path(ASSET_ID).read_bytes() == before_report
 
 
+def test_completed_semantic_task_read_rechecks_manual_terminal_state(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
+    report_path = service.report_path(ASSET_ID)
+    report = load_asset_qc_report(report_path)
+    assert report is not None
+    report["manual_review"].update(
+        {
+            "state": "queued",
+            "required": True,
+            "candidate_issue_ids": ["warn-1"],
+            "selected_issue_ids": ["warn-1"],
+            "selected_issue_id": "warn-1",
+            "issue_reviews": {},
+            "completed_at": None,
+        }
+    )
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+
+    restarted = SemanticCalibrationService(
+        assets={ASSET_ID: service._assets[ASSET_ID]},
+        reports={ASSET_ID: report_path},
+        leases={ASSET_ID: LEASE},
+    )
+    with pytest.raises(TaskStateError, match="manual|eligible|blocked"):
+        restarted.get_task(ASSET_ID)
+
+
+@pytest.mark.parametrize("action", ["confirm", "cancel"])
+def test_pending_semantic_mutation_rechecks_persisted_manual_gate(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    service = _service(tmp_path)
+    service.begin_boundary_edit(ASSET_ID, boundary_request(1, 60, revision=1))
+    report_path = service.report_path(ASSET_ID)
+    report = load_asset_qc_report(report_path)
+    assert report is not None
+    report["manual_review"].update(
+        {
+            "state": "in_progress",
+            "required": True,
+            "candidate_issue_ids": ["warn-1"],
+            "selected_issue_ids": ["warn-1"],
+            "selected_issue_id": "warn-1",
+            "issue_reviews": {},
+            "completed_at": None,
+        }
+    )
+    report["pipeline_state"].update(
+        {"status": "awaiting_external", "next_module": "manual_review"}
+    )
+    report["report_revision"] = 3
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    before = report_path.read_bytes()
+
+    with pytest.raises(TaskStateError, match="manual|semantic|next_module|blocked"):
+        if action == "confirm":
+            service.confirm_pending(ASSET_ID, expected_revision=3, lease_token=LEASE)
+        else:
+            service.cancel_pending(ASSET_ID, expected_revision=3, lease_token=LEASE)
+
+    assert report_path.read_bytes() == before
+
+
 @pytest.mark.parametrize("operation", ["get", "confirm", "complete"])
 def test_external_immutable_canonical_change_fails_closed(
     tmp_path: Path, operation: str
