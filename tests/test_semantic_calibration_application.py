@@ -152,9 +152,108 @@ def test_reportless_preview_can_be_read_but_never_mutated(tmp_path: Path) -> Non
     domain.get_task = lambda asset_id: {"asset_id": asset_id, "report_revision": 0}
     application = SemanticCalibrationApplication(domain)
 
-    assert application.get_task("preview")["asset_id"] == "preview"
+    preview = application.get_task("preview")
+    assert preview["asset_id"] == "preview"
+    assert preview["editable"] is False
     with pytest.raises(SemanticEligibilityError, match="persisted report"):
         application.acquire_lease("preview", "alice", 60)
+
+
+def test_queue_contains_only_live_persisted_tasks_while_deep_links_remain_read_only(
+    tmp_path: Path,
+) -> None:
+    live = _report(tmp_path, "live", "completed", "all_reviewed")
+    completed = _report(tmp_path, "completed", "completed", "all_reviewed")
+    completed_value = json.loads(completed.read_text(encoding="utf-8"))
+    completed_value["semantic_calibration"] = {"state": "completed"}
+    completed_value["pipeline_state"].update({"status": "completed", "next_module": None})
+    completed.write_text(json.dumps(completed_value), encoding="utf-8")
+    preview = tmp_path / "preview.json"
+    domain = DomainStub({"live": live, "completed": completed, "preview": preview})
+    original_get_task = domain.get_task
+
+    def get_task(asset_id: str):
+        if asset_id == "preview":
+            return {"asset_id": asset_id, "report_revision": 0}
+        return original_get_task(asset_id)
+
+    domain.get_task = get_task
+    application = SemanticCalibrationApplication(domain)
+
+    assert application.list_assets() == [
+        {"asset_id": "live", "state": "not_started", "report_revision": 4, "editable": True}
+    ]
+    assert application.get_task("live")["editable"] is True
+    assert application.get_task("completed")["editable"] is False
+    assert application.get_task("preview")["editable"] is False
+
+
+def test_video_capability_is_encoded_rechecks_report_and_stays_inside_explicit_root(
+    tmp_path: Path,
+) -> None:
+    asset_id = "asset/a?b"
+    report = _report(tmp_path, "video-report", "completed", "all_reviewed")
+    domain = DomainStub({asset_id: report})
+    video_root = tmp_path / "videos"
+    video_root.mkdir()
+    video = video_root / "source.mp4"
+    video.write_bytes(b"video")
+
+    with pytest.raises(ValueError, match="video root"):
+        SemanticCalibrationApplication(domain, video_paths={asset_id: video})
+
+    application = SemanticCalibrationApplication(
+        domain,
+        video_paths={asset_id: video},
+        video_roots={asset_id: video_root},
+    )
+    assert application.get_task(asset_id)["video_url"] == "/api/semantic/assets/asset%2Fa%3Fb/video"
+    assert application.semantic_video_path(asset_id) == video.resolve()
+
+    value = json.loads(report.read_text(encoding="utf-8"))
+    value["manual_review"].update({"state": "queued", "completion_mode": None})
+    report.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(SemanticEligibilityError, match="semantic_not_ready"):
+        application.semantic_video_path(asset_id)
+
+    missing_report = tmp_path / "missing-video-report.json"
+    reportless_domain = DomainStub({"preview": missing_report})
+    reportless = SemanticCalibrationApplication(
+        reportless_domain,
+        video_paths={"preview": video},
+        video_roots={"preview": video_root},
+    )
+    with pytest.raises(SemanticEligibilityError, match="persisted report"):
+        reportless.semantic_video_path("preview")
+
+
+def test_video_root_rejects_symlink_escape_at_construction_and_request_time(tmp_path: Path) -> None:
+    report = _report(tmp_path, "asset", "completed", "all_reviewed")
+    domain = DomainStub({"asset": report})
+    root = tmp_path / "videos"
+    root.mkdir()
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"secret")
+    link = root / "source.mp4"
+    link.symlink_to(outside)
+    with pytest.raises(ValueError, match="video.*root"):
+        SemanticCalibrationApplication(
+            domain,
+            video_paths={"asset": link},
+            video_roots={"asset": root},
+        )
+
+    link.unlink()
+    link.write_bytes(b"safe")
+    application = SemanticCalibrationApplication(
+        domain,
+        video_paths={"asset": link},
+        video_roots={"asset": root},
+    )
+    link.unlink()
+    link.symlink_to(outside)
+    with pytest.raises(KeyError):
+        application.semantic_video_path("asset")
 
 
 def test_public_task_dto_is_an_explicit_safe_allowlist_after_real_lease_acquire(

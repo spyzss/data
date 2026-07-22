@@ -23,8 +23,8 @@ body { margin: 0; padding: 24px; }
 .video-readout { position: absolute; right: 16px; bottom: 16px; padding: 8px 12px; border-radius: 8px; color: white; background: rgb(7 21 38 / 82%); }
 .semantic-stage { min-height: 320px; }
 .timeline-track { position: relative; min-height: 96px; border: 1px solid #cad8e8; border-radius: 12px; background: #f7f9fc; }
-.timeline-segment { position: absolute; top: 24px; height: 48px; border: 1px solid #8da9d1; background: #dce9fa; overflow: hidden; }
-.boundary-handle { position: absolute; top: 12px; width: 12px; height: 72px; border: 0; border-radius: 8px; background: #3c82f6; cursor: ew-resize; }
+.timeline-segment { position: absolute; left: var(--segment-left); width: var(--segment-width); top: 24px; height: 48px; border: 1px solid #8da9d1; background: #dce9fa; overflow: hidden; }
+.boundary-handle { position: absolute; left: var(--boundary-left); transform: translateX(-50%); top: 12px; width: 12px; height: 72px; border: 0; border-radius: 8px; background: #3c82f6; cursor: ew-resize; }
 .pending-confirmation { margin-top: 20px; border: 1px solid #f0a23b; border-radius: 12px; padding: 16px; background: #fff8ec; }
 
 @media (max-width: 720px) {

@@ -13,6 +13,10 @@ const asSegments = (semantic) => {
   return Array.isArray(segments) ? segments : [];
 };
 
+const framePercent = (frame, frameCount) => frameCount > 0
+  ? Number(((Number(frame) / Number(frameCount)) * 100).toFixed(6))
+  : 0;
+
 export function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -44,6 +48,10 @@ export function buildTimelineModel(semantic) {
     };
   });
   const frameCount = Number(timeline.frame_count ?? segments.at(-1)?.end_frame_exclusive ?? 0);
+  segments.forEach((segment) => {
+    segment.leftPercent = framePercent(segment.start_frame, frameCount);
+    segment.widthPercent = framePercent(segment.end_frame_exclusive - segment.start_frame, frameCount);
+  });
   const handles = segments.slice(1).map((segment, offset) => {
     const boundaryIndex = offset + 1;
     const previous = segments[offset];
@@ -54,7 +62,8 @@ export function buildTimelineModel(semantic) {
       previous_segment_id: previous.internal_id,
       next_segment_id: segment.internal_id,
       actor_segment_id: segment.internal_id,
-      percent: frameCount > 0 ? (frameExclusive / frameCount) * 100 : 0,
+      percent: framePercent(frameExclusive, frameCount),
+      leftPercent: framePercent(frameExclusive, frameCount),
     };
   });
   return {
@@ -112,12 +121,13 @@ export function linkedBoundaryPreview(model, boundaryIndex, frameExclusive) {
     following: {
       startFrame: frameExclusive,
       endFrameExclusive: following.end_frame_exclusive,
+      leftPercent: framePercent(frameExclusive, frameCount),
       widthPercent: frameCount > 0 ? ((following.end_frame_exclusive - frameExclusive) / frameCount) * 100 : 0,
     },
   };
 }
 
-export function renderTimelineMarkup(model, { pending = null, preview = null } = {}) {
+export function renderTimelineMarkup(model, { pending = null, preview = null, readOnly = false } = {}) {
   const affected = new Set(pendingPresentation(pending).affectedSegmentIds);
   const previewBoundary = preview?.boundary_index;
   const previewFrame = preview?.frame_exclusive;
@@ -126,18 +136,18 @@ export function renderTimelineMarkup(model, { pending = null, preview = null } =
       const className = ["timeline-segment", affected.has(segment.internal_id) ? "pending-affected" : ""]
         .filter(Boolean)
         .join(" ");
-      const width = model.frameCount > 0
-        ? Math.max(0, ((segment.end_frame_exclusive - segment.start_frame) / model.frameCount) * 100)
-        : 0;
+      const left = Math.max(0, Number(segment.leftPercent ?? 0));
+      const width = Math.max(0, Number(segment.widthPercent ?? 0));
       const text = escapeHtml(segment.text_cn || segment.text_en || `Segment ${index + 1}`);
       const endFrame = displayEndFrame(segment);
-      let html = `<div class="${className}" data-segment-id="${escapeHtml(segment.internal_id)}" data-start-frame="${segment.start_frame}" data-end-frame="${endFrame}" style="--segment-width:${width}%">`;
+      let html = `<div class="${className}" data-segment-id="${escapeHtml(segment.internal_id)}" data-start-frame="${segment.start_frame}" data-end-frame="${endFrame}" style="--segment-left:${left}%;--segment-width:${width}%">`;
       html += `<div class="segment-title">${text}</div><div class="segment-range">${segment.start_frame}–${endFrame}</div></div>`;
       const handle = model.handles[index];
       if (handle) {
         const isPreview = handle.boundary_index === previewBoundary;
         const frame = isPreview ? previewFrame : handle.frame_exclusive;
-        html += `<button type="button" class="boundary-handle${isPreview ? " is-preview" : ""}" data-boundary-index="${handle.boundary_index}" data-actor-segment-id="${escapeHtml(handle.actor_segment_id)}" data-frame-exclusive="${frame}" aria-label="调整第 ${handle.boundary_index} 个共享边界"${pending ? " disabled" : ""}></button>`;
+        const handleLeft = framePercent(frame, model.frameCount);
+        html += `<button type="button" class="boundary-handle${isPreview ? " is-preview" : ""}" data-boundary-index="${handle.boundary_index}" data-actor-segment-id="${escapeHtml(handle.actor_segment_id)}" data-frame-exclusive="${frame}" style="--boundary-left:${handleLeft}%" aria-label="调整第 ${handle.boundary_index} 个共享边界"${pending || readOnly ? " disabled" : ""}></button>`;
       }
       return html;
     })
@@ -182,17 +192,18 @@ export class SemanticCalibrationAdapter {
     this.task = task;
     this.root = root;
     const semantic = task?.semantic ?? task;
+    const readOnly = task?.editable === false;
     this.model = buildTimelineModel(semantic);
     const pending = semantic?.pending_edit ?? task?.pending_edit ?? null;
     if (!root) return this.model;
     try {
       root.innerHTML = `<section class="semantic-calibration" data-pending="${pending ? "true" : "false"}">
       <div class="timeline-toolbar"><span class="timeline-caption">时间轴（帧）</span><span class="timeline-total">0–${displayEndFrame({ end_frame_exclusive: this.model.frameCount })}</span></div>
-      <div class="timeline-host">${renderTimelineMarkup(this.model, { pending, preview: this.preview })}</div>
+      <div class="timeline-host">${renderTimelineMarkup(this.model, { pending, preview: this.preview, readOnly })}</div>
       <div class="semantic-pending-slot"></div>
       <div class="semantic-error" role="alert" aria-live="polite"></div>
       <div class="semantic-text-slot"></div>
-      <div class="semantic-complete-row"><button type="button" class="semantic-complete" data-action="complete-semantic" data-mutation-control>完成语义校准</button></div>
+      <div class="semantic-complete-row"><button type="button" class="semantic-complete" data-action="complete-semantic" data-mutation-control${readOnly ? " disabled" : ""}>完成语义校准</button></div>
     </section>`;
     } catch {
       return this.model;
@@ -242,6 +253,7 @@ export class SemanticCalibrationAdapter {
     }
     this.drag.frameExclusive = next;
     handle.dataset.frameExclusive = String(next);
+    handle.style?.setProperty?.("--boundary-left", `${framePercent(next, this.model.frameCount)}%`);
     handle.classList?.add("is-preview");
     handle.setAttribute?.("aria-valuenow", String(next));
     const previewLabel = this.root?.querySelector?.(".semantic-preview-frame");
@@ -312,7 +324,7 @@ export class SemanticCalibrationAdapter {
   renderTextEditor(pending) {
     const slot = this.root?.querySelector?.(".semantic-text-slot");
     if (!slot) return;
-    const locked = Boolean(pending);
+    const locked = Boolean(pending) || this.task?.editable === false;
     const rows = this.model.segments.map((segment) => `<div class="text-editor-row" data-segment-id="${escapeHtml(segment.internal_id)}">
       <label><span>中文</span><input data-mutation-control data-text-cn="${escapeHtml(segment.internal_id)}" value="${escapeHtml(segment.text_cn)}" ${locked ? "disabled" : ""}></label>
       <label><span>English</span><input data-mutation-control data-text-en="${escapeHtml(segment.internal_id)}" value="${escapeHtml(segment.text_en)}" ${locked ? "disabled" : ""}></label>
@@ -340,6 +352,7 @@ export class SemanticCalibrationAdapter {
     previous.classList?.add("preview-affected");
     following.classList?.add("preview-affected");
     previous.style?.setProperty?.("--segment-width", `${preview.previous.widthPercent}%`);
+    following.style?.setProperty?.("--segment-left", `${preview.following.leftPercent}%`);
     following.style?.setProperty?.("--segment-width", `${preview.following.widthPercent}%`);
     previous.dataset.endFrame = String(frameExclusive - 1);
     following.dataset.startFrame = String(frameExclusive);
@@ -359,7 +372,10 @@ export class SemanticCalibrationAdapter {
     const rows = view.affectedSegmentIds.map((id, index) => {
       const before = view.before[index] ?? {};
       const after = view.after[index] ?? {};
-      return `<div class="pending-row" data-segment-id="${escapeHtml(id)}"><span class="pending-segment-id">${escapeHtml(id)}</span><span class="pending-before">修改前：${before.start_frame}–${displayEndFrame(before)}</span><span class="pending-after">修改后：${after.start_frame}–${displayEndFrame(after)}</span></div>`;
+      if (view.editType === "text") {
+        return `<div class="pending-row pending-text-row" data-segment-id="${escapeHtml(id)}"><span class="pending-segment-id">${escapeHtml(id)}</span><span class="pending-before-cn">修改前中文：${escapeHtml(before.text_cn)}</span><span class="pending-after-cn">修改后中文：${escapeHtml(after.text_cn)}</span><span class="pending-before-en">修改前英文：${escapeHtml(before.text_en)}</span><span class="pending-after-en">修改后英文：${escapeHtml(after.text_en)}</span></div>`;
+      }
+      return `<div class="pending-row pending-boundary-row" data-segment-id="${escapeHtml(id)}"><span class="pending-segment-id">${escapeHtml(id)}</span><span class="pending-before">修改前：${before.start_frame}–${displayEndFrame(before)}</span><span class="pending-after">修改后：${after.start_frame}–${displayEndFrame(after)}</span></div>`;
     }).join("");
     slot.innerHTML = `<div class="semantic-pending" role="status"><div class="pending-title">待确认修改</div><div class="pending-rows">${rows}</div><span class="semantic-preview-frame" aria-live="polite"></span><div class="pending-actions"><button type="button" data-action="confirm-pending">确认并保存</button><button type="button" data-action="cancel-pending">取消本次修改</button></div></div>`;
     slot.querySelector?.('[data-action="confirm-pending"]')?.addEventListener("click", () => this.confirmPending());

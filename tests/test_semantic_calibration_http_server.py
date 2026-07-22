@@ -8,7 +8,7 @@ from threading import Thread
 import pytest
 
 from qc_common.reviewer_lease import LeaseConflictError, LeaseTokenError
-from semantic_calibration.http_server import SEMANTIC_ROUTES, create_http_server
+from semantic_calibration.http_server import SEMANTIC_ROUTES, VIDEO_CHUNK_SIZE, create_http_server
 from semantic_calibration.service import SemanticEligibilityError
 
 
@@ -82,6 +82,23 @@ def _raw_request(server, method: str, path: str, body: bytes = b"", headers: dic
     content_type = response.getheader("Content-Type")
     connection.close()
     return response.status, content_type, raw
+
+
+def _raw_request_details(server, method: str, path: str, body: bytes = b"", headers: dict | None = None):
+    connection = HTTPConnection("127.0.0.1", server.server_port)
+    connection.request(method, path, body=body, headers=headers or {})
+    response = connection.getresponse()
+    raw = response.read()
+    details = {
+        "status": response.status,
+        "content_type": response.getheader("Content-Type"),
+        "content_range": response.getheader("Content-Range"),
+        "content_length": response.getheader("Content-Length"),
+        "allow": response.getheader("Allow"),
+        "body": raw,
+    }
+    connection.close()
+    return details
 
 
 @pytest.fixture
@@ -192,7 +209,7 @@ def test_stable_conflicts_do_not_leak_internal_details(running_server) -> None:
     assert status == 423 and value["error"]["code"] == "lease_held"
 
 
-@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+@pytest.mark.parametrize("method", ["OPTIONS", "PUT", "PATCH", "DELETE", "TRACE", "BREW"])
 def test_unsupported_methods_return_stable_json_405(running_server, method: str) -> None:
     _, server = running_server
     status, content_type, raw = _raw_request(
@@ -206,6 +223,14 @@ def test_unsupported_methods_return_stable_json_405(running_server, method: str)
     assert status == 405
     assert content_type.startswith("application/json")
     assert value["error"]["code"] == "method_not_allowed"
+
+
+def test_head_returns_stable_json_media_type_and_405_without_a_body(running_server) -> None:
+    _, server = running_server
+    response = _raw_request_details(server, "HEAD", "/api/semantic/assets/asset-1/task")
+    assert response["status"] == 405
+    assert response["content_type"].startswith("application/json")
+    assert response["body"] == b""
 
 
 def test_post_requires_json_media_type_before_any_mutation(running_server) -> None:
@@ -232,6 +257,19 @@ def test_post_requires_json_media_type_before_any_mutation(running_server) -> No
     assert status == 200
 
 
+def test_unknown_post_is_404_before_content_type_validation(running_server) -> None:
+    _, server = running_server
+    status, _, raw = _raw_request(
+        server,
+        "POST",
+        "/api/semantic/assets/asset-1/not-a-route",
+        b"plain",
+        {"Content-Type": "text/plain"},
+    )
+    assert status == 404
+    assert json.loads(raw)["error"]["code"] == "not_found"
+
+
 def test_semantic_video_route_is_contained_and_supports_browser_ranges(
     running_server, tmp_path: Path
 ) -> None:
@@ -249,3 +287,97 @@ def test_semantic_video_route_is_contained_and_supports_browser_ranges(
     assert status == 206
     assert content_type == "video/mp4"
     assert body == b"2345"
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["bytes=0", "bytes=+1-", "bytes=0-1,3-4", "items=0-1", "bytes=-0", "bytes=20-30"],
+)
+def test_invalid_or_unsatisfiable_ranges_return_416_with_standard_size_header(
+    running_server, tmp_path: Path, header: str
+) -> None:
+    application, server = running_server
+    video = tmp_path / "asset.mp4"
+    video.write_bytes(b"0123456789")
+    application.video_path = video
+    response = _raw_request_details(
+        server,
+        "GET",
+        "/api/semantic/assets/asset-1/video",
+        headers={"Range": header},
+    )
+    assert response["status"] == 416
+    assert response["content_range"] == "bytes */10"
+    assert json.loads(response["body"])["error"]["code"] == "invalid_range"
+
+
+def test_suffix_and_long_end_ranges_are_normalized(running_server, tmp_path: Path) -> None:
+    application, server = running_server
+    video = tmp_path / "asset.mp4"
+    video.write_bytes(b"0123456789")
+    application.video_path = video
+    suffix = _raw_request_details(
+        server, "GET", "/api/semantic/assets/asset-1/video", headers={"Range": "bytes=-3"}
+    )
+    assert suffix["status"] == 206
+    assert suffix["content_range"] == "bytes 7-9/10"
+    assert suffix["body"] == b"789"
+    long_end = _raw_request_details(
+        server, "GET", "/api/semantic/assets/asset-1/video", headers={"Range": "bytes=2-999"}
+    )
+    assert long_end["content_range"] == "bytes 2-9/10"
+    assert long_end["body"] == b"23456789"
+
+
+def test_zero_byte_video_is_safe_and_any_range_is_unsatisfiable(running_server, tmp_path: Path) -> None:
+    application, server = running_server
+    video = tmp_path / "empty.mp4"
+    video.write_bytes(b"")
+    application.video_path = video
+    full = _raw_request_details(server, "GET", "/api/semantic/assets/asset-1/video")
+    assert full["status"] == 200
+    assert full["content_length"] == "0"
+    assert full["body"] == b""
+    ranged = _raw_request_details(
+        server, "GET", "/api/semantic/assets/asset-1/video", headers={"Range": "bytes=0-0"}
+    )
+    assert ranged["status"] == 416
+    assert ranged["content_range"] == "bytes */0"
+
+
+def test_video_response_reads_in_bounded_chunks(running_server, tmp_path: Path, monkeypatch) -> None:
+    application, server = running_server
+    video = tmp_path / "large.mp4"
+    video.write_bytes(b"x" * (VIDEO_CHUNK_SIZE * 2 + 17))
+    application.video_path = video
+    original_open = Path.open
+    read_sizes: list[int] = []
+
+    class TrackingReader:
+        def __init__(self, wrapped) -> None:
+            self.wrapped = wrapped
+
+        def __enter__(self):
+            self.wrapped.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.wrapped.__exit__(*args)
+
+        def seek(self, *args):
+            return self.wrapped.seek(*args)
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            return self.wrapped.read(size)
+
+    def tracking_open(path: Path, *args, **kwargs):
+        wrapped = original_open(path, *args, **kwargs)
+        return TrackingReader(wrapped) if path == video else wrapped
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    response = _raw_request_details(server, "GET", "/api/semantic/assets/asset-1/video")
+    assert response["status"] == 200
+    assert len(response["body"]) == VIDEO_CHUNK_SIZE * 2 + 17
+    assert len(read_sizes) >= 3
+    assert max(read_sizes) <= VIDEO_CHUNK_SIZE
