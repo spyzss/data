@@ -6,8 +6,6 @@
  * server transport: every user interaction is reduced to `onSeek(frame)`.
  */
 
-const LABEL_MIN_WIDTH_PERCENT = 8;
-
 const asInteger = (value) => Number.isInteger(value) ? value : null;
 
 const asObject = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -16,14 +14,27 @@ const clamp = (value, minimum, maximum) => Math.min(Math.max(value, minimum), ma
 
 const validTotalFrames = (totalFrames) => Number.isInteger(totalFrames) && totalFrames > 0 ? totalFrames : 0;
 
+const clampFrameToTotal = (frame, totalFrames) => {
+  if (!validTotalFrames(totalFrames) || !Number.isFinite(frame)) return 0;
+  return clamp(Math.floor(Number(frame)), 0, totalFrames - 1);
+};
+
+const requireTotalFrames = (totalFrames) => {
+  if (!validTotalFrames(totalFrames)) {
+    throw new RangeError("totalFrames must be a positive integer");
+  }
+  return totalFrames;
+};
+
 const compareWarnings = (left, right) => (
   left.startFrame - right.startFrame
   || left.selectedIndex - right.selectedIndex
 );
 
 const rangeForIssue = (issue) => {
-  const nested = asObject(issue?.frame_range);
-  if (nested) {
+  if (Object.prototype.hasOwnProperty.call(issue, "frame_range")) {
+    const nested = asObject(issue.frame_range);
+    if (!nested) return { start: null, end: null };
     return {
       start: asInteger(nested.start_frame),
       end: asInteger(nested.end_frame_exclusive),
@@ -38,25 +49,53 @@ const rangeForIssue = (issue) => {
   };
 };
 
+const closedRangeLabel = (startFrame, endFrameExclusive) => `${startFrame}–${endFrameExclusive - 1}`;
+
+const groupLabelText = (group) => {
+  const first = group.warnings[0];
+  return group.warnings.length > 1
+    ? `${first.displayName} · ${group.warnings.length}`
+    : first.displayName;
+};
+
+const groupAriaLabel = (group) => (
+  group.warnings
+    .map((warning) => `${warning.displayName}，帧 ${closedRangeLabel(warning.startFrame, warning.endFrameExclusive)}`)
+    .join("；")
+);
+
+const defaultLabelWidth = (text) => Array.from(String(text)).length * 16 + 24;
+
 /**
  * Normalize canonical issues into the only shape consumed by the timeline.
- * Invalid or empty intervals are omitted; retained values are half-open and
- * clamped to the video extent.
+ * Invalid selected warnings are rejected rather than silently omitted. Retained
+ * values are half-open and clamped to the video extent.
  */
 export function normalizeWarnings(issues, totalFrames) {
-  const frameCount = validTotalFrames(totalFrames);
-  if (!frameCount || !Array.isArray(issues)) return [];
+  const frameCount = requireTotalFrames(totalFrames);
+  if (!Array.isArray(issues)) throw new TypeError("issues must be an array");
+  const seenIds = new Set();
 
-  return issues.flatMap((issue, selectedIndex) => {
-    const id = typeof issue?.id === "string" && issue.id.trim() ? issue.id : null;
+  const warnings = issues.map((issue, selectedIndex) => {
+    if (!asObject(issue)) throw new TypeError(`warning at index ${selectedIndex} must be an object`);
+    const id = typeof issue.id === "string" ? issue.id.trim() : "";
+    if (!id) throw new TypeError(`warning at index ${selectedIndex} requires a non-empty id`);
+    if (seenIds.has(id)) throw new RangeError(`warning id ${id} must be unique`);
+    seenIds.add(id);
+
     const { start, end } = rangeForIssue(issue);
-    if (!id || start === null || end === null) return [];
+    if (start === null || end === null) {
+      throw new TypeError(`warning ${id} requires integer frame bounds`);
+    }
+    if (end <= start) throw new RangeError(`warning ${id} has an empty frame range`);
 
-    const startFrame = clamp(start, 0, frameCount - 1);
+    const startFrame = clamp(start, 0, frameCount);
     const endFrameExclusive = clamp(end, 0, frameCount);
-    if (endFrameExclusive <= startFrame) return [];
+    if (endFrameExclusive <= startFrame) {
+      throw new RangeError(`warning ${id} is empty after frame clamping`);
+    }
 
-    return [{
+    return {
       id,
       displayName: String(issue.display_name ?? issue.displayName ?? issue.code ?? id),
       startFrame,
@@ -65,8 +104,10 @@ export function normalizeWarnings(issues, totalFrames) {
       totalFrames: frameCount,
       threshold: asObject(issue.threshold),
       source: issue,
-    }];
-  }).sort(compareWarnings);
+    };
+  });
+
+  return warnings.sort(compareWarnings);
 }
 
 /**
@@ -107,7 +148,9 @@ export function mergeWarningIntervals(warnings) {
       ...group,
       leftPercent,
       widthPercent,
-      showLabel: widthPercent >= LABEL_MIN_WIDTH_PERCENT,
+      // The controller decides this after measuring the actual track width.
+      // A conservative model value ensures a narrow range never overflows.
+      showLabel: false,
     };
   });
 }
@@ -125,7 +168,7 @@ export function activeWarningsAtFrame(warnings, frame) {
 export function frameToPercent(frame, totalFrames) {
   const frameCount = validTotalFrames(totalFrames);
   if (!frameCount || !Number.isFinite(frame)) return 0;
-  return (clamp(Number(frame), 0, frameCount) / frameCount) * 100;
+  return (clamp(Math.floor(Number(frame)), 0, frameCount - 1) / frameCount) * 100;
 }
 
 /** Map a pointer on the entire track to an exact, clamped source-video frame. */
@@ -134,7 +177,7 @@ export function pointerToFrame(event, track, totalFrames) {
   const rect = track?.getBoundingClientRect?.();
   if (!frameCount || !rect || !(Number(rect.width) > 0) || !Number.isFinite(event?.clientX)) return 0;
   const progress = clamp((Number(event.clientX) - Number(rect.left)) / Number(rect.width), 0, 1);
-  return Math.round(progress * (frameCount - 1));
+  return clamp(Math.floor(progress * frameCount), 0, frameCount - 1);
 }
 
 const setClassState = (element, className, enabled) => {
@@ -155,6 +198,8 @@ export class WarningTimeline {
     currentFrame = 0,
     onSeek = null,
     documentRef = globalThis.document,
+    measureLabel = null,
+    resizeObserverFactory = globalThis.ResizeObserver,
   } = {}) {
     this.document = documentRef;
     this.totalFrames = validTotalFrames(totalFrames);
@@ -169,18 +214,25 @@ export class WarningTimeline {
     this._boundListeners = [];
     this._groupStates = [];
     this._dragCleanup = null;
+    this.measureLabel = typeof measureLabel === "function" ? measureLabel : defaultLabelWidth;
+    this.resizeObserverFactory = typeof resizeObserverFactory === "function" ? resizeObserverFactory : null;
+    this._layoutObserver = null;
   }
 
   clampFrame(frame) {
-    if (!this.totalFrames || !Number.isFinite(frame)) return 0;
-    return clamp(Math.round(Number(frame)), 0, this.totalFrames - 1);
+    return clampFrameToTotal(frame, this.totalFrames);
   }
 
   setWarnings(warnings, totalFrames = this.totalFrames) {
-    this.totalFrames = validTotalFrames(totalFrames);
-    this.warnings = normalizeWarnings(warnings, this.totalFrames);
-    this.groups = mergeWarningIntervals(this.warnings);
-    this.currentFrame = this.clampFrame(this.currentFrame);
+    const nextTotalFrames = requireTotalFrames(totalFrames);
+    const nextWarnings = normalizeWarnings(warnings, nextTotalFrames);
+    const nextGroups = mergeWarningIntervals(nextWarnings);
+    const nextCurrentFrame = clampFrameToTotal(this.currentFrame, nextTotalFrames);
+
+    this.totalFrames = nextTotalFrames;
+    this.warnings = nextWarnings;
+    this.groups = nextGroups;
+    this.currentFrame = nextCurrentFrame;
     if (this.root) this.mount(this.root);
     return this.groups;
   }
@@ -236,7 +288,39 @@ export class WarningTimeline {
       this._beginDrag(event);
     });
     this._renderCurrentFrame();
+    this.refreshLayout();
+    this._observeTrackLayout();
     return this;
+  }
+
+  /** Recalculate label visibility after a track/layout width change. */
+  refreshLayout() {
+    const trackWidth = Number(this.track?.getBoundingClientRect?.()?.width);
+    for (const state of this._groupStates) {
+      const availableWidth = Number.isFinite(trackWidth) && trackWidth > 0
+        ? (state.group.widthPercent / 100) * trackWidth
+        : 0;
+      const measured = Number(this.measureLabel(state.labelText, {
+        group: state.group,
+        block: state.block,
+        availableWidth,
+        trackWidth,
+      }));
+      const requiredWidth = Number.isFinite(measured) && measured >= 0
+        ? measured
+        : defaultLabelWidth(state.labelText);
+      const showLabel = availableWidth > 0 && requiredWidth <= availableWidth;
+      state.group.showLabel = showLabel;
+      state.block.dataset.showLabel = String(showLabel);
+      state.block.textContent = showLabel ? state.labelText : "";
+    }
+    return this.groups;
+  }
+
+  _observeTrackLayout() {
+    if (!this.resizeObserverFactory || !this.track) return;
+    this._layoutObserver = new this.resizeObserverFactory(() => this.refreshLayout());
+    this._layoutObserver.observe?.(this.track);
   }
 
   _appendGroup(track, element, group) {
@@ -250,18 +334,14 @@ export class WarningTimeline {
     block.style.width = `${group.widthPercent}%`;
     block.setAttribute?.("aria-haspopup", "dialog");
     block.setAttribute?.("aria-expanded", "false");
-    if (group.showLabel) {
-      const first = group.warnings[0];
-      block.textContent = group.warnings.length > 1
-        ? `${first.displayName} · ${group.warnings.length}`
-        : first.displayName;
-    }
+    block.setAttribute?.("aria-label", groupAriaLabel(group));
 
     const popover = this.document.createElement("div");
     popover.className = "warning-timeline__popover";
     popover.hidden = true;
     popover.setAttribute?.("role", "dialog");
     popover.setAttribute?.("aria-label", "重叠 Warn 选择");
+    const rows = [];
     for (const warning of group.warnings) {
       const row = this.document.createElement("button");
       row.type = "button";
@@ -271,9 +351,22 @@ export class WarningTimeline {
       row.textContent = `${warning.displayName} · ${warning.startFrame}–${warning.endFrameExclusive - 1}`;
       this._listen(row, "click", () => this.seekToFrame(warning.startFrame));
       popover.append(row);
+      rows.push(row);
     }
 
-    const state = { block, popover, pointerOnBlock: false, pointerOnPopover: false, focusInBlock: false, focusInPopover: false, closeTimer: null };
+    const state = {
+      group,
+      block,
+      popover,
+      rows,
+      labelText: groupLabelText(group),
+      pointerOnBlock: false,
+      pointerOnPopover: false,
+      focusInBlock: false,
+      focusInPopover: false,
+      closeTimer: null,
+      suppressBlockFocusOpen: false,
+    };
     this._groupStates.push(state);
     const open = () => this._openPopover(state);
     this._listen(block, "pointerenter", () => {
@@ -294,6 +387,10 @@ export class WarningTimeline {
     });
     this._listen(block, "focusin", () => {
       state.focusInBlock = true;
+      if (state.suppressBlockFocusOpen) {
+        state.suppressBlockFocusOpen = false;
+        return;
+      }
       open();
     });
     this._listen(block, "focusout", () => {
@@ -308,10 +405,34 @@ export class WarningTimeline {
       state.focusInPopover = false;
       this._schedulePopoverClose(state);
     });
+    this._listen(block, "keydown", (event) => this._handleBlockKeydown(state, event));
+    for (const row of rows) {
+      this._listen(row, "keydown", (event) => this._handlePopoverRowKeydown(state, event));
+    }
     this._listen(block, "pointerdown", (event) => event.stopPropagation?.());
     this._listen(block, "click", () => this.seekToFrame(group.warnings[0].startFrame));
     track.append(block);
     element.append(popover);
+  }
+
+  _handleBlockKeydown(state, event) {
+    const key = event?.key;
+    if (key === "ArrowDown" || key === "Enter" || key === " " || key === "Spacebar") {
+      event.preventDefault?.();
+      this._openPopover(state);
+      state.rows[0]?.focus?.();
+      return;
+    }
+    if (key === "Escape") {
+      event.preventDefault?.();
+      this._closePopover(state);
+    }
+  }
+
+  _handlePopoverRowKeydown(state, event) {
+    if (event?.key !== "Escape") return;
+    event.preventDefault?.();
+    this._closePopover(state, { returnFocus: true });
   }
 
   _openPopover(state) {
@@ -323,13 +444,25 @@ export class WarningTimeline {
     state.block.setAttribute?.("aria-expanded", "true");
   }
 
+  _closePopover(state, { returnFocus = false } = {}) {
+    if (state.closeTimer !== null) {
+      globalThis.clearTimeout?.(state.closeTimer);
+      state.closeTimer = null;
+    }
+    state.popover.hidden = true;
+    state.block.setAttribute?.("aria-expanded", "false");
+    if (returnFocus) {
+      state.suppressBlockFocusOpen = true;
+      state.block.focus?.();
+    }
+  }
+
   _schedulePopoverClose(state) {
     if (state.closeTimer !== null) globalThis.clearTimeout?.(state.closeTimer);
     state.closeTimer = globalThis.setTimeout?.(() => {
       state.closeTimer = null;
       if (state.pointerOnBlock || state.pointerOnPopover || state.focusInBlock || state.focusInPopover) return;
-      state.popover.hidden = true;
-      state.block.setAttribute?.("aria-expanded", "false");
+      this._closePopover(state);
     }, 80) ?? null;
   }
 
@@ -342,6 +475,19 @@ export class WarningTimeline {
     if (!this.track) return;
     this._endDrag();
     const pointerId = event?.pointerId;
+    const captureTarget = event?.currentTarget;
+    const canCapture = Number.isInteger(pointerId)
+      && typeof captureTarget?.setPointerCapture === "function";
+    let captured = false;
+    if (canCapture) {
+      try {
+        captureTarget.setPointerCapture(pointerId);
+        captured = true;
+      } catch {
+        // Pointer capture may be unavailable on a detached test or browser node.
+        captured = false;
+      }
+    }
     let lastFrame = null;
     const ownsPointer = (candidate) => pointerId === undefined || candidate?.pointerId === undefined || candidate.pointerId === pointerId;
     const seek = (candidate) => {
@@ -358,13 +504,25 @@ export class WarningTimeline {
       if (candidate?.type !== "pointercancel") seek(candidate);
       this._endDrag();
     };
+    const lostCapture = (candidate) => {
+      if (ownsPointer(candidate)) this._endDrag();
+    };
     this.document?.addEventListener?.("pointermove", move);
     this.document?.addEventListener?.("pointerup", end);
     this.document?.addEventListener?.("pointercancel", end);
+    captureTarget?.addEventListener?.("lostpointercapture", lostCapture);
     this._dragCleanup = () => {
       this.document?.removeEventListener?.("pointermove", move);
       this.document?.removeEventListener?.("pointerup", end);
       this.document?.removeEventListener?.("pointercancel", end);
+      captureTarget?.removeEventListener?.("lostpointercapture", lostCapture);
+      if (captured) {
+        try {
+          captureTarget.releasePointerCapture?.(pointerId);
+        } catch {
+          // A browser can release capture itself before pointercancel is handled.
+        }
+      }
       this._dragCleanup = null;
     };
   }
@@ -387,6 +545,8 @@ export class WarningTimeline {
 
   destroy() {
     this._endDrag();
+    this._layoutObserver?.disconnect?.();
+    this._layoutObserver = null;
     for (const [target, type, listener] of this._boundListeners) target.removeEventListener?.(type, listener);
     this._boundListeners = [];
     for (const state of this._groupStates) {

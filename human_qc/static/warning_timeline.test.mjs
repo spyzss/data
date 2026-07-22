@@ -61,6 +61,9 @@ class FakeElement extends FakeEventTarget {
     this.tabIndex = -1;
     this.attributes = new Map();
     this.rect = { left: 0, width: 100 };
+    this.focused = false;
+    this.capturedPointerIds = [];
+    this.releasedPointerIds = [];
   }
 
   append(...children) {
@@ -93,6 +96,18 @@ class FakeElement extends FakeEventTarget {
 
   getBoundingClientRect() {
     return { ...this.rect };
+  }
+
+  focus() {
+    this.focused = true;
+  }
+
+  setPointerCapture(pointerId) {
+    this.capturedPointerIds.push(pointerId);
+  }
+
+  releasePointerCapture(pointerId) {
+    this.releasedPointerIds.push(pointerId);
   }
 }
 
@@ -155,7 +170,6 @@ test("keeps selected-index ties deterministic, clamps fixture aliases, and does 
     { id: "first-tie", start_frame: 10, end_frame_exclusive: 15 },
     { id: "adjacent", start_frame: 20, end_frame_exclusive: 30 },
     { id: "clamped", start_frame: -10, end_frame_exclusive: 4 },
-    { id: "invalid", start_frame: 9, end_frame_exclusive: 9 },
   ], 100);
 
   assert.deepEqual(warnings.map(({ id }) => id), ["clamped", "later-tie", "first-tie", "adjacent"]);
@@ -188,6 +202,163 @@ test("uses exact clamped frames for free track and needle mapping", () => {
   assert.equal(pointerToFrame({ clientX: 300 }, track, 100), 99);
   assert.equal(pointerToFrame({ clientX: -10 }, track, 100), 0);
   assert.equal(pointerToFrame({ clientX: 1000 }, track, 100), 99);
+});
+
+
+test("uses one half-open coordinate system for high frame positions and playhead placement", () => {
+  const track = { getBoundingClientRect: () => ({ left: 0, width: 100 }) };
+
+  assert.equal(pointerToFrame({ clientX: 90 }, track, 100), 90);
+  assert.equal(pointerToFrame({ clientX: 99 }, track, 100), 99);
+  assert.equal(frameToPercent(99, 100), 99);
+  assert.equal(frameToPercent(100, 100), 99);
+});
+
+
+test("floors controlled current frames so a fractional playback value cannot jump ahead", () => {
+  const timeline = new WarningTimeline({
+    warnings: [{ id: "only", frame_range: { start_frame: 10, end_frame_exclusive: 20 } }],
+    totalFrames: 100,
+  });
+
+  assert.equal(timeline.setCurrentFrame(50.9), 50);
+  assert.equal(timeline.currentFrame, 50);
+});
+
+
+test("rejects malformed selected warnings instead of silently dropping them", () => {
+  assert.throws(() => normalizeWarnings([], 0), RangeError);
+  assert.throws(() => normalizeWarnings("not-an-array", 100), TypeError);
+  assert.throws(() => normalizeWarnings([
+    { frame_range: { start_frame: 1, end_frame_exclusive: 2 } },
+  ], 100), TypeError);
+  assert.throws(() => normalizeWarnings([
+    { id: "duplicate", frame_range: { start_frame: 1, end_frame_exclusive: 2 } },
+    { id: "duplicate", frame_range: { start_frame: 3, end_frame_exclusive: 4 } },
+  ], 100), RangeError);
+  assert.throws(() => normalizeWarnings([
+    { id: "empty", frame_range: { start_frame: 9, end_frame_exclusive: 9 } },
+  ], 100), RangeError);
+  assert.throws(() => normalizeWarnings([
+    { id: "outside", frame_range: { start_frame: 100, end_frame_exclusive: 101 } },
+  ], 100), RangeError);
+  assert.throws(() => normalizeWarnings([
+    {
+      id: "malformed-nested-range",
+      frame_range: null,
+      start_frame: 1,
+      end_frame_exclusive: 2,
+    },
+  ], 100), TypeError);
+});
+
+
+test("keeps the mounted model intact when a replacement warning payload is rejected", () => {
+  const timeline = new WarningTimeline({
+    warnings: [{ id: "stable", frame_range: { start_frame: 10, end_frame_exclusive: 20 } }],
+    totalFrames: 100,
+    currentFrame: 12,
+  });
+
+  assert.throws(() => timeline.setWarnings([
+    { id: "replacement", frame_range: { start_frame: 30, end_frame_exclusive: 40 } },
+  ], 0), RangeError);
+  assert.equal(timeline.totalFrames, 100);
+  assert.equal(timeline.currentFrame, 12);
+  assert.deepEqual(timeline.warnings.map(({ id }) => id), ["stable"]);
+});
+
+
+test("fits labels to actual track pixels, recomputes layout, and retains full block accessibility text", () => {
+  const documentRef = new FakeDocument();
+  const root = new FakeElement("section");
+  const timeline = new WarningTimeline({
+    documentRef,
+    warnings: [{ id: "short", display_name: "短问题", frame_range: { start_frame: 10, end_frame_exclusive: 20 } }],
+    totalFrames: 100,
+    measureLabel: () => 30,
+  });
+
+  timeline.mount(root);
+  const block = findAll(root, (element) => element.className.includes("warning-timeline__block"))[0];
+  const track = findAll(root, (element) => element.className.includes("warning-timeline__track"))[0];
+  assert.equal(block.dataset.showLabel, "false");
+  assert.equal(block.textContent, "");
+  assert.match(block.getAttribute("aria-label"), /短问题.*10.*19/);
+
+  track.rect = { left: 0, width: 400 };
+  timeline.refreshLayout();
+  assert.equal(block.dataset.showLabel, "true");
+  assert.equal(block.textContent, "短问题");
+});
+
+
+test("observes track resize for label fit and releases the observer on destroy", () => {
+  const documentRef = new FakeDocument();
+  const root = new FakeElement("section");
+  const observers = [];
+  class FakeResizeObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.observed = null;
+      this.disconnected = false;
+      observers.push(this);
+    }
+
+    observe(element) {
+      this.observed = element;
+    }
+
+    disconnect() {
+      this.disconnected = true;
+    }
+  }
+  const timeline = new WarningTimeline({
+    documentRef,
+    warnings: [{ id: "short", display_name: "短问题", frame_range: { start_frame: 10, end_frame_exclusive: 20 } }],
+    totalFrames: 100,
+    measureLabel: () => 30,
+    resizeObserverFactory: FakeResizeObserver,
+  });
+
+  timeline.mount(root);
+  const block = findAll(root, (element) => element.className.includes("warning-timeline__block"))[0];
+  const track = findAll(root, (element) => element.className.includes("warning-timeline__track"))[0];
+  assert.equal(observers.length, 1);
+  assert.equal(observers[0].observed, track);
+  assert.equal(block.dataset.showLabel, "false");
+
+  track.rect = { left: 0, width: 400 };
+  observers[0].callback();
+  assert.equal(block.dataset.showLabel, "true");
+
+  timeline.destroy();
+  assert.equal(observers[0].disconnected, true);
+});
+
+
+test("lets keyboard users enter a popover and escape back to its warning block", () => {
+  const documentRef = new FakeDocument();
+  const root = new FakeElement("section");
+  const timeline = new WarningTimeline({
+    documentRef,
+    warnings: canonicalIssues,
+    totalFrames: 1800,
+  });
+
+  timeline.mount(root);
+  const block = findAll(root, (element) => element.className.includes("warning-timeline__block"))[0];
+  const popover = findAll(root, (element) => element.className.includes("warning-timeline__popover"))[0];
+  const row = findAll(root, (element) => element.className.includes("warning-timeline__popover-row"))[0];
+  const enter = block.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(enter.defaultPrevented, true);
+  assert.equal(popover.hidden, false);
+  assert.equal(row.focused, true);
+
+  const escape = row.dispatch("keydown", { key: "Escape" });
+  assert.equal(escape.defaultPrevented, true);
+  assert.equal(popover.hidden, true);
+  assert.equal(block.focused, true);
 });
 
 
@@ -290,4 +461,33 @@ test("pointer cancellation releases the drag without inventing a frame-zero seek
   assert.deepEqual(seeks, [50]);
   assert.equal(documentRef.listenerCount("pointermove"), 0);
   assert.equal(documentRef.listenerCount("pointerup"), 0);
+});
+
+
+test("captures and releases the active pointer for up, cancel, and destroy cleanup", () => {
+  const documentRef = new FakeDocument();
+  const root = new FakeElement("section");
+  const timeline = new WarningTimeline({
+    documentRef,
+    warnings: [{ id: "only", frame_range: { start_frame: 10, end_frame_exclusive: 20 } }],
+    totalFrames: 100,
+  });
+
+  timeline.mount(root);
+  const track = findAll(root, (element) => element.className.includes("warning-timeline__track"))[0];
+  track.rect = { left: 0, width: 100 };
+
+  track.dispatch("pointerdown", { clientX: 20, pointerId: 7 });
+  assert.deepEqual(track.capturedPointerIds, [7]);
+  documentRef.dispatch("pointerup", { clientX: 20, pointerId: 7 });
+  assert.deepEqual(track.releasedPointerIds, [7]);
+
+  track.dispatch("pointerdown", { clientX: 30, pointerId: 8 });
+  documentRef.dispatch("pointercancel", { pointerId: 8 });
+  assert.deepEqual(track.releasedPointerIds, [7, 8]);
+
+  track.dispatch("pointerdown", { clientX: 40, pointerId: 9 });
+  timeline.destroy();
+  assert.deepEqual(track.releasedPointerIds, [7, 8, 9]);
+  assert.equal(documentRef.listenerCount("pointermove"), 0);
 });
