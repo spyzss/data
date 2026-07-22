@@ -49,6 +49,14 @@ def _wait_until_terminal(worker: object, request: object, *, timeout: float = 3.
     pytest.fail("overlay job did not become terminal")
 
 
+def _regular_file_bytes(path: Path) -> int:
+    return sum(
+        candidate.stat().st_size
+        for candidate in path.rglob("*")
+        if candidate.is_file()
+    )
+
+
 def _hold_render_fence_while_cpu_bound(
     fence_path: str,
     started: object,
@@ -374,6 +382,179 @@ def test_worker_reports_cache_full_without_publishing_a_ready_manifest(tmp_path:
         worker.shutdown()
 
 
+def test_ready_publication_accounts_for_the_larger_final_manifest_before_quota(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    max_cache_bytes = 1600
+    request = _request(
+        tmp_path,
+        intervals=((0, 1), (2, 3), (4, 5), (6, 7), (8, 9)),
+        renderer=RecordingRenderer(),
+    )
+    worker = BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=0,
+        max_cache_bytes=max_cache_bytes,
+    )
+    try:
+        worker.submit(request)
+        terminal = _wait_until_terminal(worker, request)
+
+        assert terminal.status == "failed"
+        assert terminal.code == "overlay_cache_full"
+        assert _regular_file_bytes(request.cache_root) <= max_cache_bytes
+    finally:
+        worker.shutdown()
+
+
+def test_job_footprint_counts_every_regular_file_and_can_replace_the_manifest(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    job_dir = tmp_path / ("a" * 64)
+    job_dir.mkdir()
+    files = {
+        "manifest.json": b"old-manifest",
+        ".generation.lock": b"lock",
+        ".render.fence": b"fence",
+        ".generation-owner.json": b"owner",
+        "segment-000.mp4": b"media",
+    }
+    for name, payload in files.items():
+        (job_dir / name).write_bytes(payload)
+    (job_dir / "ignored-directory").mkdir()
+
+    assert BoundedOverlayWorker._job_footprint(job_dir) == sum(
+        len(payload) for payload in files.values()
+    )
+    assert BoundedOverlayWorker._job_footprint(
+        job_dir,
+        manifest_size=101,
+    ) == sum(
+        len(payload)
+        for name, payload in files.items()
+        if name != "manifest.json"
+    ) + 101
+
+
+@pytest.mark.parametrize("failure_site", ("iterdir", "is_file", "stat"))
+def test_job_footprint_is_unknown_after_any_filesystem_scan_error(
+    failure_site: str,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    class BrokenEntry:
+        name = ".generation-owner.json"
+
+        def is_file(self) -> bool:
+            if failure_site == "is_file":
+                raise OSError("private is_file failure")
+            return True
+
+        def stat(self) -> object:
+            if failure_site == "stat":
+                raise OSError("private stat failure")
+            return type("Stat", (), {"st_size": 17})()
+
+    class BrokenDirectory:
+        def iterdir(self) -> tuple[BrokenEntry, ...]:
+            if failure_site == "iterdir":
+                raise OSError("private iterdir failure")
+            return (BrokenEntry(),)
+
+    assert BoundedOverlayWorker._job_footprint(BrokenDirectory()) is None
+
+
+def test_ready_publication_fails_closed_when_the_current_footprint_is_unknown(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=RecordingRenderer(),
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=0, max_cache_bytes=4096)
+    original_footprint = worker._job_footprint
+    job_dir = request.cache_root / request.cache_key.digest
+
+    def unknown_current(
+        path: Path,
+        *,
+        manifest_size: int | None = None,
+    ) -> int | None:
+        if path == job_dir:
+            return None
+        return original_footprint(path, manifest_size=manifest_size)
+
+    worker._job_footprint = unknown_current
+    try:
+        worker.submit(request)
+        failed = _wait_until_terminal(worker, request)
+
+        assert failed.status == "failed"
+        assert failed.code == "overlay_cache_full"
+        assert not job_dir.exists()
+    finally:
+        worker._job_footprint = original_footprint
+        worker.shutdown()
+
+
+def test_ready_eviction_fails_closed_when_an_existing_footprint_is_unknown(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    first = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "5" * 64,
+    )
+    second = _request(
+        tmp_path,
+        intervals=((2, 3),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "6" * 64,
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=0, max_ready_jobs=1)
+    original_footprint = worker._job_footprint
+    first_job_dir = first.cache_root / first.cache_key.digest
+
+    def unknown_existing(
+        path: Path,
+        *,
+        manifest_size: int | None = None,
+    ) -> int | None:
+        if path == first_job_dir:
+            return None
+        return original_footprint(path, manifest_size=manifest_size)
+
+    try:
+        worker.submit(first)
+        assert _wait_until_terminal(worker, first).status == "ready"
+        worker._job_footprint = unknown_existing
+
+        worker.submit(second)
+        second_terminal = _wait_until_terminal(worker, second)
+        statuses = [
+            json.loads(path.read_text(encoding="utf-8"))["status"]
+            for path in first.cache_root.glob("*/manifest.json")
+        ]
+
+        assert second_terminal.status == "failed"
+        assert second_terminal.code == "overlay_cache_full"
+        assert first_job_dir.is_dir()
+        assert statuses.count("ready") == 1
+    finally:
+        worker._job_footprint = original_footprint
+        worker.shutdown()
+
+
 def test_failed_job_eviction_does_not_release_a_ready_job_slot(tmp_path: Path) -> None:
     from human_qc.overlay_worker import BoundedOverlayWorker
 
@@ -439,6 +620,146 @@ def test_distinct_failed_keys_do_not_accumulate_empty_job_directories_under_tiny
                 for path in request.cache_root.glob("*")
                 if path.is_dir() and len(path.name) == 64
             ]
+    finally:
+        worker.shutdown()
+
+
+def test_tiny_quota_cleanup_reports_that_a_current_failed_job_was_not_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from human_qc import overlay_worker
+
+    request = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=FailingRenderer(),
+    )
+    worker = overlay_worker.BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=0,
+        max_cache_bytes=1,
+    )
+
+    def broken_rmtree(_path: object) -> None:
+        raise OSError("private current-job deletion failure")
+
+    monkeypatch.setattr(overlay_worker.shutil, "rmtree", broken_rmtree)
+    try:
+        worker.submit(request)
+        failed = _wait_until_terminal(worker, request)
+        job_dir = request.cache_root / request.cache_key.digest
+
+        assert failed.status == "failed"
+        assert job_dir.exists()
+        assert _regular_file_bytes(job_dir) > 1
+        assert worker._safe_remove_job(request.cache_root, job_dir) is False
+        assert job_dir.exists()
+    finally:
+        worker.shutdown()
+
+
+def test_failed_eviction_does_not_deduct_bytes_when_victim_deletion_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from human_qc import overlay_worker
+
+    max_cache_bytes = 700
+    first = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=FailingRenderer(),
+        source_sha256="sha256:" + "1" * 64,
+    )
+    second = _request(
+        tmp_path,
+        intervals=((2, 3),),
+        renderer=FailingRenderer(),
+        source_sha256="sha256:" + "2" * 64,
+    )
+    worker = overlay_worker.BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=0,
+        max_cache_bytes=max_cache_bytes,
+    )
+    original_rmtree = overlay_worker.shutil.rmtree
+    first_job_dir = first.cache_root / first.cache_key.digest
+    failed_deletions = 0
+
+    def fail_first_victim(path: object) -> None:
+        nonlocal failed_deletions
+        if Path(path) == first_job_dir and failed_deletions == 0:
+            failed_deletions += 1
+            raise OSError("private failed-victim deletion failure")
+        original_rmtree(path)
+
+    try:
+        worker.submit(first)
+        assert _wait_until_terminal(worker, first).status == "failed"
+        assert first_job_dir.is_dir()
+        monkeypatch.setattr(overlay_worker.shutil, "rmtree", fail_first_victim)
+
+        worker.submit(second)
+        assert _wait_until_terminal(worker, second).status == "failed"
+
+        assert failed_deletions == 1
+        assert first_job_dir.is_dir()
+        assert _regular_file_bytes(first.cache_root) <= max_cache_bytes
+    finally:
+        worker.shutdown()
+
+
+def test_ready_eviction_does_not_release_a_slot_when_victim_deletion_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from human_qc import overlay_worker
+
+    first = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "3" * 64,
+    )
+    second = _request(
+        tmp_path,
+        intervals=((2, 3),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "4" * 64,
+    )
+    worker = overlay_worker.BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=0,
+        max_ready_jobs=1,
+    )
+    original_rmtree = overlay_worker.shutil.rmtree
+    first_job_dir = first.cache_root / first.cache_key.digest
+    failed_deletions = 0
+
+    def fail_first_victim(path: object) -> None:
+        nonlocal failed_deletions
+        if Path(path) == first_job_dir and failed_deletions == 0:
+            failed_deletions += 1
+            raise OSError("private ready-victim deletion failure")
+        original_rmtree(path)
+
+    try:
+        worker.submit(first)
+        assert _wait_until_terminal(worker, first).status == "ready"
+        monkeypatch.setattr(overlay_worker.shutil, "rmtree", fail_first_victim)
+
+        worker.submit(second)
+        second_terminal = _wait_until_terminal(worker, second)
+        statuses = [
+            json.loads(path.read_text(encoding="utf-8"))["status"]
+            for path in first.cache_root.glob("*/manifest.json")
+        ]
+
+        assert failed_deletions == 1
+        assert second_terminal.status == "failed"
+        assert second_terminal.code == "overlay_cache_full"
+        assert statuses.count("ready") == 1
     finally:
         worker.shutdown()
 
@@ -831,15 +1152,40 @@ def test_cleanup_failure_quota_counts_the_remaining_owner_file_in_final_footprin
         intervals=((20, 21),),
         renderer=RecordingRenderer(),
     )
-    max_cache_bytes = 647
     worker = BoundedOverlayWorker(
         max_workers=1,
         max_pending=0,
-        max_cache_bytes=max_cache_bytes,
     )
     original_release = worker._release_owner
+    observed: dict[str, int] = {}
 
     def broken_release(_request: object, _token: str) -> None:
+        cleanup = worker._failed_view(
+            request,
+            "overlay_cleanup_failed",
+            retryable=True,
+        )
+        manifest_size = len(
+            json.dumps(
+                worker._manifest_payload(request, cleanup),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        job_dir = request.cache_root / request.cache_key.digest
+        retained_file_bytes = sum(
+            path.stat().st_size
+            for path in job_dir.iterdir()
+            if path.is_file()
+            and path.name != "manifest.json"
+            and path.suffix != ".mp4"
+            and ".partial-" not in path.name
+        )
+        projected_bytes = manifest_size + retained_file_bytes
+        observed["projected_bytes"] = projected_bytes
+        observed["max_cache_bytes"] = projected_bytes - 1
+        worker._max_cache_bytes = projected_bytes - 1
         raise OSError("private owner cleanup failure")
 
     worker._release_owner = broken_release
@@ -851,9 +1197,10 @@ def test_cleanup_failure_quota_counts_the_remaining_owner_file_in_final_footprin
         assert failed.status == "failed"
         assert failed.code == "overlay_cleanup_failed"
         assert worker.get(request).code == "overlay_cleanup_failed"
+        assert observed["projected_bytes"] > observed["max_cache_bytes"]
         assert not job_dir.exists() or sum(
             path.stat().st_size for path in job_dir.iterdir() if path.is_file()
-        ) <= max_cache_bytes
+        ) <= observed["max_cache_bytes"]
     finally:
         worker._release_owner = original_release
         worker.shutdown()
@@ -966,10 +1313,11 @@ def test_heartbeat_after_quota_cleanup_does_not_recreate_an_empty_job_directory(
     original_heartbeat = worker._heartbeat_owner
     original_stop = worker._stop_owner_heartbeat
 
-    def observed_remove(root: Path, candidate: Path) -> None:
-        original_remove(root, candidate)
+    def observed_remove(root: Path, candidate: Path) -> bool:
+        removed = original_remove(root, candidate)
         if candidate == job_dir and not candidate.exists():
             quota_cleanup_done.set()
+        return removed
 
     def observed_heartbeat(heartbeat_request: object, token: str) -> None:
         original_heartbeat(heartbeat_request, token)

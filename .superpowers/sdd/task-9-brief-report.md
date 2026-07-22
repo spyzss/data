@@ -757,3 +757,92 @@ RED：`2 failed in 0.34s`。
 
 `py_compile human_qc/overlay_worker.py tests/test_sam3_overlay_worker.py` 与
 `git diff --check` 均 exit 0。
+
+---
+
+# Task 9C unified terminal-footprint and deletion-accounting follow-up
+
+## 状态与范围
+
+DONE
+
+本轮只修复最终审查中剩余的 cache accounting 原语：ready 最终 manifest 膨胀、
+terminal victim 删除失败后的虚假配额扣减，以及 existing/current terminal directory
+不一致的 footprint 计算。只修改 `human_qc/overlay_worker.py`、
+`tests/test_sam3_overlay_worker.py` 和本报告；未修改 runner、recipe、launcher、HTTP、
+browser、OpenSpec、主计划或 `.comet`。
+
+基线：`6fbdc325883398bbf033b31e99f354696fb239c8`。本轮独立提交 SHA 以最终任务
+回报中的 `git rev-parse HEAD` 为准。
+
+## Root cause
+
+1. ready publication 把仍为 `generating` 的旧 manifest 与 media 的 `_job_size()` 传给
+   `_evict_for()`，随后写入更大的五段 ready manifest。因此 `max_cache_bytes=1600`
+   的候选仍会发布为 ready，最终真实目录可能超过 quota。
+2. `_safe_remove_job()` 吞掉 `shutil.rmtree()` 的 `OSError` 并返回 `None`；两个 eviction
+   循环无条件减去 victim size，ready 循环还无条件释放 ready slot。删除没有发生时，
+   账面却已回收容量。
+3. existing terminal directory 使用会排除 generation lock、且扫描异常时返回部分和的
+   `_job_size()`；failed current directory 则使用另一套
+   `_job_size_replacing_manifest()`。同一 quota 因调用路径不同得到不同 footprint，且
+   部分扫描可能被误判为安全。
+4. 旧 owner 边界测试写死本机 `647` bytes，hostname/PID 改变 owner JSON 长度后会失去
+   精确边界意义。
+
+## 最小修复与 fail-closed 语义
+
+- 删除两套 `_job_size*`，统一为 `_job_footprint(path, manifest_size=...)`。无替换参数时
+  统计目录内每个 regular file；提供参数时以最终 manifest 字节替换旧 manifest，再统计
+  owner、generation lock、render fence、media 和其他所有 regular file。任一
+  `iterdir/is_file/stat` `OSError` 返回 unknown (`None`)，existing/current publication
+  都 fail closed，绝不使用部分和。
+- ready 与 failed 均用相同的 canonical JSON 序列化参数得到最终 manifest size，并在
+  落盘前调用同一 footprint 原语。ready 五段候选若最终投影超限，转为安全的
+  `overlay_cache_full` failed 路径；failed 路径继续按自己的最终投影重新验 quota。
+- `_safe_remove_job()` 仅在删除后以 `stat()` 确认 digest directory 已不存在时返回
+  `True`；删除/确认异常或目录仍存在均返回 `False`。eviction 删除失败时不扣 bytes、
+  不减 ready count，继续尝试其他 evictable victim；全部候选耗尽仍不满足约束时，当前
+  publication 整体 fail closed。
+- owner 边界测试在 `_release_owner()` 故障点实时序列化 cleanup manifest，累加实际保留
+  的 owner/lock/fence bytes，并把 quota 设为 `projected_bytes - 1`，不再依赖 hostname、
+  PID 或固定字节数。
+
+## TDD RED / GREEN
+
+先只修改测试。初始聚焦选择经参数化展开为 9 cases，结果 `8 failed, 1 passed`：
+
+- 五段、`max_cache_bytes=1600` 实际仍返回 ready；
+- 统一 `_job_footprint` 不存在，`iterdir/is_file/stat` 三种异常没有 unknown 语义；
+- `max_cache_bytes=1` 的单 failed current job 删除故障后仍残留超限目录，
+  `_safe_remove_job()` 返回 `None` 而非失败；
+- `max_cache_bytes=700` 的两个 failed job 在首个 victim 删除故障后实际占用 `812`
+  bytes；
+- `max_ready_jobs=1` 的两个 ready job 在首个 victim 删除故障后第二个仍发布 ready；
+- 动态 owner+manifest `projected - 1` 边界作为测试健壮性更新，在旧实现上已通过。
+
+最小实现后加入 current/existing footprint unknown 的两条行为级门禁，最终新回归选择
+为 `11 passed in 0.57s`；同一 11-case 选择并行重复 5 轮，五轮均为 `11 passed`
+（单轮 0.52-0.62s）。worker 全文件结果为 `35 passed in 1.63s`。
+
+## 最终验证
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py \
+  tests/test_sam3_overlay_worker.py tests/test_review_evidence.py \
+  tests/test_qc_pipeline_sam3_runner.py tests/test_canonical_qc_runner_bridge.py \
+  tests/test_human_qc_media.py
+# 177 passed in 5.65s
+
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_workbench.py tests/test_human_qc_http_server.py \
+  tests/test_canonical_video_probe.py
+# 110 passed in 5.95s
+
+.venv/bin/python -m pytest -q
+# 1870 passed, 1 skipped in 190.80s
+```
+
+全量 pytest 在任务中断前已经正常 exit 0；中断发生在读取 completion verification
+说明时，不存在被截断或仍运行的 pytest 进程。

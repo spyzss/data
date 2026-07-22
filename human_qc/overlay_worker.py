@@ -1034,29 +1034,22 @@ class BoundedOverlayWorker:
         return "overlay_render_failed"
 
     @staticmethod
-    def _job_size(path: Path) -> int:
-        total = 0
-        try:
-            for entry in path.iterdir():
-                if entry.is_file() and not entry.name.startswith(".generation.lock"):
-                    total += entry.stat().st_size
-        except OSError:
-            return total
-        return total
+    def _job_footprint(
+        path: Path,
+        *,
+        manifest_size: int | None = None,
+    ) -> int | None:
+        """Return a complete regular-file footprint, or unknown on scan error.
 
-    @staticmethod
-    def _job_size_replacing_manifest(path: Path, manifest_size: int) -> int | None:
-        """Return the final footprint after replacing only ``manifest.json``.
-
-        Failed publication has already removed media, but owner/fence/lock files
-        can remain.  Any unreadable entry fails closed rather than undercounting
-        the cache footprint.
+        ``manifest_size`` projects a publication that replaces ``manifest.json``.
+        Lock, fence, owner, media, and any other regular files all count.  A
+        partial scan must never be mistaken for a quota-safe byte total.
         """
 
-        total = manifest_size
+        total = 0 if manifest_size is None else manifest_size
         try:
             for entry in path.iterdir():
-                if entry.name == _MANIFEST_NAME:
+                if manifest_size is not None and entry.name == _MANIFEST_NAME:
                     continue
                 if entry.is_file():
                     total += entry.stat().st_size
@@ -1064,13 +1057,36 @@ class BoundedOverlayWorker:
             return None
         return total
 
-    def _safe_remove_job(self, root: Path, job_dir: Path) -> None:
+    def _manifest_size(
+        self,
+        request: OverlayRequest,
+        view: OverlayJobView,
+    ) -> int:
+        return len(
+            json.dumps(
+                self._manifest_payload(request, view),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    def _safe_remove_job(self, root: Path, job_dir: Path) -> bool:
         try:
             if job_dir.parent.resolve() != root.resolve() or _DIGEST(job_dir.name) is None:
-                return
+                return False
             shutil.rmtree(job_dir)
+        except FileNotFoundError:
+            pass
         except OSError:
-            return
+            pass
+        try:
+            job_dir.stat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return False
 
     def _discard_job_media(self, request: OverlayRequest) -> None:
         """Remove every material media product from a non-ready job."""
@@ -1179,14 +1195,18 @@ class BoundedOverlayWorker:
             manifest = path / _MANIFEST_NAME
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except OSError:
+                return False
+            except json.JSONDecodeError:
                 continue
             if not isinstance(data, Mapping) or data.get("status") not in {
                 "ready",
                 "failed",
             }:
                 continue
-            size = self._job_size(path)
+            size = self._job_footprint(path)
+            if size is None:
+                return False
             total_size += size
             is_ready = data.get("status") == "ready"
             if is_ready:
@@ -1194,7 +1214,7 @@ class BoundedOverlayWorker:
             try:
                 modified = manifest.stat().st_mtime
             except OSError:
-                modified = 0.0
+                return False
             ready.append(
                 (
                     modified,
@@ -1221,10 +1241,10 @@ class BoundedOverlayWorker:
             if victim_index is None:
                 break
             _, size, victim, _, victim_is_ready = ready.pop(victim_index)
-            self._safe_remove_job(root, victim)
-            total_size -= size
-            if victim_is_ready:
-                target_count -= 1
+            if self._safe_remove_job(root, victim):
+                total_size -= size
+                if victim_is_ready:
+                    target_count -= 1
         if self._max_cache_bytes is not None and total_size + current_job_size > self._max_cache_bytes:
             return False
         return self._max_ready_jobs is None or target_count <= self._max_ready_jobs
@@ -1254,20 +1274,24 @@ class BoundedOverlayWorker:
             manifest = path / _MANIFEST_NAME
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except OSError:
+                return False
+            except json.JSONDecodeError:
                 continue
             if not isinstance(data, Mapping) or data.get("status") not in {
                 "ready",
                 "failed",
             }:
                 continue
-            size = self._job_size(path)
+            size = self._job_footprint(path)
+            if size is None:
+                return False
             total_size += size
             is_ready = data.get("status") == "ready"
             try:
                 modified = manifest.stat().st_mtime
             except OSError:
-                modified = 0.0
+                return False
             terminal.append(
                 (
                     1 if is_ready else 0,
@@ -1286,8 +1310,8 @@ class BoundedOverlayWorker:
             if victim_index is None:
                 return False
             _, _, size, victim, _ = terminal.pop(victim_index)
-            self._safe_remove_job(root, victim)
-            total_size -= size
+            if self._safe_remove_job(root, victim):
+                total_size -= size
         return True
 
     def _render(self, request: OverlayRequest, initial: OverlayJobView) -> OverlayJobView:
@@ -1446,16 +1470,9 @@ class BoundedOverlayWorker:
         final = self._normalized_failed_view(request, candidate)
         self._discard_segments(candidate.segments)
         self._discard_job_media(request)
-        manifest_size = len(
-            json.dumps(
-                self._manifest_payload(request, final),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        projected_size = self._job_size_replacing_manifest(
-            self._job_dir(request), manifest_size
+        projected_size = self._job_footprint(
+            self._job_dir(request),
+            manifest_size=self._manifest_size(request, final),
         )
         if projected_size is None or not self._evict_failed_for(
             request, projected_size
@@ -1523,8 +1540,12 @@ class BoundedOverlayWorker:
                 final = candidate
                 if candidate.status == "failed":
                     return self._publish_failed_locked(request, candidate)
-                elif not self._evict_for(
-                    request, self._job_size(self._job_dir(request))
+                projected_size = self._job_footprint(
+                    self._job_dir(request),
+                    manifest_size=self._manifest_size(request, candidate),
+                )
+                if projected_size is None or not self._evict_for(
+                    request, projected_size
                 ):
                     self._discard_segments(candidate.segments)
                     failed_segments = tuple(
