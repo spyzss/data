@@ -812,37 +812,49 @@ git commit -m "test(human-qc): cover complete warn review workflow"
 **Interfaces:**
 - Documents the final contract and operating commands.
 
-- [ ] **Step 1: Update user and data-contract documentation**
+- [x] **Step 1: Update user and data-contract documentation**
 
 Document the exact flow `自动 QC → Warn 人工复核 → 语义校准`, `completion_mode`, unreviewed selected issues, failure-reason precedence, full-video controls, overlap popover, auto lease, SAM3 readiness and both independent server commands. Remove instructions for the shared workbench, edit-lock button, issue-only clips and score body.
 
-- [ ] **Step 2: Run focused documentation and OpenSpec validation**
+- [x] **Step 2: Run focused documentation and OpenSpec validation**
 
 ```bash
-pytest -q tests/test_qc_docs_contract.py tests/test_human_qc_static_contract.py
+.venv/bin/python -m pytest -q tests/test_qc_docs_contract.py tests/test_human_qc_static_contract.py
 openspec validate add-human-semantic-warn-review --strict
 git diff --check
 ```
 
 Expected: all PASS and no whitespace errors.
 
-- [ ] **Step 3: Run complete Python and Node suites**
+- [x] **Step 3: Run complete Python and Node suites**
 
 ```bash
-pytest -q
+.venv/bin/python -m pytest -q
 node --test human_qc/static/*.test.mjs semantic_calibration/static/*.test.mjs
 ```
 
 Expected: all PASS with no skipped test introduced for this change.
 
-- [ ] **Step 4: Perform final dependency and browser-source checks**
+- [x] **Step 4: Perform final dependency and browser-source checks**
 
 ```bash
-python - <<'PY'
+.venv/bin/python - <<'PY'
+import ast
 from pathlib import Path
 
 for root, forbidden in ((Path("human_qc"), "semantic_calibration"), (Path("semantic_calibration"), "human_qc")):
-    hits = [str(path) for path in root.rglob("*.py") if forbidden in path.read_text(encoding="utf-8")]
+    hits = []
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            else:
+                continue
+            if any(name == forbidden or name.startswith(f"{forbidden}.") for name in names):
+                hits.append(f"{path}:{node.lineno}")
     assert not hits, hits
 PY
 if rg -n "获取编辑锁|语义与 Warn 复核|[+-]1 帧|machine score" human_qc/static docs/reviewer-guide.md; then exit 1; fi
@@ -850,7 +862,7 @@ if rg -n "获取编辑锁|语义与 Warn 复核|[+-]1 帧|machine score" human_q
 
 Expected: dependency script exits 0; `rg` returns no matches.
 
-- [ ] **Step 5: Mark tasks complete and commit documentation**
+- [x] **Step 5: Mark tasks complete and commit documentation**
 
 ```bash
 git add docs tools/serve_human_qc_workbench.py openspec/changes/add-human-semantic-warn-review/tasks.md

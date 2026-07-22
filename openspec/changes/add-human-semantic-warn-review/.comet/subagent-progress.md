@@ -15,9 +15,9 @@
 
 ## Current Task
 
-- Plan task: `Task 12: 文档契约与完整验证`
-- OpenSpec mapping: `11.2 文档同步；11.3 全量验证`
-- Stage: `build`
+- Plan task: `All planned tasks complete`
+- OpenSpec mapping: `11.1–11.3 complete`
+- Stage: `verify`
 - Review mode: `thorough`
 - Review/fix round: `Task 9A 3/3 approved; Task 9B 2/2 approved; Task 9C explicit user-authorized fourth narrow repair`
 - Task 5 evidence: initial RED `28 failed, 11 passed`; repair RED sets `3 failed` and `1 failed`; final focused `60 passed`, final targeted `10 passed, 8 deselected`, full baseline `1775 passed, 1 skipped`, compileall/OpenSpec strict/diff-check pass.
@@ -84,6 +84,7 @@
 - Task 11 review: CHANGES_REQUESTED with no Critical and three Important browser-harness reliability defects. CDP commands lack per-request timeouts and Chrome/server cleanup is not guaranteed after external timeout; `CHROME_BIN` is hard-coded rather than environment/fallback-resolved; and network health ignores `Network.loadingFailed`, allowing non-HTTP request failures to appear healthy.
 - Task 11 browser-harness repair dispatch: existing Task11 agent must TDD command/child cleanup, portable browser resolution, and requestId-aware non-HTTP failure capture without changing product code. Fresh browser-focused review is required before Task 11 checkoff.
 - Task 11 final approval: APPROVED after `ce24647`. The final reviewer confirmed that the Python parent timeout now sends SIGTERM to the driver before any fallback kill, and the driver immediately reaps only its own Chrome child even when live CDP close is stalled. The active-CDP regression proves Node exits through SIGTERM, Chrome PID is gone, and the fixture HTTP server thread stops. Evidence: browser contract `3 passed` twice, focused Python `66 passed`, Node `68 passed`, and diff-check pass. Plan Task 11 and OpenSpec 11.1 are now checked off.
+- Task 12 final approval: APPROVED after `b739587`. The final reviewer confirmed each authoritative document states that both `not_required` and `all_reviewed` are semantic-ready while `early_fail` stops the asset; it also distinguishes immediate per-issue Fail persistence from asset-level early-fail completion. Per-document positive and negative contract assertions prevent the old all-reviewed-only wording. Coordinator final verification: full Python `1903 passed, 1 skipped` (external AnyGrasp dataset unavailable), Node `79 passed`, Chrome contract `3 passed`, docs/static `12 passed`, both CLI helps, OpenSpec strict, AST bidirectional import boundary, deprecated UI scan, and diff-check all pass. Plan Task 12 and OpenSpec 11.2/11.3 are now checked off.
 - Binding downstream decisions:
   - Build a new `WarnWorkbenchService`; do not extend the shared legacy facade or use raw `jsonable()` projection.
   - Warn task DTOs are strict allowlists: source video, normalized half-open selected issue ranges, threshold/reason/review/overlay state, completion and safe lease state only.

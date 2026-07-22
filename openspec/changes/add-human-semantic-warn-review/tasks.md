@@ -72,5 +72,5 @@
 ## 11. 验证与文档同步
 
 - [x] 11.1 增加 Python、Node、DOM、API 和浏览器测试，覆盖 120–181 重叠区间与 early-fail 完整流程
-- [ ] 11.2 同步 PRD、JSON 格式、reviewer guide 和启动说明中的 Warn 前置流转与新操作规则
-- [ ] 11.3 运行 Python/Node 全量测试、OpenSpec strict 验证、静态资源验收和 `git diff --check`
+- [x] 11.2 同步 PRD、JSON 格式、reviewer guide 和启动说明中的 Warn 前置流转与新操作规则
+- [x] 11.3 运行 Python/Node 全量测试、OpenSpec strict 验证、静态资源验收和 `git diff --check`
