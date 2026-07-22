@@ -604,19 +604,15 @@ def _require_semantic_task_access(value: Mapping[str, Any]) -> dict[str, Any]:
 
     semantic = value.get("semantic_calibration")
     pipeline = value.get("pipeline_state")
-    completed_read = (
-        isinstance(semantic, Mapping)
-        and semantic.get("state") == "completed"
-        and isinstance(pipeline, dict)
-        and pipeline.get("status") == "completed"
-    )
-    if not completed_read:
-        return _require_semantic_pipeline_cursor(value)
-    if semantic_eligibility(value) != "ready":
-        raise TaskStateError(
-            "semantic task is blocked until manual review has a legal terminal state"
-        )
-    return pipeline
+    if isinstance(semantic, Mapping) and semantic.get("state") == "completed":
+        if not isinstance(pipeline, dict):
+            raise TaskStateError("pipeline_state must be an object")
+        if semantic_eligibility(value) != "ready":
+            raise TaskStateError(
+                "semantic task is blocked until manual review has a legal terminal state"
+            )
+        return pipeline
+    return _require_semantic_pipeline_cursor(value)
 
 
 def _sha256(path: Path) -> str:
@@ -822,12 +818,11 @@ class SemanticCalibrationService:
         asset_id = _non_empty(asset_id, "asset_id")
         self._assert_navigation(asset_id)
         report_path = self._reports.get(asset_id)
-        if report_path is not None:
-            report = load_asset_qc_report(report_path)
-            if report is None:
-                raise FileNotFoundError(report_path)
-            _require_semantic_task_access(report)
+        if report_path is not None and not report_path.is_file():
+            raise FileNotFoundError(report_path)
         state = self._load_state(asset_id)
+        if state.report_path is not None and state.report_path.is_file():
+            _require_semantic_task_access(state.report)
         return self._view(state)
 
     def _view(self, state: _AssetState) -> SemanticTaskView:
