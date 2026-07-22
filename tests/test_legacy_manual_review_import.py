@@ -160,6 +160,108 @@ def test_import_writes_manual_block_audit_and_completes_selected_reviews(
     assert manual["import_audit"][-1]["progress_sha256"].startswith("sha256:")
 
 
+def test_import_pass_preserves_existing_failure_reason_while_fail_remains(
+    tmp_path: Path,
+) -> None:
+    report_path = _report(tmp_path)
+    report = load_asset_qc_report(report_path)
+    assert report is not None
+    reason = {
+        "mode": "manual",
+        "reason_codes": ["occlusion"],
+        "other_text": None,
+    }
+    original_audit = [
+        {
+            "action": "failure_reason_changed",
+            "issue_id": "warn-1",
+            "previous_failure_reason": None,
+            "failure_reason": copy.deepcopy(reason),
+            "reviewed_at": "2026-07-21T00:00:00Z",
+        }
+    ]
+    report["manual_review"].update(
+        {
+            "state": "in_progress",
+            "issue_reviews": {
+                "warn-1": {
+                    "verdict": "fail",
+                    "effective_verdict": "fail",
+                    "machine_verdict": "warn",
+                    "reason": "confirmed defect",
+                    "reviewer": "alice",
+                    "reviewed_at": "2026-07-21T00:00:00Z",
+                }
+            },
+            "failure_reason": copy.deepcopy(reason),
+            "review_audit": copy.deepcopy(original_audit),
+        }
+    )
+    report["report_revision"] = 2
+    write_asset_qc_report(
+        report_path,
+        report,
+        expected_revision=1,
+        profile="acceptance",
+    )
+
+    import_legacy_manual_review(
+        report_path,
+        _csv(tmp_path, [_row("warn-2", "false_positive")]),
+        None,
+        expected_revision=2,
+        reviewer="migration-bot",
+    )
+
+    persisted = load_asset_qc_report(report_path)
+    assert persisted is not None
+    manual = persisted["manual_review"]
+    assert manual["completion_mode"] == "early_fail"
+    assert manual["failure_reason"] == reason
+    assert manual["review_audit"] == original_audit
+
+
+def test_import_audits_cleared_failure_reason_when_no_fail_remains(
+    tmp_path: Path,
+) -> None:
+    report_path = _report(tmp_path, issue_ids=("warn-1",))
+    report = load_asset_qc_report(report_path)
+    assert report is not None
+    reason = {
+        "mode": "manual",
+        "reason_codes": ["occlusion"],
+        "other_text": None,
+    }
+    report["manual_review"]["failure_reason"] = copy.deepcopy(reason)
+    report["report_revision"] = 2
+    write_asset_qc_report(
+        report_path,
+        report,
+        expected_revision=1,
+        profile="acceptance",
+    )
+
+    import_legacy_manual_review(
+        report_path,
+        _csv(tmp_path, [_row("warn-1", "false_positive")]),
+        None,
+        expected_revision=2,
+        reviewer="migration-bot",
+    )
+
+    persisted = load_asset_qc_report(report_path)
+    assert persisted is not None
+    manual = persisted["manual_review"]
+    assert manual["failure_reason"] is None
+    assert manual["review_audit"][-1] == {
+        "action": "failure_reason_changed",
+        "issue_id": None,
+        "previous_failure_reason": reason,
+        "failure_reason": None,
+        "reviewed_at": manual["completed_at"],
+    }
+
+
 def test_unknown_duplicate_and_ambiguous_rows_are_reported_without_guessing(
     tmp_path: Path,
 ) -> None:

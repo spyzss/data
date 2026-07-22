@@ -599,6 +599,26 @@ def _require_semantic_pipeline_cursor(value: Mapping[str, Any]) -> dict[str, Any
     return pipeline
 
 
+def _require_semantic_task_access(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Require the persisted manual gate for live and historical task reads."""
+
+    semantic = value.get("semantic_calibration")
+    pipeline = value.get("pipeline_state")
+    completed_read = (
+        isinstance(semantic, Mapping)
+        and semantic.get("state") == "completed"
+        and isinstance(pipeline, dict)
+        and pipeline.get("status") == "completed"
+    )
+    if not completed_read:
+        return _require_semantic_pipeline_cursor(value)
+    if semantic_eligibility(value) != "ready":
+        raise TaskStateError(
+            "semantic task is blocked until manual review has a legal terminal state"
+        )
+    return pipeline
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -806,16 +826,7 @@ class SemanticCalibrationService:
             report = load_asset_qc_report(report_path)
             if report is None:
                 raise FileNotFoundError(report_path)
-            semantic = report.get("semantic_calibration")
-            pipeline = report.get("pipeline_state")
-            completed_read = (
-                isinstance(semantic, Mapping)
-                and semantic.get("state") == "completed"
-                and isinstance(pipeline, Mapping)
-                and pipeline.get("status") == "completed"
-            )
-            if not completed_read:
-                _require_semantic_pipeline_cursor(report)
+            _require_semantic_task_access(report)
         state = self._load_state(asset_id)
         return self._view(state)
 
@@ -1039,6 +1050,7 @@ class SemanticCalibrationService:
     def confirm_pending(self, asset_id: str, expected_revision: int, lease_token: str) -> SemanticTaskView:
         self._assert_navigation(asset_id)
         state = self._load_state(asset_id)
+        _require_semantic_pipeline_cursor(state.report)
         self._check_lease(state, lease_token)
         if state.revision != expected_revision:
             raise StaleSemanticRevisionError(
@@ -1077,6 +1089,7 @@ class SemanticCalibrationService:
     def cancel_pending(self, asset_id: str, expected_revision: int, lease_token: str) -> SemanticTaskView:
         self._assert_navigation(asset_id)
         state = self._load_state(asset_id)
+        _require_semantic_pipeline_cursor(state.report)
         self._check_lease(state, lease_token)
         if state.revision != expected_revision:
             raise StaleSemanticRevisionError(
@@ -1113,6 +1126,7 @@ class SemanticCalibrationService:
     ) -> SemanticTaskView:
         self._assert_navigation(asset_id)
         state = self._load_state(asset_id)
+        _require_semantic_task_access(state.report)
         self._check_lease(state, lease_token)
         if state.revision != expected_revision:
             raise StaleSemanticRevisionError(
@@ -1135,8 +1149,6 @@ class SemanticCalibrationService:
             return self._view(self._load_state(asset_id, recover=False))
         if current_state in {"error", "skipped_due_to_fail"}:
             raise TaskStateError(f"semantic task cannot complete from state {current_state}")
-        _require_semantic_pipeline_cursor(state.report)
-
         # Reconstructing SharedBoundaryTimeline above validates frame coverage,
         # positivity, and all shared-boundary invariants before any bytes stage.
         state.loaded = self._adapter.load(state.source_path)

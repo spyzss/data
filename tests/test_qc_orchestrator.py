@@ -330,6 +330,7 @@ def test_acceptance_frame_budget_stops_only_skeleton_branch_below_ninety_percent
     ]
     assert outcome.status == "completed"
     assert outcome.report["overall_decision"] == "fail"
+    assert outcome.report["keypoint_morphology"]["flow"]["result_gate"]["verdict"] == "fail"
     for module in ("keypoint_temporal", "sam3_containment"):
         assert outcome.report["execution"]["module_states"][module] == {
             "state": "not_run_due_to_acceptance_frame_budget",
@@ -341,6 +342,63 @@ def test_acceptance_frame_budget_stops_only_skeleton_branch_below_ninety_percent
     assert outcome.report["acceptance_frame_survival"]["stop_reason"] == (
         "insufficient_remaining_frames"
     )
+
+
+def test_active_acceptance_frame_budget_skips_manual_and_semantic_without_blocking(
+    tmp_path: Path,
+) -> None:
+    config = load_qc_acceptance_config()
+    calls: list[str] = []
+    registry = ModuleRegistry()
+    for module in config.pipeline_modules:
+        module_config = config.module_config(module)
+        if not module_config.get("enabled") or module_config.get("execution_kind") == "external":
+            continue
+        implementation = str(module_config["implementation"])
+
+        def run(
+            context: AssetContext,
+            loaded: LoadedQcConfig,
+            *,
+            module: str = module,
+        ) -> ModuleResult:
+            assert loaded is config
+            calls.append(module)
+            if module == "keypoint_morphology":
+                return _frame_survival_result(
+                    module,
+                    remaining_frame_count=8_999,
+                    remaining_frame_ratio=0.8999,
+                    stop_triggered=True,
+                )
+            return ModuleResult(module, "pass", {"decision": "pass"}, {})
+
+        registry.register(implementation, run)
+
+    outcome = run_asset(
+        _context(tmp_path, "active-frame-budget"),
+        config=config,
+        profile="acceptance",
+        registry=registry,
+        now=lambda: "2026-07-22T00:00:00Z",
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.report["overall_decision"] == "fail"
+    assert outcome.report["keypoint_morphology"]["flow"]["result_gate"]["verdict"] == "fail"
+    assert outcome.report["acceptance_frame_survival"]["stop_triggered"] is True
+    assert outcome.report["manual_review"]["state"] == "skipped_due_to_fail"
+    assert outcome.report["semantic_calibration"]["state"] == "skipped_due_to_fail"
+    assert outcome.report["execution"]["module_states"]["manual_review"] == {
+        "state": "not_run_due_to_acceptance_frame_budget",
+        "reason": "insufficient_remaining_frames",
+    }
+    assert outcome.report["execution"]["module_states"]["semantic_consistency"] == {
+        "state": "not_run_due_to_acceptance_frame_budget",
+        "reason": "insufficient_remaining_frames",
+    }
+    assert outcome.report["pipeline_state"]["next_module"] is None
+    assert "supplier_data_audit" in calls
 
 
 @pytest.mark.parametrize(

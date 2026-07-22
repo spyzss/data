@@ -258,6 +258,29 @@ def _planned_review(
     }
 
 
+def _audit_failure_reason_change(
+    block: dict[str, Any],
+    failure_reason: object,
+    *,
+    reviewed_at: str,
+) -> None:
+    previous = block.get("failure_reason")
+    if previous is None or previous == failure_reason:
+        return
+    audit = block.setdefault("review_audit", [])
+    if not isinstance(audit, list):
+        raise ValueError("manual_review.review_audit must be a list")
+    audit.append(
+        {
+            "action": "failure_reason_changed",
+            "issue_id": None,
+            "previous_failure_reason": deepcopy(previous),
+            "failure_reason": deepcopy(failure_reason),
+            "reviewed_at": reviewed_at,
+        }
+    )
+
+
 def import_legacy_manual_review(
     report_path: Path,
     csv_path: Path,
@@ -522,19 +545,29 @@ def import_legacy_manual_review(
             reviews[row.issue_id] = deepcopy(review)
         block["selected_issue_id"] = selected[0] if selected else None
         all_reviewed = bool(selected) and set(selected).issubset(reviews)
+        has_fail = any(
+            isinstance(reviews.get(issue_id), Mapping)
+            and reviews[issue_id].get("verdict") == "fail"
+            for issue_id in selected
+        )
         block["state"] = "completed" if all_reviewed else "in_progress"
         block["completed_at"] = reviewed_at if all_reviewed else None
         if all_reviewed:
-            has_fail = any(
-                isinstance(reviews.get(issue_id), Mapping)
-                and reviews[issue_id].get("verdict") == "fail"
-                for issue_id in selected
-            )
             block["completion_mode"] = "early_fail" if has_fail else "all_reviewed"
-            block["failure_reason"] = None
+            final_failure_reason = (
+                deepcopy(block.get("failure_reason")) if has_fail else None
+            )
+            _audit_failure_reason_change(
+                block,
+                final_failure_reason,
+                reviewed_at=reviewed_at,
+            )
+            block["failure_reason"] = final_failure_reason
         else:
             block.pop("completion_mode", None)
-            block.pop("failure_reason", None)
+            if not has_fail and block.get("failure_reason") is not None:
+                _audit_failure_reason_change(block, None, reviewed_at=reviewed_at)
+                block["failure_reason"] = None
         audit = block.setdefault("import_audit", [])
         if not isinstance(audit, list):
             raise ValueError("manual_review.import_audit must be a list")
