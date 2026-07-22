@@ -137,6 +137,29 @@ class FailingRenderer(RecordingRenderer):
         return super().render_interval(request, start_frame, end_frame_exclusive, output_path)
 
 
+class LateFailingLargeRenderer(RecordingRenderer):
+    """Produce one material file, then fail the later interval."""
+
+    def render_interval(
+        self,
+        request: object,
+        start_frame: int,
+        end_frame_exclusive: int,
+        output_path: Path,
+    ) -> dict[str, object]:
+        if self.calls:
+            raise RuntimeError("private late render failure")
+        with self._lock:
+            self.calls += 1
+            self.intervals.append((start_frame, end_frame_exclusive))
+            self.output_paths.append(output_path)
+        output_path.write_bytes(b"x" * 4096)
+        return {
+            "frame_count": end_frame_exclusive - start_frame,
+            "fps": request.fps,
+        }
+
+
 def test_merge_frame_intervals_merges_overlap_and_adjacency_but_rejects_invalid_ranges() -> None:
     from human_qc.overlay_worker import merge_frame_intervals
 
@@ -714,6 +737,42 @@ def test_corrupt_durable_pins_do_not_block_cross_worker_eviction(tmp_path: Path)
     finally:
         worker_a.shutdown()
         worker_b.shutdown()
+
+
+def test_failed_multi_segment_jobs_delete_media_and_remain_inside_batch_quota(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    worker = BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=1,
+        max_cache_bytes=2048,
+    )
+    requests = [
+        _request(
+            tmp_path,
+            intervals=((0, 1), (2, 3)),
+            renderer=LateFailingLargeRenderer(),
+            source_sha256="sha256:" + f"{index:064x}",
+        )
+        for index in range(1, 8)
+    ]
+    try:
+        for request in requests:
+            worker.submit(request)
+            failed = _wait_until_terminal(worker, request)
+            assert failed.status == "failed"
+            assert all(segment.path is None for segment in failed.segments)
+            assert not list(request.cache_root.rglob("*.mp4"))
+        persisted_bytes = sum(
+            path.stat().st_size
+            for path in requests[0].cache_root.rglob("*")
+            if path.is_file()
+        )
+        assert persisted_bytes <= 2048
+    finally:
+        worker.shutdown()
 
 
 def test_distinct_concurrent_jobs_publish_within_the_shared_ready_cache_limit(

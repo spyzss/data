@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import math
 import mimetypes
@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import tempfile
 from threading import RLock
+import time
 from typing import Any, BinaryIO
 
 from canonical_qc.video_probe import probe_video
@@ -62,6 +63,14 @@ class MediaResource:
 class SourceMedia(MediaResource):
     fps: float = 0.0
     total_frames: int = 0
+
+
+@dataclass(frozen=True)
+class _OverlayRegistration:
+    path: Path
+    lease_expires_at: float | None = None
+    renew_lease: Callable[[], float] | None = None
+    release_lease: Callable[[], None] | None = None
 
 
 def parse_byte_range(header: str | None, size: int) -> ByteRange | None:
@@ -209,7 +218,10 @@ class MediaCatalog:
         ] = {}
         self._probe_by_hash: dict[str, tuple[float, int]] = {}
         self._probe_inflight: dict[str, Future[tuple[float, int]]] = {}
-        self._overlays: dict[tuple[str, str], Path] = {}
+        self._source_hash_by_path: dict[Path, str] = {}
+        self._frozen_sources: dict[str, SourceMedia] = {}
+        self._sources_frozen = False
+        self._overlays: dict[tuple[str, str], _OverlayRegistration] = {}
         self._lock = RLock()
 
     @staticmethod
@@ -393,6 +405,12 @@ class MediaCatalog:
         raise failure
 
     def source(self, asset_id: str) -> SourceMedia:
+        with self._lock:
+            frozen = self._frozen_sources.get(asset_id) if self._sources_frozen else None
+        if frozen is not None:
+            if self._identity(frozen.path) != frozen.identity:
+                raise MediaUnavailableError("source_video_unavailable")
+            return frozen
         context = self._context(asset_id)
         raw = context.source_files.get("video")
         if not isinstance(raw, Mapping):
@@ -409,7 +427,7 @@ class MediaCatalog:
         if self._identity(path) != identity:
             raise MediaUnavailableError("source_video_unavailable")
         mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        return SourceMedia(
+        result = SourceMedia(
             path=path,
             size=identity[2],
             mime_type=mime_type,
@@ -419,12 +437,95 @@ class MediaCatalog:
             total_frames=values[1],
         )
 
-    def allow_overlay(self, asset_id: str, overlay_id: str, path: str | Path) -> None:
+        with self._lock:
+            previous_hash = self._source_hash_by_path.get(path)
+            self._source_hash_by_path[path] = source_hash
+            if previous_hash is not None and previous_hash != source_hash:
+                still_used = previous_hash in self._source_hash_by_path.values()
+                if not still_used:
+                    self._probe_by_hash.pop(previous_hash, None)
+        return result
+
+    def freeze_sources(self) -> None:
+        """Eagerly validate source metadata once, then make request reads stat-only."""
+
+        with self._lock:
+            if self._sources_frozen:
+                return
+        prepared = {asset_id: self.source(asset_id) for asset_id in self._contexts}
+        with self._lock:
+            self._frozen_sources = prepared
+            self._sources_frozen = True
+
+    @staticmethod
+    def _lease_expiry(value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("overlay lease expiry must be finite")
+        expiry = float(value)
+        if not math.isfinite(expiry) or expiry <= time.time():
+            raise ValueError("overlay lease expiry must be in the future")
+        return expiry
+
+    def allow_overlay(
+        self,
+        asset_id: str,
+        overlay_id: str,
+        path: str | Path,
+        *,
+        lease_expires_at: float | None = None,
+        renew_lease: Callable[[], float] | None = None,
+        release_lease: Callable[[], None] | None = None,
+    ) -> None:
         context = self._context(asset_id)
         opaque = self._opaque_id(overlay_id)
         resolved = self._inside(context, path)
+        expiry = (
+            None
+            if lease_expires_at is None
+            else self._lease_expiry(lease_expires_at)
+        )
+        key = (asset_id, opaque)
         with self._lock:
-            self._overlays[(asset_id, opaque)] = resolved
+            previous = self._overlays.get(key)
+            if (
+                previous is not None
+                and expiry is None
+                and renew_lease is None
+                and release_lease is None
+            ):
+                self._overlays[key] = replace(previous, path=resolved)
+            else:
+                self._overlays[key] = _OverlayRegistration(
+                    resolved,
+                    expiry,
+                    renew_lease,
+                    release_lease,
+                )
+
+    @staticmethod
+    def _release_registration(registration: _OverlayRegistration | None) -> None:
+        if registration is None or registration.release_lease is None:
+            return
+        try:
+            registration.release_lease()
+        except Exception:
+            pass
+
+    def release_overlay(self, asset_id: str, overlay_id: str) -> None:
+        try:
+            opaque = self._opaque_id(overlay_id)
+        except ValueError:
+            return
+        with self._lock:
+            registration = self._overlays.pop((asset_id, opaque), None)
+        self._release_registration(registration)
+
+    def release_asset_overlays(self, asset_id: str) -> None:
+        with self._lock:
+            keys = [key for key in self._overlays if key[0] == asset_id]
+            registrations = [self._overlays.pop(key) for key in keys]
+        for registration in registrations:
+            self._release_registration(registration)
 
     def overlay(self, asset_id: str, overlay_id: str) -> MediaResource:
         try:
@@ -432,11 +533,43 @@ class MediaCatalog:
         except ValueError as exc:
             raise MediaNotFoundError("media_not_found") from exc
         context = self._context(asset_id)
+        key = (asset_id, opaque)
         with self._lock:
-            path = self._overlays.get((asset_id, opaque))
-        if path is None:
+            registration = self._overlays.get(key)
+            if (
+                registration is not None
+                and registration.lease_expires_at is not None
+                and registration.lease_expires_at <= time.time()
+            ):
+                registration = self._overlays.pop(key)
+                expired = True
+            else:
+                expired = False
+        if expired:
+            self._release_registration(registration)
             raise MediaNotFoundError("media_not_found")
-        resolved = self._inside(context, path)
+        if registration is None:
+            raise MediaNotFoundError("media_not_found")
+        if registration.renew_lease is not None:
+            try:
+                renewed_expiry = self._lease_expiry(registration.renew_lease())
+            except Exception:
+                with self._lock:
+                    removed = self._overlays.pop(key, None)
+                self._release_registration(removed)
+                raise MediaNotFoundError("media_not_found") from None
+            renewed = replace(registration, lease_expires_at=renewed_expiry)
+            with self._lock:
+                if self._overlays.get(key) is registration:
+                    self._overlays[key] = renewed
+            registration = renewed
+        try:
+            resolved = self._inside(context, registration.path)
+        except MediaNotFoundError:
+            with self._lock:
+                removed = self._overlays.pop(key, None)
+            self._release_registration(removed)
+            raise
         try:
             stat = resolved.stat()
         except OSError as exc:

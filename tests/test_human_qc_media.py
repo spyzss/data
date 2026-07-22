@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from threading import Barrier, Event, Lock
+import time
 
 import pytest
 
@@ -261,3 +262,96 @@ def test_probe_result_is_not_cached_when_source_identity_changes(tmp_path: Path)
 
     assert source.fps == 30.0
     assert probe_calls == [first.resolve(), second.resolve()]
+
+
+def test_startup_frozen_source_makes_request_path_metadata_only_and_replacement_fails_closed(
+    tmp_path: Path,
+) -> None:
+    from human_qc.media import MediaCatalog, MediaUnavailableError
+    from qc_pipeline.context import AssetContext
+
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"original-video")
+    context = AssetContext(
+        asset_id="asset-1",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-1.json",
+        source_files={"video": {"path": "video.mp4"}},
+    )
+    probe_calls: list[Path] = []
+    catalog = MediaCatalog(
+        {"asset-1": context},
+        probe=lambda path: probe_calls.append(path)
+        or {"fps": 30.0, "total_frames": 4},
+    )
+
+    catalog.freeze_sources()
+    assert len(probe_calls) == 1
+    catalog._hash_file = lambda *_args: pytest.fail("GET must not hash video")  # type: ignore[method-assign]
+    catalog._probe = lambda *_args: pytest.fail("GET must not ffprobe video")
+
+    assert catalog.source("asset-1").total_frames == 4
+    replacement = tmp_path / "replacement.mp4"
+    replacement.write_bytes(b"changed-video")
+    replacement.replace(video)
+    with pytest.raises(MediaUnavailableError, match="source_video_unavailable"):
+        catalog.source("asset-1")
+
+
+def test_overlay_allowlist_lease_renews_releases_and_expires(tmp_path: Path) -> None:
+    from human_qc.media import MediaCatalog, MediaNotFoundError
+    from qc_pipeline.context import AssetContext
+
+    context = AssetContext(
+        asset_id="asset-1",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-1.json",
+        source_files={},
+    )
+    overlay = tmp_path / "overlay.mp4"
+    overlay.write_bytes(b"overlay")
+    renew_calls: list[str] = []
+    release_calls: list[str] = []
+    catalog = MediaCatalog({"asset-1": context})
+    expires_at = time.time() + 0.08
+
+    catalog.allow_overlay(
+        "asset-1",
+        "overlay-1",
+        overlay,
+        lease_expires_at=expires_at,
+        renew_lease=lambda: renew_calls.append("renew") or (time.time() + 0.08),
+        release_lease=lambda: release_calls.append("release"),
+    )
+
+    assert catalog.overlay("asset-1", "overlay-1").path == overlay.resolve()
+    assert renew_calls == ["renew"]
+    catalog.release_overlay("asset-1", "overlay-1")
+    assert release_calls == ["release"]
+    with pytest.raises(MediaNotFoundError):
+        catalog.overlay("asset-1", "overlay-1")
+
+    catalog.allow_overlay(
+        "asset-1",
+        "overlay-2",
+        overlay,
+        lease_expires_at=time.time() + 0.02,
+        release_lease=lambda: release_calls.append("expired"),
+    )
+    time.sleep(0.04)
+    with pytest.raises(MediaNotFoundError):
+        catalog.overlay("asset-1", "overlay-2")
+    assert release_calls == ["release", "expired"]
+
+    overlay.write_bytes(b"overlay")
+    catalog.allow_overlay(
+        "asset-1",
+        "overlay-3",
+        overlay,
+        lease_expires_at=time.time() + 1.0,
+        release_lease=lambda: release_calls.append("missing"),
+    )
+    overlay.unlink()
+    with pytest.raises(MediaNotFoundError):
+        catalog.overlay("asset-1", "overlay-3")
+    assert release_calls == ["release", "expired", "missing"]

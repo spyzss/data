@@ -1023,6 +1023,24 @@ class BoundedOverlayWorker:
         except OSError:
             return
 
+    def _discard_job_media(self, request: OverlayRequest) -> None:
+        """Remove every material media product from a non-ready job."""
+
+        job_dir = self._job_dir(request)
+        try:
+            candidates = tuple(job_dir.iterdir())
+        except OSError:
+            return
+        for path in candidates:
+            if not path.is_file() or not (
+                path.suffix == ".mp4" or ".partial-" in path.name
+            ):
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     @staticmethod
     def _pin_directory(root: Path, digest: str) -> Path:
         return root / _PIN_ROOT_NAME / digest
@@ -1114,16 +1132,28 @@ class BoundedOverlayWorker:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if not isinstance(data, Mapping) or data.get("status") != "ready":
+            if not isinstance(data, Mapping) or data.get("status") not in {
+                "ready",
+                "failed",
+            }:
                 continue
             size = self._job_size(path)
             total_size += size
-            ready_count += 1
+            is_ready = data.get("status") == "ready"
+            if is_ready:
+                ready_count += 1
             try:
                 modified = manifest.stat().st_mtime
             except OSError:
                 modified = 0.0
-            ready.append((modified, size, path, not self._has_live_pin(root, path.name)))
+            ready.append(
+                (
+                    modified,
+                    size,
+                    path,
+                    not is_ready or not self._has_live_pin(root, path.name),
+                )
+            )
         ready.sort(key=lambda item: item[0])
         target_count = ready_count + 1
         while (
@@ -1143,6 +1173,67 @@ class BoundedOverlayWorker:
         if self._max_cache_bytes is not None and total_size + current_job_size > self._max_cache_bytes:
             return False
         return self._max_ready_jobs is None or target_count <= self._max_ready_jobs
+
+    def _evict_failed_for(self, request: OverlayRequest, current_job_size: int) -> bool:
+        """Bound failed manifests too, without consuming a ready-job slot."""
+
+        if self._max_cache_bytes is None:
+            return True
+        root = self._root(request)
+        try:
+            candidates = [
+                path
+                for path in root.iterdir()
+                if path.is_dir() and _DIGEST(path.name)
+            ]
+        except OSError:
+            return False
+        terminal: list[tuple[int, float, int, Path, bool]] = []
+        total_size = 0
+        for path in candidates:
+            if path == self._job_dir(request):
+                continue
+            key = (str(root), path.name)
+            if key in self._scheduled:
+                continue
+            manifest = path / _MANIFEST_NAME
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, Mapping) or data.get("status") not in {
+                "ready",
+                "failed",
+            }:
+                continue
+            size = self._job_size(path)
+            total_size += size
+            is_ready = data.get("status") == "ready"
+            try:
+                modified = manifest.stat().st_mtime
+            except OSError:
+                modified = 0.0
+            terminal.append(
+                (
+                    1 if is_ready else 0,
+                    modified,
+                    size,
+                    path,
+                    not is_ready or not self._has_live_pin(root, path.name),
+                )
+            )
+        terminal.sort(key=lambda item: (item[0], item[1]))
+        while total_size + current_job_size > self._max_cache_bytes:
+            victim_index = next(
+                (index for index, (*_, evictable) in enumerate(terminal) if evictable),
+                None,
+            )
+            if victim_index is None:
+                return False
+            _, _, size, victim, _ = terminal.pop(victim_index)
+            self._safe_remove_job(root, victim)
+            total_size -= size
+        return True
 
     def _render(self, request: OverlayRequest, initial: OverlayJobView) -> OverlayJobView:
         job_dir = self._job_dir(request)
@@ -1212,11 +1303,24 @@ class BoundedOverlayWorker:
             (segment.code for segment in produced if segment.status == "failed" and segment.code),
             "overlay_render_failed",
         )
+        self._discard_segments(produced)
+        failed_segments = tuple(
+            replace(
+                segment,
+                status="failed",
+                path=None,
+                code=code,
+                retryable=True,
+                content_sha256=None,
+                metadata=None,
+            )
+            for segment in produced
+        )
         return self._failed_view(
             request,
             code,
             retryable=True,
-            segments=tuple(produced),
+            segments=failed_segments,
         )
 
     def _generating_view(
@@ -1282,7 +1386,39 @@ class BoundedOverlayWorker:
                     )
                     return replace(durable, cache_hit=True)
                 final = candidate
-                if candidate.status == "ready" and not self._evict_for(
+                if candidate.status == "failed":
+                    self._discard_segments(candidate.segments)
+                    self._discard_job_media(request)
+                    candidate = self._failed_view(
+                        request,
+                        candidate.code or "overlay_render_failed",
+                        retryable=candidate.retryable,
+                        segments=tuple(
+                            replace(
+                                segment,
+                                status="failed",
+                                path=None,
+                                code=candidate.code or segment.code or "overlay_render_failed",
+                                retryable=candidate.retryable or segment.retryable,
+                                content_sha256=None,
+                                metadata=None,
+                            )
+                            for segment in candidate.segments
+                        ),
+                    )
+                    final = candidate
+                    manifest_size = len(
+                        json.dumps(
+                            self._manifest_payload(request, candidate),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
+                    if not self._evict_failed_for(request, manifest_size):
+                        self._safe_remove_job(self._root(request), self._job_dir(request))
+                        return final
+                elif not self._evict_for(
                     request, self._job_size(self._job_dir(request))
                 ):
                     self._discard_segments(candidate.segments)
@@ -1312,6 +1448,7 @@ class BoundedOverlayWorker:
             with self._root_publish_lock(request):
                 with self._key_lock(request) as acquired:
                     if acquired:
+                        self._discard_job_media(request)
                         self._persist(request, view)
         except BaseException:
             return
@@ -1534,7 +1671,7 @@ class BoundedOverlayWorker:
                 return self._failed_view(request, "overlay_queue_full", retryable=True)
             return self._schedule(request, current)
 
-    def pin(self, request: OverlayRequest, *, lease_seconds: float | None = None) -> None:
+    def pin(self, request: OverlayRequest, *, lease_seconds: float | None = None) -> float:
         """Create or renew this worker's root-visible cache pin lease.
 
         Callers that keep media allowlisted for longer than the configured
@@ -1562,8 +1699,10 @@ class BoundedOverlayWorker:
                 token, lease_path = lease
             with self._root_publish_lock(request):
                 lease_path.parent.mkdir(parents=True, exist_ok=True)
-                self._atomic_json(lease_path, self._pin_payload(request, token, seconds))
+                payload = self._pin_payload(request, token, seconds)
+                self._atomic_json(lease_path, payload)
             self._pin_leases[job_id] = (token, lease_path)
+            return float(payload["expires_at"])
 
     def unpin(self, request: OverlayRequest) -> None:
         if not isinstance(request, OverlayRequest):
@@ -1586,6 +1725,18 @@ class BoundedOverlayWorker:
         with self._lock:
             self._closed = True
         self._executor.shutdown(wait=wait, cancel_futures=False)
+        # Runtime owners normally release catalog registrations first.  This
+        # fallback ensures a direct worker shutdown does not leave live leases.
+        with self._lock:
+            pin_paths = tuple(value[1] for value in self._pin_leases.values())
+            self._pin_leases.clear()
+        for lease_path in pin_paths:
+            try:
+                lease_path.unlink(missing_ok=True)
+                lease_path.parent.rmdir()
+                lease_path.parent.parent.rmdir()
+            except OSError:
+                pass
 
 
 __all__ = [

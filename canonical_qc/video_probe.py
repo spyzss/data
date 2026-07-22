@@ -92,10 +92,11 @@ def _probe_payload(path: Path, *, pass_fds: tuple[int, ...] = ()) -> dict[str, A
         (
             "stream=codec_name,codec_type,width,height,pix_fmt,avg_frame_rate,"
             "time_base:frame=media_type,best_effort_timestamp,"
-            "best_effort_timestamp_time"
+            "best_effort_timestamp_time:format=format_name"
         ),
         "-show_streams",
         "-show_frames",
+        "-show_format",
         "-of",
         "json",
         str(path),
@@ -198,6 +199,15 @@ def probe_video(path: Path, *, file_descriptor: int | None = None) -> ProbedVide
         )
 
     stream = streams[0]
+    raw_format = payload.get("format")
+    raw_container = (
+        raw_format.get("format_name") if isinstance(raw_format, dict) else None
+    )
+    container_format = (
+        raw_container.strip()
+        if isinstance(raw_container, str) and raw_container.strip()
+        else None
+    )
     fps = _fraction(stream.get("avg_frame_rate"), field="main_video.fps")
     raw_time_base = stream.get("time_base")
     time_base: Fraction | None = None
@@ -244,4 +254,5 @@ def probe_video(path: Path, *, file_descriptor: int | None = None) -> ProbedVide
             stream.get("pix_fmt"), field="main_video.pixel_format"
         ),
         timestamps_ns=timestamps_ns,
+        container_format=container_format,
     )

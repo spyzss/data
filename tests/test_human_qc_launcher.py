@@ -8,6 +8,7 @@ import pytest
 
 from tools import serve_human_qc_workbench as launcher
 from tools.serve_human_qc_workbench import load_contexts, parse_args
+from tests.qc_report_fixtures import make_v2_report
 
 
 def test_warn_only_launcher_accepts_report_when_declared_hdf5_is_missing(
@@ -96,6 +97,119 @@ def test_launcher_rehydrates_manifest_metadata_for_strict_overlay_mapping(
     }
 
 
+def _current_overlay_recipe(asset_id: str = "asset-1") -> dict[str, object]:
+    return {
+        "schema_version": "sam3_overlay_input.v2",
+        "asset_id": asset_id,
+        "producer_fingerprint_sha256": "sha256:" + "b" * 64,
+        "video_source": "video",
+        "video_identity": "sha256:" + "a" * 64,
+        "candidate_intervals": [[0, 3]],
+        "source_mapping": {
+            "schema_version": "linear_ranges.v1",
+            "ranges": [
+                {
+                    "start_frame": 0,
+                    "end_frame_exclusive": 3,
+                    "video_start_frame": 0,
+                }
+            ],
+        },
+        "keypoints_2d_reference": {
+            "schema_version": "json_keypoints.v1",
+            "relative_path": ".qc_pipeline/asset-1/overlay-inputs/points.json",
+            "sha256": "sha256:" + "c" * 64,
+            "size_bytes": 123,
+        },
+    }
+
+
+def _current_report_with_recipe() -> dict[str, object]:
+    recipe = _current_overlay_recipe()
+    report = make_v2_report()
+    report.update(
+        asset_id="asset-1",
+        source_files={"video": {"path": "video.mp4"}},
+        sam3_containment={
+            "flow": {
+                "entry_gate": {"state": "ready", "eligible": True},
+                "result_gate": {"verdict": "warn"},
+                "exit_gate": {"state": "continue", "continue_to_next_module": True},
+            },
+            "runtime": {
+                "artifact_state": "computed",
+                "fingerprint_sha256": "sha256:" + "b" * 64,
+                "overlay_input_recipe": recipe,
+            },
+        },
+    )
+    return report
+
+
+def test_launcher_accepts_recipe_only_from_current_completed_v2_sam3_report(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "quality_archive"
+    archive.mkdir()
+    (tmp_path / "video.mp4").write_bytes(b"video")
+    report = _current_report_with_recipe()
+    (archive / "asset-1.json").write_text(json.dumps(report), encoding="utf-8")
+
+    context = load_contexts(tmp_path, archive)[0]
+
+    loaded = context.metadata["sam3_overlay_recipe"]
+    assert loaded["schema_version"] == "sam3_overlay_input.v2"
+    assert loaded["asset_id"] == "asset-1"
+    assert loaded["candidate_intervals"] == ((0, 3),)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda report: report.update(schema_version="asset_qc_report.v1"),
+        lambda report: report["sam3_containment"]["runtime"].update(  # type: ignore[index]
+            artifact_state="stale"
+        ),
+        lambda report: report["sam3_containment"]["flow"]["exit_gate"].update(  # type: ignore[index]
+            state="blocked", continue_to_next_module=False
+        ),
+        lambda report: report["sam3_containment"]["runtime"].update(  # type: ignore[index]
+            fingerprint_sha256="sha256:" + "d" * 64
+        ),
+        lambda report: report["sam3_containment"]["runtime"][  # type: ignore[index]
+            "overlay_input_recipe"
+        ].update(
+            keypoints_2d={"0": {"left": [[1.0, 2.0]]}}
+        ),
+        lambda report: report["sam3_containment"]["runtime"][  # type: ignore[index]
+            "overlay_input_recipe"
+        ]["source_mapping"].update(
+            ranges=[
+                {
+                    "start_frame": 0,
+                    "end_frame_exclusive": 2,
+                    "video_start_frame": 0,
+                }
+            ]
+        ),
+    ],
+)
+def test_launcher_rejects_historical_stale_ambiguous_or_gapped_overlay_recipe(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    archive = tmp_path / "quality_archive"
+    archive.mkdir()
+    (tmp_path / "video.mp4").write_bytes(b"video")
+    report = _current_report_with_recipe()
+    mutation(report)
+    (archive / "asset-1.json").write_text(json.dumps(report), encoding="utf-8")
+
+    context = load_contexts(tmp_path, archive)[0]
+
+    assert "sam3_overlay_recipe" not in context.metadata
+
+
 def test_launcher_accepts_explicit_model_and_bounded_overlay_inputs(
     tmp_path: Path,
 ) -> None:
@@ -167,8 +281,13 @@ def test_production_launcher_builds_one_shared_runtime_worker_and_injects_provid
 
     worker.shutdown = shutdown
     provider = object()
+    freeze_calls: list[str] = []
+    media_catalog = SimpleNamespace(
+        freeze_sources=lambda: freeze_calls.append("freeze")
+    )
 
     monkeypatch.setattr(launcher, "load_contexts", lambda *_args: [context])
+    monkeypatch.setattr(launcher, "MediaCatalog", lambda _contexts: media_catalog)
     monkeypatch.setattr(
         launcher,
         "WarnReviewService",
@@ -208,6 +327,7 @@ def test_production_launcher_builds_one_shared_runtime_worker_and_injects_provid
     )
 
     assert calls == 1
+    assert freeze_calls == ["freeze"]
     assert captured["overlay_provider"] is provider
     build_kwargs = captured["overlay_runtime_kwargs"]
     assert build_kwargs["contexts"] == {"asset-1": context}
@@ -231,7 +351,15 @@ def test_launcher_without_model_fails_closed_instead_of_leaving_overlay_pending(
         report_path=tmp_path / "quality_archive" / "asset-1.json",
     )
     captured: dict[str, object] = {}
+    freeze_calls: list[str] = []
     monkeypatch.setattr(launcher, "load_contexts", lambda *_args: [context])
+    monkeypatch.setattr(
+        launcher,
+        "MediaCatalog",
+        lambda _contexts: SimpleNamespace(
+            freeze_sources=lambda: freeze_calls.append("freeze")
+        ),
+    )
     monkeypatch.setattr(
         launcher,
         "WarnReviewService",
@@ -262,6 +390,7 @@ def test_launcher_without_model_fails_closed_instead_of_leaving_overlay_pending(
     assert result["issue-1"].status == "failed"
     assert result["issue-1"].code == "overlay_model_unavailable"
     assert runtime.worker is None
+    assert freeze_calls == ["freeze"]
 
 
 def test_main_closes_overlay_worker_in_finally(
@@ -355,6 +484,11 @@ def test_runtime_preload_failure_shuts_down_overlay_resources(
         shutdown=lambda: shutdown_calls.append("shutdown"),
     )
     monkeypatch.setattr(launcher, "load_contexts", lambda *_args: [context])
+    monkeypatch.setattr(
+        launcher,
+        "MediaCatalog",
+        lambda _contexts: SimpleNamespace(freeze_sources=lambda: None),
+    )
     monkeypatch.setattr(
         launcher,
         "build_production_overlay_runtime",

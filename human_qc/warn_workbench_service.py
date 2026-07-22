@@ -1231,7 +1231,11 @@ class WarnWorkbenchService:
 
     def release_lease(self, asset_id: str, token: str) -> Lease:
         self._context(asset_id)
-        return self.lease_store.release(asset_id, token)
+        lease = self.lease_store.release(asset_id, token)
+        release_overlay = getattr(self.overlay_provider, "release_asset", None)
+        if callable(release_overlay):
+            release_overlay(asset_id)
+        return lease
 
     def validate_lease(self, asset_id: str, token: str) -> Lease:
         return self.lease_store.validate(asset_id, token)

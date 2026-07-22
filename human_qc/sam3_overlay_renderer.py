@@ -11,10 +11,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from threading import RLock
+import tempfile
 from typing import Any, Protocol
 
 import numpy as np
@@ -28,6 +31,7 @@ from .overlay_worker import (
     BoundedOverlayWorker,
     OverlayRenderError,
     OverlayRequest,
+    merge_frame_intervals,
 )
 from .warn_workbench_service import (
     OverlayHandle,
@@ -37,8 +41,11 @@ from .warn_workbench_service import (
 
 
 RENDERER_VERSION = "sam3-overlay-renderer-v1"
-RECIPE_SCHEMA = "sam3_overlay_input.v1"
-REFERENCE_SCHEMA = "parquet_columns.v1"
+RECIPE_SCHEMA = "sam3_overlay_input.v2"
+MAPPING_SCHEMA = "linear_ranges.v1"
+PARQUET_REFERENCE_SCHEMA = "parquet_columns.v2"
+JSON_REFERENCE_SCHEMA = "json_keypoints.v1"
+KEYPOINT_SIDECAR_SCHEMA = "sam3_overlay_keypoints.v1"
 DEFAULT_OVERLAY_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024
 PUBLIC_OVERLAY_FAILURE_CODES = frozenset(
     {
@@ -378,6 +385,13 @@ class Sam3OverlayRenderer:
                 except BaseException as exc:
                     if failure is None:
                         failure = self._render_error("overlay_encoder_failed", exc)
+            close_provider = getattr(self.frame_provider, "close", None)
+            if callable(close_provider):
+                try:
+                    close_provider()
+                except BaseException as exc:
+                    if failure is None:
+                        failure = self._render_error("overlay_render_failed", exc)
         if failure is not None:
             self._remove_partial(output_path)
             raise failure
@@ -392,6 +406,7 @@ class Sam3OverlayRenderer:
             fps_num = getattr(probed, "fps_num")
             fps_den = getattr(probed, "fps_den")
             codec = getattr(probed, "codec")
+            container_format = getattr(probed, "container_format")
             actual_fps = float(fps_num) / float(fps_den)
         except Exception as exc:
             self._remove_partial(output_path)
@@ -406,6 +421,12 @@ class Sam3OverlayRenderer:
                 abs_tol=1e-3,
             )
             or codec != "mpeg4"
+            or not isinstance(container_format, str)
+            or "mp4" not in {
+                item.strip().lower()
+                for item in container_format.split(",")
+                if item.strip()
+            }
         ):
             self._remove_partial(output_path)
             raise self._render_error("overlay_encoder_failed")
@@ -415,11 +436,172 @@ class Sam3OverlayRenderer:
             "width_px": width,
             "height_px": height,
             "codec": codec,
+            "container_format": container_format,
             "first_source_frame": start_frame,
             "end_source_frame_exclusive": end_frame_exclusive,
             "mapping": "explicit",
             "renderer_version": self.renderer_version,
         }
+
+
+def _sha256_identity(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("sha256:")
+        or len(value) != 71
+    ):
+        raise OverlaySetupError("overlay_input_unavailable")
+    try:
+        int(value[7:], 16)
+    except ValueError:
+        raise OverlaySetupError("overlay_input_unavailable") from None
+    return value.lower()
+
+
+def validate_overlay_recipe(
+    value: object,
+    *,
+    asset_id: str | None = None,
+    producer_fingerprint_sha256: str | None = None,
+) -> dict[str, object]:
+    """Validate one compact current recipe without reading referenced payloads."""
+
+    if not isinstance(value, Mapping) or value.get("schema_version") != RECIPE_SCHEMA:
+        raise OverlaySetupError("overlay_mapping_unavailable")
+    if "source_to_video" in value or "keypoints_2d" in value:
+        raise OverlaySetupError("overlay_input_unavailable")
+    recipe_asset = value.get("asset_id")
+    if not isinstance(recipe_asset, str) or not recipe_asset:
+        raise OverlaySetupError("overlay_input_unavailable")
+    if asset_id is not None and recipe_asset != asset_id:
+        raise OverlaySetupError("overlay_input_unavailable")
+    fingerprint = _sha256_identity(value.get("producer_fingerprint_sha256"))
+    if (
+        producer_fingerprint_sha256 is not None
+        and fingerprint != producer_fingerprint_sha256
+    ):
+        raise OverlaySetupError("overlay_input_unavailable")
+    video_source = value.get("video_source")
+    if not isinstance(video_source, str) or not video_source:
+        raise OverlaySetupError("overlay_source_unavailable")
+    video_identity = _sha256_identity(value.get("video_identity"))
+
+    raw_intervals = value.get("candidate_intervals")
+    if (
+        isinstance(raw_intervals, (str, bytes, bytearray, Mapping))
+        or not isinstance(raw_intervals, Sequence)
+    ):
+        raise OverlaySetupError("overlay_mapping_unavailable")
+    try:
+        intervals = merge_frame_intervals(tuple(tuple(item) for item in raw_intervals))
+    except (TypeError, ValueError):
+        raise OverlaySetupError("overlay_mapping_unavailable") from None
+    if not intervals:
+        raise OverlaySetupError("overlay_mapping_unavailable")
+
+    raw_mapping = value.get("source_mapping")
+    if (
+        not isinstance(raw_mapping, Mapping)
+        or raw_mapping.get("schema_version") != MAPPING_SCHEMA
+    ):
+        raise OverlaySetupError("overlay_mapping_unavailable")
+    raw_ranges = raw_mapping.get("ranges")
+    if (
+        isinstance(raw_ranges, (str, bytes, bytearray, Mapping))
+        or not isinstance(raw_ranges, Sequence)
+    ):
+        raise OverlaySetupError("overlay_mapping_unavailable")
+    ranges: list[dict[str, int]] = []
+    for raw in raw_ranges:
+        if not isinstance(raw, Mapping):
+            raise OverlaySetupError("overlay_mapping_unavailable")
+        start = _finite_int(raw.get("start_frame"), name="start_frame")
+        end = _finite_int(
+            raw.get("end_frame_exclusive"),
+            name="end_frame_exclusive",
+            minimum=1,
+        )
+        video_start = _finite_int(
+            raw.get("video_start_frame"),
+            name="video_start_frame",
+        )
+        if end <= start:
+            raise OverlaySetupError("overlay_mapping_unavailable")
+        ranges.append(
+            {
+                "start_frame": start,
+                "end_frame_exclusive": end,
+                "video_start_frame": video_start,
+            }
+        )
+    if tuple((item["start_frame"], item["end_frame_exclusive"]) for item in ranges) != intervals:
+        raise OverlaySetupError("overlay_mapping_unavailable")
+
+    reference = value.get("keypoints_2d_reference")
+    if not isinstance(reference, Mapping):
+        raise OverlaySetupError("overlay_input_unavailable")
+    reference_schema = reference.get("schema_version")
+    size_bytes = reference.get("size_bytes")
+    if (
+        isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or size_bytes <= 0
+    ):
+        raise OverlaySetupError("overlay_input_unavailable")
+    reference_sha = _sha256_identity(reference.get("sha256"))
+    normalized_reference: dict[str, object] = {
+        "schema_version": reference_schema,
+        "sha256": reference_sha,
+        "size_bytes": size_bytes,
+    }
+    if reference_schema == PARQUET_REFERENCE_SCHEMA:
+        source = reference.get("source")
+        fields = reference.get("fields")
+        if (
+            not isinstance(source, str)
+            or not source
+            or reference.get("row_mapping") != "source_frame_index"
+            or not isinstance(fields, Mapping)
+            or not fields
+            or any(
+                not isinstance(side, str)
+                or not side
+                or not isinstance(field, str)
+                or not field
+                for side, field in fields.items()
+            )
+        ):
+            raise OverlaySetupError("overlay_input_unavailable")
+        normalized_reference.update(
+            {
+                "source": source,
+                "row_mapping": "source_frame_index",
+                "fields": {str(side): str(field) for side, field in fields.items()},
+            }
+        )
+    elif reference_schema == JSON_REFERENCE_SCHEMA:
+        relative_path = reference.get("relative_path")
+        if not isinstance(relative_path, str) or not relative_path:
+            raise OverlaySetupError("overlay_input_unavailable")
+        normalized_reference["relative_path"] = relative_path
+    else:
+        raise OverlaySetupError("overlay_input_unavailable")
+
+    normalized = {
+        "schema_version": RECIPE_SCHEMA,
+        "asset_id": recipe_asset,
+        "producer_fingerprint_sha256": fingerprint,
+        "video_source": video_source,
+        "video_identity": video_identity,
+        "candidate_intervals": [list(interval) for interval in intervals],
+        "source_mapping": {
+            "schema_version": MAPPING_SCHEMA,
+            "ranges": ranges,
+        },
+        "keypoints_2d_reference": normalized_reference,
+    }
+    canonical_sha256(normalized)
+    return normalized
 
 
 class ExplicitRecipeFrameProvider:
@@ -436,110 +618,190 @@ class ExplicitRecipeFrameProvider:
         video_path: Path,
         recipe: Mapping[str, object],
         keypoint_reference_path: Path | None = None,
+        expected_video_identity: tuple[int, int, int, int] | None = None,
     ) -> None:
-        if recipe.get("schema_version") != RECIPE_SCHEMA:
-            raise OverlaySetupError("overlay_mapping_unavailable")
-        raw_mapping = recipe.get("source_to_video")
-        raw_keypoints = recipe.get("keypoints_2d")
-        raw_reference = recipe.get("keypoints_2d_reference")
-        if not isinstance(raw_mapping, Mapping) or (
-            not isinstance(raw_keypoints, Mapping)
-            and not isinstance(raw_reference, Mapping)
-        ):
-            raise OverlaySetupError("overlay_mapping_unavailable")
-        mapping: dict[int, int] = {}
-        for raw_source, raw_video in raw_mapping.items():
-            try:
-                source_frame = int(raw_source)
-            except (TypeError, ValueError):
-                raise OverlaySetupError("overlay_mapping_unavailable") from None
-            if str(source_frame) != str(raw_source) and raw_source != source_frame:
-                raise OverlaySetupError("overlay_mapping_unavailable")
-            mapping[source_frame] = _finite_int(
-                raw_video, name="video_frame", minimum=0
-            )
-        if not mapping:
-            raise OverlaySetupError("overlay_mapping_unavailable")
+        normalized = validate_overlay_recipe(recipe)
+        self._recipe_asset_id = str(normalized["asset_id"])
+        raw_mapping = normalized["source_mapping"]
+        assert isinstance(raw_mapping, Mapping)
+        raw_ranges = raw_mapping["ranges"]
+        assert isinstance(raw_ranges, list)
         self._video_path = Path(video_path).resolve()
-        self._mapping = mapping
-        self._keypoints = dict(raw_keypoints) if isinstance(raw_keypoints, Mapping) else None
+        self._expected_video_identity = expected_video_identity
+        self._mapping_ranges = tuple(
+            (
+                int(item["start_frame"]),
+                int(item["end_frame_exclusive"]),
+                int(item["video_start_frame"]),
+            )
+            for item in raw_ranges
+            if isinstance(item, Mapping)
+        )
+        raw_reference = normalized["keypoints_2d_reference"]
+        assert isinstance(raw_reference, Mapping)
+        self._reference = dict(raw_reference)
+        self._reference_path = (
+            None if keypoint_reference_path is None else Path(keypoint_reference_path).resolve()
+        )
+        if self._reference_path is None:
+            raise OverlaySetupError("overlay_input_unavailable")
         self._keypoint_table: Any | None = None
+        self._json_keypoints: dict[int, Mapping[str, object]] | None = None
         self._keypoint_fields: dict[str, str] = {}
-        keypoint_identity: object = raw_keypoints
-        if isinstance(raw_reference, Mapping):
-            if (
-                raw_reference.get("schema_version") != REFERENCE_SCHEMA
-                or raw_reference.get("row_mapping") != "source_frame_index"
-                or keypoint_reference_path is None
-                or raw_reference.get("sha256") != file_sha256(keypoint_reference_path)
-            ):
-                raise OverlaySetupError("overlay_input_unavailable")
+        if raw_reference.get("schema_version") == PARQUET_REFERENCE_SCHEMA:
             raw_fields = raw_reference.get("fields")
-            if not isinstance(raw_fields, Mapping) or not raw_fields:
-                raise OverlaySetupError("overlay_input_unavailable")
+            assert isinstance(raw_fields, Mapping)
             for side, field in raw_fields.items():
-                if not isinstance(side, str) or not isinstance(field, str) or not field:
-                    raise OverlaySetupError("overlay_input_unavailable")
-                self._keypoint_fields[side] = field
-            try:
-                import pandas as pd
-
-                self._keypoint_table = pd.read_parquet(keypoint_reference_path)
-            except Exception:
-                raise OverlaySetupError("overlay_input_unavailable") from None
-            if any(
-                field not in self._keypoint_table.columns
-                for field in self._keypoint_fields.values()
-            ):
-                raise OverlaySetupError("overlay_input_unavailable")
-            keypoint_identity = {
-                "schema_version": REFERENCE_SCHEMA,
-                "source": str(raw_reference.get("source") or ""),
-                "sha256": str(raw_reference.get("sha256") or ""),
-                "row_mapping": "source_frame_index",
-                "fields": dict(self._keypoint_fields),
-            }
-        else:
-            keypoint_identity = _plain_identity(keypoint_identity)
+                self._keypoint_fields[str(side)] = str(field)
         self._identity = {
             "recipe_version": RECIPE_SCHEMA,
-            "mapping": canonical_sha256(mapping),
-            "video": str(recipe.get("video_identity") or ""),
-            "keypoints": canonical_sha256(keypoint_identity),
+            "mapping": canonical_sha256(normalized["source_mapping"]),
+            "video": str(normalized["video_identity"]),
+            "keypoints": str(raw_reference["sha256"]),
         }
-        if not self._identity["video"]:
-            raise OverlaySetupError("overlay_source_unavailable")
         self._video_identity = str(self._identity["video"])
         self._capture: Any | None = None
+        self._video_handle: Any | None = None
+        self._parquet_snapshot: Any | None = None
         self._lock = RLock()
 
     @property
     def input_identity(self) -> Mapping[str, object]:
         return dict(self._identity)
 
+    @staticmethod
+    def _opened_identity(handle: Any) -> tuple[int, int, int, int]:
+        stat = os.fstat(handle.fileno())
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    @classmethod
+    def _verified_payload(
+        cls,
+        path: Path,
+        *,
+        expected_sha256: str,
+        expected_size: int,
+    ) -> bytes:
+        try:
+            with path.open("rb") as handle:
+                before = cls._opened_identity(handle)
+                if before[2] != expected_size:
+                    raise OverlaySetupError("overlay_input_unavailable")
+                digest = hashlib.sha256()
+                chunks: list[bytes] = []
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    chunks.append(chunk)
+                if cls._opened_identity(handle) != before:
+                    raise OverlaySetupError("overlay_input_unavailable")
+        except OverlaySetupError:
+            raise
+        except OSError:
+            raise OverlaySetupError("overlay_input_unavailable") from None
+        if "sha256:" + digest.hexdigest() != expected_sha256:
+            raise OverlaySetupError("overlay_input_unavailable")
+        return b"".join(chunks)
+
+    def _materialize_keypoints(self) -> None:
+        if self._keypoint_table is not None or self._json_keypoints is not None:
+            return
+        payload = self._verified_payload(
+            self._reference_path,
+            expected_sha256=str(self._reference["sha256"]),
+            expected_size=int(self._reference["size_bytes"]),
+        )
+        schema = self._reference.get("schema_version")
+        if schema == PARQUET_REFERENCE_SCHEMA:
+            snapshot: Any | None = None
+            try:
+                import pandas as pd
+
+                snapshot = tempfile.NamedTemporaryFile(mode="w+b", suffix=".parquet")
+                snapshot.write(payload)
+                snapshot.flush()
+                snapshot.seek(0)
+                self._keypoint_table = pd.read_parquet(snapshot.name)
+                self._parquet_snapshot = snapshot
+            except Exception:
+                if snapshot is not None:
+                    snapshot.close()
+                raise OverlaySetupError("overlay_input_unavailable") from None
+            if any(
+                field not in self._keypoint_table.columns
+                for field in self._keypoint_fields.values()
+            ):
+                raise OverlaySetupError("overlay_input_unavailable")
+            return
+        try:
+            raw = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise OverlaySetupError("overlay_input_unavailable") from None
+        if (
+            not isinstance(raw, Mapping)
+            or raw.get("schema_version") != KEYPOINT_SIDECAR_SCHEMA
+            or raw.get("asset_id") != self._recipe_asset_id
+            or not isinstance(raw.get("frames"), list)
+        ):
+            raise OverlaySetupError("overlay_input_unavailable")
+        keypoints: dict[int, Mapping[str, object]] = {}
+        for row in raw["frames"]:
+            if not isinstance(row, Mapping):
+                raise OverlaySetupError("overlay_input_unavailable")
+            source_frame = _finite_int(row.get("source_frame"), name="source_frame")
+            points = row.get("keypoints")
+            if source_frame in keypoints or not isinstance(points, Mapping):
+                raise OverlaySetupError("overlay_input_unavailable")
+            keypoints[source_frame] = points
+        self._json_keypoints = keypoints
+
     def _open(self) -> Any:
         import cv2
 
         try:
-            actual_identity = file_sha256(self._video_path)
+            handle = self._video_path.open("rb")
         except OSError:
             raise OverlaySetupError("overlay_source_unavailable") from None
-        if actual_identity != self._video_identity:
-            raise OverlaySetupError("overlay_source_unavailable")
-        capture = cv2.VideoCapture(str(self._video_path))
+        try:
+            identity = self._opened_identity(handle)
+            if self._expected_video_identity is not None and identity != self._expected_video_identity:
+                raise OverlaySetupError("overlay_source_unavailable")
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            if self._opened_identity(handle) != identity:
+                raise OverlaySetupError("overlay_source_unavailable")
+            if "sha256:" + digest.hexdigest() != self._video_identity:
+                raise OverlaySetupError("overlay_source_unavailable")
+            handle.seek(0)
+        except Exception:
+            handle.close()
+            raise
+        try:
+            capture = cv2.VideoCapture(f"/dev/fd/{handle.fileno()}")
+        except Exception:
+            handle.close()
+            raise OverlaySetupError("overlay_source_unavailable") from None
         if not capture.isOpened():
             capture.release()
+            handle.close()
             raise OverlaySetupError("overlay_source_unavailable")
+        self._video_handle = handle
         return capture
+
+    def _video_frame(self, source_frame: int) -> int | None:
+        for start, end, video_start in self._mapping_ranges:
+            if start <= source_frame < end:
+                return video_start + source_frame - start
+        return None
 
     def read_frame(self, source_frame: int) -> OverlayFrame:
         import cv2
 
-        video_frame = self._mapping.get(source_frame)
-        if self._keypoints is not None:
-            raw_points = self._keypoints.get(
-                str(source_frame), self._keypoints.get(source_frame)
-            )
+        video_frame = self._video_frame(source_frame)
+        with self._lock:
+            self._materialize_keypoints()
+        if self._json_keypoints is not None:
+            raw_points = self._json_keypoints.get(source_frame)
         elif (
             self._keypoint_table is not None
             and 0 <= source_frame < len(self._keypoint_table)
@@ -563,7 +825,7 @@ class ExplicitRecipeFrameProvider:
                 array = np.asarray(value, dtype=np.float32)
             except (TypeError, ValueError):
                 raise OverlaySetupError("overlay_input_unavailable") from None
-            if self._keypoints is None:
+            if self._keypoint_table is not None:
                 if array.size != 42:
                     raise OverlaySetupError("overlay_input_unavailable")
                 array = array.reshape(21, 2)
@@ -605,6 +867,14 @@ class ExplicitRecipeFrameProvider:
             if self._capture is not None:
                 self._capture.release()
                 self._capture = None
+            if self._video_handle is not None:
+                self._video_handle.close()
+                self._video_handle = None
+            if self._parquet_snapshot is not None:
+                self._parquet_snapshot.close()
+                self._parquet_snapshot = None
+            self._keypoint_table = None
+            self._json_keypoints = None
 
 
 def frame_provider_from_context(
@@ -621,6 +891,7 @@ def frame_provider_from_context(
         )
     if not isinstance(recipe, Mapping):
         raise OverlaySetupError("overlay_mapping_unavailable")
+    recipe = validate_overlay_recipe(recipe, asset_id=context.asset_id)
     video_source = recipe.get("video_source")
     if not isinstance(video_source, str) or not video_source:
         raise OverlaySetupError("overlay_source_unavailable")
@@ -637,15 +908,18 @@ def frame_provider_from_context(
     reference_path: Path | None = None
     raw_reference = recipe.get("keypoints_2d_reference")
     if isinstance(raw_reference, Mapping):
-        reference_source = raw_reference.get("source")
-        if not isinstance(reference_source, str) or not reference_source:
-            raise OverlaySetupError("overlay_input_unavailable")
-        reference_entry = context.source_files.get(reference_source)
-        reference_value = (
-            reference_entry.get("path")
-            if isinstance(reference_entry, Mapping)
-            else None
-        )
+        if raw_reference.get("schema_version") == PARQUET_REFERENCE_SCHEMA:
+            reference_source = raw_reference.get("source")
+            if not isinstance(reference_source, str) or not reference_source:
+                raise OverlaySetupError("overlay_input_unavailable")
+            reference_entry = context.source_files.get(reference_source)
+            reference_value = (
+                reference_entry.get("path")
+                if isinstance(reference_entry, Mapping)
+                else None
+            )
+        else:
+            reference_value = raw_reference.get("relative_path")
         if not isinstance(reference_value, str) or not reference_value:
             raise OverlaySetupError("overlay_input_unavailable")
         reference_path = (context.batch_root / reference_value).resolve()
@@ -659,6 +933,7 @@ def frame_provider_from_context(
         video_path=source.path,
         recipe=recipe,
         keypoint_reference_path=reference_path,
+        expected_video_identity=getattr(source, "identity", None),
     )
 
 
@@ -765,10 +1040,107 @@ class ProductionWorkerOverlayProvider(WorkerOverlayProvider):
         request_factory: Callable[
             [str, tuple[OverlayIssueInput, ...]], OverlayRequest
         ],
+        media_catalog: MediaCatalog | None = None,
+        pin_lease_seconds: float | None = None,
     ) -> None:
         self._production_worker = worker
         self._production_request_factory = request_factory
+        self._media_catalog = media_catalog
+        self._pin_lease_seconds = pin_lease_seconds
+        self._lease_lock = RLock()
+        self._leased_requests: dict[str, OverlayRequest] = {}
+        self._leased_overlay_ids: dict[str, set[str]] = {}
         super().__init__(worker=worker, request_factory=request_factory)
+
+    def _renew_request(self, request: OverlayRequest) -> float:
+        return self._production_worker.pin(
+            request,
+            lease_seconds=self._pin_lease_seconds,
+        )
+
+    def _release_request(
+        self,
+        asset_id: str,
+        request: OverlayRequest,
+        overlay_id: str,
+    ) -> None:
+        with self._lease_lock:
+            current = self._leased_requests.get(asset_id)
+            if current is not request:
+                return
+            remaining = self._leased_overlay_ids.get(asset_id)
+            if remaining is not None:
+                remaining.discard(overlay_id)
+                if remaining:
+                    return
+                self._leased_overlay_ids.pop(asset_id, None)
+            self._leased_requests.pop(asset_id, None)
+        self._production_worker.unpin(request)
+
+    def _publish_ready_lease(
+        self,
+        asset_id: str,
+        request: OverlayRequest,
+        view: object,
+    ) -> None:
+        catalog = self._media_catalog
+        allow_overlay = getattr(catalog, "allow_overlay", None)
+        if not callable(allow_overlay):
+            return
+        raw_segments = getattr(view, "segments", ())
+        ready_segments = tuple(
+            segment
+            for segment in raw_segments
+            if getattr(segment, "status", None) == "ready"
+            and isinstance(getattr(segment, "overlay_id", None), str)
+            and isinstance(getattr(segment, "path", None), Path)
+        )
+        if not ready_segments:
+            return
+        with self._lease_lock:
+            previous = self._leased_requests.get(asset_id)
+        if previous is not None and previous.cache_key != request.cache_key:
+            release_asset = getattr(catalog, "release_asset_overlays", None)
+            if callable(release_asset):
+                release_asset(asset_id)
+            self._production_worker.unpin(previous)
+        expiry = self._renew_request(request)
+        with self._lease_lock:
+            self._leased_requests[asset_id] = request
+            self._leased_overlay_ids[asset_id] = {
+                str(segment.overlay_id) for segment in ready_segments
+            }
+
+        for segment in ready_segments:
+            overlay_id = str(segment.overlay_id)
+            path = Path(segment.path)
+            allow_overlay(
+                asset_id,
+                overlay_id,
+                path,
+                lease_expires_at=expiry,
+                renew_lease=lambda request=request: self._renew_request(request),
+                release_lease=lambda asset_id=asset_id, request=request, overlay_id=overlay_id: self._release_request(
+                    asset_id, request, overlay_id
+                ),
+            )
+
+    def release_asset(self, asset_id: str) -> None:
+        catalog = self._media_catalog
+        release_asset = getattr(catalog, "release_asset_overlays", None)
+        if callable(release_asset):
+            release_asset(asset_id)
+        with self._lease_lock:
+            request = self._leased_requests.pop(asset_id, None)
+            self._leased_overlay_ids.pop(asset_id, None)
+        if request is not None:
+            self._production_worker.unpin(request)
+
+    def release_all(self) -> None:
+        with self._lease_lock:
+            asset_ids = tuple(self._leased_requests)
+        for asset_id in asset_ids:
+            self.release_asset(asset_id)
 
     def get_asset_overlays(
         self,
@@ -791,6 +1163,8 @@ class ProductionWorkerOverlayProvider(WorkerOverlayProvider):
             def submit(value: OverlayRequest) -> object:
                 view = worker.submit(value)
                 if getattr(view, "status", None) != "failed":
+                    if getattr(view, "status", None) == "ready":
+                        self._publish_ready_lease(asset_id, request, view)
                     return view
                 code = getattr(view, "code", None) or "overlay_render_failed"
                 retryable = getattr(view, "retryable", False) is True
@@ -844,6 +1218,9 @@ class ProductionOverlayRuntime:
     frame_providers: dict[tuple[str, str], StrictFrameProvider]
 
     def shutdown(self) -> None:
+        release_all = getattr(self.provider, "release_all", None)
+        if callable(release_all):
+            release_all()
         self.worker.shutdown()
         for provider in self.frame_providers.values():
             close = getattr(provider, "close", None)
@@ -890,6 +1267,12 @@ def build_production_overlay_runtime(
     resolved_model = Path(model_path).expanduser().resolve()
     model_hash = _model_hash(resolved_model)
     cache_root = _batch_cache_root(contexts, cache_relative)
+    freeze_sources = getattr(media_catalog, "freeze_sources", None)
+    if callable(freeze_sources):
+        try:
+            freeze_sources()
+        except MediaError:
+            raise OverlaySetupError("overlay_source_unavailable") from None
     runtime_provider = Sam3RuntimeProvider()
     worker = BoundedOverlayWorker(
         max_workers=max_workers,
@@ -902,7 +1285,6 @@ def build_production_overlay_runtime(
         max_ready_jobs=max_ready_jobs,
     )
     providers: dict[tuple[str, str], StrictFrameProvider] = {}
-    provider_lock = RLock()
 
     def request_factory(
         asset_id: str,
@@ -918,12 +1300,11 @@ def build_production_overlay_runtime(
         source_identity = source.etag
         if not isinstance(source_identity, str) or not source_identity:
             raise OverlaySetupError("overlay_source_unavailable")
-        provider_key = (asset_id, source_identity)
-        with provider_lock:
-            frame_provider = providers.get(provider_key)
-            if frame_provider is None:
-                frame_provider = frame_provider_factory(context, source)
-                providers[provider_key] = frame_provider
+        # Keep request construction metadata-only.  The provider constructor
+        # validates compact recipe structure/path containment; hashing,
+        # Parquet/sidecar materialization and decoder open happen in the
+        # bounded worker's render_interval call.
+        frame_provider = frame_provider_factory(context, source)
         renderer_inputs = {
             "queries": list(queries),
             "style": "mask-and-keypoints-v1",
@@ -949,6 +1330,7 @@ def build_production_overlay_runtime(
     provider = ProductionWorkerOverlayProvider(
         worker=worker,
         request_factory=request_factory,
+        media_catalog=media_catalog,
     )
     return ProductionOverlayRuntime(runtime_provider, worker, provider, providers)
 
@@ -967,4 +1349,5 @@ __all__ = [
     "build_overlay_request",
     "build_production_overlay_runtime",
     "frame_provider_from_context",
+    "validate_overlay_recipe",
 ]

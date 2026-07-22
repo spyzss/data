@@ -132,6 +132,7 @@ def _renderer(
             fps_num=30,
             fps_den=1,
             codec="mpeg4",
+            container_format="mov,mp4,m4a,3gp,3g2,mj2",
         ),
     )
     return renderer, frame_provider, runtime, concrete_segmenter, observed
@@ -167,6 +168,61 @@ def _wait(worker: object, request: object):
     pytest.fail("overlay render did not become terminal")
 
 
+def _v2_recipe_with_json_sidecar(
+    tmp_path: Path,
+    video: Path,
+    *,
+    source_frame: int,
+    video_frame: int,
+    asset_id: str = "asset-a",
+) -> tuple[dict[str, object], Path, tuple[int, int, int, int]]:
+    from qc_pipeline.artifacts import file_sha256
+
+    sidecar = tmp_path / f"{asset_id}-points-{source_frame}.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema_version": "sam3_overlay_keypoints.v1",
+                "asset_id": asset_id,
+                "frames": [
+                    {
+                        "source_frame": source_frame,
+                        "keypoints": {"left": [[1.0, 2.0]]},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stat = video.stat()
+    recipe: dict[str, object] = {
+        "schema_version": "sam3_overlay_input.v2",
+        "asset_id": asset_id,
+        "producer_fingerprint_sha256": "sha256:" + "f" * 64,
+        "video_source": "video",
+        "video_identity": file_sha256(video),
+        "candidate_intervals": [[source_frame, source_frame + 1]],
+        "source_mapping": {
+            "schema_version": "linear_ranges.v1",
+            "ranges": [
+                {
+                    "start_frame": source_frame,
+                    "end_frame_exclusive": source_frame + 1,
+                    "video_start_frame": video_frame,
+                }
+            ],
+        },
+        "keypoints_2d_reference": {
+            "schema_version": "json_keypoints.v1",
+            "relative_path": sidecar.name,
+            "sha256": file_sha256(sidecar),
+            "size_bytes": sidecar.stat().st_size,
+        },
+    }
+    identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    return recipe, sidecar, identity
+
+
 def test_renderer_consumes_every_explicit_source_frame_once_and_uses_shared_runtime(
     tmp_path: Path,
 ) -> None:
@@ -193,6 +249,7 @@ def test_renderer_consumes_every_explicit_source_frame_once_and_uses_shared_runt
         "width_px": 6,
         "height_px": 4,
         "codec": "mpeg4",
+        "container_format": "mov,mp4,m4a,3gp,3g2,mj2",
         "first_source_frame": 120,
         "end_source_frame_exclusive": 182,
         "mapping": "explicit",
@@ -367,23 +424,24 @@ def test_explicit_recipe_provider_rejects_untrusted_video_seek_or_boundary(
     video_frame = 5 if failure == "out_of_bounds" else 2
     video_path = tmp_path / "video.mp4"
     video_path.write_bytes(b"video")
-    from qc_pipeline.artifacts import file_sha256
-
+    recipe, sidecar, identity = _v2_recipe_with_json_sidecar(
+        tmp_path,
+        video_path,
+        source_frame=10,
+        video_frame=video_frame,
+    )
     provider = module.ExplicitRecipeFrameProvider(
         video_path=video_path,
-        recipe={
-            "schema_version": "sam3_overlay_input.v1",
-            "video_identity": file_sha256(video_path),
-            "source_to_video": {"10": video_frame},
-            "keypoints_2d": {"10": {"left": [[1.0, 2.0]]}},
-        },
+        recipe=recipe,
+        keypoint_reference_path=sidecar,
+        expected_video_identity=identity,
     )
 
     with pytest.raises(module.OverlaySetupError, match="overlay_decode_failed"):
         provider.read_frame(10)
 
 
-def test_runtime_rebuilds_frame_provider_when_same_asset_source_identity_changes(
+def test_runtime_recreates_frame_provider_without_retaining_per_identity_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -461,7 +519,13 @@ def test_runtime_rebuilds_frame_provider_when_same_asset_source_identity_changes
     finally:
         runtime.shutdown()
 
-    assert factory_calls == ["sha256:" + "a" * 64, "sha256:" + "b" * 64]
+    assert factory_calls[0] == "sha256:" + "a" * 64
+    assert factory_calls[-1] == "sha256:" + "b" * 64
+    assert set(factory_calls) == {
+        "sha256:" + "a" * 64,
+        "sha256:" + "b" * 64,
+    }
+    assert runtime.frame_providers == {}
 
 
 def test_explicit_recipe_provider_rejects_source_file_substitution_before_decode(
@@ -474,14 +538,17 @@ def test_explicit_recipe_provider_rejects_source_file_substitution_before_decode
     module = _renderer_module()
     video = tmp_path / "video.mp4"
     video.write_bytes(b"original")
+    recipe, sidecar, identity = _v2_recipe_with_json_sidecar(
+        tmp_path,
+        video,
+        source_frame=0,
+        video_frame=0,
+    )
     provider = module.ExplicitRecipeFrameProvider(
         video_path=video,
-        recipe={
-            "schema_version": "sam3_overlay_input.v1",
-            "video_identity": file_sha256(video),
-            "source_to_video": {"0": 0},
-            "keypoints_2d": {"0": {"left": [[1.0, 2.0]]}},
-        },
+        recipe=recipe,
+        keypoint_reference_path=sidecar,
+        expected_video_identity=identity,
     )
     video.write_bytes(b"replaced")
     monkeypatch.setattr(
@@ -492,6 +559,174 @@ def test_explicit_recipe_provider_rejects_source_file_substitution_before_decode
 
     with pytest.raises(module.OverlaySetupError, match="overlay_source_unavailable"):
         provider.read_frame(0)
+
+
+def test_v2_sidecar_provider_decodes_from_verified_open_file_identity_not_reopened_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cv2
+    from qc_pipeline.artifacts import file_sha256
+
+    module = _renderer_module()
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"source-bytes")
+    sidecar = tmp_path / "points.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema_version": "sam3_overlay_keypoints.v1",
+                "asset_id": "asset-a",
+                "frames": [
+                    {
+                        "source_frame": 0,
+                        "keypoints": {"left": [[1.0, 2.0]]},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    recipe = {
+        "schema_version": "sam3_overlay_input.v2",
+        "asset_id": "asset-a",
+        "producer_fingerprint_sha256": "sha256:" + "f" * 64,
+        "video_source": "video",
+        "video_identity": file_sha256(video),
+        "candidate_intervals": [[0, 1]],
+        "source_mapping": {
+            "schema_version": "linear_ranges.v1",
+            "ranges": [
+                {
+                    "start_frame": 0,
+                    "end_frame_exclusive": 1,
+                    "video_start_frame": 0,
+                }
+            ],
+        },
+        "keypoints_2d_reference": {
+            "schema_version": "json_keypoints.v1",
+            "relative_path": "points.json",
+            "sha256": file_sha256(sidecar),
+            "size_bytes": sidecar.stat().st_size,
+        },
+    }
+
+    class Capture:
+        position = 0.0
+
+        @staticmethod
+        def isOpened() -> bool:
+            return True
+
+        @staticmethod
+        def release() -> None:
+            return None
+
+        def get(self, prop: int) -> float:
+            if prop == cv2.CAP_PROP_FRAME_COUNT:
+                return 1.0
+            return self.position
+
+        def set(self, _prop: int, value: float) -> bool:
+            self.position = value
+            return True
+
+        def read(self):
+            self.position += 1
+            return True, np.zeros((4, 6, 3), dtype=np.uint8)
+
+    opened_paths: list[str] = []
+
+    def open_capture(path: str):
+        opened_paths.append(path)
+        assert path.startswith("/dev/fd/")
+        return Capture()
+
+    monkeypatch.setattr(cv2, "VideoCapture", open_capture)
+    provider = module.ExplicitRecipeFrameProvider(
+        video_path=video,
+        recipe=recipe,
+        keypoint_reference_path=sidecar,
+        expected_video_identity=(
+            video.stat().st_dev,
+            video.stat().st_ino,
+            video.stat().st_size,
+            video.stat().st_mtime_ns,
+        ),
+    )
+
+    frame = provider.read_frame(0)
+    provider.close()
+
+    assert frame.video_frame == 0
+    assert opened_paths and opened_paths[0].startswith("/dev/fd/")
+
+
+def test_request_time_frame_provider_creation_does_not_read_parquet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pandas as pd
+    from qc_pipeline.artifacts import file_sha256
+    from qc_pipeline.context import AssetContext
+
+    module = _renderer_module()
+    video = tmp_path / "video.mp4"
+    parquet = tmp_path / "points.parquet"
+    video.write_bytes(b"video")
+    parquet.write_bytes(b"parquet")
+    recipe = {
+        "schema_version": "sam3_overlay_input.v2",
+        "asset_id": "asset-a",
+        "producer_fingerprint_sha256": "sha256:" + "f" * 64,
+        "video_source": "video",
+        "video_identity": file_sha256(video),
+        "candidate_intervals": [[0, 1]],
+        "source_mapping": {
+            "schema_version": "linear_ranges.v1",
+            "ranges": [
+                {
+                    "start_frame": 0,
+                    "end_frame_exclusive": 1,
+                    "video_start_frame": 0,
+                }
+            ],
+        },
+        "keypoints_2d_reference": {
+            "schema_version": "parquet_columns.v2",
+            "source": "parquet",
+            "sha256": file_sha256(parquet),
+            "size_bytes": parquet.stat().st_size,
+            "row_mapping": "source_frame_index",
+            "fields": {"left": "left_points"},
+        },
+    }
+    context = AssetContext(
+        asset_id="asset-a",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-a.json",
+        source_files={
+            "video": {"path": "video.mp4"},
+            "parquet": {"path": "points.parquet"},
+        },
+        metadata={"sam3_overlay_recipe": recipe},
+    )
+    stat = video.stat()
+    source = SimpleNamespace(
+        path=video,
+        etag=file_sha256(video),
+        identity=(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns),
+    )
+    monkeypatch.setattr(
+        pd,
+        "read_parquet",
+        lambda *_args, **_kwargs: pytest.fail("task GET must not read Parquet"),
+    )
+
+    provider = module.frame_provider_from_context(context, source)
+
+    assert provider.input_identity["keypoints"].startswith("sha256:")
 
 
 def test_model_hash_covers_all_directory_content_even_when_size_and_mtime_are_preserved(
@@ -583,6 +818,73 @@ def test_renderer_rejects_bad_mp4_product_after_encoder_close(tmp_path: Path) ->
     assert not output.exists()
 
 
+def test_renderer_rejects_mpeg4_stream_inside_non_mp4_container(tmp_path: Path) -> None:
+    import cv2
+
+    module = _renderer_module()
+
+    class AviNamedMp4Encoder:
+        def __init__(self, output_path: Path, fps: float, size: tuple[int, int]) -> None:
+            self.output_path = output_path
+            self.avi_path = output_path.with_suffix(".avi")
+            self.writer = cv2.VideoWriter(
+                str(self.avi_path),
+                cv2.VideoWriter_fourcc(*"XVID"),
+                fps,
+                size,
+            )
+            assert self.writer.isOpened()
+
+        def write(self, frame: np.ndarray) -> None:
+            self.writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+        def close(self) -> None:
+            self.writer.release()
+            self.avi_path.replace(self.output_path)
+
+    renderer = module.Sam3OverlayRenderer(
+        frame_provider=FakeFrameProvider(),
+        runtime_provider=RecordingRuntimeProvider(RecordingSegmenter()),
+        model_path=tmp_path / "model",
+        runtime_config={},
+        queries=("hand",),
+        encoder_factory=AviNamedMp4Encoder,
+    )
+    output = tmp_path / "avi-disguised-as-mp4.mp4"
+
+    with pytest.raises(module.OverlayRenderError, match="overlay_encoder_failed"):
+        renderer.render_interval(
+            _request(tmp_path, renderer, interval=(0, 2)),
+            0,
+            2,
+            output,
+        )
+
+    assert not output.exists()
+
+
+def test_renderer_closes_frame_provider_after_each_bounded_interval(tmp_path: Path) -> None:
+    class ClosableFrameProvider(FakeFrameProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    provider = ClosableFrameProvider()
+    renderer, *_ = _renderer(tmp_path, provider=provider)
+
+    renderer.render_interval(
+        _request(tmp_path, renderer, interval=(0, 2)),
+        0,
+        2,
+        tmp_path / "bounded-provider.mp4",
+    )
+
+    assert provider.close_calls == 1
+
+
 def test_malformed_frame_array_maps_to_stable_decode_failure(tmp_path: Path) -> None:
     module = _renderer_module()
 
@@ -606,7 +908,7 @@ def test_malformed_frame_array_maps_to_stable_decode_failure(tmp_path: Path) -> 
         )
 
 
-def test_inline_recipe_rehydrates_from_frozen_report_context(tmp_path: Path) -> None:
+def test_historical_inline_recipe_is_rejected_from_frozen_report_context(tmp_path: Path) -> None:
     from qc_pipeline.artifacts import file_sha256
     from qc_pipeline.context import AssetContext
 
@@ -630,10 +932,8 @@ def test_inline_recipe_rehydrates_from_frozen_report_context(tmp_path: Path) -> 
     )
     source = SimpleNamespace(path=video, etag=file_sha256(video))
 
-    provider = module.frame_provider_from_context(context, source)
-
-    assert provider.input_identity["video"] == file_sha256(video)
-    assert provider.input_identity["keypoints"].startswith("sha256:")
+    with pytest.raises(module.OverlaySetupError, match="overlay_mapping_unavailable"):
+        module.frame_provider_from_context(context, source)
 
 
 def test_production_provider_never_exposes_ready_segments_from_a_failed_multi_interval_job(
@@ -679,6 +979,85 @@ def test_production_provider_never_exposes_ready_segments_from_a_failed_multi_in
         or all(segment.path is None for segment in value.segments)
         for value in values.values()
     )
+
+
+def test_ready_overlay_url_is_pinned_until_catalog_lease_expiry_across_asset_eviction(
+    tmp_path: Path,
+) -> None:
+    import time
+
+    from human_qc.media import MediaCatalog, MediaNotFoundError
+    from human_qc.overlay_worker import BoundedOverlayWorker
+    from human_qc.warn_workbench_service import FrameRangeDto, OverlayIssueInput
+    from qc_pipeline.context import AssetContext
+
+    module = _renderer_module()
+    contexts = {
+        asset_id: AssetContext(
+            asset_id=asset_id,
+            batch_root=tmp_path,
+            report_path=tmp_path / "quality_archive" / f"{asset_id}.json",
+            source_files={},
+        )
+        for asset_id in ("asset-a", "asset-b")
+    }
+    catalog = MediaCatalog(contexts)
+    shared_root = tmp_path / ".human_qc" / "overlay-cache"
+    renderer_a, *_ = _renderer(tmp_path)
+    renderer_b, *_ = _renderer(tmp_path)
+    requests = {
+        "asset-a": replace(
+            _request(tmp_path, renderer_a, interval=(0, 1)),
+            asset_id="asset-a",
+            cache_root=shared_root,
+            source_sha256="sha256:" + "1" * 64,
+        ),
+        "asset-b": replace(
+            _request(tmp_path, renderer_b, interval=(0, 1)),
+            asset_id="asset-b",
+            cache_root=shared_root,
+            source_sha256="sha256:" + "2" * 64,
+        ),
+    }
+    worker = BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=1,
+        max_ready_jobs=1,
+        pin_lease_seconds=0.08,
+    )
+    production = module.ProductionWorkerOverlayProvider(
+        worker=worker,
+        request_factory=lambda asset_id, _selected: requests[asset_id],
+        media_catalog=catalog,
+        pin_lease_seconds=0.08,
+    )
+    selected = (OverlayIssueInput("issue", FrameRangeDto(0, 1)),)
+    try:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            ready_a = production.get_asset_overlays("asset-a", selected)["issue"]
+            if ready_a.status == "ready":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("asset-a overlay did not become ready")
+        overlay_id = ready_a.segments[0].overlay_id
+        assert overlay_id is not None
+        assert catalog.overlay("asset-a", overlay_id).path.is_file()
+
+        production.get_asset_overlays("asset-b", selected)
+        blocked_b = _wait(worker, requests["asset-b"])
+        assert blocked_b.code == "overlay_cache_full"
+        assert catalog.overlay("asset-a", overlay_id).path.is_file()
+
+        time.sleep(0.11)
+        worker.retry(requests["asset-b"])
+        assert _wait(worker, requests["asset-b"]).status == "ready"
+        with pytest.raises(MediaNotFoundError):
+            catalog.overlay("asset-a", overlay_id)
+    finally:
+        production.release_all()
+        worker.shutdown()
 
 
 def test_production_cache_quota_is_shared_across_assets_and_keeps_asset_identity(

@@ -23,9 +23,11 @@ from human_qc.sam3_overlay_renderer import (  # noqa: E402
     ProductionOverlayRuntime,
     UnavailableOverlayProvider,
     build_production_overlay_runtime,
+    validate_overlay_recipe,
 )
 from qc_common.reviewer_lease import LeaseStore  # noqa: E402
 from qc_common.manifest_metadata import context_metadata_from_report  # noqa: E402
+from qc_common.schema import validate_asset_qc_report  # noqa: E402
 from human_qc.warn_service import WarnReviewService  # noqa: E402
 from human_qc.warn_workbench_service import WarnWorkbenchService  # noqa: E402
 from qc_pipeline.context import AssetContext  # noqa: E402
@@ -75,6 +77,59 @@ def _inside(root: Path, value: str | Path, *, field: str) -> tuple[str, Path]:
 
 
 _SHA256 = re.compile(r"sha256:[0-9a-fA-F]{64}").fullmatch
+
+
+def _validated_report_overlay_recipe(
+    report: Mapping[str, Any], asset_id: str
+) -> dict[str, object] | None:
+    """Accept recipes only from a completed current SAM3 module block."""
+
+    if (
+        report.get("schema_version") != "asset_qc_report.v2"
+        or report.get("asset_id") != asset_id
+    ):
+        return None
+    try:
+        validate_asset_qc_report(dict(report))
+    except (TypeError, ValueError):
+        return None
+    module = report.get("sam3_containment")
+    if not isinstance(module, Mapping):
+        return None
+    flow = module.get("flow")
+    if not isinstance(flow, Mapping):
+        return None
+    entry = flow.get("entry_gate")
+    result = flow.get("result_gate")
+    exit_gate = flow.get("exit_gate")
+    if (
+        not isinstance(entry, Mapping)
+        or entry.get("state") != "ready"
+        or entry.get("eligible") is not True
+        or not isinstance(result, Mapping)
+        or result.get("verdict") not in {"pass", "warn", "fail"}
+        or not isinstance(exit_gate, Mapping)
+        or exit_gate.get("state") not in {"continue", "complete_qc"}
+        or not isinstance(exit_gate.get("continue_to_next_module"), bool)
+    ):
+        return None
+    runtime = module.get("runtime")
+    if (
+        not isinstance(runtime, Mapping)
+        or runtime.get("artifact_state") not in {"computed", "reused"}
+    ):
+        return None
+    fingerprint = runtime.get("fingerprint_sha256")
+    if not isinstance(fingerprint, str) or _SHA256(fingerprint) is None:
+        return None
+    try:
+        return validate_overlay_recipe(
+            runtime.get("overlay_input_recipe"),
+            asset_id=asset_id,
+            producer_fingerprint_sha256=fingerprint.lower(),
+        )
+    except OverlaySetupError:
+        return None
 
 
 def _source_files(
@@ -162,15 +217,9 @@ def load_contexts(batch_root: Path, quality_archive: Path) -> list[AssetContext]
             "profile": report.get("profile"),
             **context_metadata_from_report(report),
         }
-        module = report.get("sam3_containment")
-        runtime = module.get("runtime") if isinstance(module, Mapping) else None
-        recipe = (
-            runtime.get("overlay_input_recipe")
-            if isinstance(runtime, Mapping)
-            else None
-        )
-        if isinstance(recipe, Mapping):
-            metadata["sam3_overlay_recipe"] = dict(recipe)
+        recipe = _validated_report_overlay_recipe(report, asset_id)
+        if recipe is not None:
+            metadata["sam3_overlay_recipe"] = recipe
         contexts.append(
             AssetContext(
                 asset_id=asset_id,
@@ -231,6 +280,7 @@ def build_workbench_runtime(
     warn = WarnReviewService(reports=reports)
     contexts_by_id = {context.asset_id: context for context in contexts}
     media_catalog = MediaCatalog(contexts_by_id)
+    media_catalog.freeze_sources()
     overlay_runtime: ProductionOverlayRuntime | object | None = None
     if sam3_model is None:
         overlay_provider: object = UnavailableOverlayProvider(

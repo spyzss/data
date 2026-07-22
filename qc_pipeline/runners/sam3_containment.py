@@ -220,11 +220,114 @@ def _candidate_source_frames(
     )
 
 
+def _candidate_intervals(candidate_rows: list[dict[str, Any]]) -> tuple[tuple[int, int], ...]:
+    intervals = sorted(
+        (int(row["start_frame"]), int(row["end_frame"]) + 1)
+        for row in candidate_rows
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _linear_mapping_ranges(
+    candidate_rows: list[dict[str, Any]],
+    video_frame_for_source: Callable[[int], int | None],
+) -> list[dict[str, int]] | None:
+    ranges: list[dict[str, int]] = []
+    for start, end in _candidate_intervals(candidate_rows):
+        video_start = video_frame_for_source(start)
+        if isinstance(video_start, bool) or not isinstance(video_start, int) or video_start < 0:
+            return None
+        for source_frame in range(start + 1, end):
+            if video_frame_for_source(source_frame) != video_start + source_frame - start:
+                return None
+        ranges.append(
+            {
+                "start_frame": start,
+                "end_frame_exclusive": end,
+                "video_start_frame": video_start,
+            }
+        )
+    return ranges or None
+
+
+def _recipe_base(
+    *,
+    context: AssetContext,
+    candidate_rows: list[dict[str, Any]],
+    video_identity: str,
+    producer_fingerprint_sha256: str,
+    mapping_ranges: list[dict[str, int]],
+    keypoint_reference: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "sam3_overlay_input.v2",
+        "asset_id": context.asset_id,
+        "producer_fingerprint_sha256": producer_fingerprint_sha256,
+        "video_source": "video",
+        "video_identity": video_identity,
+        "candidate_intervals": [list(value) for value in _candidate_intervals(candidate_rows)],
+        "source_mapping": {
+            "schema_version": "linear_ranges.v1",
+            "ranges": mapping_ranges,
+        },
+        "keypoints_2d_reference": dict(keypoint_reference),
+    }
+
+
+def _write_keypoint_sidecar(
+    *,
+    context: AssetContext,
+    producer_fingerprint_sha256: str,
+    frames: list[dict[str, Any]],
+) -> dict[str, Any]:
+    from qc_pipeline.artifacts import file_sha256
+
+    root = context.batch_root / ".qc_pipeline" / context.asset_id / "sam3_overlay_inputs"
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / f"{producer_fingerprint_sha256.removeprefix('sha256:')}.json"
+    payload = json.dumps(
+        {
+            "schema_version": "sam3_overlay_keypoints.v1",
+            "asset_id": context.asset_id,
+            "frames": frames,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    with tempfile.NamedTemporaryFile(dir=root, prefix=".overlay-input-", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(payload)
+            handle.flush()
+            import os
+
+            os.fsync(handle.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    temporary.replace(destination)
+    return {
+        "schema_version": "json_keypoints.v1",
+        "relative_path": destination.relative_to(context.batch_root).as_posix(),
+        "sha256": file_sha256(destination),
+        "size_bytes": destination.stat().st_size,
+    }
+
+
 def _jdt_overlay_input_recipe(
     *,
     context: AssetContext,
     candidate_rows: list[dict[str, Any]],
     manifest_row: Mapping[str, Any],
+    producer_fingerprint_sha256: str,
 ) -> dict[str, Any]:
     from qc_pipeline.artifacts import file_sha256
 
@@ -241,24 +344,34 @@ def _jdt_overlay_input_recipe(
                 f"manifest {side}_hand_2d_field is unavailable for overlay",
             )
         fields[side] = value.strip()
-    source_frames = _candidate_source_frames(candidate_rows)
-    if not source_frames:
+    intervals = _candidate_intervals(candidate_rows)
+    if not intervals:
         raise ModuleInputError(
             "sam3_containment", "overlay source mapping has no candidate frames"
         )
-    return {
-        "schema_version": "sam3_overlay_input.v1",
-        "video_source": "video",
-        "video_identity": file_sha256(video_path),
-        "source_to_video": {str(frame): frame for frame in source_frames},
-        "keypoints_2d_reference": {
-            "schema_version": "parquet_columns.v1",
+    mapping_ranges = [
+        {
+            "start_frame": start,
+            "end_frame_exclusive": end,
+            "video_start_frame": start,
+        }
+        for start, end in intervals
+    ]
+    return _recipe_base(
+        context=context,
+        candidate_rows=candidate_rows,
+        video_identity=file_sha256(video_path),
+        producer_fingerprint_sha256=producer_fingerprint_sha256,
+        mapping_ranges=mapping_ranges,
+        keypoint_reference={
+            "schema_version": "parquet_columns.v2",
             "source": "parquet",
             "sha256": file_sha256(parquet_path),
+            "size_bytes": parquet_path.stat().st_size,
             "row_mapping": "source_frame_index",
             "fields": fields,
         },
-    }
+    )
 
 
 def _required_sides_by_source_frame(
@@ -281,6 +394,7 @@ def _dr_overlay_input_recipe(
     hdf5_path: Path,
     video_path: Path,
     validation: Any,
+    producer_fingerprint_sha256: str,
 ) -> dict[str, Any] | None:
     import numpy as np
 
@@ -297,8 +411,7 @@ def _dr_overlay_input_recipe(
     ):
         return None
     clip_start, _ = context.source_range
-    mapping: dict[str, int] = {}
-    keypoints: dict[str, dict[str, list[list[float]]]] = {}
+    sidecar_frames: list[dict[str, Any]] = []
     for source_frame, required_sides in _required_sides_by_source_frame(
         candidate_rows
     ).items():
@@ -326,17 +439,28 @@ def _dr_overlay_input_recipe(
             if selected.size == 0:
                 return None
             frame_points[side] = selected.tolist()
-        mapping[str(source_frame)] = source_frame - clip_start
-        keypoints[str(source_frame)] = frame_points
-    if not mapping:
+        sidecar_frames.append(
+            {"source_frame": source_frame, "keypoints": frame_points}
+        )
+    mapping_ranges = _linear_mapping_ranges(
+        candidate_rows,
+        lambda source_frame: source_frame - clip_start,
+    )
+    if mapping_ranges is None or not sidecar_frames:
         return None
-    return {
-        "schema_version": "sam3_overlay_input.v1",
-        "video_source": "video",
-        "video_identity": file_sha256(video_path),
-        "source_to_video": mapping,
-        "keypoints_2d": keypoints,
-    }
+    reference = _write_keypoint_sidecar(
+        context=context,
+        producer_fingerprint_sha256=producer_fingerprint_sha256,
+        frames=sidecar_frames,
+    )
+    return _recipe_base(
+        context=context,
+        candidate_rows=candidate_rows,
+        video_identity=file_sha256(video_path),
+        producer_fingerprint_sha256=producer_fingerprint_sha256,
+        mapping_ranges=mapping_ranges,
+        keypoint_reference=reference,
+    )
 
 
 def _qy_overlay_input_recipe(
@@ -344,6 +468,7 @@ def _qy_overlay_input_recipe(
     context: AssetContext,
     candidate_rows: list[dict[str, Any]],
     inputs: _QyContainmentInputs,
+    producer_fingerprint_sha256: str,
 ) -> dict[str, Any] | None:
     import numpy as np
 
@@ -355,8 +480,8 @@ def _qy_overlay_input_recipe(
         or declared_video.resolve() != inputs.video_path.resolve()
     ):
         return None
-    mapping: dict[str, int] = {}
-    keypoints: dict[str, dict[str, list[list[float]]]] = {}
+    video_by_source: dict[int, int] = {}
+    sidecar_frames: list[dict[str, Any]] = []
     for source_frame, required_sides in _required_sides_by_source_frame(
         candidate_rows
     ).items():
@@ -383,17 +508,29 @@ def _qy_overlay_input_recipe(
             frame_points[side] = points.tolist()
         if len(video_frames) != 1:
             return None
-        mapping[str(source_frame)] = next(iter(video_frames))
-        keypoints[str(source_frame)] = frame_points
-    if not mapping:
+        video_by_source[source_frame] = next(iter(video_frames))
+        sidecar_frames.append(
+            {"source_frame": source_frame, "keypoints": frame_points}
+        )
+    mapping_ranges = _linear_mapping_ranges(
+        candidate_rows,
+        video_by_source.get,
+    )
+    if mapping_ranges is None or not sidecar_frames:
         return None
-    return {
-        "schema_version": "sam3_overlay_input.v1",
-        "video_source": "video",
-        "video_identity": file_sha256(inputs.video_path),
-        "source_to_video": mapping,
-        "keypoints_2d": keypoints,
-    }
+    reference = _write_keypoint_sidecar(
+        context=context,
+        producer_fingerprint_sha256=producer_fingerprint_sha256,
+        frames=sidecar_frames,
+    )
+    return _recipe_base(
+        context=context,
+        candidate_rows=candidate_rows,
+        video_identity=file_sha256(inputs.video_path),
+        producer_fingerprint_sha256=producer_fingerprint_sha256,
+        mapping_ranges=mapping_ranges,
+        keypoint_reference=reference,
+    )
 
 
 def _canonical_overlay_input_recipe(
@@ -402,6 +539,7 @@ def _canonical_overlay_input_recipe(
     candidate_rows: list[dict[str, Any]],
     episode: Any,
     video_path: Path,
+    producer_fingerprint_sha256: str,
 ) -> dict[str, Any] | None:
     """Build a recipe only when canonical logical-to-physical mapping is proven."""
     import numpy as np
@@ -453,8 +591,7 @@ def _canonical_overlay_input_recipe(
             required.setdefault(source_frame, set()).update(sides)
     if not required:
         return None
-    mapping: dict[str, int] = {}
-    keypoints: dict[str, dict[str, list[list[float]]]] = {}
+    sidecar_frames: list[dict[str, Any]] = []
     side_indices = {"left": 0, "right": 1}
     for source_frame, required_sides in required.items():
         frame_points: dict[str, list[list[float]]] = {}
@@ -468,15 +605,28 @@ def _canonical_overlay_input_recipe(
             if selected.size == 0:
                 return None
             frame_points[side] = selected.astype(np.float64, copy=False).tolist()
-        mapping[str(source_frame)] = physical_start + source_frame
-        keypoints[str(source_frame)] = frame_points
-    return {
-        "schema_version": "sam3_overlay_input.v1",
-        "video_source": "video",
-        "video_identity": file_sha256(video_path),
-        "source_to_video": mapping,
-        "keypoints_2d": keypoints,
-    }
+        sidecar_frames.append(
+            {"source_frame": source_frame, "keypoints": frame_points}
+        )
+    mapping_ranges = _linear_mapping_ranges(
+        candidate_rows,
+        lambda source_frame: physical_start + source_frame,
+    )
+    if mapping_ranges is None:
+        return None
+    reference = _write_keypoint_sidecar(
+        context=context,
+        producer_fingerprint_sha256=producer_fingerprint_sha256,
+        frames=sidecar_frames,
+    )
+    return _recipe_base(
+        context=context,
+        candidate_rows=candidate_rows,
+        video_identity=file_sha256(video_path),
+        producer_fingerprint_sha256=producer_fingerprint_sha256,
+        mapping_ranges=mapping_ranges,
+        keypoint_reference=reference,
+    )
 
 
 def _publish_sam3_artifact(
@@ -1335,18 +1485,38 @@ def _run_canonical(
             else None
         ),
     )
-    recipe = _canonical_overlay_input_recipe(
-        context=context,
-        candidate_rows=candidate_rows,
-        episode=episode,
-        video_path=video_path,
+    from qc_pipeline.artifacts import canonical_sha256, file_sha256
+
+    fingerprint_sha256 = canonical_sha256(
+        {
+            "producer": "sam3_containment",
+            "implementation_version": _IMPLEMENTATION_VERSION,
+            "asset_id": context.asset_id,
+            "video_identity": file_sha256(video_path),
+            "candidate_rows": candidate_rows,
+        }
     )
+    result = replace(
+        result,
+        runtime={
+            **dict(result.runtime),
+            "artifact_state": "computed",
+            "fingerprint_sha256": fingerprint_sha256,
+        },
+    )
+    try:
+        recipe = _canonical_overlay_input_recipe(
+            context=context,
+            candidate_rows=candidate_rows,
+            episode=episode,
+            video_path=video_path,
+            producer_fingerprint_sha256=fingerprint_sha256,
+        )
+    except Exception:
+        return result
     if recipe is None:
         return result
-    return replace(
-        result,
-        runtime={**dict(result.runtime), "overlay_input_recipe": recipe},
-    )
+    return replace(result, runtime={**dict(result.runtime), "overlay_input_recipe": recipe})
 
 
 def runner(
@@ -1556,7 +1726,6 @@ def runner(
                 for name in ("video", "observations_2d", "timebase")
                 if name in context.source_files
             )
-        overlay_input_recipe: Mapping[str, Any] | None = None
         jdt_manifest_row: dict[str, Any] | None = None
         if supplier == "jdt":
             if manifest_path is not None:
@@ -1577,11 +1746,6 @@ def runner(
                     "exactly one manifest row for asset_id",
                 )
             jdt_manifest_row = dict(manifest_rows[0])
-            overlay_input_recipe = _jdt_overlay_input_recipe(
-                context=context,
-                candidate_rows=candidate_rows,
-                manifest_row=jdt_manifest_row,
-            )
             for field, source_name in (
                 ("primary_video_path", "video"),
                 ("parquet_path", "parquet"),
@@ -1596,22 +1760,6 @@ def runner(
                     jdt_manifest_row[field] = str(
                         value if value.is_absolute() else manifest_dir / value
                     )
-        elif supplier in {"dr", "deepreach"}:
-            assert dr_inputs is not None
-            overlay_input_recipe = _dr_overlay_input_recipe(
-                context=context,
-                candidate_rows=candidate_rows,
-                hdf5_path=dr_inputs[0],
-                video_path=dr_inputs[1],
-                validation=dr_inputs[4],
-            )
-        else:
-            assert qy_inputs is not None
-            overlay_input_recipe = _qy_overlay_input_recipe(
-                context=context,
-                candidate_rows=candidate_rows,
-                inputs=qy_inputs,
-            )
         model = _source_path(
             context,
             "sam3_model",
@@ -1682,6 +1830,46 @@ def runner(
                 allow_symlinked_sources=context.allow_symlinked_sources,
             )
         fingerprint_sha256 = canonical_sha256(fingerprint)
+
+        def attach_overlay_recipe(result: ModuleResult) -> ModuleResult:
+            """Best-effort post-processing that cannot alter machine QC."""
+
+            try:
+                if supplier == "jdt":
+                    assert jdt_manifest_row is not None
+                    recipe = _jdt_overlay_input_recipe(
+                        context=context,
+                        candidate_rows=candidate_rows,
+                        manifest_row=jdt_manifest_row,
+                        producer_fingerprint_sha256=fingerprint_sha256,
+                    )
+                elif supplier in {"dr", "deepreach"}:
+                    assert dr_inputs is not None
+                    recipe = _dr_overlay_input_recipe(
+                        context=context,
+                        candidate_rows=candidate_rows,
+                        hdf5_path=dr_inputs[0],
+                        video_path=dr_inputs[1],
+                        validation=dr_inputs[4],
+                        producer_fingerprint_sha256=fingerprint_sha256,
+                    )
+                else:
+                    assert qy_inputs is not None
+                    recipe = _qy_overlay_input_recipe(
+                        context=context,
+                        candidate_rows=candidate_rows,
+                        inputs=qy_inputs,
+                        producer_fingerprint_sha256=fingerprint_sha256,
+                    )
+            except Exception:
+                return result
+            if recipe is None:
+                return result
+            return replace(
+                result,
+                runtime={**dict(result.runtime), "overlay_input_recipe": recipe},
+            )
+
         artifact = artifact_for(context, "sam3_containment")
         if bool(context.metadata.get("reuse_artifacts", True)) and reusable_artifact(
             artifact, fingerprint
@@ -1695,12 +1883,13 @@ def runner(
                 evidence_rows=evidence_rows,
                 config=config,
             )
-            return _with_artifact_runtime(
-                result,
-                state="reused",
-                elapsed_seconds=perf_counter() - started,
-                fingerprint_sha256=fingerprint_sha256,
-                overlay_input_recipe=overlay_input_recipe,
+            return attach_overlay_recipe(
+                _with_artifact_runtime(
+                    result,
+                    state="reused",
+                    elapsed_seconds=perf_counter() - started,
+                    fingerprint_sha256=fingerprint_sha256,
+                )
             )
         staging_root = context.batch_root / ".qc_pipeline" / context.asset_id / "sam3"
         staging_root.mkdir(parents=True, exist_ok=True)
@@ -1749,12 +1938,13 @@ def runner(
                 evidence_rows=evidence_rows,
                 config=config,
             )
-            return _with_artifact_runtime(
-                result,
-                state="computed",
-                elapsed_seconds=elapsed,
-                fingerprint_sha256=fingerprint_sha256,
-                overlay_input_recipe=overlay_input_recipe,
+            return attach_overlay_recipe(
+                _with_artifact_runtime(
+                    result,
+                    state="computed",
+                    elapsed_seconds=elapsed,
+                    fingerprint_sha256=fingerprint_sha256,
+                )
             )
         if supplier in {"dr", "deepreach"}:
             if segmenter_factory is not None:
@@ -1813,12 +2003,13 @@ def runner(
                 evidence_rows=evidence_rows,
                 config=config,
             )
-            return _with_artifact_runtime(
-                result,
-                state="computed",
-                elapsed_seconds=elapsed,
-                fingerprint_sha256=fingerprint_sha256,
-                overlay_input_recipe=overlay_input_recipe,
+            return attach_overlay_recipe(
+                _with_artifact_runtime(
+                    result,
+                    state="computed",
+                    elapsed_seconds=elapsed,
+                    fingerprint_sha256=fingerprint_sha256,
+                )
             )
         assert jdt_manifest_row is not None
         manifest_row = jdt_manifest_row
@@ -1891,12 +2082,13 @@ def runner(
             evidence_rows=evidence_rows,
             config=config,
         )
-        return _with_artifact_runtime(
-            result,
-            state="computed",
-            elapsed_seconds=elapsed,
-            fingerprint_sha256=fingerprint_sha256,
-            overlay_input_recipe=overlay_input_recipe,
+        return attach_overlay_recipe(
+            _with_artifact_runtime(
+                result,
+                state="computed",
+                elapsed_seconds=elapsed,
+                fingerprint_sha256=fingerprint_sha256,
+            )
         )
 
     return run
