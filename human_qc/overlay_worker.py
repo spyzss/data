@@ -1156,6 +1156,7 @@ class BoundedOverlayWorker:
                 return False
             if expected_status == "ready" and self._has_live_pin(root, job_dir.name):
                 return False
+            removed = False
             try:
                 with self._path_render_fence(
                     job_dir / _RENDER_FENCE_NAME,
@@ -1164,9 +1165,10 @@ class BoundedOverlayWorker:
                 ) as fence_acquired:
                     if not fence_acquired:
                         return False
-                    return self._safe_remove_job(root, job_dir)
+                    removed = self._safe_remove_job(root, job_dir)
             except OSError:
-                return False
+                return removed
+            return removed
 
     def _discard_job_media(self, request: OverlayRequest) -> None:
         """Remove every material media product from a non-ready job."""

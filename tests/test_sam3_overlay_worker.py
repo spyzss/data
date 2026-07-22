@@ -1453,6 +1453,84 @@ def test_terminal_victim_fence_path_error_fails_closed(
         worker.shutdown()
 
 
+@pytest.mark.parametrize("eviction_helper", ("ready", "failed"))
+@pytest.mark.parametrize("terminal_status", ("ready", "failed"))
+@pytest.mark.parametrize("exit_failure", ("unlock", "close"))
+def test_eviction_accounts_for_a_deleted_terminal_victim_despite_fence_exit_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    eviction_helper: str,
+    terminal_status: str,
+    exit_failure: str,
+) -> None:
+    import fcntl
+
+    from human_qc import overlay_worker
+
+    victim_request = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "9" * 64,
+    )
+    current_request = _request(
+        tmp_path,
+        intervals=((2, 3),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "a" * 64,
+    )
+    job_dir = _write_terminal_job_with_expired_owner(
+        victim_request,
+        terminal_status,
+    )
+    worker = overlay_worker.BoundedOverlayWorker(max_workers=1, max_pending=0)
+    original_flock = fcntl.flock
+    original_close = overlay_worker.os.close
+    fence_descriptor: int | None = None
+    injected_failures = 0
+
+    def observed_flock(descriptor: int, operation: int) -> None:
+        nonlocal fence_descriptor, injected_failures
+        if operation == fcntl.LOCK_EX | fcntl.LOCK_NB:
+            fence_descriptor = descriptor
+        if (
+            exit_failure == "unlock"
+            and operation == fcntl.LOCK_UN
+            and descriptor == fence_descriptor
+        ):
+            injected_failures += 1
+            raise OSError("injected render-fence unlock failure")
+        original_flock(descriptor, operation)
+
+    def observed_close(descriptor: int) -> None:
+        nonlocal injected_failures
+        original_close(descriptor)
+        if exit_failure == "close" and descriptor == fence_descriptor:
+            injected_failures += 1
+            raise OSError("injected render-fence close failure")
+
+    monkeypatch.setattr(fcntl, "flock", observed_flock)
+    if exit_failure == "close":
+        monkeypatch.setattr(overlay_worker.os, "close", observed_close)
+
+    try:
+        victim_size = worker._job_footprint(job_dir)
+        assert victim_size is not None and victim_size > 0
+        worker._max_cache_bytes = victim_size
+        if eviction_helper == "ready":
+            worker._max_ready_jobs = 1
+
+        with worker._root_publish_lock(current_request):
+            if eviction_helper == "ready":
+                allowed = worker._evict_for(current_request, victim_size)
+            else:
+                allowed = worker._evict_failed_for(current_request, victim_size)
+
+        assert (allowed, job_dir.exists(), injected_failures) == (True, False, 1)
+    finally:
+        worker.shutdown()
+
+
 def test_owner_cleanup_error_still_releases_capacity_and_returns_safe_failure(
     tmp_path: Path,
 ) -> None:

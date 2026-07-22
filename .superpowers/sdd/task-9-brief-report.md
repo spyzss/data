@@ -997,3 +997,70 @@ expired-owner recovery fence 合跑 `11 passed in 0.91s`。新 8-case 选择连�
 .venv/bin/python -m pytest -q
 # 1880 passed, 1 skipped in 113.76s
 ```
+
+---
+
+# Task 9C render-fence exit accounting follow-up
+
+## 状态与范围
+
+DONE
+
+本轮只修复最终审查发现的 fence 退出异常与 eviction accounting 不一致：terminal victim
+已由 `_safe_remove_job()` 确认删除后，即使 `_path_render_fence()` 的 `LOCK_UN` 或
+`os.close()` 抛出 `OSError`，两个 eviction helper 仍必须扣减已删除 victim 的账面占用并
+允许当前 publication。只修改 `human_qc/overlay_worker.py`、
+`tests/test_sam3_overlay_worker.py` 和本报告；未触碰 Task 10、runner、recipe、launcher、
+HTTP、browser、OpenSpec、主计划或 `.comet`。
+
+基线：`fbdbd96fb40aa5994e5b35fa68e24e57d61f66fe`。本轮独立提交 SHA 以最终任务
+回报中的 `git rev-parse HEAD` 为准。
+
+## Root cause 与 fail-closed 边界
+
+旧实现从 fence context body 直接 `return self._safe_remove_job(...)`。Python 会先计算出
+`True`，再执行 context manager 的退出清理；若此时 unlock/close 抛出 `OSError`，外层
+`except` 会把已确认的删除结果覆盖成 `False`。victim 目录实际上已经消失，但
+`_evict_for()` / `_evict_failed_for()` 都不会扣减 snapshot bytes，ready helper 也不会
+调整 ready count，最终错误拒绝当前 publication。
+
+修复仅记录 `_safe_remove_job()` 的确认结果，并在 fence 退出异常时返回该结果：
+
+- open/flock acquisition 异常发生在删除前，结果仍为 `False`，目录保留；
+- fence busy 仍立即返回 `False`，目录保留；
+- `rmtree/stat` 删除失败仍为 `False`，目录保留且 eviction 不扣账；
+- 只有 `_safe_remove_job()` 已确认目录不存在后，unlock/close 退出异常才返回 `True`。
+
+锁的获取与持有范围没有变化，仍为 root publication lock -> victim key lock ->
+nonblocking render fence；没有新增反序或目录重建路径。
+
+## TDD RED / GREEN
+
+先只新增 8 个参数化 cases，交叉覆盖 `_evict_for()` / `_evict_failed_for()`、ready/failed
+victim、以及 `LOCK_UN` / `os.close` 两类 fence EXIT `OSError`。注入只命中 fence
+descriptor，并验证异常发生一次、victim 目录已经删除、helper 必须返回 `True`。
+
+RED 结果 `8 failed, 45 deselected in 0.43s`；八项实际值均为
+`(allowed=False, dir_exists=False, injected=1)`，精确复现“磁盘已删但 accounting 未扣”的
+错误。最小修复后，新 cases 与 busy fence、fence path open error、victim deletion failure
+回归合跑为 `17 passed, 36 deselected in 0.80s`；worker 全文件为
+`53 passed in 2.42s`。
+
+## 最终验证
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py \
+  tests/test_sam3_overlay_worker.py tests/test_review_evidence.py \
+  tests/test_qc_pipeline_sam3_runner.py tests/test_canonical_qc_runner_bridge.py \
+  tests/test_human_qc_media.py
+# 195 passed in 5.77s
+
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_workbench.py tests/test_human_qc_http_server.py \
+  tests/test_canonical_video_probe.py
+# 110 passed in 5.84s
+
+.venv/bin/python -m pytest -q
+# 1888 passed, 1 skipped in 114.17s
+```
