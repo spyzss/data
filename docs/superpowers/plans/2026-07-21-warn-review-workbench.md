@@ -658,7 +658,7 @@ HTTP polling、retry 路由或浏览器同步（均属于 Task 10）。
 - Modify: `tests/test_human_qc_launcher.py`
 - Modify only if a safe recipe is unavailable: `qc_pipeline/runners/sam3_containment.py`, its focused tests
 
-- [ ] **Step 6: Write failing production renderer and launcher tests**
+- [x] **Step 6: Write failing production renderer and launcher tests**
 
 Use a fake strict frame provider and locked segmenter. Assert every source
 frame in a merged half-open interval is rendered once, failures never publish a
@@ -669,7 +669,7 @@ cache below the batch root, and shuts the worker down. Missing or ambiguous
 frame mapping/model inputs must produce an allowlisted unavailable/failed view;
 they must not guess direct frame indexing.
 
-- [ ] **Step 7: Run the new tests and verify Red**
+- [x] **Step 7: Run the new tests and verify Red**
 
 ```bash
 pytest -q tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py tests/test_sam3_overlay_worker.py tests/test_review_evidence.py
@@ -677,7 +677,7 @@ pytest -q tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py te
 
 Expected: FAIL because the launcher has no production renderer/provider wiring.
 
-- [ ] **Step 8: Implement strict production renderer and launcher wiring**
+- [x] **Step 8: Implement strict production renderer and launcher wiring**
 
 Add a server-only renderer that uses one shared `Sam3RuntimeProvider`, decodes
 only the worker-provided half-open source intervals, invokes the inference-locked
@@ -690,11 +690,11 @@ asset batch root, pass `WorkerOverlayProvider` to `WarnWorkbenchService`, and
 shut down the worker in its existing `finally` path. Task GET remains enqueue/
 status-only and never renders synchronously.
 
-- [ ] **Step 9: Run focused production-overlay tests and verify Green**
+- [x] **Step 9: Run focused production-overlay tests and verify Green**
 
 Run the Step 7 command plus the relevant SAM3 runner tests. Expected: PASS.
 
-- [ ] **Step 10: Commit Task 9C**
+- [x] **Step 10: Commit Task 9C**
 
 ```bash
 git add human_qc/sam3_overlay_renderer.py tools/serve_human_qc_workbench.py \
