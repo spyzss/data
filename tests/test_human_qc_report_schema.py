@@ -227,6 +227,39 @@ def test_write_allows_completed_publisher_reviews_without_warn_completion_fields
     assert load_asset_qc_report(path) == report
 
 
+def test_completed_non_publisher_review_requires_legacy_human_structure() -> None:
+    report = make_v2_report()
+    report["manual_review"] = {
+        "state": "completed",
+        "candidate_issue_ids": [],
+        "failures_for_batch_stats_issue_ids": [],
+        "completion_mode": "all_reviewed",
+        "failure_reason": None,
+    }
+
+    with pytest.raises(ReportValidationError, match="selected_issue_ids"):
+        validate_asset_qc_report(report)
+
+
+def test_write_rejects_completed_non_publisher_review_without_legacy_human_structure(
+    tmp_path: Path,
+) -> None:
+    report = make_v2_report()
+    report["manual_review"] = {
+        "state": "completed",
+        "candidate_issue_ids": [],
+        "failures_for_batch_stats_issue_ids": [],
+        "completion_mode": "all_reviewed",
+        "failure_reason": None,
+    }
+    path = tmp_path / "quality_archive" / "incomplete-completed-review.json"
+
+    with pytest.raises(ReportValidationError, match="selected_issue_ids"):
+        write_asset_qc_report(path, report, 0)
+
+    assert not path.exists()
+
+
 def test_completed_early_fail_records_canonical_failure_reason() -> None:
     report = make_v2_report()
     report["manual_review"] = make_manual_block(
