@@ -588,3 +588,86 @@ Task 9C 聚焦组合（原报告 155 项，加本轮新增参数化回归后为 
 ```
 
 `py_compile`（4 个业务文件和 3 个聚焦测试文件）及 `git diff --check` 均 exit 0。
+
+---
+
+# Task 9C terminal-failure quota convergence follow-up
+
+## 状态与范围
+
+DONE
+
+本轮继续只修复最终缓存验收遗漏：公开 interrupted recovery、`_run` exception
+fallback、cleanup failure 三条 terminal-failed 路径的 quota 收敛，以及 heartbeat 与
+quota cleanup 交错后重建空 digest 目录的问题。仅修改
+`human_qc/overlay_worker.py`、`tests/test_sam3_overlay_worker.py` 和本报告；未触碰
+runner、recipe、launcher、HTTP、browser、OpenSpec、主计划或 `.comet`。
+
+基线：`9e7b7cd330487df5d0b81042b4612d3847ecc2df`。本轮独立提交 SHA 以最终任务
+回报中的 `git rev-parse HEAD` 为准。
+
+## Root cause 与锁约束
+
+1. `_recover_interrupted_locked()`、`_run` 的 catch fallback 和
+   `_persist_cleanup_failure()` 各自直接 `_persist(failed)`，绕过上一轮只在 render
+   publication 分支加入的 failed-byte quota。`max_cache_bytes=1` 时，公开
+   `worker.get()` 恢复 pending/generating 会落盘超额 failed manifest；fallback 与
+   cleanup failure 也会留下 terminal digest 目录。
+2. heartbeat 使用默认 `create=True` 的 `_key_lock()`，owner 续租又调用会创建父目录
+   的 `_atomic_json()`。quota 已删除 current job 后、heartbeat 停止前的窗口内，续租
+   线程可以重建 `.generation.lock`-only digest 目录。
+3. 修复后的唯一 failed 落盘点为 `_publish_failed_locked()`；其调用方必须已按
+   root publish lock -> current key lock 的顺序持锁。外层 `_publish_failed()` 统一
+   获取这一顺序。公开 interrupted recovery 使用 root -> key -> nonblocking render
+   fence；schedule 内部 recovery 只构造 view、不落 terminal manifest。heartbeat
+   只尝试 nonblocking existing-key lock，不取 root，并使用 existing-parent-only 原子
+   写，因此既不形成 key -> root 反序，也不能复活已删除目录。
+
+## TDD RED / GREEN
+
+先只新增四个确定性测试并运行：
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_worker.py::test_public_interrupted_recovery_respects_tiny_quota_without_accumulating_job_dirs \
+  tests/test_sam3_overlay_worker.py::test_run_exception_fallback_failed_view_respects_tiny_quota \
+  tests/test_sam3_overlay_worker.py::test_cleanup_failure_failed_view_respects_tiny_quota \
+  tests/test_sam3_overlay_worker.py::test_heartbeat_after_quota_cleanup_does_not_recreate_an_empty_job_directory
+```
+
+RED：`4 failed in 0.46s`。四项均稳定失败于 digest 目录仍存在：
+
+- 公开 `worker.get()` 对预置 pending/generating 两个不同 key 返回安全
+  `overlay_interrupted`，但持久化超额 failed manifest 并累积目录；
+- 强制 publication exception 后，`_run` fallback 绕过 quota；
+- 强制 owner cleanup error 后，cleanup-failed manifest 绕过 quota；
+- 短 owner lease `0.03s` + Event 协调，确保 quota 删除后至少执行一次 heartbeat，
+  稳定重建 lock-only 目录。
+
+最小实现后同一命令 GREEN：`4 passed in 0.34s`。为验证交错测试不是偶然通过，
+同一四项连续运行 5 轮，五轮均为 `4 passed`（单轮 0.18-0.24s）。
+
+## 最终验证
+
+```bash
+.venv/bin/python -m pytest -q tests/test_sam3_overlay_worker.py
+# 23 passed in 2.16s
+
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py \
+  tests/test_sam3_overlay_worker.py tests/test_review_evidence.py \
+  tests/test_qc_pipeline_sam3_runner.py tests/test_canonical_qc_runner_bridge.py \
+  tests/test_human_qc_media.py
+# 165 passed in 5.22s
+
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_workbench.py tests/test_human_qc_http_server.py \
+  tests/test_canonical_video_probe.py
+# 110 passed in 5.88s
+
+.venv/bin/python -m pytest -q
+# 1858 passed, 1 skipped in 113.38s
+```
+
+`py_compile human_qc/overlay_worker.py tests/test_sam3_overlay_worker.py` 与
+`git diff --check` 均 exit 0。

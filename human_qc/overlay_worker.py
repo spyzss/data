@@ -471,8 +471,15 @@ class BoundedOverlayWorker:
             os.close(descriptor)
 
     @classmethod
-    def _atomic_json(cls, path: Path, payload: Mapping[str, object]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def _atomic_json(
+        cls,
+        path: Path,
+        payload: Mapping[str, object],
+        *,
+        create_parent: bool = True,
+    ) -> None:
+        if create_parent:
+            path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, raw_temp = tempfile.mkstemp(
             prefix=".manifest-", suffix=".tmp", dir=path.parent
         )
@@ -669,7 +676,7 @@ class BoundedOverlayWorker:
     def _recover_interrupted_locked(
         self, request: OverlayRequest, view: OverlayJobView
     ) -> OverlayJobView:
-        """Persist a restart recovery while the short per-key state lock is held."""
+        """Build a safe restart-recovery view while the key state is stable."""
 
         interrupted_segments = tuple(
             segment
@@ -688,7 +695,6 @@ class BoundedOverlayWorker:
             retryable=True,
             segments=interrupted_segments,
         )
-        self._persist(request, recovered)
         return recovered
 
     def _read_owner_locked(self, request: OverlayRequest) -> Mapping[str, object] | None:
@@ -797,9 +803,13 @@ class BoundedOverlayWorker:
         """Renew a live owner's bounded lease without blocking a renderer."""
 
         try:
-            with self._key_lock(request, blocking=False) as acquired:
+            with self._key_lock(request, blocking=False, create=False) as acquired:
                 if acquired and self._owns_owner_locked(request, token):
-                    self._atomic_json(self._owner_path(request), self._owner_payload(token))
+                    self._atomic_json(
+                        self._owner_path(request),
+                        self._owner_payload(token),
+                        create_parent=False,
+                    )
         except OSError:
             # A later observer can safely recover once the last valid lease
             # expires; no filesystem details are exposed through the job view.
@@ -843,25 +853,29 @@ class BoundedOverlayWorker:
         # Do not hold a lock while rendering.  The owner marker is created
         # before pending state is published, so an observer can safely retain a
         # live view without acquiring renderer ownership.
-        with self._key_lock(request, blocking=False) as acquired:
-            if not acquired:
-                return view
-            latest = self._parse_manifest(request)
-            if latest is None or latest.status not in {"pending", "generating"}:
-                return latest or view
-            if self._owner_is_live_locked(request):
-                return latest
-            # A delayed heartbeat can expire while a separate process is still
-            # CPU-bound in the renderer.  Only recover an expired marker after
-            # the OS-owned renderer fence is free; process death releases it.
-            with self._render_fence(request, blocking=False) as fence_acquired:
-                if not fence_acquired:
+        with self._root_publish_lock(request):
+            with self._key_lock(request, blocking=False) as acquired:
+                if not acquired:
+                    return view
+                latest = self._parse_manifest(request)
+                if latest is None or latest.status not in {"pending", "generating"}:
+                    return latest or view
+                if self._owner_is_live_locked(request):
                     return latest
-                try:
-                    self._owner_path(request).unlink(missing_ok=True)
-                except OSError:
-                    return self._failed_view(request, "overlay_cache_invalid", retryable=True)
-                return self._recover_interrupted_locked(request, latest)
+                # A delayed heartbeat can expire while a separate process is still
+                # CPU-bound in the renderer.  Only recover an expired marker after
+                # the OS-owned renderer fence is free; process death releases it.
+                with self._render_fence(request, blocking=False) as fence_acquired:
+                    if not fence_acquired:
+                        return latest
+                    try:
+                        self._owner_path(request).unlink(missing_ok=True)
+                    except OSError:
+                        return self._failed_view(
+                            request, "overlay_cache_invalid", retryable=True
+                        )
+                    recovered = self._recover_interrupted_locked(request, latest)
+                    return self._publish_failed_locked(request, recovered)
 
     def _load_durable(self, request: OverlayRequest, *, recover: bool) -> OverlayJobView | None:
         view = self._parse_manifest(request)
@@ -1375,6 +1389,83 @@ class BoundedOverlayWorker:
                 except OSError:
                     pass
 
+    def _normalized_failed_view(
+        self,
+        request: OverlayRequest,
+        candidate: OverlayJobView,
+    ) -> OverlayJobView:
+        code = candidate.code or "overlay_render_failed"
+        retryable = candidate.retryable or any(
+            segment.retryable for segment in candidate.segments
+        )
+        return self._failed_view(
+            request,
+            code,
+            retryable=retryable,
+            segments=tuple(
+                replace(
+                    segment,
+                    status="failed",
+                    path=None,
+                    code=code,
+                    retryable=retryable,
+                    content_sha256=None,
+                    metadata=None,
+                )
+                for segment in candidate.segments
+            ),
+        )
+
+    def _publish_failed_locked(
+        self,
+        request: OverlayRequest,
+        candidate: OverlayJobView,
+    ) -> OverlayJobView:
+        """Publish one failed terminal view under held root and key locks."""
+
+        final = self._normalized_failed_view(request, candidate)
+        self._discard_segments(candidate.segments)
+        self._discard_job_media(request)
+        manifest_size = len(
+            json.dumps(
+                self._manifest_payload(request, final),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if not self._evict_failed_for(request, manifest_size):
+            self._safe_remove_job(self._root(request), self._job_dir(request))
+            return final
+        try:
+            self._persist(request, final)
+        except BaseException:
+            self._safe_remove_job(self._root(request), self._job_dir(request))
+        return final
+
+    def _publish_failed(
+        self,
+        request: OverlayRequest,
+        candidate: OverlayJobView,
+        *,
+        owner_token: str | None = None,
+    ) -> OverlayJobView:
+        """Quota-publish a failed view, or retain it safely in memory only."""
+
+        fallback = self._normalized_failed_view(request, candidate)
+        try:
+            with self._root_publish_lock(request):
+                with self._key_lock(request, create=False) as acquired:
+                    if not acquired:
+                        return fallback
+                    if owner_token is not None and not self._owns_owner_locked(
+                        request, owner_token
+                    ):
+                        return self._parse_manifest(request) or fallback
+                    return self._publish_failed_locked(request, fallback)
+        except BaseException:
+            return fallback
+
     def _publish_rendered(
         self,
         request: OverlayRequest,
@@ -1408,26 +1499,7 @@ class BoundedOverlayWorker:
                     return replace(durable, cache_hit=True)
                 final = candidate
                 if candidate.status == "failed":
-                    self._discard_segments(candidate.segments)
-                    self._discard_job_media(request)
-                    candidate = self._failed_view(
-                        request,
-                        candidate.code or "overlay_render_failed",
-                        retryable=candidate.retryable,
-                        segments=tuple(
-                            replace(
-                                segment,
-                                status="failed",
-                                path=None,
-                                code=candidate.code or segment.code or "overlay_render_failed",
-                                retryable=candidate.retryable or segment.retryable,
-                                content_sha256=None,
-                                metadata=None,
-                            )
-                            for segment in candidate.segments
-                        ),
-                    )
-                    final = candidate
+                    return self._publish_failed_locked(request, candidate)
                 elif not self._evict_for(
                     request, self._job_size(self._job_dir(request))
                 ):
@@ -1450,30 +1522,9 @@ class BoundedOverlayWorker:
                         retryable=True,
                         segments=failed_segments,
                     )
-                if final.status == "failed":
-                    manifest_size = len(
-                        json.dumps(
-                            self._manifest_payload(request, final),
-                            ensure_ascii=True,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    )
-                    if not self._evict_failed_for(request, manifest_size):
-                        self._safe_remove_job(self._root(request), self._job_dir(request))
-                        return final
+                    return self._publish_failed_locked(request, final)
                 self._persist(request, final)
                 return final
-
-    def _persist_cleanup_failure(self, request: OverlayRequest, view: OverlayJobView) -> None:
-        try:
-            with self._root_publish_lock(request):
-                with self._key_lock(request) as acquired:
-                    if acquired:
-                        self._discard_job_media(request)
-                        self._persist(request, view)
-        except BaseException:
-            return
 
     def _run(
         self,
@@ -1514,13 +1565,11 @@ class BoundedOverlayWorker:
                 final = self._publish_rendered(request, rendered, owner_token)
         except BaseException:
             final = self._failed_view(request, "overlay_render_failed", retryable=True)
-            try:
-                with self._root_publish_lock(request):
-                    with self._key_lock(request) as acquired:
-                        if acquired and self._owns_owner_locked(request, owner_token):
-                            self._persist(request, final)
-            except BaseException:
-                pass
+            final = self._publish_failed(
+                request,
+                final,
+                owner_token=owner_token,
+            )
         finally:
             cleanup_failed = False
             try:
@@ -1539,7 +1588,7 @@ class BoundedOverlayWorker:
                     "overlay_cleanup_failed",
                     retryable=True,
                 )
-                self._persist_cleanup_failure(request, final)
+                final = self._publish_failed(request, final)
             try:
                 self._publish_view(request, final)
             finally:

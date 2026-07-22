@@ -304,6 +304,58 @@ def test_worker_recovers_interrupted_manifest_as_retryable_failure(tmp_path: Pat
         worker.shutdown()
 
 
+def test_public_interrupted_recovery_respects_tiny_quota_without_accumulating_job_dirs(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    requests = [
+        (
+            _request(
+                tmp_path,
+                intervals=((index, index + 1),),
+                renderer=RecordingRenderer(),
+                source_sha256="sha256:" + f"{index:064x}",
+            ),
+            status,
+        )
+        for index, status in enumerate(("pending", "generating"), start=1)
+    ]
+    for request, status in requests:
+        job_dir = request.cache_root / request.cache_key.digest
+        job_dir.mkdir(parents=True)
+        (job_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "key_digest": request.cache_key.digest,
+                    "status": status,
+                    "segments": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=1, max_cache_bytes=1)
+    try:
+        recovered = [worker.get(request) for request, _status in requests]
+
+        assert [view.status for view in recovered] == ["failed", "failed"]
+        assert [view.code for view in recovered] == [
+            "overlay_interrupted",
+            "overlay_interrupted",
+        ]
+        assert all(view.retryable for view in recovered)
+        assert all(worker.get(request).code == "overlay_interrupted" for request, _ in requests)
+        assert not [
+            path
+            for path in requests[0][0].cache_root.glob("*")
+            if path.is_dir() and len(path.name) == 64
+        ]
+    finally:
+        worker.shutdown()
+
+
 def test_worker_reports_cache_full_without_publishing_a_ready_manifest(tmp_path: Path) -> None:
     from human_qc.overlay_worker import BoundedOverlayWorker
 
@@ -708,6 +760,120 @@ def test_owner_cleanup_error_still_releases_capacity_and_returns_safe_failure(
         assert _wait_until_terminal(worker, next_request).status == "ready"
     finally:
         worker._release_owner = original_release
+        worker.shutdown()
+
+
+def test_run_exception_fallback_failed_view_respects_tiny_quota(tmp_path: Path) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(
+        tmp_path,
+        intervals=((20, 21),),
+        renderer=RecordingRenderer(),
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=0, max_cache_bytes=1)
+    original_publish = worker._publish_rendered
+
+    def broken_publish(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("private publish failure")
+
+    worker._publish_rendered = broken_publish
+    try:
+        worker.submit(request)
+        failed = _wait_until_terminal(worker, request)
+
+        assert failed.status == "failed"
+        assert failed.code == "overlay_render_failed"
+        assert failed.retryable is True
+        assert worker.get(request).code == "overlay_render_failed"
+        assert not (request.cache_root / request.cache_key.digest).exists()
+    finally:
+        worker._publish_rendered = original_publish
+        worker.shutdown()
+
+
+def test_cleanup_failure_failed_view_respects_tiny_quota(tmp_path: Path) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(
+        tmp_path,
+        intervals=((20, 21),),
+        renderer=RecordingRenderer(),
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=0, max_cache_bytes=1)
+    original_release = worker._release_owner
+
+    def broken_release(_request: object, _token: str) -> None:
+        raise OSError("private owner cleanup failure")
+
+    worker._release_owner = broken_release
+    try:
+        worker.submit(request)
+        failed = _wait_until_terminal(worker, request)
+
+        assert failed.status == "failed"
+        assert failed.code == "overlay_cleanup_failed"
+        assert failed.retryable is True
+        assert worker.get(request).code == "overlay_cleanup_failed"
+        assert not (request.cache_root / request.cache_key.digest).exists()
+    finally:
+        worker._release_owner = original_release
+        worker.shutdown()
+
+
+def test_heartbeat_after_quota_cleanup_does_not_recreate_an_empty_job_directory(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(
+        tmp_path,
+        intervals=((20, 21),),
+        renderer=RecordingRenderer(),
+    )
+    worker = BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=0,
+        max_cache_bytes=1,
+        owner_lease_seconds=0.03,
+    )
+    job_dir = request.cache_root / request.cache_key.digest
+    quota_cleanup_done = Event()
+    heartbeat_after_cleanup = Event()
+    original_remove = worker._safe_remove_job
+    original_heartbeat = worker._heartbeat_owner
+    original_stop = worker._stop_owner_heartbeat
+
+    def observed_remove(root: Path, candidate: Path) -> None:
+        original_remove(root, candidate)
+        if candidate == job_dir and not candidate.exists():
+            quota_cleanup_done.set()
+
+    def observed_heartbeat(heartbeat_request: object, token: str) -> None:
+        original_heartbeat(heartbeat_request, token)
+        if quota_cleanup_done.is_set():
+            heartbeat_after_cleanup.set()
+
+    def stop_after_interleaving(stop: Event, thread: object) -> None:
+        assert quota_cleanup_done.wait(1.0)
+        assert heartbeat_after_cleanup.wait(1.0)
+        original_stop(stop, thread)
+
+    worker._safe_remove_job = observed_remove
+    worker._heartbeat_owner = observed_heartbeat
+    worker._stop_owner_heartbeat = stop_after_interleaving
+    try:
+        worker.submit(request)
+        failed = _wait_until_terminal(worker, request)
+
+        assert failed.status == "failed"
+        assert failed.code == "overlay_cache_full"
+        assert heartbeat_after_cleanup.is_set()
+        assert not job_dir.exists()
+    finally:
+        worker._safe_remove_job = original_remove
+        worker._heartbeat_owner = original_heartbeat
+        worker._stop_owner_heartbeat = original_stop
         worker.shutdown()
 
 
