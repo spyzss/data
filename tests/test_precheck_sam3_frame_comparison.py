@@ -506,3 +506,536 @@ def test_precheck_artifact_directory_injects_and_validates_asset_identity(
     )
     with pytest.raises(ValueError, match="asset_id disagrees with artifact path"):
         read_precheck_artifacts((tmp_path,), artifact_name="check_results.json")
+
+
+def _variant_rows(
+    *,
+    timebase: str,
+    sampled_frames: set[int],
+    positive_frames: set[int],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for frame in range(5):
+        rows.append(
+            {
+                "asset_id": "jdt__episode_1",
+                "source_frame_idx": frame,
+                "check": "keypoint_missing",
+                "flag": False,
+                "reason": "present",
+                "metrics": {"keypoint_presence_invalid": False},
+            }
+        )
+        sampled = frame in sampled_frames
+        rows.append(
+            {
+                "asset_id": "jdt__episode_1",
+                "source_frame_idx": frame,
+                "check": "skeleton_quality_score",
+                "flag": frame in positive_frames if sampled else None,
+                "reason": "temporal",
+                "metrics": {
+                    "decision_metric_source": (
+                        "standardized_30hz"
+                        if timebase == "standardized"
+                        else "native_source_fps"
+                    ),
+                    "temporal_output_valid": sampled,
+                    "standardized_sample_selected": (
+                        sampled if timebase == "standardized" else True
+                    ),
+                    "joint_position_abs_m_max": 0.5,
+                },
+            }
+        )
+    return rows
+
+
+def test_dual_projection_uses_manifest_universe_and_keeps_unsampled_unknown() -> None:
+    from tools.build_precheck_sam3_frame_comparison import (
+        build_temporal_frame_comparison,
+    )
+
+    frame = build_temporal_frame_comparison(
+        manifest_rows=[
+            {
+                "asset_id": "jdt__episode_1",
+                "start_frame": 0,
+                "end_frame": 4,
+            }
+        ],
+        sam3_frame_rows=_sam3_rows(),
+        native_check_rows=_variant_rows(
+            timebase="native",
+            sampled_frames={0, 1, 2, 3, 4},
+            positive_frames={0, 2},
+        ),
+        standardized_check_rows=_variant_rows(
+            timebase="standardized",
+            sampled_frames={0, 2, 4},
+            positive_frames={0},
+        ),
+        native_candidate_rows=[],
+        standardized_candidate_rows=[],
+        candidate_inputs_provided=True,
+        thresholds={
+            "finite_extreme_displacement_m": None,
+            "finite_extreme_acceleration_m_s2": None,
+            "finite_extreme_position_abs_m": None,
+        },
+    )
+
+    assert frame[["asset_id", "source_frame"]].to_dict(orient="records") == [
+        {"asset_id": "jdt__episode_1", "source_frame": frame}
+        for frame in range(5)
+    ]
+    assert pd.isna(frame.loc[1, "standardized_temporal_only_flag"])
+    assert pd.isna(frame.loc[3, "standardized_any_precheck_flag"])
+    assert not bool(frame.loc[1, "standardized_candidate_window_membership"])
+    assert frame.loc[1, "standardized_candidate_window_membership_evaluable"]
+
+
+def test_native_temporal_flag_excludes_presence_only_score_flag() -> None:
+    from tools.build_precheck_sam3_frame_comparison import (
+        build_temporal_frame_comparison,
+    )
+
+    native_rows = [
+        {
+            "asset_id": "jdt__episode_1",
+            "source_frame_idx": 0,
+            "check": "keypoint_presence",
+            "flag": True,
+            "metrics": {"keypoint_presence_invalid": True},
+        },
+        {
+            "asset_id": "jdt__episode_1",
+            "source_frame_idx": 0,
+            "check": "skeleton_quality_score",
+            "flag": True,
+            "metrics": {
+                "decision_metric_source": "native_source_fps",
+                "temporal_output_valid": True,
+                "which_thresholds_exceeded": [],
+                "keypoint_presence_invalid": True,
+            },
+        },
+    ]
+    frame = build_temporal_frame_comparison(
+        manifest_rows=[
+            {"asset_id": "jdt__episode_1", "start_frame": 0, "end_frame": 0}
+        ],
+        sam3_frame_rows=[
+            {
+                "asset_id": "jdt__episode_1",
+                "source_frame": 0,
+                "frame_verdict": "fail",
+            }
+        ],
+        native_check_rows=native_rows,
+        standardized_check_rows=[],
+        native_candidate_rows=[],
+        standardized_candidate_rows=[],
+        candidate_inputs_provided=False,
+        thresholds={},
+    )
+
+    assert not bool(frame.loc[0, "native_temporal_only_flag"])
+    assert bool(frame.loc[0, "native_hard_existence_morphology_flag"])
+    assert bool(frame.loc[0, "native_any_precheck_flag"])
+
+
+def test_dual_confusion_uses_same_frames_for_native_and_standardized() -> None:
+    from tools.build_precheck_sam3_frame_comparison import (
+        build_temporal_confusion_summary,
+        build_temporal_frame_comparison,
+    )
+
+    frame = build_temporal_frame_comparison(
+        manifest_rows=[
+            {
+                "asset_id": "jdt__episode_1",
+                "start_frame": 0,
+                "end_frame": 4,
+            }
+        ],
+        sam3_frame_rows=_sam3_rows(),
+        native_check_rows=_variant_rows(
+            timebase="native",
+            sampled_frames={0, 1, 2, 3, 4},
+            positive_frames={0, 2},
+        ),
+        standardized_check_rows=_variant_rows(
+            timebase="standardized",
+            sampled_frames={0, 2, 4},
+            positive_frames={0},
+        ),
+        native_candidate_rows=[],
+        standardized_candidate_rows=[],
+        candidate_inputs_provided=True,
+        thresholds={},
+    )
+    summary = pd.DataFrame(build_temporal_confusion_summary(frame))
+    temporal_broad = summary.loc[
+        (summary["comparison_reference"] == "sam3_proxy_broad")
+        & (summary["precheck_positive_definition"] == "temporal_only_flag")
+    ]
+
+    assert temporal_broad["evaluated_frame_count"].nunique() == 1
+    assert set(temporal_broad["baseline"]) == {"native", "standardized"}
+    assert int(temporal_broad.iloc[0]["evaluated_frame_count"]) == 2
+
+
+def test_broad_and_strict_proxy_review_and_blocked_semantics() -> None:
+    from tools.build_precheck_sam3_frame_comparison import (
+        build_temporal_confusion_summary,
+        build_temporal_frame_comparison,
+    )
+
+    rows = _variant_rows(
+        timebase="native",
+        sampled_frames={0, 1, 2, 3, 4},
+        positive_frames={0, 2},
+    )
+    frame = build_temporal_frame_comparison(
+        manifest_rows=[
+            {
+                "asset_id": "jdt__episode_1",
+                "start_frame": 0,
+                "end_frame": 4,
+            }
+        ],
+        sam3_frame_rows=_sam3_rows(),
+        native_check_rows=rows,
+        standardized_check_rows=_variant_rows(
+            timebase="standardized",
+            sampled_frames={0, 1, 2, 3, 4},
+            positive_frames={0, 2},
+        ),
+        native_candidate_rows=[],
+        standardized_candidate_rows=[],
+        candidate_inputs_provided=True,
+        thresholds={},
+    )
+    summary = pd.DataFrame(build_temporal_confusion_summary(frame))
+    broad = summary.loc[
+        (summary["baseline"] == "native")
+        & (summary["comparison_reference"] == "sam3_proxy_broad")
+        & (summary["precheck_positive_definition"] == "temporal_only_flag")
+    ].iloc[0]
+    strict = summary.loc[
+        (summary["baseline"] == "native")
+        & (summary["comparison_reference"] == "sam3_proxy_strict")
+        & (summary["precheck_positive_definition"] == "temporal_only_flag")
+    ].iloc[0]
+
+    assert (broad["TP"], broad["FN"], broad["FP"], broad["TN"]) == (1, 1, 1, 1)
+    assert broad["unevaluable_count"] == 1
+    assert broad["review_count"] == 1
+    assert strict["review_count"] == 1
+    assert strict["evaluated_frame_count"] == 3
+    assert strict["unevaluable_count"] == 2
+    assert strict["precision"] == pytest.approx(0.5)
+    assert strict["recall"] == pytest.approx(1.0)
+
+
+def test_confusion_zero_denominators_are_null() -> None:
+    from tools.build_precheck_sam3_frame_comparison import (
+        confusion_metrics,
+    )
+
+    metrics = confusion_metrics(
+        visual_labels=[False, False],
+        precheck_labels=[False, False],
+        total_universe_count=2,
+        review_count=0,
+    )
+
+    assert metrics["precision"] is None
+    assert metrics["recall"] is None
+    assert metrics["false_negative_rate"] is None
+    assert metrics["false_positive_rate"] == 0.0
+    assert metrics["mcc"] is None
+
+
+def test_optional_manual_labels_write_separate_confusion_output(
+    tmp_path: Path,
+) -> None:
+    from tools.build_precheck_sam3_frame_comparison import (
+        build_temporal_comparison_outputs,
+    )
+
+    rows = _variant_rows(
+        timebase="native",
+        sampled_frames={0, 1, 2, 3, 4},
+        positive_frames={0, 2},
+    )
+    output_dir = tmp_path / "dual-comparison"
+    build_temporal_comparison_outputs(
+        manifest_rows=[
+            {
+                "asset_id": "jdt__episode_1",
+                "start_frame": 0,
+                "end_frame": 4,
+            }
+        ],
+        sam3_frame_rows=_sam3_rows(),
+        native_check_rows=rows,
+        standardized_check_rows=rows,
+        native_candidate_rows=[],
+        standardized_candidate_rows=[],
+        output_dir=output_dir,
+        config_reference={"config_version": "test"},
+        thresholds={},
+        manual_labels={
+            "segments": [
+                {
+                    "asset_id": "jdt__episode_1",
+                    "start": 0,
+                    "end": 0,
+                    "label": "positive",
+                },
+                {
+                    "asset_id": "jdt__episode_1",
+                    "start": 1,
+                    "end": 1,
+                    "label": "acceptable_flagged",
+                },
+            ]
+        },
+        run_metadata={},
+    )
+
+    assert (output_dir / "temporal_precheck_vs_sam3_frame_comparison.csv").is_file()
+    assert (output_dir / "temporal_precheck_vs_sam3_frame_comparison.json").is_file()
+    assert (output_dir / "temporal_precheck_vs_sam3_frame_comparison.parquet").is_file()
+    assert (output_dir / "temporal_precheck_vs_sam3_confusion_summary.csv").is_file()
+    assert (output_dir / "temporal_precheck_vs_sam3_confusion_summary.json").is_file()
+    assert (output_dir / "temporal_precheck_vs_sam3_confusion_summary.parquet").is_file()
+    manual_path = output_dir / "temporal_precheck_vs_manual_confusion_summary.json"
+    assert manual_path.is_file()
+    sam3_summary = json.loads(
+        (output_dir / "temporal_precheck_vs_sam3_confusion_summary.json").read_text()
+    )
+    manual_summary = json.loads(manual_path.read_text())
+    assert {row["comparison_reference"] for row in sam3_summary} == {
+        "sam3_proxy_broad",
+        "sam3_proxy_strict",
+    }
+    assert {row["comparison_reference"] for row in manual_summary} == {
+        "manual_ground_truth"
+    }
+
+
+def test_dual_cli_records_inputs_config_and_audit_only_thresholds(
+    tmp_path: Path,
+) -> None:
+    from tools.build_precheck_sam3_frame_comparison import main
+
+    manifest = tmp_path / "manifest.csv"
+    pd.DataFrame(
+        [
+            {
+                "asset_id": "jdt__episode_1",
+                "start_frame": 0,
+                "end_frame": 4,
+            }
+        ]
+    ).to_csv(manifest, index=False)
+    sam3 = tmp_path / "sam3.json"
+    sam3.write_text(json.dumps(_sam3_rows()), encoding="utf-8")
+    native = tmp_path / "native.json"
+    native.write_text(
+        json.dumps(
+            _variant_rows(
+                timebase="native",
+                sampled_frames={0, 1, 2, 3, 4},
+                positive_frames={0, 2},
+            )
+        ),
+        encoding="utf-8",
+    )
+    standardized = tmp_path / "standardized.json"
+    standardized.write_text(
+        json.dumps(
+            _variant_rows(
+                timebase="standardized",
+                sampled_frames={0, 2, 4},
+                positive_frames={0},
+            )
+        ),
+        encoding="utf-8",
+    )
+    native_candidates = tmp_path / "native-candidates.json"
+    standardized_candidates = tmp_path / "standardized-candidates.json"
+    native_candidates.write_text("[]", encoding="utf-8")
+    standardized_candidates.write_text("[]", encoding="utf-8")
+    output_dir = tmp_path / "cli-output"
+
+    exit_code = main(
+        [
+            "--manifest",
+            str(manifest),
+            "--sam3-frame-results",
+            str(sam3),
+            "--native-precheck-results",
+            str(native),
+            "--standardized-precheck-results",
+            str(standardized),
+            "--native-candidate-windows",
+            str(native_candidates),
+            "--standardized-candidate-windows",
+            str(standardized_candidates),
+            "--finite-extreme-position-abs-m",
+            "100",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert exit_code == 0
+    run_config = json.loads((output_dir / "run_config.json").read_text())
+    assert run_config["config_reference"]["config_version"] == "qc_acceptance_v2.4.0"
+    assert run_config["frame_universe_definition"] == (
+        "manifest_inclusive_source_frames"
+    )
+    assert run_config["finite_extreme_audit_parameters"][
+        "finite_extreme_position_abs_m"
+    ] == {
+        "value": 100.0,
+        "source": "cli",
+        "enabled": True,
+        "affects_acceptance_decisions": False,
+    }
+    assert run_config["models_loaded"] == []
+    assert run_config["mutates_precheck_outputs"] is False
+    assert run_config["standardized_unsampled_source_frame_policy"] == (
+        "unknown_not_clean_no_forward_fill"
+    )
+    assert run_config["input_metadata"]["input_paths"]["manifest"][0][
+        "sha256"
+    ].startswith("sha256:")
+    assert run_config["input_metadata"]["consumed_artifacts"][
+        "native_check_results"
+    ][0]["sha256"].startswith("sha256:")
+    assert run_config["input_metadata"]["variant_validation"]["native"][
+        "status"
+    ] == "verified_source_with_partial_artifact_lineage"
+
+
+def test_variant_timebase_validation_rejects_swapped_artifacts() -> None:
+    from tools.build_precheck_sam3_frame_comparison import (
+        _validate_variant_timebase,
+    )
+
+    with pytest.raises(ValueError, match="native.*standardized_30hz"):
+        _validate_variant_timebase(
+            _variant_rows(
+                timebase="standardized",
+                sampled_frames={0, 2, 4},
+                positive_frames={0},
+            ),
+            variant="native",
+            expected_source="native_source_fps",
+            producer_run_configs=[],
+        )
+
+
+def test_nested_pipeline_run_config_lineage_and_config_mismatch_guard(
+    tmp_path: Path,
+) -> None:
+    from tools.build_precheck_sam3_frame_comparison import (
+        _producer_run_config_records,
+        _validate_config_compatibility,
+        _validate_variant_timebase,
+    )
+
+    artifact_root = tmp_path / "artifact"
+    artifact_root.mkdir()
+    (artifact_root / "check_results.json").write_text("[]", encoding="utf-8")
+    (artifact_root / "run_config.json").write_text(
+        json.dumps(
+            {
+                "temporal_sampling": {
+                    "decision_metric_source": "standardized_30hz",
+                    "schema_version": "keypoint_temporal.output.v3",
+                },
+                "fingerprint": {
+                    "temporal_output_schema_version": (
+                        "keypoint_temporal.output.v3"
+                    ),
+                    "config": {"config_hash": "sha256:producer"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    unrelated = artifact_root / "sam3"
+    unrelated.mkdir()
+    (unrelated / "run_config.json").write_text(
+        json.dumps(
+            {
+                "temporal_sampling": {
+                    "decision_metric_source": "native_source_fps"
+                },
+                "fingerprint": {
+                    "config": {"config_hash": "sha256:unrelated"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    records = _producer_run_config_records(
+        [artifact_root],
+        artifact_name="check_results.json",
+    )
+
+    assert len(records) == 1
+    assert records[0]["decision_metric_source"] == "standardized_30hz"
+    assert records[0]["temporal_output_schema_version"] == (
+        "keypoint_temporal.output.v3"
+    )
+    assert records[0]["config_hashes"] == ["sha256:producer"]
+    assert records[0]["run_config_missing"] is False
+    validation = _validate_variant_timebase(
+        [],
+        variant="standardized",
+        expected_source="standardized_30hz",
+        producer_run_configs=records,
+    )
+    assert validation["status"] == "verified"
+    assert validation["temporal_output_schema_status"] == "verified"
+    with pytest.raises(ValueError, match="config hash mismatch"):
+        _validate_config_compatibility(
+            native_run_configs=records,
+            standardized_run_configs=records,
+            runtime_config_hash="sha256:runtime",
+            allow_mismatch=False,
+        )
+    allowed = _validate_config_compatibility(
+        native_run_configs=records,
+        standardized_run_configs=records,
+        runtime_config_hash="sha256:runtime",
+        allow_mismatch=True,
+    )
+    assert allowed["mismatch_override_enabled"] is True
+    assert allowed["native"]["status"] == "mismatch_reported_not_rewritten"
+
+    missing_root = tmp_path / "missing-lineage"
+    missing_root.mkdir()
+    (missing_root / "check_results.json").write_text("[]", encoding="utf-8")
+    missing_records = _producer_run_config_records(
+        [missing_root],
+        artifact_name="check_results.json",
+    )
+    partial = _validate_config_compatibility(
+        native_run_configs=[*records, *missing_records],
+        standardized_run_configs=records,
+        runtime_config_hash="sha256:producer",
+        allow_mismatch=False,
+    )
+    assert partial["native"]["status"] == (
+        "partially_unverified_missing_config_hash"
+    )
+    assert partial["native"]["artifact_lineage_coverage"] == pytest.approx(0.5)
