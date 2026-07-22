@@ -48,6 +48,85 @@ def jsonable(value: Any) -> Any:
     raise TypeError(f"value of type {type(value).__name__} is not JSON serializable")
 
 
+def _field(value: object, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _segment_dto(value: object) -> dict[str, Any]:
+    """Project one semantic row without source-domain/private fields."""
+
+    return {
+        "internal_id": str(_field(value, "internal_id", "")),
+        "start_frame": int(_field(value, "start_frame", 0)),
+        "end_frame_exclusive": int(_field(value, "end_frame_exclusive", 0)),
+        "text_cn": str(_field(value, "text_cn", "")),
+        "text_en": str(_field(value, "text_en", "")),
+    }
+
+
+def _snapshot_dto(value: object) -> dict[str, Any]:
+    return _segment_dto(value)
+
+
+def _pending_dto(value: object | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    before = _field(value, "before", ())
+    after = _field(value, "after", ())
+    result: dict[str, Any] = {
+        "edit_type": str(_field(value, "edit_type", "boundary")),
+        "affected_segment_ids": [
+            str(item) for item in (_field(value, "affected_segment_ids", ()) or ())
+        ],
+        "before": [_snapshot_dto(item) for item in (before or ())],
+        "after": [_snapshot_dto(item) for item in (after or ())],
+        "reviewer": str(_field(value, "reviewer", "")),
+        "created_at": str(_field(value, "created_at", "")),
+    }
+    for name in ("boundary_id", "boundary_index", "actor_segment_id", "segment_id"):
+        item = _field(value, name)
+        if item is not None:
+            result[name] = item
+    return result
+
+
+def semantic_task_dto(value: object, *, video_url: str | None = None) -> dict[str, Any]:
+    """Return the explicit public semantic DTO allowlist.
+
+    The domain view deliberately contains server paths, hashes, source
+    records, and the currently bound lease token.  None of those values are
+    browser capabilities and none cross this application boundary.
+    """
+
+    timeline = _field(value, "timeline", {})
+    segments = _field(timeline, "segments", ()) or ()
+    revision = int(_field(value, "report_revision", _field(value, "revision", 0)))
+    semantic = {
+        "report_revision": revision,
+        "report_state": str(_field(value, "report_state", _field(value, "state", "not_started"))),
+        "pipeline_state": _field(value, "pipeline_state"),
+        "semantic_consistency_state": _field(value, "semantic_consistency_state"),
+        "timeline_edit_count": int(_field(value, "timeline_edit_count", 0)),
+        "subtask_text_edit_count": int(_field(value, "subtask_text_edit_count", 0)),
+        "pending_edit": _pending_dto(_field(value, "pending_edit")),
+        "timeline": {
+            "frame_count": int(_field(timeline, "frame_count", 0)),
+            "fps": float(_field(timeline, "fps", 0.0)),
+            "segments": [_segment_dto(segment) for segment in segments],
+        },
+    }
+    return {
+        "asset_id": str(_field(value, "asset_id", "")),
+        "revision": revision,
+        "report_revision": revision,
+        "task_type": "semantic_calibration",
+        "video_url": video_url,
+        "semantic": semantic,
+    }
+
+
 class SemanticCalibrationApplication:
     """Expose only eligible semantic tasks through one application boundary."""
 
@@ -61,6 +140,7 @@ class SemanticCalibrationApplication:
         profile: str | None = None,
         config: LoadedQcConfig | None = None,
         registry_factory: Callable[[AssetContext, LoadedQcConfig], ModuleRegistry] | None = None,
+        video_paths: Mapping[str, str | Path] | None = None,
     ) -> None:
         if isinstance(lease_ttl_seconds, bool) or not isinstance(lease_ttl_seconds, int) or lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be a positive integer")
@@ -71,6 +151,20 @@ class SemanticCalibrationApplication:
         self.profile = profile
         self.config = config
         self.registry_factory = registry_factory or build_default_registry
+        self._video_paths = {
+            str(asset_id): Path(path).resolve()
+            for asset_id, path in (video_paths or {}).items()
+        }
+        for asset_id, context in self.asset_contexts.items():
+            source = context.source_files.get("video")
+            raw_path = source.get("path") if isinstance(source, Mapping) else None
+            if isinstance(raw_path, str) and raw_path:
+                candidate = (context.batch_root / raw_path).resolve()
+                try:
+                    candidate.relative_to(context.batch_root.resolve())
+                except ValueError as exc:
+                    raise ValueError("semantic video must stay inside batch root") from exc
+                self._video_paths.setdefault(asset_id, candidate)
 
     def _asset_ids(self) -> tuple[str, ...]:
         getter = getattr(self.domain_service, "asset_ids", None)
@@ -137,17 +231,34 @@ class SemanticCalibrationApplication:
 
     def get_task(self, asset_id: str) -> dict[str, Any]:
         self._require_eligible(asset_id, persisted=False)
-        self._recover_resume(asset_id)
         view = self.domain_service.get_task(asset_id)
-        value = jsonable(view)
-        revision = value.get("report_revision", value.get("revision", 0)) if isinstance(value, Mapping) else 0
-        return {
-            "asset_id": asset_id,
-            "revision": revision,
-            "report_revision": revision,
-            "task_type": "semantic_calibration",
-            "semantic": value,
-        }
+        if self._recover_resume(asset_id):
+            view = self.domain_service.get_task(asset_id)
+        video_url = (
+            f"/api/semantic/assets/{asset_id}/video"
+            if asset_id in self._video_paths
+            else None
+        )
+        return semantic_task_dto(view, video_url=video_url)
+
+    def semantic_video_path(self, asset_id: str) -> Path:
+        """Resolve the configured browser video without exposing its path."""
+
+        if asset_id not in self._asset_ids():
+            raise KeyError(asset_id)
+        try:
+            path = self._video_paths[asset_id]
+        except KeyError as exc:
+            raise KeyError(asset_id) from exc
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        context = self.asset_contexts.get(asset_id)
+        if context is not None:
+            try:
+                path.relative_to(context.batch_root.resolve())
+            except ValueError as exc:
+                raise KeyError(asset_id) from exc
+        return path
 
     def current_revision(self, asset_id: str) -> int | None:
         try:
@@ -180,7 +291,9 @@ class SemanticCalibrationApplication:
         return lease
 
     def release_lease(self, asset_id: str, lease_token: str) -> dict[str, bool]:
-        self._require_eligible(asset_id, persisted=True)
+        # Release is cleanup, not an edit.  Completion moves the cursor out of
+        # the live eligibility gate before the browser's finally block runs.
+        self._report_path(asset_id)
         self.lease_store.release(asset_id, lease_token)
         return {"released": True}
 
@@ -198,7 +311,7 @@ class SemanticCalibrationApplication:
             actor_segment_id=payload.get("actor_segment_id"),
             expected_revision=payload.get("expected_revision"),
             lease_token=lease.token,
-            reviewer=str(payload.get("reviewer") or lease.reviewer),
+            reviewer=lease.reviewer,
             now=payload.get("now"),
         )
         self.domain_service.begin_boundary_edit(asset_id, request)
@@ -212,7 +325,7 @@ class SemanticCalibrationApplication:
             text_en=payload.get("text_en", ""),
             expected_revision=payload.get("expected_revision"),
             lease_token=lease.token,
-            reviewer=str(payload.get("reviewer") or lease.reviewer),
+            reviewer=lease.reviewer,
             now=payload.get("now"),
         )
         self.domain_service.begin_text_edit(asset_id, request)
@@ -276,9 +389,9 @@ class SemanticCalibrationApplication:
             registry=registry,
         )
 
-    def _recover_resume(self, asset_id: str) -> None:
+    def _recover_resume(self, asset_id: str) -> bool:
         if self.config is None:
-            return
+            return False
         report = self._report(asset_id)
         semantic = report.get("semantic_calibration") if isinstance(report, Mapping) else None
         pipeline = report.get("pipeline_state") if isinstance(report, Mapping) else None
@@ -287,7 +400,7 @@ class SemanticCalibrationApplication:
             and pipeline.get("status") == "running"
             and self._recover_running_transition(asset_id, report, pipeline)
         ):
-            return
+            return True
         if (
             isinstance(semantic, Mapping)
             and semantic.get("state") == "completed"
@@ -297,6 +410,8 @@ class SemanticCalibrationApplication:
             and pipeline.get("next_module") == "semantic_consistency"
         ):
             self._resume(asset_id)
+            return True
+        return False
 
     def _recover_running_transition(
         self,
@@ -342,4 +457,8 @@ class SemanticCalibrationApplication:
         return True
 
 
-__all__ = ["SemanticCalibrationApplication", "jsonable"]
+__all__ = [
+    "SemanticCalibrationApplication",
+    "jsonable",
+    "semantic_task_dto",
+]

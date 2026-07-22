@@ -20,11 +20,9 @@ from typing import Any
 
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report
 from qc_common.manual_review import semantic_eligibility
-from qc_common.human_state import (
-    initialize_semantic_calibration,
-    reduce_overall_decision,
-    update_human_state,
-)
+from qc_common.human_state import update_human_state
+from qc_common.reduction import reduce_overall_decision
+from .report_state import initialize_semantic_calibration
 
 from .contracts import BoundaryEdit, BoundaryError, SegmentSnapshot, SubtaskSegment
 from .hdf5_commit import (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from http.client import HTTPConnection
+from pathlib import Path
 from threading import Thread
 
 import pytest
@@ -51,6 +52,11 @@ class FakeSemanticApplication:
         self.calls.append((operation, asset_id, payload))
         return {"asset_id": asset_id, "revision": self.revision + 1, "operation": operation}
 
+    def semantic_video_path(self, asset_id: str):
+        if not hasattr(self, "video_path"):
+            raise KeyError(asset_id)
+        return self.video_path
+
 
 def _request(server, method: str, path: str, body: dict | None = None):
     connection = HTTPConnection("127.0.0.1", server.server_port)
@@ -66,6 +72,16 @@ def _request(server, method: str, path: str, body: dict | None = None):
     connection.close()
     value = json.loads(raw.decode("utf-8")) if raw else None
     return response.status, value
+
+
+def _raw_request(server, method: str, path: str, body: bytes = b"", headers: dict | None = None):
+    connection = HTTPConnection("127.0.0.1", server.server_port)
+    connection.request(method, path, body=body, headers=headers or {})
+    response = connection.getresponse()
+    raw = response.read()
+    content_type = response.getheader("Content-Type")
+    connection.close()
+    return response.status, content_type, raw
 
 
 @pytest.fixture
@@ -86,6 +102,7 @@ def test_route_table_is_explicit_and_semantic_only() -> None:
     assert SEMANTIC_ROUTES == {
         "GET /api/semantic/assets",
         "GET /api/semantic/assets/{asset_id}/task",
+        "GET /api/semantic/assets/{asset_id}/video",
         "POST /api/semantic/assets/{asset_id}/lease/acquire",
         "POST /api/semantic/assets/{asset_id}/lease/renew",
         "POST /api/semantic/assets/{asset_id}/lease/release",
@@ -114,7 +131,12 @@ def test_list_task_lease_release_and_mutation_routes(running_server) -> None:
     common = {"expected_revision": 7, "lease_token": application.token}
     status, _ = _request(server, "POST", "/api/semantic/assets/asset-1/lease/renew", common)
     assert status == 200
-    status, _ = _request(server, "POST", "/api/semantic/assets/asset-1/lease/release", common)
+    status, _ = _request(
+        server,
+        "POST",
+        "/api/semantic/assets/asset-1/lease/release",
+        {"lease_token": application.token},
+    )
     assert status == 200
 
     payloads = {
@@ -168,3 +190,62 @@ def test_stable_conflicts_do_not_leak_internal_details(running_server) -> None:
         {"reviewer": "busy"},
     )
     assert status == 423 and value["error"]["code"] == "lease_held"
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_unsupported_methods_return_stable_json_405(running_server, method: str) -> None:
+    _, server = running_server
+    status, content_type, raw = _raw_request(
+        server,
+        method,
+        "/api/semantic/assets/asset-1/task",
+        b"{}",
+        {"Content-Type": "application/json"},
+    )
+    value = json.loads(raw)
+    assert status == 405
+    assert content_type.startswith("application/json")
+    assert value["error"]["code"] == "method_not_allowed"
+
+
+def test_post_requires_json_media_type_before_any_mutation(running_server) -> None:
+    application, server = running_server
+    before = list(application.calls)
+    status, _, raw = _raw_request(
+        server,
+        "POST",
+        "/api/semantic/assets/asset-1/lease/acquire",
+        b'{"reviewer":"alice"}',
+        {"Content-Type": "text/plain"},
+    )
+    assert status == 415
+    assert json.loads(raw)["error"]["code"] == "unsupported_media_type"
+    assert application.calls == before
+
+    status, _, _ = _raw_request(
+        server,
+        "POST",
+        "/api/semantic/assets/asset-1/lease/acquire",
+        b'{"reviewer":"alice"}',
+        {"Content-Type": "application/json; charset=utf-8"},
+    )
+    assert status == 200
+
+
+def test_semantic_video_route_is_contained_and_supports_browser_ranges(
+    running_server, tmp_path: Path
+) -> None:
+    application, server = running_server
+    video = tmp_path / "asset.mp4"
+    video.write_bytes(b"0123456789")
+    application.video_path = video
+
+    status, content_type, body = _raw_request(
+        server,
+        "GET",
+        "/api/semantic/assets/asset-1/video",
+        headers={"Range": "bytes=2-5"},
+    )
+    assert status == 206
+    assert content_type == "video/mp4"
+    assert body == b"2345"

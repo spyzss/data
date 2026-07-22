@@ -11,6 +11,35 @@ ALL_CANDIDATES_SELECTION_POLICY = "all_candidates"
 _PENDING_PIPELINE_STATUSES = frozenset({"pending", "running", "awaiting_external"})
 
 
+def initialize_manual_review(
+    report: dict[str, Any], candidate_issue_ids: Sequence[str]
+) -> None:
+    """Initialize manual-review state while preserving routing extensions."""
+
+    if not isinstance(report, dict):
+        raise TypeError("report must be a dictionary")
+    candidates = _issue_ids(candidate_issue_ids, "candidate_issue_ids")
+    existing = report.get("manual_review")
+    if existing is None:
+        block: dict[str, Any] = {}
+    elif isinstance(existing, Mapping):
+        block = deepcopy(dict(existing))
+    else:
+        raise ValueError("manual_review must be an object")
+    prior_state = block.get("state")
+    block["candidate_issue_ids"] = candidates
+    block.setdefault("failures_for_batch_stats_issue_ids", [])
+    if block.get("required") is None:
+        block["required"] = bool(candidates)
+    block.setdefault("selected_issue_ids", [])
+    block.setdefault("selected_issue_id", None)
+    block.setdefault("issue_reviews", {})
+    block.setdefault("completed_at", None)
+    if prior_state in (None, "not_evaluated"):
+        block["state"] = "queued" if candidates else "not_required"
+    report["manual_review"] = block
+
+
 def semantic_eligibility(
     report: Mapping[str, Any],
 ) -> Literal["ready", "blocked", "skipped_due_to_fail"]:
@@ -130,6 +159,7 @@ def select_pending_manual_review_candidates(
 
 __all__ = [
     "ALL_CANDIDATES_SELECTION_POLICY",
+    "initialize_manual_review",
     "mark_semantic_skipped_due_to_fail",
     "select_pending_manual_review_candidates",
     "semantic_eligibility",

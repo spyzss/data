@@ -8,14 +8,11 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from qc_common.schema import ReportValidationError, validate_asset_qc_report
-from qc_common.manual_review import select_pending_manual_review_candidates
+from qc_common.manual_review import initialize_manual_review, select_pending_manual_review_candidates
+from qc_common.reduction import reduce_overall_decision
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report, write_asset_qc_report
-from qc_common.human_state import (
-    initialize_manual_review,
-    initialize_semantic_calibration,
-    reduce_overall_decision,
-    update_human_state,
-)
+from qc_common.human_state import update_human_state
+from semantic_calibration.report_state import initialize_semantic_calibration
 from tests.qc_report_fixtures import (
     make_boundary_edit,
     make_manual_block,
