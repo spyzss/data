@@ -554,7 +554,7 @@ git commit -m "feat(human-qc): add focused frame and speed controls"
 - Produces: `ReviewPanel` and `WarnReviewApp`.
 - Consumes: `VideoController`, `WarningTimeline`, Warn-only DTO/API.
 
-- [ ] **Step 1: Write failing state and DOM contract tests**
+- [x] **Step 1: Write failing state and DOM contract tests**
 
 Assert:
 
@@ -568,7 +568,7 @@ assert.deepEqual(completionGate(withFail), {enabled: true, mode: "early_fail"});
 
 Static tests must prove: title is “Warn 复核”; no lock button, score body, semantic adapter, or `±1` buttons; current frame appears once in the video; `other` reveals a required text input; bottom order is Pass/Fail → 完成复核 → 上一条/下一条.
 
-- [ ] **Step 2: Run tests and verify Red**
+- [x] **Step 2: Run tests and verify Red**
 
 ```bash
 node --test human_qc/static/workbench.test.mjs
@@ -577,15 +577,15 @@ pytest -q tests/test_human_qc_static_contract.py
 
 Expected: FAIL because the existing shared shell and adapter implement the old layout and completion logic.
 
-- [ ] **Step 3: Implement `ReviewPanel` and `WarnReviewApp`**
+- [x] **Step 3: Implement `ReviewPanel` and `WarnReviewApp`**
 
 Render every issue active at the current frame. Use the earliest pending active issue as the default target; only a click on the lower status row may set `explicitIssueId`. Reason chips update draft state only. On Fail, submit the current normalized reason atomically; on Pass, ignore the draft for verdict state and select the next pending issue after a successful response. Completion sends the server-derived mode and then loads the next asset. Direct asset navigation calls `resetDraft()` before loading the target.
 
-- [ ] **Step 4: Run Node and static tests and verify Green**
+- [x] **Step 4: Run Node and static tests and verify Green**
 
 Run the Step 2 command. Expected: PASS.
 
-- [ ] **Step 5: Commit Task 8**
+- [x] **Step 5: Commit Task 8**
 
 ```bash
 git add human_qc/static tests/test_human_qc_static_contract.py openspec/changes/add-human-semantic-warn-review/tasks.md

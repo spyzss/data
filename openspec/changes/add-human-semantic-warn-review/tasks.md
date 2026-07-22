@@ -56,11 +56,11 @@
 ## 9. 整段视频与 Warning 时间轴
 
 - [x] 9.1 提供安全原视频 URL、FPS、总帧数、规范化半开区间、阈值提示和原因选项 DTO，并支持 HTTP Range
-- [ ] 9.2 以 ES modules 拆分 `WarnReviewApp`、`VideoController`、`WarningTimeline` 和 `ReviewPanel`
+- [x] 9.2 以 ES modules 拆分 `WarnReviewApp`、`VideoController`、`WarningTimeline` 和 `ReviewPanel`
 - [x] 9.3 实现真实帧宽度、重叠合并、窄色块、可进入弹层、色块跳起始帧和可拖动蓝色时间针
 - [x] 9.4 实现视频聚焦后的左右键逐帧、六档倍速持久化、唯一当前帧和视频/判定状态分离
-- [ ] 9.5 实现同时命中 Warning 的确定 Pass 顺序、已通过标志、已判定项修改和底部完成/资产导航
-- [ ] 9.6 实现人工原因先选后 Fail、多选取消、Other 输入框和直接资产切换丢弃未提交草稿
+- [x] 9.5 实现同时命中 Warning 的确定 Pass 顺序、已通过标志、已判定项修改和底部完成/资产导航
+- [x] 9.6 实现人工原因先选后 Fail、多选取消、Other 输入框和直接资产切换丢弃未提交草稿
 
 ## 10. SAM3 区间连续 Overlay
 
