@@ -773,11 +773,11 @@ git commit -m "feat(human-qc): synchronize interval overlay evidence"
 **Interfaces:**
 - Verifies the complete workflow; does not introduce new production interfaces.
 
-- [ ] **Step 1: Add end-to-end scenarios**
+- [x] **Step 1: Add end-to-end scenarios**
 
 Cover one full desktop fixture with Warning ranges 120–168, 142–181 and 390–426. Assert timeline block count, popover choice, exact seek frames, drag seek, first-Pass order, return-and-modify, reason draft behavior, 409/423 recovery, overlay lock/unlock, explicit completion and automatic next asset.
 
-- [ ] **Step 2: Run scenarios and verify Red for remaining integration gaps**
+- [x] **Step 2: Run scenarios and verify Red for remaining integration gaps**
 
 ```bash
 pytest -q tests/test_warn_review_browser_contract.py tests/test_human_qc_end_to_end.py tests/test_human_qc_profile_routing.py tests/test_human_qc_recovery.py tests/test_human_qc_workbench.py
@@ -785,15 +785,15 @@ pytest -q tests/test_warn_review_browser_contract.py tests/test_human_qc_end_to_
 
 Expected before integration fixes: at least one FAIL identifies a missing real route, state restoration or DOM connection; no test may use an implementation-only shortcut.
 
-- [ ] **Step 3: Fix only the identified integration seams**
+- [x] **Step 3: Fix only the identified integration seams**
 
 Wire the already defined APIs and controllers; do not add alternative state paths. Ensure task reload uses server revision, lease renew survives asset changes, completion response provides next asset or explicit empty-queue state, and direct navigation clears only unsaved reason draft.
 
-- [ ] **Step 4: Run integration suites and verify Green**
+- [x] **Step 4: Run integration suites and verify Green**
 
 Run the Step 2 command and all static Node tests. Expected: PASS.
 
-- [ ] **Step 5: Commit Task 11**
+- [x] **Step 5: Commit Task 11**
 
 ```bash
 git add human_qc semantic_calibration tests/test_warn_review_browser_contract.py tests/test_human_qc_end_to_end.py tests/test_human_qc_profile_routing.py tests/test_human_qc_recovery.py tests/test_human_qc_workbench.py openspec/changes/add-human-semantic-warn-review/tasks.md

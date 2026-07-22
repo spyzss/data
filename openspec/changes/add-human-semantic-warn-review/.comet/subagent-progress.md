@@ -15,8 +15,8 @@
 
 ## Current Task
 
-- Plan task: `Task 11: 集成验收与回归修复`
-- OpenSpec mapping: `11.1 Python、Node、DOM、API 与浏览器测试`
+- Plan task: `Task 12: 文档契约与完整验证`
+- OpenSpec mapping: `11.2 文档同步；11.3 全量验证`
 - Stage: `build`
 - Review mode: `thorough`
 - Review/fix round: `Task 9A 3/3 approved; Task 9B 2/2 approved; Task 9C explicit user-authorized fourth narrow repair`
@@ -80,6 +80,10 @@
 - Task 10 polling/retry re-review: CHANGES_REQUESTED with no Critical and one Important poll-reentry race. An in-flight status poll clears its timer before the request completes; a retry success can schedule and execute another poll in the same generation before the old request returns. Abort/generation alone does not serialize this case.
 - Task 10 poll-serialization repair dispatch: existing Task10 agent must add an in-flight/queued poll invariant, TDD the hanging-status-plus-retry race, preserve all backoff/503/draft semantics, and return for one more independent approval before 10.3/10.4 checkoff.
 - Task 10 final approval: APPROVED after `b26ae0a`. The final reviewer confirmed same-generation polls serialize through a single in-flight promise, queued reset runs exactly once after completion, asset switch/destroy invalidate late work, and backoff/503/safe notice/draft/API/overlay/gating behavior remain intact. Evidence: Node `59 passed`, focused Python `81 passed`, and syntax/diff checks pass. Plan Task 10 and OpenSpec 10.3/10.4 are now checked off.
+- Task 11 implementation: `2c8e290` added a zero-npm real Chrome/CDP contract with H.264 source/overlay fixtures, browser-observed timeline/focus/overlay fixes, and end-to-end/profile/recovery tests. Coordinator independently reproduced Chrome/Python `64 passed` and Node `61 passed`.
+- Task 11 review: CHANGES_REQUESTED with no Critical and three Important browser-harness reliability defects. CDP commands lack per-request timeouts and Chrome/server cleanup is not guaranteed after external timeout; `CHROME_BIN` is hard-coded rather than environment/fallback-resolved; and network health ignores `Network.loadingFailed`, allowing non-HTTP request failures to appear healthy.
+- Task 11 browser-harness repair dispatch: existing Task11 agent must TDD command/child cleanup, portable browser resolution, and requestId-aware non-HTTP failure capture without changing product code. Fresh browser-focused review is required before Task 11 checkoff.
+- Task 11 final approval: APPROVED after `ce24647`. The final reviewer confirmed that the Python parent timeout now sends SIGTERM to the driver before any fallback kill, and the driver immediately reaps only its own Chrome child even when live CDP close is stalled. The active-CDP regression proves Node exits through SIGTERM, Chrome PID is gone, and the fixture HTTP server thread stops. Evidence: browser contract `3 passed` twice, focused Python `66 passed`, Node `68 passed`, and diff-check pass. Plan Task 11 and OpenSpec 11.1 are now checked off.
 - Binding downstream decisions:
   - Build a new `WarnWorkbenchService`; do not extend the shared legacy facade or use raw `jsonable()` projection.
   - Warn task DTOs are strict allowlists: source video, normalized half-open selected issue ranges, threshold/reason/review/overlay state, completion and safe lease state only.
