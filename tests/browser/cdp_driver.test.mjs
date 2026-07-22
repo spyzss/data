@@ -126,6 +126,38 @@ test("a timed-out driver operation reaps both supervised Chrome and server child
 });
 
 
+test("a stalled CDP close never holds Chrome reaping, and signal cleanup skips that close", async () => {
+  const chrome = new FakeChild({ exitOn: "SIGTERM" });
+  let releaseClose;
+  let closeCalls = 0;
+  const stalledClose = new Promise((resolve) => { releaseClose = resolve; });
+  const normal = shutdownResources({
+    cdp: { close: () => { closeCalls += 1; return stalledClose; } },
+    children: [chrome],
+    stopOptions: { termGraceMs: 2, killGraceMs: 2 },
+  });
+
+  await sleep(5);
+  assert.equal(closeCalls, 1);
+  assert.deepEqual(chrome.signals, ["SIGTERM"]);
+  assert.equal(chrome.signalCode, "SIGTERM");
+  releaseClose();
+  await normal;
+
+  const signalChrome = new FakeChild({ exitOn: "SIGTERM" });
+  let signalCloseCalls = 0;
+  const result = await shutdownResources({
+    cdp: { close: () => { signalCloseCalls += 1; return new Promise(() => {}); } },
+    children: [signalChrome],
+    stopOptions: { termGraceMs: 2, killGraceMs: 2 },
+    skipCdpClose: true,
+  });
+  assert.deepEqual(result, ["sigterm"]);
+  assert.equal(signalCloseCalls, 0);
+  assert.deepEqual(signalChrome.signals, ["SIGTERM"]);
+});
+
+
 test("SIGTERM and SIGINT await cleanup before exiting and only handle the first signal", async () => {
   const processRef = new EventEmitter();
   const calls = [];

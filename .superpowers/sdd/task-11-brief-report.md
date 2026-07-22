@@ -94,6 +94,31 @@ Node static + driver suite: 67 passed
 git diff --check: clean
 ```
 
+## Active-CDP shutdown repair
+
+The signal path now calls cleanup with `skipCdpClose`: it reaps only the
+isolated Chrome child and exits, instead of waiting for a potentially stalled
+DevTools WebSocket close.  Normal cleanup starts child reaping and CDP close
+in parallel, so an ordinary slow close cannot defer ownership cleanup either.
+The outer Python grace remains bounded at five seconds; it is no longer asked
+to cover the 8--10 second CDP close budget.
+
+The active-CDP regression launches an isolated real Chrome, confirms a live
+CDP connection, injects a ten-second close stall, and then triggers a
+five-second outer Python timeout.  It proves the driver still exits after
+SIGTERM cleanup (143), the isolated Chrome PID is gone, and the HTTP server
+thread is stopped.  Unit coverage additionally verifies that normal cleanup
+reaps before a stalled close settles and that the signal variant never calls
+close.
+
+```text
+Chrome contract including both outer-timeout regressions, run 1: 3 passed in 11.03s
+Chrome contract including both outer-timeout regressions, run 2: 3 passed in 10.91s
+Focused Python suite: 66 passed in 12.57s
+Node static + driver suite: 68 passed
+git diff --check: clean
+```
+
 ## Outer Python timeout repair
 
 The browser contract no longer uses `subprocess.run(..., timeout=...)`, whose

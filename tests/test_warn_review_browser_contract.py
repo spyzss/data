@@ -314,13 +314,56 @@ def test_outer_python_timeout_terminates_driver_before_killing_and_reaps_chrome_
             _run_browser_process(
                 f"http://127.0.0.1:{server.server_port}/",
                 sandbox / "profile",
-                timeout_seconds=1,
+                timeout_seconds=3,
                 terminate_grace_seconds=3,
                 environment={**os.environ, "CHROME_BIN": str(fake_chrome)},
             )
         assert raised.value.cleaned_after_sigterm is True
         assert raised.value.returncode == 143
         chrome_pid = int(pid_path.read_text(encoding="utf-8"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(chrome_pid, 0)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+    assert thread.is_alive() is False
+
+
+def test_outer_timeout_with_active_cdp_skips_stalled_close_and_reaps_isolated_chrome(
+    tmp_path: Path,
+) -> None:
+    """SIGTERM cleanup must not wait for a stuck DevTools socket before reaping Chrome."""
+
+    if not CHROME_BIN.is_file():
+        pytest.skip("real Chrome is required for active-CDP timeout coverage")
+    sandbox = tmp_path / "active-cdp-timeout"
+    sandbox.mkdir()
+    connected_path = sandbox / "cdp-connected"
+    chrome_pid_path = sandbox / "isolated-chrome.pid"
+    server = HTTPServer(("127.0.0.1", 0), _QuietHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(BrowserDriverTimeout) as raised:
+            _run_browser_process(
+                f"http://127.0.0.1:{server.server_port}/",
+                sandbox / "profile",
+                timeout_seconds=5,
+                terminate_grace_seconds=3,
+                environment={
+                    **os.environ,
+                    "CHROME_BIN": str(CHROME_BIN),
+                    "HUMAN_QC_CDP_TEST_CONNECTED_FILE": str(connected_path),
+                    "HUMAN_QC_CDP_TEST_CHROME_PID_FILE": str(chrome_pid_path),
+                    "HUMAN_QC_CDP_TEST_HOLD_AFTER_CONNECT_MS": "10000",
+                    "HUMAN_QC_CDP_TEST_CLOSE_STALL_MS": "10000",
+                },
+            )
+        assert connected_path.is_file(), "driver never reached an active CDP connection"
+        assert raised.value.cleaned_after_sigterm is True
+        assert raised.value.returncode == 143
+        chrome_pid = int(chrome_pid_path.read_text(encoding="utf-8"))
         with pytest.raises(ProcessLookupError):
             os.kill(chrome_pid, 0)
     finally:

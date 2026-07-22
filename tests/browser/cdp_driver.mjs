@@ -6,7 +6,7 @@
  * written through Runtime.evaluate.
  */
 
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
@@ -87,6 +87,21 @@ export const withTimeout = async (promise, { timeoutMs, label } = {}) => {
 
 const timeoutAt = (milliseconds) => Date.now() + milliseconds;
 
+const harnessDelay = (environment, name) => {
+  const raw = environment[name];
+  if (raw === undefined || raw === "") return 0;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0 || value > 30_000) {
+    throw new Error(`${name} must be an integer between 0 and 30000`);
+  }
+  return value;
+};
+
+const writeHarnessMarker = (environment, name, value) => {
+  const destination = environment[name];
+  if (typeof destination === "string" && destination) writeFileSync(destination, String(value));
+};
+
 const until = async (predicate, { timeout = 8000, label = "condition" } = {}) => {
   const deadline = timeoutAt(timeout);
   let lastError = null;
@@ -103,9 +118,10 @@ const until = async (predicate, { timeout = 8000, label = "condition" } = {}) =>
 };
 
 export class Cdp {
-  constructor(url, { requestTimeoutMs = cdpTimeoutFromEnvironment() } = {}) {
+  constructor(url, { requestTimeoutMs = cdpTimeoutFromEnvironment(), closeDelayMs = 0 } = {}) {
     this.url = url;
     this.requestTimeoutMs = requestTimeoutMs;
+    this.closeDelayMs = closeDelayMs;
     this.socket = null;
     this.sequence = 0;
     this.pending = new Map();
@@ -183,6 +199,7 @@ export class Cdp {
     const socket = this.socket;
     if (!socket) return;
     try {
+      if (this.closeDelayMs > 0) await delay(this.closeDelayMs);
       if (socket.readyState === WebSocket.CLOSED) return;
       await withTimeout(new Promise((resolve) => {
         socket.addEventListener("close", resolve, { once: true });
@@ -224,9 +241,21 @@ export const stopChild = async (
   throw new Error("Chrome process did not exit after SIGTERM and SIGKILL");
 };
 
-export const shutdownResources = async ({ cdp = null, children = [], stopOptions = {} } = {}) => {
-  await cdp?.close?.();
-  return Promise.all(children.filter(Boolean).map((child) => stopChild(child, stopOptions)));
+export const shutdownResources = async ({
+  cdp = null,
+  children = [],
+  stopOptions = {},
+  skipCdpClose = false,
+} = {}) => {
+  // Reap owned children immediately. A DevTools close can itself be stalled,
+  // and must never hold Chrome reaping behind its request-timeout budget.
+  const reaped = Promise.all(children.filter(Boolean).map((child) => stopChild(child, stopOptions)));
+  if (skipCdpClose) return reaped;
+  await Promise.all([
+    reaped,
+    Promise.resolve(cdp?.close?.()).catch(() => undefined),
+  ]);
+  return reaped;
 };
 
 export const installShutdownSignalHandlers = ({
@@ -314,8 +343,8 @@ const uncaught = [];
 const consoleErrors = [];
 const mutationRequests = [];
 
-const shutdown = async () => {
-  shutdownPromise ??= shutdownResources({ cdp, children: [chrome] });
+const shutdown = async ({ skipCdpClose = false } = {}) => {
+  shutdownPromise ??= shutdownResources({ cdp, children: [chrome], skipCdpClose });
   return shutdownPromise;
 };
 
@@ -405,12 +434,17 @@ export const runDriver = async ({
   baseUrl = parsed.baseUrl;
   profileDir = parsed.profileDir;
   const requestTimeoutMs = cdpTimeoutFromEnvironment(environment);
+  const closeDelayMs = harnessDelay(environment, "HUMAN_QC_CDP_TEST_CLOSE_STALL_MS");
+  const holdAfterConnectMs = harnessDelay(environment, "HUMAN_QC_CDP_TEST_HOLD_AFTER_CONNECT_MS");
   const chromeBin = resolveChromeBin({
     environment,
     explicit: parsed.explicitChromeBin,
   });
   chrome = launchChrome(chromeBin);
-  const removeSignalHandlers = installShutdownSignalHandlers({ shutdown });
+  writeHarnessMarker(environment, "HUMAN_QC_CDP_TEST_CHROME_PID_FILE", chrome.pid);
+  const removeSignalHandlers = installShutdownSignalHandlers({
+    shutdown: () => shutdown({ skipCdpClose: true }),
+  });
   try {
   mkdirSync(profileDir, { recursive: true });
   const port = await devtoolsPort();
@@ -419,7 +453,12 @@ export const runDriver = async ({
     const values = await response.json();
     return values.find((item) => item.type === "page" && item.webSocketDebuggerUrl) ?? null;
   }, { label: "Chrome page target" });
-  cdp = await new Cdp(pages.webSocketDebuggerUrl, { requestTimeoutMs }).connect();
+  cdp = await new Cdp(pages.webSocketDebuggerUrl, {
+    requestTimeoutMs,
+    closeDelayMs,
+  }).connect();
+  writeHarnessMarker(environment, "HUMAN_QC_CDP_TEST_CONNECTED_FILE", "connected");
+  if (holdAfterConnectMs > 0) await delay(holdAfterConnectMs);
   const networkHealth = new NetworkHealth(baseUrl);
   cdp.on("Runtime.exceptionThrown", ({ exceptionDetails }) => {
     uncaught.push(exceptionDetails?.exception?.description ?? exceptionDetails?.text ?? "runtime exception");
