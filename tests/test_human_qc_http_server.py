@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
@@ -505,6 +506,61 @@ def test_source_replacement_between_catalog_and_stream_is_rejected(tmp_path: Pat
         assert headers["Content-Type"].startswith("application/json")
         assert value["error"]["code"] == "source_video_unavailable"
         assert "z" * 32 not in json.dumps(value)
+    finally:
+        _stop(server, thread)
+
+
+def test_source_in_place_rewrite_after_open_serves_one_consistent_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import human_qc.http_server as http_server
+    from tests.test_human_qc_workbench import _service
+
+    service, _, _, context = _service(tmp_path)
+    source = context.batch_root / context.source_files["video"]["path"]
+    original = source.read_bytes()
+    replacement = bytes(reversed(original))
+    original_identity = source.stat()
+    real_open = http_server.open_verified_media
+    rewrite_once = True
+
+    def open_then_rewrite_in_place(resource):
+        nonlocal rewrite_once
+        opened = real_open(resource)
+        if rewrite_once:
+            rewrite_once = False
+            with source.open("r+b") as target:
+                target.write(replacement)
+                target.flush()
+            rewritten = source.stat()
+            assert rewritten.st_ino == original_identity.st_ino
+            assert rewritten.st_size == original_identity.st_size
+        return opened
+
+    monkeypatch.setattr(http_server, "open_verified_media", open_then_rewrite_in_place)
+    server, thread = _running_server(service)
+    try:
+        status, headers, body = _request_raw(
+            server, "GET", "/media/assets/asset-1/source"
+        )
+        first_etag = headers["ETag"]
+
+        assert status == 200
+        assert body == original
+        assert first_etag == json.dumps(
+            "sha256:" + hashlib.sha256(original).hexdigest()
+        )
+
+        status, headers, body = _request_raw(
+            server, "GET", "/media/assets/asset-1/source"
+        )
+
+        assert status == 200
+        assert body == replacement
+        assert headers["ETag"] == json.dumps(
+            "sha256:" + hashlib.sha256(replacement).hexdigest()
+        )
+        assert headers["ETag"] != first_etag
     finally:
         _stop(server, thread)
 

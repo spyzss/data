@@ -335,6 +335,156 @@ def test_warn_task_projects_minimal_audit_and_server_completion_gate(
         assert forbidden not in serialized
 
 
+@pytest.mark.parametrize(
+    "raw_issue_id",
+    [
+        "/private/source.mp4",
+        "command",
+        "ffmpeg",
+        "traceback",
+    ],
+)
+def test_untrusted_selected_issue_id_is_opaque_in_task_and_audit(
+    tmp_path: Path, raw_issue_id: str,
+) -> None:
+    from human_qc.media import MediaCatalog
+    from human_qc.warn_workbench_service import WarnWorkbenchService
+
+    report = _report()
+    report["issues"] = [{**report["issues"][0], "issue_id": raw_issue_id}]
+    report["manual_review"]["candidate_issue_ids"] = [raw_issue_id]
+    report["manual_review"]["selected_issue_ids"] = [raw_issue_id]
+    report["manual_review"]["issue_reviews"] = {
+        raw_issue_id: report["manual_review"]["issue_reviews"]["warn-1"]
+    }
+    report["manual_review"]["review_audit"] = [
+        {
+            "action": "resubmitted",
+            "issue_id": raw_issue_id,
+            "reviewed_at": "2026-07-22T00:01:00+00:00",
+        }
+    ]
+    context = _context(tmp_path, report)
+    service = WarnWorkbenchService(
+        reviewer="alice",
+        asset_contexts={"asset-1": context},
+        media_catalog=MediaCatalog(
+            {"asset-1": context},
+            probe=lambda _path: {"fps": 30.0, "total_frames": 1800},
+        ),
+    )
+
+    task = service.get_asset_task("asset-1")
+    public_issue_id = task["issues"][0]["id"]
+    reloaded = service.get_asset_task(
+        "asset-1", lease_token=task["lease"]["token"]
+    )
+
+    assert public_issue_id != raw_issue_id
+    assert public_issue_id.startswith("issue-")
+    assert public_issue_id.replace("-", "").isalnum()
+    assert reloaded["issues"][0]["id"] == public_issue_id
+    assert task["review_audit"] == [
+        {
+            "action": "resubmitted",
+            "issue_id": public_issue_id,
+            "reviewed_at": "2026-07-22T00:01:00+00:00",
+        }
+    ]
+    serialized = json.dumps(task, ensure_ascii=False).lower()
+    for forbidden in (raw_issue_id, "/private", "command", "ffmpeg", "traceback"):
+        assert forbidden not in serialized
+
+
+def test_opaque_issue_id_is_not_reused_as_display_fallback(tmp_path: Path) -> None:
+    from human_qc.media import MediaCatalog
+    from human_qc.warn_workbench_service import WarnWorkbenchService
+
+    raw_issue_id = "command"
+    report = _report()
+    issue = {**report["issues"][0], "issue_id": raw_issue_id}
+    for field in ("code", "display_name", "title", "default_reason"):
+        issue.pop(field, None)
+    report["issues"] = [issue]
+    report["manual_review"]["candidate_issue_ids"] = [raw_issue_id]
+    report["manual_review"]["selected_issue_ids"] = [raw_issue_id]
+    report["manual_review"]["issue_reviews"] = {}
+    context = _context(tmp_path, report)
+    service = WarnWorkbenchService(
+        reviewer="alice",
+        asset_contexts={"asset-1": context},
+        media_catalog=MediaCatalog(
+            {"asset-1": context},
+            probe=lambda _path: {"fps": 30.0, "total_frames": 1800},
+        ),
+    )
+
+    task = service.get_asset_task("asset-1")
+
+    assert task["issues"][0]["id"] != raw_issue_id
+    assert task["issues"][0]["display_name"] == "issue"
+    assert task["issues"][0]["default_reason"] == "issue"
+    assert raw_issue_id not in json.dumps(task, ensure_ascii=False).lower()
+
+
+def test_opaque_selected_issue_id_preserves_internal_write_semantics(
+    tmp_path: Path,
+) -> None:
+    from human_qc.media import MediaCatalog
+    from human_qc.warn_workbench_service import WarnWorkbenchService
+
+    raw_issue_id = "/private/traceback-command=ffmpeg"
+    report = _report()
+    report["issues"] = [{**report["issues"][0], "issue_id": raw_issue_id}]
+    report["manual_review"]["candidate_issue_ids"] = [raw_issue_id]
+    report["manual_review"]["selected_issue_ids"] = [raw_issue_id]
+    report["manual_review"]["issue_reviews"] = {}
+    context = _context(tmp_path, report)
+    warn = RecordingWarnService(context.report_path)
+    service = WarnWorkbenchService(
+        reviewer="alice",
+        warn_service=warn,
+        asset_contexts={"asset-1": context},
+        media_catalog=MediaCatalog(
+            {"asset-1": context},
+            probe=lambda _path: {"fps": 30.0, "total_frames": 1800},
+        ),
+    )
+    task = service.get_asset_task("asset-1")
+    public_issue_id = task["issues"][0]["id"]
+
+    service.warn_verdict(
+        "asset-1",
+        issue_id=public_issue_id,
+        verdict="pass",
+        expected_revision=3,
+        lease_token=task["lease"]["token"],
+    )
+
+    assert public_issue_id != raw_issue_id
+    assert warn.calls[-1][0] == "submit_verdict"
+    assert warn.calls[-1][1][1] == raw_issue_id
+
+
+def test_untrusted_selected_issue_id_error_does_not_echo_raw_value(
+    tmp_path: Path,
+) -> None:
+    raw_issue_id = "/private/traceback-command=ffmpeg"
+    report = _report()
+    report["manual_review"]["candidate_issue_ids"] = [raw_issue_id]
+    report["manual_review"]["selected_issue_ids"] = [raw_issue_id]
+    service, _, _, context = _service(tmp_path)
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(WarnStateError) as caught:
+        service.get_asset_task("asset-1")
+
+    assert raw_issue_id not in str(caught.value)
+    assert "/private" not in str(caught.value).lower()
+    assert "traceback" not in str(caught.value).lower()
+    assert "ffmpeg" not in str(caught.value).lower()
+
+
 def test_task_load_lease_collision_is_safe_read_only(tmp_path: Path) -> None:
     service, lease_store, _, _ = _service(tmp_path)
     held = lease_store.acquire("asset-1", "bob", 60)

@@ -11,6 +11,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import tempfile
 from threading import RLock
 from typing import Any, BinaryIO
 
@@ -152,6 +153,39 @@ def open_verified_media(resource: MediaResource) -> BinaryIO:
                 if isinstance(resource, SourceMedia)
                 else "media_not_found"
             )
+        if isinstance(resource, SourceMedia):
+            snapshot = tempfile.TemporaryFile(mode="w+b")
+            try:
+                digest = hashlib.sha256()
+                copied = 0
+                while True:
+                    chunk = source.read(64 * 1024)
+                    if not chunk:
+                        break
+                    snapshot.write(chunk)
+                    digest.update(chunk)
+                    copied += len(chunk)
+                final = os.fstat(source.fileno())
+                final_identity = (
+                    final.st_dev,
+                    final.st_ino,
+                    final.st_size,
+                    final.st_mtime_ns,
+                )
+                actual_etag = "sha256:" + digest.hexdigest()
+                if (
+                    final_identity != identity
+                    or copied != resource.size
+                    or resource.etag is None
+                    or actual_etag != resource.etag
+                ):
+                    raise MediaUnavailableError("source_video_unavailable")
+                snapshot.seek(0)
+            except Exception:
+                snapshot.close()
+                raise
+            source.close()
+            return snapshot
         return source
     except Exception:
         source.close()

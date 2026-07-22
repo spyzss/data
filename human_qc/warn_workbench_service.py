@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import math
 from pathlib import Path
 import re
@@ -25,9 +26,13 @@ from .warn_service import WarnReviewService, WarnRevisionError, WarnStateError
 
 
 _STABLE_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}").fullmatch
+_PUBLIC_ISSUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}").fullmatch
 _UNSAFE_PUBLIC_TEXT = re.compile(
     r"[/\\]|(?:command|cmd)\s*[:=]|\b(?:ffmpeg|traceback|stack\s+trace)\b",
     re.IGNORECASE,
+).search
+_UNSAFE_ISSUE_ID_TEXT = re.compile(
+    r"(?:command|cmd|ffmpeg|traceback|stack[._-]?trace)", re.IGNORECASE
 ).search
 _MANUAL_REVIEW_STATES = frozenset(
     {
@@ -269,6 +274,33 @@ def _safe_code(value: object) -> str | None:
     return value if isinstance(value, str) and _STABLE_CODE(value) else None
 
 
+def _public_issue_id(value: str) -> str:
+    if _PUBLIC_ISSUE_ID(value) and _UNSAFE_ISSUE_ID_TEXT(value) is None:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"issue-{digest}"
+
+
+def _selected_issue_maps(
+    manual: Mapping[str, Any],
+) -> tuple[tuple[str, ...], dict[str, str], dict[str, str]]:
+    selected = manual.get("selected_issue_ids")
+    if not isinstance(selected, (list, tuple)) or any(
+        not isinstance(item, str) or not item for item in selected
+    ):
+        raise WarnStateError("manual_review.selected_issue_ids must contain strings")
+    raw_to_public: dict[str, str] = {}
+    public_to_raw: dict[str, str] = {}
+    for raw_issue_id in selected:
+        public_issue_id = _public_issue_id(raw_issue_id)
+        existing = public_to_raw.get(public_issue_id)
+        if existing is not None and existing != raw_issue_id:
+            raise WarnStateError("selected issue identifiers conflict")
+        raw_to_public[raw_issue_id] = public_issue_id
+        public_to_raw[public_issue_id] = raw_issue_id
+    return tuple(selected), raw_to_public, public_to_raw
+
+
 def _safe_display_text(value: object, *, fallback: str | None = None) -> str | None:
     if not isinstance(value, str):
         return fallback
@@ -384,7 +416,7 @@ def _completion_mode(value: object) -> str | None:
 
 
 def _review_audit(
-    value: object, selected_issue_ids: set[str]
+    value: object, selected_issue_ids: Mapping[str, str]
 ) -> tuple[ReviewAuditDto, ...]:
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         return ()
@@ -400,10 +432,15 @@ def _review_audit(
             not isinstance(issue_id, str) or issue_id not in selected_issue_ids
         ):
             continue
+        public_issue_id = (
+            None if issue_id is None else selected_issue_ids[issue_id]
+        )
         reviewed_at = _safe_timestamp(entry.get("reviewed_at"))
         if reviewed_at is None:
             continue
-        result.append(ReviewAuditDto(action, issue_id, reviewed_at))  # type: ignore[arg-type]
+        result.append(
+            ReviewAuditDto(action, public_issue_id, reviewed_at)  # type: ignore[arg-type]
+        )
     return tuple(result)
 
 
@@ -598,11 +635,7 @@ class WarnWorkbenchService:
         total_frames: int,
     ) -> tuple[WarnIssueDto, ...]:
         manual = self._manual(report)
-        selected = manual.get("selected_issue_ids")
-        if not isinstance(selected, (list, tuple)) or any(
-            not isinstance(item, str) or not item for item in selected
-        ):
-            raise WarnStateError("manual_review.selected_issue_ids must contain strings")
+        selected, raw_to_public, _ = _selected_issue_maps(manual)
         raw_issues = report.get("issues")
         if not isinstance(raw_issues, (list, tuple)):
             raise WarnStateError("report issues must be a sequence")
@@ -617,12 +650,17 @@ class WarnWorkbenchService:
         for issue_id in selected:
             issue = by_id.get(issue_id)
             if issue is None:
-                raise WarnStateError(f"selected issue {issue_id} is missing from report")
+                raise WarnStateError("selected issue is missing from report")
             frame_range = normalize_issue_range(issue, total_frames)
-            code = _safe_code(issue.get("code")) or _safe_code(issue_id) or "issue"
+            public_issue_id = raw_to_public[issue_id]
+            code = (
+                _safe_code(issue.get("code"))
+                or (_safe_code(issue_id) if public_issue_id == issue_id else None)
+                or "issue"
+            )
             result.append(
                 WarnIssueDto(
-                    id=issue_id,
+                    id=public_issue_id,
                     display_name=(
                         _safe_display_text(issue.get("display_name"))
                         or _safe_display_text(issue.get("title"))
@@ -657,18 +695,14 @@ class WarnWorkbenchService:
             raise WarnStateError("report_revision must be a non-negative integer")
         manual_state = _manual_state(manual.get("state", "not_evaluated"))
         completion_mode = _completion_mode(manual.get("completion_mode"))
-        selected = manual.get("selected_issue_ids")
-        if not isinstance(selected, (list, tuple)) or any(
-            not isinstance(item, str) or not item for item in selected
-        ):
-            raise WarnStateError("manual_review.selected_issue_ids must contain strings")
+        _, raw_to_public, _ = _selected_issue_maps(manual)
         dto = WarnTaskDto(
             asset_id=asset_id,
             report_revision=revision,
             manual_review_state=manual_state,
             completion_mode=completion_mode,
             failure_reason=_failure_reason(manual.get("failure_reason")),
-            review_audit=_review_audit(manual.get("review_audit"), set(selected)),
+            review_audit=_review_audit(manual.get("review_audit"), raw_to_public),
             can_complete=self._can_complete(report),
             video=VideoDto(
                 f"/media/assets/{quote(asset_id, safe='')}/source",
@@ -727,6 +761,14 @@ class WarnWorkbenchService:
             raise WarnRevisionError("stale_revision")
         return lease
 
+    def _raw_issue_id(self, asset_id: str, public_issue_id: str) -> str:
+        report = self._report(asset_id)
+        _, _, public_to_raw = _selected_issue_maps(self._manual(report))
+        raw_issue_id = public_to_raw.get(public_issue_id)
+        if raw_issue_id is None:
+            raise WarnStateError("selected issue is not available")
+        return raw_issue_id
+
     def _domain_warn(self, asset_id: str, lease: Lease):
         service = self.warn_service
         if service is None or isinstance(service, WarnReviewService):
@@ -754,10 +796,11 @@ class WarnWorkbenchService:
         lease_token: str,
     ) -> dict[str, object]:
         lease = self._prepare_mutation(asset_id, expected_revision, lease_token)
+        raw_issue_id = self._raw_issue_id(asset_id, issue_id)
         service = self._domain_warn(asset_id, lease)
         service.submit_verdict(
             asset_id,
-            issue_id,
+            raw_issue_id,
             verdict,
             reason,
             expected_revision,
