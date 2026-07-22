@@ -42,8 +42,8 @@ _AUTOMATIC_MODULES = (
 )
 _PIPELINE_MODULES = (
     *_AUTOMATIC_MODULES,
-    "semantic_consistency",
     "manual_review",
+    "semantic_consistency",
 )
 
 
@@ -86,7 +86,7 @@ def _fixture_config() -> LoadedQcConfig:
             },
             "pipeline": {
                 "default_profile": "acceptance",
-                "terminal_module": "manual_review",
+                "terminal_module": "semantic_consistency",
                 "modules": list(_PIPELINE_MODULES),
             },
             "modules": modules,
@@ -336,7 +336,8 @@ def test_fixture_batch_reports_have_independent_revision_cursors(tmp_path: Path)
         for asset_id in ("pass", "warn", "hard-fail", "runtime-error")
     }
 
-    assert revisions["pass"] == revisions["warn"] == revisions["hard-fail"] == 5
+    assert revisions["pass"] == revisions["hard-fail"] == 6
+    assert revisions["warn"] == 5
     assert revisions["runtime-error"] == 2
 
 

@@ -75,6 +75,19 @@ def _write_asset(tmp_path: Path, *, report: dict | None = None) -> tuple[Path, P
     # paused at this external module; other cursors must be rejected.
     if report is None:
         value["pipeline_state"]["next_module"] = "semantic_consistency"
+    if value["pipeline_state"].get("next_module") == "semantic_consistency" and value[
+        "manual_review"
+    ].get("state") == "not_evaluated":
+        value["manual_review"].update(
+            {
+                "required": False,
+                "state": "not_required",
+                "selected_issue_ids": [],
+                "selected_issue_id": None,
+                "issue_reviews": {},
+                "completed_at": None,
+            }
+        )
     value["source_files"] = {"hdf5": {"path": str(hdf5_path)}}
     write_asset_qc_report(report_path, value, expected_revision=0, profile="acceptance")
     return hdf5_path, report_path
@@ -285,7 +298,7 @@ def test_complete_rejects_pipeline_cursor_outside_semantic_stage(tmp_path: Path)
     assert service.report_path(ASSET_ID).read_bytes() == before_report
 
 
-def test_complete_with_manual_candidates_advances_to_manual_review(tmp_path: Path) -> None:
+def test_semantic_task_is_blocked_while_manual_review_is_incomplete(tmp_path: Path) -> None:
     report = make_v2_report(status="awaiting_external")
     report["pipeline_state"]["next_module"] = "semantic_consistency"
     report["manual_review"].update(
@@ -300,14 +313,16 @@ def test_complete_with_manual_candidates_advances_to_manual_review(tmp_path: Pat
         }
     )
     service = _service(tmp_path, report=report)
-    completed = service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
-    assert completed.pipeline_state == "awaiting_external"
-    persisted = load_asset_qc_report(service.report_path(ASSET_ID))
-    assert persisted is not None
-    assert persisted["pipeline_state"]["next_module"] == "manual_review"
-    assert persisted["manual_review"]["candidate_issue_ids"] == ["warn-1"]
-    assert persisted["manual_review"]["selected_issue_ids"] == ["warn-1"]
-    assert persisted["manual_review"]["selection_policy"] == "all_candidates"
+    before_hdf5 = service._assets[ASSET_ID].read_bytes()
+    before_report = service.report_path(ASSET_ID).read_bytes()
+
+    with pytest.raises(TaskStateError, match="manual|eligible|blocked"):
+        service.get_task(ASSET_ID)
+    with pytest.raises(TaskStateError, match="manual|eligible|blocked"):
+        service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
+
+    assert service._assets[ASSET_ID].read_bytes() == before_hdf5
+    assert service.report_path(ASSET_ID).read_bytes() == before_report
 
 
 @pytest.mark.parametrize("operation", ["get", "confirm", "complete"])
@@ -442,6 +457,17 @@ def test_finalizing_wrong_pipeline_cursor_fails_closed_before_recovery(
 
 def test_finalizing_task_is_recovered_before_read(tmp_path: Path) -> None:
     report = make_v2_report(status="awaiting_external")
+    report["pipeline_state"]["next_module"] = "semantic_consistency"
+    report["manual_review"].update(
+        {
+            "required": False,
+            "state": "not_required",
+            "selected_issue_ids": [],
+            "selected_issue_id": None,
+            "issue_reviews": {},
+            "completed_at": None,
+        }
+    )
     report["semantic_calibration"] = {
         "state": "finalizing",
         "source_dataset_path": DATASET_PATH,

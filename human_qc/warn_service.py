@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report
+from qc_common.manual_review import mark_semantic_skipped_due_to_fail
 
 from .report_updates import reduce_overall_decision, update_human_state
 
@@ -289,9 +290,9 @@ class WarnReviewService:
     @staticmethod
     def _assert_semantic_handoff_available(report: Mapping[str, Any]) -> None:
         semantic = report.get("semantic_calibration")
-        if not isinstance(semantic, Mapping):
-            raise WarnStateError("semantic_calibration block is missing")
-        if semantic.get("pending_edit") is not None:
+        if semantic is not None and not isinstance(semantic, Mapping):
+            raise WarnStateError("semantic_calibration block must be an object")
+        if isinstance(semantic, Mapping) and semantic.get("pending_edit") is not None:
             raise WarnStateError("semantic calibration has a pending edit")
 
     @staticmethod
@@ -545,11 +546,10 @@ class WarnReviewService:
                     pipeline_now["status"] = "stopped"
                     pipeline_now["next_module"] = None
                     pipeline_now["stop_reason"] = "manual_review_failed"
-                    semantic = candidate.get("semantic_calibration")
-                    if not isinstance(semantic, dict):
-                        raise WarnStateError("semantic_calibration block is missing")
-                    semantic["state"] = "skipped_due_to_fail"
-                    semantic["pending_edit"] = None
+                    try:
+                        mark_semantic_skipped_due_to_fail(candidate)
+                    except ValueError as exc:
+                        raise WarnStateError(str(exc)) from exc
                     candidate["overall_decision"] = "fail"
                 elif actual_mode == "all_reviewed":
                     pipeline_now["status"] = "awaiting_external"

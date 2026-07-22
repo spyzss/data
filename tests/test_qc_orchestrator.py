@@ -508,7 +508,12 @@ import qc_common.module_registry
 def test_orchestrator_runs_in_config_order_and_retains_external_pause(
     tmp_path: Path,
 ) -> None:
-    modules = ["hdf5_text_info", "quality_hand", "semantic_consistency"]
+    modules = [
+        "hdf5_text_info",
+        "quality_hand",
+        "manual_review",
+        "semantic_consistency",
+    ]
     config = _config(tmp_path, modules)
     calls: list[str] = []
     registry = _registry(
@@ -529,13 +534,13 @@ def test_orchestrator_runs_in_config_order_and_retains_external_pause(
     assert first.executed_modules == ("hdf5_text_info", "quality_hand")
     assert first.report["pipeline_state"] == {
         "status": "awaiting_external",
-        "last_completed_module": "quality_hand",
+        "last_completed_module": "manual_review",
         "next_module": "semantic_consistency",
         "stop_reason": None,
     }
-    assert first.report["report_revision"] == 3
+    assert first.report["report_revision"] == 4
     assert "semantic_consistency" not in first.report
-    assert first.report["manual_review"]["state"] == "not_evaluated"
+    assert first.report["manual_review"]["state"] == "not_required"
 
     calls.clear()
     second = run_asset(
@@ -555,7 +560,12 @@ def test_orchestrator_runs_in_config_order_and_retains_external_pause(
 def test_module_states_distinguish_completed_skipped_and_awaiting_external(
     tmp_path: Path,
 ) -> None:
-    modules = ["hdf5_text_info", "quality_hand", "semantic_consistency"]
+    modules = [
+        "hdf5_text_info",
+        "quality_hand",
+        "manual_review",
+        "semantic_consistency",
+    ]
     config = _config(tmp_path, modules)
 
     outcome = run_asset(
@@ -574,6 +584,10 @@ def test_module_states_distinguish_completed_skipped_and_awaiting_external(
     assert outcome.report["execution"]["module_states"] == {
         "hdf5_text_info": {"state": "completed"},
         "quality_hand": {"state": "skipped"},
+        "manual_review": {
+            "state": "skipped",
+            "reason": "no_selected_issues",
+        },
         "semantic_consistency": {"state": "awaiting_external"},
     }
     assert outcome.report["quality_hand"]["flow"]["result_gate"]["verdict"] == (
@@ -587,8 +601,8 @@ def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
         "hdf5_text_info",
         "video_quality",
         "sam3_containment",
-        "semantic_consistency",
         "manual_review",
+        "semantic_consistency",
     ]
     verdicts = {
         "hdf5_text_info": "pass",
@@ -658,9 +672,9 @@ def test_profiles_keep_machine_fail_but_change_flow(tmp_path: Path) -> None:
     assert supplier["pipeline_state"]["status"] == "awaiting_external"
     assert "semantic_consistency" not in supplier
     assert supplier["overall_decision"] is None
-    assert supplier["manual_review"]["state"] == "not_evaluated"
+    assert supplier["manual_review"]["state"] == "not_required"
     assert acceptance["report_revision"] == 2
-    assert supplier["report_revision"] == 4
+    assert supplier["report_revision"] == 5
     acceptance_path = _context(tmp_path / "acceptance").report_path
     supplier_path = _context(tmp_path / "supplier").report_path
     assert json.loads(acceptance_path.read_text(encoding="utf-8")) == acceptance
@@ -809,7 +823,7 @@ def test_supplier_profile_records_blocked_sam3_and_continues_independent_module(
 def test_external_completion_preserves_incomplete_without_final_verdict(
     tmp_path: Path,
 ) -> None:
-    modules = ["hdf5_text_info", "semantic_consistency"]
+    modules = ["hdf5_text_info", "manual_review", "semantic_consistency"]
     config = _config(tmp_path, modules)
     context = _context(tmp_path)
     first = run_asset(
@@ -1043,7 +1057,12 @@ def test_detector_value_error_is_structured_as_nonretryable_runtime_error(
 
 
 def test_disabled_module_advances_without_a_fake_result(tmp_path: Path) -> None:
-    modules = ["hdf5_text_info", "quality_hand", "semantic_consistency"]
+    modules = [
+        "hdf5_text_info",
+        "quality_hand",
+        "manual_review",
+        "semantic_consistency",
+    ]
     config = _config(tmp_path, modules, disabled={"quality_hand"})
     calls: list[str] = []
 
@@ -1132,7 +1151,7 @@ def test_unavailable_automatic_runner_is_persisted_as_incomplete_error(
 
 
 def test_config_drift_is_rejected_before_resuming(tmp_path: Path) -> None:
-    modules = ["hdf5_text_info", "semantic_consistency"]
+    modules = ["hdf5_text_info", "manual_review", "semantic_consistency"]
     config = _config(tmp_path, modules)
     context = _context(tmp_path)
     first = run_asset(
@@ -1479,7 +1498,9 @@ def test_default_registry_is_bound_to_the_exact_asset_context(
 def test_resume_rejects_source_identity_drift_before_runner_work(
     tmp_path: Path,
 ) -> None:
-    config = _config(tmp_path, ["hdf5_text_info", "semantic_consistency"])
+    config = _config(
+        tmp_path, ["hdf5_text_info", "manual_review", "semantic_consistency"]
+    )
     original = _context(tmp_path)
     run_asset(
         original,

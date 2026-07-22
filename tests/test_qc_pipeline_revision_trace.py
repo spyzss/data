@@ -9,6 +9,7 @@ from typing import Any, Iterable
 import pytest
 
 import qc_common.report_mutation as report_mutation
+import qc_pipeline.orchestrator as orchestrator_module
 from qc_common.config import LoadedQcConfig
 from qc_common.contracts import Issue, ModuleResult
 from qc_common.module_registry import ModulePrerequisiteError, ModuleRegistry
@@ -21,8 +22,8 @@ _HASH = "sha256:" + "1" * 64
 _MODULES = (
     "hdf5_text_info",
     "quality_hand",
-    "semantic_consistency",
     "manual_review",
+    "semantic_consistency",
 )
 _WARN_ID = "quality_hand:fixture_warn:11111111111111111111"
 
@@ -72,7 +73,7 @@ def _config(tmp_path: Path) -> LoadedQcConfig:
             },
             "pipeline": {
                 "default_profile": "acceptance",
-                "terminal_module": "manual_review",
+                "terminal_module": "semantic_consistency",
                 "modules": list(_MODULES),
             },
             "modules": modules,
@@ -184,6 +185,7 @@ def run_trace_fixtures(tmp_path: Path, manifest_path: Path) -> list[dict[str, An
     traces: list[dict[str, Any]] = []
     reports: dict[str, list[dict[str, Any]]] = defaultdict(list)
     original_writer = report_mutation.write_asset_qc_report
+    original_orchestrator_writer = orchestrator_module.write_asset_qc_report
 
     def capture_writer(
         path: Path,
@@ -205,6 +207,7 @@ def run_trace_fixtures(tmp_path: Path, manifest_path: Path) -> list[dict[str, An
     # Patch only the shared mutation writer; run_asset and all mutation paths
     # still perform their real validation/CAS/atomic replacement.
     report_mutation.write_asset_qc_report = capture_writer
+    orchestrator_module.write_asset_qc_report = capture_writer
     try:
         for line in manifest_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -227,6 +230,7 @@ def run_trace_fixtures(tmp_path: Path, manifest_path: Path) -> list[dict[str, An
             assert outcome.report["asset_id"] == asset_id
     finally:
         report_mutation.write_asset_qc_report = original_writer
+        orchestrator_module.write_asset_qc_report = original_orchestrator_writer
 
     for asset_id in [
         json.loads(line)["asset_id"]
@@ -274,7 +278,7 @@ def test_trace_records_warn_candidates_and_skips_external_after_hard_fail(
         Path("tests/fixtures/qc_pipeline/manifest.jsonl"),
     )
     by_asset = group_by_asset(actual)
-    assert by_asset["warn"][-1]["module"] == "semantic_consistency"
+    assert by_asset["warn"][-1]["module"] == "manual_review"
     assert by_asset["warn"][-1]["pipeline_status"] == "awaiting_external"
     warn_report = json.loads(
         (tmp_path / "warn" / "quality_archive" / "warn.json").read_text(

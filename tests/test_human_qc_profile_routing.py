@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import h5py
 import pytest
 
+import qc_common.manual_review as manual_review_module
 from human_qc.semantic_service import SemanticCalibrationService
 from human_qc.warn_service import WarnReviewService
 from human_qc.workbench_service import WorkbenchService
@@ -29,7 +30,7 @@ def _config(
     tmp_path: Path,
     modules: list[str] | None = None,
 ) -> LoadedQcConfig:
-    modules = modules or ["auto", "semantic_consistency", "tail"]
+    modules = modules or ["auto", "manual_review", "semantic_consistency", "tail"]
     module_configs = {}
     for module in modules:
         if module in {"semantic_consistency", "manual_review"}:
@@ -109,6 +110,202 @@ def _warn_issue() -> Issue:
     )
 
 
+def test_semantic_eligibility_is_derived_only_from_persisted_manual_terminal_state() -> None:
+    eligibility = manual_review_module.semantic_eligibility
+
+    assert eligibility({"manual_review": {"state": "not_required"}}) == "ready"
+    assert eligibility(
+        {
+            "manual_review": {
+                "state": "completed",
+                "completion_mode": "all_reviewed",
+            }
+        }
+    ) == "ready"
+    assert eligibility(
+        {
+            "manual_review": {
+                "state": "completed",
+                "completion_mode": "early_fail",
+            }
+        }
+    ) == "skipped_due_to_fail"
+    assert eligibility({"manual_review": {"state": "queued"}}) == "blocked"
+    assert eligibility(
+        {"manual_review": {"state": "completed", "completion_mode": None}}
+    ) == "blocked"
+
+
+def test_no_warn_skips_manual_before_exposing_semantic(tmp_path: Path) -> None:
+    context = _context(tmp_path, "no-warn")
+    config = _config(
+        tmp_path,
+        ["auto", "manual_review", "semantic_consistency", "tail"],
+    )
+
+    outcome = run_asset(
+        context,
+        config=config,
+        profile="acceptance",
+        registry=_registry(),
+    )
+
+    assert outcome.status == "awaiting_external"
+    assert outcome.report["manual_review"]["state"] == "not_required"
+    assert outcome.report["pipeline_state"]["next_module"] == "semantic_consistency"
+
+
+def test_all_pass_manual_completion_hands_off_to_semantic(tmp_path: Path) -> None:
+    context = _context(tmp_path, "all-pass")
+    config = _config(
+        tmp_path,
+        ["auto", "manual_review", "semantic_consistency", "tail"],
+    )
+    first = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=_registry(auto_issues=(_warn_issue(),)),
+    )
+    warn = WarnReviewService(
+        reports={context.asset_id: context.report_path},
+        leases={context.asset_id: "lease"},
+        reviewer="alice",
+        clock=lambda: "2026-07-22T00:00:00Z",
+    )
+    reviewed = warn.submit_verdict(
+        context.asset_id,
+        "warn-1",
+        "pass",
+        None,
+        first.report["report_revision"],
+        "lease",
+    )
+    completed = warn.complete(
+        context.asset_id,
+        reviewed.report_revision,
+        "lease",
+        completion_mode="all_reviewed",
+        advance_pipeline=False,
+    )
+
+    resumed = resume_after_external(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        completed_module="manual_review",
+        expected_revision=completed.report_revision,
+        registry=_registry(),
+    )
+
+    assert resumed.status == "awaiting_external"
+    assert resumed.report["manual_review"]["completion_mode"] == "all_reviewed"
+    assert resumed.report["pipeline_state"]["next_module"] == "semantic_consistency"
+
+
+def test_early_fail_is_terminal_and_never_resumes_semantic(tmp_path: Path) -> None:
+    context = _context(tmp_path, "early-fail")
+    config = _config(
+        tmp_path,
+        ["auto", "manual_review", "semantic_consistency", "tail"],
+    )
+    first = run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=_registry(auto_issues=(_warn_issue(),)),
+    )
+    warn = WarnReviewService(
+        reports={context.asset_id: context.report_path},
+        leases={context.asset_id: "lease"},
+        reviewer="alice",
+        clock=lambda: "2026-07-22T00:00:00Z",
+    )
+    reviewed = warn.submit_verdict(
+        context.asset_id,
+        "warn-1",
+        "fail",
+        None,
+        first.report["report_revision"],
+        "lease",
+    )
+    completed = warn.complete(
+        context.asset_id,
+        reviewed.report_revision,
+        "lease",
+        completion_mode="early_fail",
+        advance_pipeline=False,
+    )
+    persisted = load_asset_qc_report(context.report_path)
+
+    assert completed.state == "completed"
+    assert persisted is not None
+    assert persisted["manual_review"]["completion_mode"] == "early_fail"
+    assert persisted["pipeline_state"]["status"] == "stopped"
+    assert persisted["pipeline_state"]["next_module"] is None
+    assert persisted["semantic_calibration"]["state"] == "skipped_due_to_fail"
+    before = context.report_path.read_bytes()
+    assert run_asset(
+        context,
+        config=config,
+        profile="supplier_evaluation",
+        registry=_registry(),
+    ).status == "stopped"
+    assert context.report_path.read_bytes() == before
+
+
+class _ForbiddenSemanticProjection:
+    def __init__(self, report_path: Path) -> None:
+        self._reports = {"blocked-semantic": report_path}
+        self.calls = 0
+
+    def get_task(self, asset_id: str) -> SimpleNamespace:
+        self.calls += 1
+        return SimpleNamespace(report_revision=1, report_state="not_started")
+
+
+def test_workbench_does_not_expose_semantic_task_before_manual_completion(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path, "blocked-semantic")
+    context.report_path.parent.mkdir(parents=True, exist_ok=True)
+    context.report_path.write_text(
+        json.dumps(
+            {
+                "asset_id": context.asset_id,
+                "report_revision": 1,
+                "execution": {"profile": "acceptance"},
+                "pipeline_state": {
+                    "status": "awaiting_external",
+                    "last_completed_module": "auto",
+                    "next_module": "manual_review",
+                    "stop_reason": None,
+                },
+                "manual_review": {
+                    "state": "queued",
+                    "candidate_issue_ids": ["warn-1"],
+                    "selected_issue_ids": ["warn-1"],
+                },
+                "issues": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    semantic = _ForbiddenSemanticProjection(context.report_path)
+    warn = _StaleWarnProjection(context.report_path, context.asset_id)
+    service = WorkbenchService(
+        semantic_service=semantic,
+        warn_service=warn,
+        asset_contexts={context.asset_id: context},
+    )
+
+    task = service.get_asset_task(context.asset_id)
+
+    assert task["task_type"] == "warn_review"
+    assert task["semantic"] is None
+    assert semantic.calls == 0
+
+
 def test_resume_after_external_advances_once_and_runs_successors(tmp_path: Path) -> None:
     context = _context(tmp_path)
     config = _config(tmp_path)
@@ -173,7 +370,7 @@ def test_supplier_machine_fail_continues_human_stage_but_remains_final_fail(tmp_
 
 def test_terminal_external_completion_preserves_machine_fail(tmp_path: Path) -> None:
     context = _context(tmp_path)
-    config = _config(tmp_path, ["auto", "semantic_consistency"])
+    config = _config(tmp_path, ["auto", "manual_review", "semantic_consistency"])
     first = run_asset(
         context,
         config=config,
@@ -197,7 +394,7 @@ def test_empty_manual_review_stage_skips_and_runs_downstream(tmp_path: Path) -> 
     context = _context(tmp_path)
     config = _config(
         tmp_path,
-        ["auto", "semantic_consistency", "manual_review", "tail"],
+        ["auto", "manual_review", "semantic_consistency", "tail"],
     )
     calls: list[str] = []
     registry = _registry(calls=calls)
@@ -229,7 +426,7 @@ def test_machine_warn_with_empty_selection_selects_all_and_awaits_manual_review(
     context = _context(tmp_path)
     config = _config(
         tmp_path,
-        ["auto", "semantic_consistency", "manual_review", "tail"],
+        ["auto", "manual_review", "semantic_consistency", "tail"],
     )
     calls: list[str] = []
     registry = _registry(calls=calls, auto_issues=(_warn_issue(),))
@@ -240,24 +437,12 @@ def test_machine_warn_with_empty_selection_selects_all_and_awaits_manual_review(
         registry=registry,
     )
     assert first.report["manual_review"]["candidate_issue_ids"] == ["warn-1"]
-    assert first.report["manual_review"].get("selected_issue_ids", []) == []
-
-    resumed = resume_after_external(
-        context,
-        config=config,
-        profile="supplier_evaluation",
-        completed_module="semantic_consistency",
-        expected_revision=first.report["report_revision"],
-        registry=registry,
-    )
-
-    assert resumed.status == "awaiting_external"
+    assert first.status == "awaiting_external"
     assert calls == ["auto"]
-    assert resumed.report["manual_review"]["candidate_issue_ids"] == ["warn-1"]
-    assert resumed.report["manual_review"]["selected_issue_ids"] == ["warn-1"]
-    assert resumed.report["manual_review"]["selection_policy"] == "all_candidates"
-    assert resumed.report["manual_review"]["state"] == "queued"
-    assert resumed.report["pipeline_state"]["next_module"] == "manual_review"
+    assert first.report["manual_review"]["selected_issue_ids"] == ["warn-1"]
+    assert first.report["manual_review"]["selection_policy"] == "all_candidates"
+    assert first.report["manual_review"]["state"] == "queued"
+    assert first.report["pipeline_state"]["next_module"] == "manual_review"
 
 
 def test_direct_manual_stage_selects_all_before_exposing_external_task(
@@ -266,7 +451,7 @@ def test_direct_manual_stage_selects_all_before_exposing_external_task(
     context = _context(tmp_path)
     config = _config(
         tmp_path,
-        ["auto", "semantic_consistency", "manual_review", "tail"],
+        ["auto", "manual_review", "semantic_consistency", "tail"],
     )
     registry = _registry(auto_issues=(_warn_issue(),))
     first = run_asset(
@@ -315,21 +500,13 @@ def test_restart_repairs_awaiting_manual_empty_selection_revision_safely(
     context = _context(tmp_path)
     config = _config(
         tmp_path,
-        ["auto", "semantic_consistency", "manual_review", "tail"],
+        ["auto", "manual_review", "semantic_consistency", "tail"],
     )
     registry = _registry(auto_issues=(_warn_issue(),))
-    semantic_pending = run_asset(
+    manual_pending = run_asset(
         context,
         config=config,
         profile="supplier_evaluation",
-        registry=registry,
-    )
-    manual_pending = resume_after_external(
-        context,
-        config=config,
-        profile="supplier_evaluation",
-        completed_module="semantic_consistency",
-        expected_revision=semantic_pending.report["report_revision"],
         registry=registry,
     )
     assert manual_pending.status == "awaiting_external"
@@ -370,7 +547,7 @@ def test_terminal_external_completion_replay_is_rejected_without_write(
     tmp_path: Path,
 ) -> None:
     context = _context(tmp_path)
-    config = _config(tmp_path, ["auto", "semantic_consistency"])
+    config = _config(tmp_path, ["auto", "manual_review", "semantic_consistency"])
     first = run_asset(
         context,
         config=config,
@@ -402,7 +579,7 @@ def test_successor_pending_external_replay_is_rejected_without_write(
     tmp_path: Path,
 ) -> None:
     context = _context(tmp_path)
-    config = _config(tmp_path, ["auto", "semantic_consistency", "tail"])
+    config = _config(tmp_path, ["auto", "manual_review", "semantic_consistency", "tail"])
     first = run_asset(
         context,
         config=config,
@@ -438,7 +615,7 @@ def test_workbench_warn_completion_resumes_configured_downstream_once(
     context = _context(tmp_path)
     config = _config(
         tmp_path,
-        ["auto", "semantic_consistency", "manual_review", "tail"],
+        ["auto", "manual_review", "semantic_consistency", "tail"],
     )
     calls: list[str] = []
     registry = _registry(calls=calls, auto_issues=(_warn_issue(),))
@@ -448,41 +625,8 @@ def test_workbench_warn_completion_resumes_configured_downstream_once(
         profile="supplier_evaluation",
         registry=registry,
     )
-    selected_report = load_asset_qc_report(context.report_path)
-    assert selected_report is not None
-    selected_report["manual_review"].update(
-        {
-            "required": True,
-            "state": "queued",
-            "selected_issue_ids": ["warn-1"],
-            "selected_issue_id": "warn-1",
-            "issue_reviews": {},
-            "completed_at": None,
-        }
-    )
-    context.report_path.write_text(json.dumps(selected_report), encoding="utf-8")
-    semantic_done = resume_after_external(
-        context,
-        config=config,
-        profile="supplier_evaluation",
-        completed_module="semantic_consistency",
-        expected_revision=first.report["report_revision"],
-        registry=registry,
-    )
-    assert semantic_done.status == "awaiting_external"
     report = load_asset_qc_report(context.report_path)
     assert report is not None
-    report["semantic_calibration"] = {
-        "state": "completed",
-        "source_dataset_path": "/label/subtask_label",
-        "base_hdf5_sha256": "sha256:" + "0" * 64,
-        "final_hdf5_sha256": "sha256:" + "1" * 64,
-        "timeline_edit_count": 0,
-        "subtask_text_edit_count": 0,
-        "pending_edit": None,
-        "audit": [],
-    }
-    context.report_path.write_text(json.dumps(report), encoding="utf-8")
     warn = WarnReviewService(
         reports={context.asset_id: context.report_path},
         reviewer="alice",
@@ -496,7 +640,7 @@ def test_workbench_warn_completion_resumes_configured_downstream_once(
         assert domain_report["manual_review"]["state"] == "completed"
         assert domain_report["pipeline_state"] == {
             "status": "awaiting_external",
-            "last_completed_module": "semantic_consistency",
+            "last_completed_module": "auto",
             "next_module": "manual_review",
             "stop_reason": None,
         }
@@ -524,14 +668,14 @@ def test_workbench_warn_completion_resumes_configured_downstream_once(
         lease_token=lease.token,
     )
 
-    assert completed["task_type"] == "completed"
-    assert calls == ["auto", "tail"]
+    assert calls == ["auto"]
     persisted = load_asset_qc_report(context.report_path)
     assert persisted is not None
     assert persisted["execution"]["module_states"]["manual_review"] == {
         "state": "completed"
     }
-    assert persisted["pipeline_state"]["last_completed_module"] == "tail"
+    assert persisted["pipeline_state"]["last_completed_module"] == "manual_review"
+    assert persisted["pipeline_state"]["next_module"] == "semantic_consistency"
 
 
 def test_workbench_semantic_completion_keeps_cursor_for_orchestrator(
@@ -578,7 +722,7 @@ def test_workbench_semantic_completion_keeps_cursor_for_orchestrator(
     )
     config = _config(
         tmp_path,
-        ["auto", "semantic_consistency", "manual_review", "tail"],
+        ["auto", "manual_review", "semantic_consistency", "tail"],
     )
     calls: list[str] = []
     registry = _registry(calls=calls)
@@ -669,7 +813,7 @@ def test_task_fetch_recovers_semantic_domain_completion_crash_window_once(
         tmp_path / "quality_archive" / f"{asset_id}.json",
         {"hdf5": {"path": hdf5_path.relative_to(tmp_path).as_posix()}},
     )
-    config = _config(tmp_path, ["auto", "semantic_consistency", "tail"])
+    config = _config(tmp_path, ["auto", "manual_review", "semantic_consistency", "tail"])
     calls: list[str] = []
     registry = _registry(calls=calls)
     first = run_asset(context, config=config, profile="acceptance", registry=registry)
@@ -733,7 +877,7 @@ def test_task_fetch_recovers_warn_domain_completion_crash_window_once(
     context = _context(tmp_path, "warn-recovery")
     config = _config(
         tmp_path,
-        ["auto", "semantic_consistency", "manual_review", "tail"],
+        ["auto", "manual_review", "semantic_consistency", "tail"],
     )
     calls: list[str] = []
     registry = _registry(calls=calls, auto_issues=(_warn_issue(),))
@@ -745,38 +889,6 @@ def test_task_fetch_recovers_warn_domain_completion_crash_window_once(
     )
     report = load_asset_qc_report(context.report_path)
     assert report is not None
-    report["manual_review"].update(
-        {
-            "required": True,
-            "state": "queued",
-            "selected_issue_ids": ["warn-1"],
-            "selected_issue_id": "warn-1",
-            "issue_reviews": {},
-            "completed_at": None,
-        }
-    )
-    context.report_path.write_text(json.dumps(report), encoding="utf-8")
-    resume_after_external(
-        context,
-        config=config,
-        profile="supplier_evaluation",
-        completed_module="semantic_consistency",
-        expected_revision=first.report["report_revision"],
-        registry=registry,
-    )
-    report = load_asset_qc_report(context.report_path)
-    assert report is not None
-    report["semantic_calibration"] = {
-        "state": "completed",
-        "source_dataset_path": "/label/subtask_label",
-        "base_hdf5_sha256": "sha256:" + "0" * 64,
-        "final_hdf5_sha256": "sha256:" + "1" * 64,
-        "timeline_edit_count": 0,
-        "subtask_text_edit_count": 0,
-        "pending_edit": None,
-        "audit": [],
-    }
-    context.report_path.write_text(json.dumps(report), encoding="utf-8")
     warn = WarnReviewService(
         reports={context.asset_id: context.report_path},
         leases={context.asset_id: "lease"},
@@ -828,10 +940,11 @@ def test_task_fetch_recovers_warn_domain_completion_crash_window_once(
     recovered_again = service.get_asset_task(context.asset_id)
 
     assert recovered["task_type"] == recovered_again["task_type"] == "completed"
-    assert calls == ["auto", "tail"]
+    assert calls == ["auto"]
     persisted = load_asset_qc_report(context.report_path)
     assert persisted is not None
-    assert persisted["pipeline_state"]["last_completed_module"] == "tail"
+    assert persisted["pipeline_state"]["last_completed_module"] == "manual_review"
+    assert persisted["pipeline_state"]["next_module"] == "semantic_consistency"
     assert "orchestrator_resume_required" not in persisted["manual_review"]
     assert context.report_path.read_bytes() == after_first_fetch
 
@@ -843,12 +956,12 @@ def test_task_fetch_recovers_transition_persisted_before_successor_run_once(
     completed_module: str,
 ) -> None:
     context = _context(tmp_path, f"post-transition-{completed_module}")
-    modules = ["auto", "semantic_consistency", "tail"]
-    if completed_module == "manual_review":
-        modules = ["auto", "semantic_consistency", "manual_review", "tail"]
-    config = _config(tmp_path, modules)
+    config = _config(
+        tmp_path, ["auto", "manual_review", "semantic_consistency", "tail"]
+    )
     calls: list[str] = []
-    registry = _registry(calls=calls, auto_issues=(_warn_issue(),))
+    issues = (_warn_issue(),) if completed_module == "manual_review" else ()
+    registry = _registry(calls=calls, auto_issues=issues)
     first = run_asset(
         context,
         config=config,
@@ -857,48 +970,42 @@ def test_task_fetch_recovers_transition_persisted_before_successor_run_once(
     )
     report = load_asset_qc_report(context.report_path)
     assert report is not None
-    report["semantic_calibration"] = {
-        "state": "completed",
-        "source_dataset_path": "/label/subtask_label",
-        "base_hdf5_sha256": "sha256:" + "0" * 64,
-        "final_hdf5_sha256": "sha256:" + "1" * 64,
-        "timeline_edit_count": 0,
-        "subtask_text_edit_count": 0,
-        "pending_edit": None,
-        "audit": [],
-        "orchestrator_resume_required": True,
-    }
     if completed_module == "manual_review":
-        report["manual_review"].update(
-            {
-                "required": True,
-                "state": "queued",
-                "selected_issue_ids": ["warn-1"],
-                "selected_issue_id": "warn-1",
-                "issue_reviews": {},
-                "completed_at": None,
-            }
+        warn = WarnReviewService(
+            reports={context.asset_id: context.report_path},
+            leases={context.asset_id: "lease"},
+            reviewer="alice",
         )
-        context.report_path.write_text(json.dumps(report), encoding="utf-8")
-        resume_after_external(
-            context,
-            config=config,
-            profile="supplier_evaluation",
-            completed_module="semantic_consistency",
-            expected_revision=first.report["report_revision"],
-            registry=registry,
+        reviewed = warn.submit_verdict(
+            context.asset_id,
+            "warn-1",
+            "pass",
+            None,
+            first.report["report_revision"],
+            "lease",
+        )
+        warn.complete(
+            context.asset_id,
+            reviewed.report_revision,
+            "lease",
+            completion_mode="all_reviewed",
+            advance_pipeline=False,
         )
         report = load_asset_qc_report(context.report_path)
         assert report is not None
-        report["manual_review"].update(
-            {
-                "state": "completed",
-                "issue_reviews": {"warn-1": {"verdict": "pass"}},
-                "completed_at": "2026-07-15T00:00:00Z",
-                "orchestrator_resume_required": True,
-            }
-        )
-    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    else:
+        report["semantic_calibration"] = {
+            "state": "completed",
+            "source_dataset_path": "/label/subtask_label",
+            "base_hdf5_sha256": "sha256:" + "0" * 64,
+            "final_hdf5_sha256": "sha256:" + "1" * 64,
+            "timeline_edit_count": 0,
+            "subtask_text_edit_count": 0,
+            "pending_edit": None,
+            "audit": [],
+            "orchestrator_resume_required": True,
+        }
+        context.report_path.write_text(json.dumps(report), encoding="utf-8")
     expected_revision = int(report["report_revision"])
     real_run_asset = orchestrator_module.run_asset
     downstream_attempts = 0
@@ -926,7 +1033,10 @@ def test_task_fetch_recovers_transition_persisted_before_successor_run_once(
     crashed = load_asset_qc_report(context.report_path)
     assert crashed is not None
     assert crashed["pipeline_state"]["status"] == "running"
-    assert crashed["pipeline_state"]["next_module"] == "tail"
+    expected_next = (
+        "semantic_consistency" if completed_module == "manual_review" else "tail"
+    )
+    assert crashed["pipeline_state"]["next_module"] == expected_next
     assert crashed["pipeline_state"]["external_resume"]["completed_module"] == completed_module
     transition_revision = crashed["report_revision"]
     service = WorkbenchService(
@@ -941,7 +1051,7 @@ def test_task_fetch_recovers_transition_persisted_before_successor_run_once(
     recovered_again = service.get_asset_task(context.asset_id)
 
     assert recovered["task_type"] == recovered_again["task_type"] == "completed"
-    assert calls == ["auto", "tail"]
+    assert calls == (["auto"] if completed_module == "manual_review" else ["auto", "tail"])
     assert downstream_attempts == 2
     persisted = load_asset_qc_report(context.report_path)
     assert persisted is not None
@@ -952,7 +1062,7 @@ def test_task_fetch_recovers_transition_persisted_before_successor_run_once(
 
 def test_task_fetch_does_not_run_unowned_running_pipeline(tmp_path: Path) -> None:
     context = _context(tmp_path, "unowned-running")
-    config = _config(tmp_path, ["auto", "semantic_consistency", "tail"])
+    config = _config(tmp_path, ["auto", "manual_review", "semantic_consistency", "tail"])
     calls: list[str] = []
     registry = _registry(calls=calls)
     first = run_asset(
@@ -997,7 +1107,11 @@ def test_workbench_lists_only_profile_matching_external_assets(tmp_path: Path) -
                     "report_revision": 2,
                     "execution": {"profile": profile},
                     "pipeline_state": {"status": status, "next_module": next_module},
-                    "manual_review": {"state": "not_evaluated", "candidate_issue_ids": []},
+                    "manual_review": {
+                        "state": "not_required",
+                        "candidate_issue_ids": [],
+                        "selected_issue_ids": [],
+                    },
                     "issues": [],
                 }
             ),
@@ -1015,7 +1129,7 @@ def test_acceptance_hard_stop_exposes_no_semantic_task_or_lease(tmp_path: Path) 
     context = _context(tmp_path, "acceptance-hard-stop")
     config = _config(
         tmp_path,
-        ["auto", "semantic_consistency", "manual_review", "tail"],
+        ["auto", "manual_review", "semantic_consistency", "tail"],
     )
     outcome = run_asset(
         context,
@@ -1080,7 +1194,11 @@ def test_terminal_status_blocks_stale_projection_acquire_and_renew(
             "next_module": "semantic_consistency",
             "stop_reason": None,
         },
-        "manual_review": {"state": "not_evaluated", "candidate_issue_ids": []},
+        "manual_review": {
+            "state": "not_required",
+            "candidate_issue_ids": [],
+            "selected_issue_ids": [],
+        },
         "issues": [],
     }
     context.report_path.parent.mkdir(parents=True, exist_ok=True)

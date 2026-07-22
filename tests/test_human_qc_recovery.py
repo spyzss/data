@@ -75,7 +75,7 @@ def _managed_artifacts(path: Path) -> list[Path]:
 
 
 def test_browser_refresh_recovers_pending_edit_from_server_report(tmp_path: Path) -> None:
-    asset = build_file_asset(tmp_path, asset_id="asset-refresh")
+    asset = build_file_asset(tmp_path, asset_id="asset-refresh", selected_warn_ids=())
     first = _semantic(asset)
     pending = first.begin_boundary_edit(asset.asset_id, _boundary_request(1))
     restarted_semantic = _semantic(asset)
@@ -102,7 +102,7 @@ def test_browser_refresh_recovers_pending_edit_from_server_report(tmp_path: Path
 
 
 def test_two_reviewers_with_same_snapshot_cannot_overwrite_newer_revision(tmp_path: Path) -> None:
-    asset = build_file_asset(tmp_path, asset_id="asset-stale")
+    asset = build_file_asset(tmp_path, asset_id="asset-stale", selected_warn_ids=())
     alice = _semantic(asset, lease="lease-alice")
     bob = _semantic(asset, lease="lease-bob")
     snapshot_revision = alice.get_task(asset.asset_id).report_revision
@@ -123,7 +123,7 @@ def test_two_reviewers_with_same_snapshot_cannot_overwrite_newer_revision(tmp_pa
 
 
 def test_expired_workbench_lease_blocks_mutation_without_report_write(tmp_path: Path) -> None:
-    asset = build_file_asset(tmp_path, asset_id="asset-expired")
+    asset = build_file_asset(tmp_path, asset_id="asset-expired", selected_warn_ids=())
     clock = Clock()
     semantic = SemanticCalibrationService(
         assets={asset.asset_id: asset.hdf5_path}, reports={asset.asset_id: asset.report_path}
@@ -154,7 +154,6 @@ def test_expired_workbench_lease_blocks_mutation_without_report_write(tmp_path: 
 def test_overlay_failure_degrades_in_integrated_task_but_keeps_clip(tmp_path: Path) -> None:
     asset = build_file_asset(tmp_path, asset_id="asset-overlay", hard_fail=False)
     semantic = _semantic(asset)
-    semantic.complete(asset.asset_id, expected_revision=1, lease_token=LEASE)
 
     def generate_clip(command, output: Path) -> None:
         output.write_bytes(b"clip")
@@ -185,7 +184,6 @@ def test_overlay_failure_degrades_in_integrated_task_but_keeps_clip(tmp_path: Pa
 def test_clip_failure_exposes_stable_code_without_internal_exception(tmp_path: Path) -> None:
     asset = build_file_asset(tmp_path, asset_id="asset-clip-error", hard_fail=False)
     semantic = _semantic(asset)
-    semantic.complete(asset.asset_id, expected_revision=1, lease_token=LEASE)
 
     def fail_clip(*_args: object) -> None:
         raise RuntimeError(f"ffmpeg failed for {asset.video_path}")
@@ -205,7 +203,7 @@ def test_clip_failure_exposes_stable_code_without_internal_exception(tmp_path: P
 def test_prepare_phase_failure_leaves_original_byte_identical(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    asset = build_file_asset(tmp_path, asset_id="asset-prepare")
+    asset = build_file_asset(tmp_path, asset_id="asset-prepare", selected_warn_ids=())
     service = _semantic(asset)
     before_hdf5 = asset.hdf5_path.read_bytes()
     before_report = asset.report_path.read_bytes()
@@ -225,7 +223,7 @@ def test_prepare_phase_failure_leaves_original_byte_identical(
 def test_replace_failure_keeps_old_bytes_then_restart_completes_and_cleans(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    asset = build_file_asset(tmp_path, asset_id="asset-replace")
+    asset = build_file_asset(tmp_path, asset_id="asset-replace", selected_warn_ids=())
     service = _semantic(asset)
     before_hdf5 = asset.hdf5_path.read_bytes()
 
@@ -250,7 +248,9 @@ def test_replace_failure_keeps_old_bytes_then_restart_completes_and_cleans(
 def test_replace_success_report_failure_recovers_after_restart_without_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    asset = build_file_asset(tmp_path, asset_id="asset-report-recovery")
+    asset = build_file_asset(
+        tmp_path, asset_id="asset-report-recovery", selected_warn_ids=()
+    )
     service = _semantic(asset)
     module = __import__("human_qc.semantic_service", fromlist=["update_human_state"])
     real_update = module.update_human_state
@@ -276,7 +276,9 @@ def test_replace_success_report_failure_recovers_after_restart_without_artifacts
 
 
 def test_unknown_current_hash_refuses_recovery_overwrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    asset = build_file_asset(tmp_path, asset_id="asset-hash-conflict")
+    asset = build_file_asset(
+        tmp_path, asset_id="asset-hash-conflict", selected_warn_ids=()
+    )
     service = _semantic(asset)
     monkeypatch.setattr(
         "human_qc.semantic_service.commit_hdf5_replacement",

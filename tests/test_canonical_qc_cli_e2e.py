@@ -152,9 +152,9 @@ def test_canonical_config_active_alias_matches_immutable_validated_snapshot() ->
     loaded = load_canonical_qc_config()
 
     alias = ROOT / "configs/canonical_qc.yaml"
-    snapshot = ROOT / "configs/canonical_qc/canonical_qc_v1.2.0.yaml"
+    snapshot = ROOT / "configs/canonical_qc/canonical_qc_v1.3.0.yaml"
     assert alias.read_bytes() == snapshot.read_bytes()
-    assert loaded.config_version == "canonical_qc_v1.2.0"
+    assert loaded.config_version == "canonical_qc_v1.3.0"
     assert loaded.source_gate_rule_id == "canonical.source_gate.contract_failure"
     qc = load_qc_acceptance_config(loaded.qc_config_path)
     registered_qc_rule_ids = {
