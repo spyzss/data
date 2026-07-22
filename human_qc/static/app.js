@@ -127,6 +127,9 @@ export class WarnReviewApp {
     this.timeline = null;
     this._overlayAvailability = new Map();
     this._overlayPollTimer = null;
+    this._overlayPollInFlight = null;
+    this._overlayPollQueued = false;
+    this._overlayPollQueuedReset = false;
     this._overlayPollGeneration = 0;
     this._overlayPollDelay = 1000;
     this._overlayAbort = null;
@@ -566,6 +569,9 @@ export class WarnReviewApp {
     this._overlayPollGeneration += 1;
     if (this._overlayPollTimer !== null) this.scheduler.clearTimeout?.(this._overlayPollTimer);
     this._overlayPollTimer = null;
+    this._overlayPollInFlight = null;
+    this._overlayPollQueued = false;
+    this._overlayPollQueuedReset = false;
     this._overlayAbort?.abort?.();
     this._overlayAbort = null;
     for (const issueId of this._overlayRetrying) this.panel.setRetryPending?.(issueId, false);
@@ -578,6 +584,11 @@ export class WarnReviewApp {
     const issues = this._overlayIssuesToPoll();
     const cooldownDelay = this._nextOverlayCooldownDelay();
     if (!issues.length && cooldownDelay === null) return;
+    if (this._overlayPollInFlight) {
+      this._overlayPollQueued = true;
+      this._overlayPollQueuedReset = this._overlayPollQueuedReset || reset;
+      return;
+    }
     if (reset) this._overlayPollDelay = 1000;
     if (this._overlayPollTimer !== null) return;
     const jitter = 0.8 + Math.min(Math.max(Number(this.random()) || 0.5, 0), 1) * 0.4;
@@ -587,8 +598,29 @@ export class WarnReviewApp {
     const generation = this._overlayPollGeneration;
     this._overlayPollTimer = this.scheduler.setTimeout(() => {
       this._overlayPollTimer = null;
-      return this._pollOverlayStatuses(generation);
+      return this._runOverlayPoll(generation);
     }, delay);
+  }
+
+  _runOverlayPoll(generation) {
+    if (!this.assetId || generation !== this._overlayPollGeneration) return Promise.resolve(null);
+    if (this._overlayPollInFlight) {
+      this._overlayPollQueued = true;
+      return this._overlayPollInFlight;
+    }
+    const pending = this._pollOverlayStatuses(generation);
+    this._overlayPollInFlight = pending;
+    void pending.finally(() => {
+      if (this._overlayPollInFlight !== pending) return;
+      this._overlayPollInFlight = null;
+      if (generation !== this._overlayPollGeneration) return;
+      const queued = this._overlayPollQueued;
+      const reset = this._overlayPollQueuedReset;
+      this._overlayPollQueued = false;
+      this._overlayPollQueuedReset = false;
+      if (queued) this._scheduleOverlayPoll({ reset });
+    }).catch(() => {});
+    return pending;
   }
 
   async _overlayRequest(path, { method = "GET", body = undefined, signal = undefined } = {}) {

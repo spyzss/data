@@ -88,6 +88,17 @@ function fakePanelRoot() {
 }
 
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+
 test("the earliest pending active warning wins even when active ids arrive in another order", () => {
   const task = canonicalTask();
   assert.equal(nextDecisionTarget(task, ["shake", "exposure"], null), "exposure");
@@ -334,6 +345,171 @@ test("status transport failures and 5xx show a safe retry notice without clearin
   assert.deepEqual(app.panel.reasonDraft().reasonCodes, ["occlusion"]);
   assert.deepEqual(timers.map((timer) => timer.delay), [4000]);
   app.destroy();
+});
+
+
+test("a retry queues behind a suspended status poll instead of starting a concurrent same-generation fetch", async () => {
+  const initial = canonicalTask({
+    issues: canonicalTask().issues.map((issue) => {
+      if (issue.id === "exposure") return { ...issue, overlay: { status: "generating", segments: [] } };
+      if (issue.id === "shake") return { ...issue, overlay: { status: "failed", retryable: true, segments: [] } };
+      return issue;
+    }),
+  });
+  const firstStatus = deferred();
+  const timers = [];
+  let statusCalls = 0;
+  const app = new WarnReviewApp({
+    scheduler: {
+      setTimeout(fn, delay) {
+        const timer = { fn, delay };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout(timer) {
+        const index = timers.indexOf(timer);
+        if (index >= 0) timers.splice(index, 1);
+      },
+    },
+    random: () => 0.5,
+    fetcher: async (path) => {
+      if (path.endsWith("/task")) return { ok: true, status: 200, json: async () => ({ task: initial }) };
+      if (path.endsWith("/retry")) return {
+        ok: true,
+        status: 202,
+        json: async () => ({
+          asset_id: "asset-1",
+          issue_id: "shake",
+          overlay: { status: "ready", segments: [] },
+        }),
+      };
+      if (path.endsWith("/status")) {
+        statusCalls += 1;
+        if (statusCalls === 1) return firstStatus.promise;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            asset_id: "asset-1",
+            issue_id: "exposure",
+            overlay: { status: "generating", segments: [] },
+          }),
+        };
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+
+  await app.loadAsset("asset-1");
+  const pollA = timers.shift().fn();
+  await Promise.resolve();
+  assert.equal(statusCalls, 1);
+
+  await app.retryOverlay("shake");
+  assert.equal(statusCalls, 1);
+  assert.equal(timers.length, 0);
+
+  firstStatus.resolve({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      asset_id: "asset-1",
+      issue_id: "exposure",
+      overlay: { status: "generating", segments: [] },
+    }),
+  });
+  await pollA;
+  await Promise.resolve();
+  assert.equal(statusCalls, 1);
+  assert.deepEqual(timers.map((timer) => timer.delay), [1000]);
+
+  await timers.shift().fn();
+  assert.equal(statusCalls, 2);
+  app.destroy();
+});
+
+
+test("asset changes and destroy clear queued state from a suspended overlay poll", async () => {
+  const initial = canonicalTask({
+    issues: canonicalTask().issues.map((issue) => (
+      issue.id === "exposure" ? { ...issue, overlay: { status: "generating", segments: [] } } : issue
+    )),
+  });
+  const successor = canonicalTask({
+    asset_id: "asset-2",
+    video: { ...canonicalTask().video, url: "/media/assets/asset-2/source" },
+  });
+  const timers = [];
+  const pendingStatus = deferred();
+  const destroyedStatus = deferred();
+  let statusRequests = 0;
+  const app = new WarnReviewApp({
+    scheduler: {
+      setTimeout(fn, delay) {
+        const timer = { fn, delay };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout(timer) {
+        const index = timers.indexOf(timer);
+        if (index >= 0) timers.splice(index, 1);
+      },
+    },
+    random: () => 0.5,
+    fetcher: async (path) => {
+      if (path.endsWith("/assets/asset-1/task")) return { ok: true, status: 200, json: async () => ({ task: initial }) };
+      if (path.endsWith("/assets/asset-2/task")) return { ok: true, status: 200, json: async () => ({ task: successor }) };
+      if (path.endsWith("/status")) {
+        statusRequests += 1;
+        return statusRequests === 1 ? pendingStatus.promise : destroyedStatus.promise;
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+
+  await app.loadAsset("asset-1");
+  const pendingPoll = timers.shift().fn();
+  await Promise.resolve();
+  await app.loadAsset("asset-2");
+  assert.equal(app._overlayPollInFlight, null);
+  assert.equal(timers.length, 0);
+
+  pendingStatus.resolve({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      asset_id: "asset-1",
+      issue_id: "exposure",
+      overlay: { status: "generating", segments: [] },
+    }),
+  });
+  await pendingPoll;
+  await Promise.resolve();
+  assert.equal(app.assetId, "asset-2");
+  assert.equal(app._overlayPollInFlight, null);
+  assert.equal(timers.length, 0);
+
+  await app.loadAsset("asset-1");
+  const destroyedPoll = timers.shift().fn();
+  await Promise.resolve();
+  app.destroy();
+  assert.equal(app._overlayPollInFlight, null);
+  assert.equal(app._overlayPollTimer, null);
+  assert.equal(timers.length, 0);
+
+  destroyedStatus.resolve({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      asset_id: "asset-1",
+      issue_id: "exposure",
+      overlay: { status: "generating", segments: [] },
+    }),
+  });
+  await destroyedPoll;
+  await Promise.resolve();
+  assert.equal(app._overlayPollInFlight, null);
+  assert.equal(timers.length, 0);
 });
 
 

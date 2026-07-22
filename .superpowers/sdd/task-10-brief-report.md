@@ -56,6 +56,27 @@ git diff --check
 # success
 ```
 
+## 终审修复（二）：轮询单飞
+
+- status poll 显式保存单个 in-flight promise；任意 retry 或下一轮 intent 在前一轮结束前仅标记 queued，不会启动同 generation 的并发 status fetch。
+- queued retry 保留 reset intent，当前 poll 结束后才按既有 scheduler 安排一次后续轮询；原有 1/2/4/5 秒退避、503 `Retry-After` 和本地草稿语义不变。
+- asset change 和 destroy 会同时清空 timer、queued intent 和 in-flight 引用；迟到的旧请求不能为新 asset 重新安排轮询。
+
+```text
+node --test human_qc/static/*.test.mjs
+# 59 passed
+
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_static_contract.py \
+  tests/test_human_qc_workbench.py \
+  tests/test_human_qc_http_server.py
+# 34 passed
+
+node --check human_qc/static/app.js
+git diff --check
+# success
+```
+
 ## 终审修复（最小范围）
 
 - 同一 issue 的 `generating` 状态仅在 overlay 安全投影实际变化时重置轮询；连续同值响应按 `1000 → 2000 → 4000 → 5000ms` 退避。
