@@ -1059,6 +1059,73 @@ def test_production_provider_never_exposes_ready_segments_from_a_failed_multi_in
     )
 
 
+def test_production_provider_retries_the_same_asset_union_request_once(
+    tmp_path: Path,
+) -> None:
+    module = _renderer_module()
+    renderer, *_ = _renderer(tmp_path)
+    request = replace(
+        _request(tmp_path, renderer, interval=(120, 169)),
+        intervals=((120, 169), (390, 427)),
+    )
+    from human_qc.overlay_worker import OverlayJobView, OverlaySegmentView
+    from human_qc.warn_workbench_service import FrameRangeDto, OverlayIssueInput
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.retry_requests: list[object] = []
+            self.failed = OverlayJobView(
+                request.cache_key,
+                "failed",
+                (
+                    OverlaySegmentView(120, 169, "failed", "opaque-a", code="overlay_render_failed", retryable=True),
+                    OverlaySegmentView(390, 427, "failed", "opaque-b", code="overlay_render_failed", retryable=True),
+                ),
+                code="overlay_render_failed",
+                retryable=True,
+            )
+            self.pending = OverlayJobView(
+                request.cache_key,
+                "pending",
+                (
+                    OverlaySegmentView(120, 169, "pending", "opaque-a"),
+                    OverlaySegmentView(390, 427, "pending", "opaque-b"),
+                ),
+            )
+
+        def submit(self, value):
+            assert value is request
+            return self.failed
+
+        def get(self, value):
+            assert value is request
+            return self.failed
+
+        def retry(self, value):
+            self.retry_requests.append(value)
+            return self.pending
+
+    worker = FakeWorker()
+    selected = (
+        OverlayIssueInput("issue-a", FrameRangeDto(120, 169)),
+        OverlayIssueInput("issue-b", FrameRangeDto(390, 427)),
+    )
+    production = module.ProductionWorkerOverlayProvider(
+        worker=worker,
+        request_factory=lambda asset_id, actual_selected: (
+            request if asset_id == "asset-1" and actual_selected == selected else None
+        ),
+    )
+
+    values = production.retry_asset_overlays("asset-1", selected)
+
+    assert worker.retry_requests == [request]
+    assert {issue_id: value.status for issue_id, value in values.items()} == {
+        "issue-a": "pending",
+        "issue-b": "pending",
+    }
+
+
 def test_ready_overlay_url_is_pinned_until_catalog_lease_expiry_across_asset_eviction(
     tmp_path: Path,
 ) -> None:

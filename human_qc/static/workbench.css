@@ -103,6 +103,15 @@ h2 { font-size: 21px; letter-spacing: -.025em; }
   background: radial-gradient(circle at 46% 34%, #193457 0, #0d1d32 62%, #081525 100%);
 }
 .video-stage video { display: block; width: 100%; height: min(56vw, 610px); object-fit: contain; }
+.video-stage [data-overlay-video] {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  width: 100%;
+  height: min(56vw, 610px);
+  pointer-events: none;
+}
+.video-stage [data-overlay-video][hidden] { display: none; }
 .video-placeholder {
   position: absolute;
   inset: 0;
@@ -306,6 +315,8 @@ h2 { font-size: 21px; letter-spacing: -.025em; }
 .other-reason-label { display: grid; gap: 8px; margin-top: 14px; color: #536b88; font-size: 14px; font-weight: 700; }
 .other-reason-label input { width: min(680px, 100%); min-height: 45px; padding: 10px 13px; border: 1px solid #b9cdf0; border-radius: 10px; color: var(--ink); }
 .overlay-state { margin-top: 14px; color: var(--muted); font-size: 13px; }
+.overlay-retry { min-height: 38px; margin-top: 12px; padding: 7px 13px; border: 1px solid #d89a35; border-radius: 9px; background: var(--amber-soft); color: #9c5d07; font-weight: 750; }
+.overlay-retry:hover:not(:disabled) { background: #ffedcb; }
 
 .verdict-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 24px; }
 .verdict-actions button, .complete-button { min-height: 50px; border-radius: 11px; font-weight: 800; }

@@ -138,12 +138,14 @@ export class ReviewPanel {
     onVerdict = null,
     onComplete = null,
     onSelectIssue = null,
+    onRetryOverlay = null,
     canSubmitIssue = () => true,
   } = {}) {
     this.document = documentRef;
     this.onVerdict = typeof onVerdict === "function" ? onVerdict : async () => {};
     this.onComplete = typeof onComplete === "function" ? onComplete : async () => {};
     this.onSelectIssue = typeof onSelectIssue === "function" ? onSelectIssue : () => {};
+    this.onRetryOverlay = typeof onRetryOverlay === "function" ? onRetryOverlay : async () => {};
     this.canSubmitIssue = typeof canSubmitIssue === "function" ? canSubmitIssue : () => true;
     this.root = null;
     this.task = null;
@@ -153,6 +155,8 @@ export class ReviewPanel {
     this.otherText = "";
     this.localError = "";
     this.isBusy = false;
+    this.overlayAvailability = new Map();
+    this.retryingOverlayIssues = new Set();
     this._bound = false;
     this._clickListener = (event) => this._handleClick(event);
     this._inputListener = (event) => this._handleInput(event);
@@ -223,6 +227,33 @@ export class ReviewPanel {
     this.isBusy = Boolean(busy);
     this.render();
     return this.isBusy;
+  }
+
+  setOverlayAvailability(issueId, available, code = null) {
+    if (typeof issueId !== "string" || !issueId) return;
+    this.overlayAvailability.set(issueId, { available: available === true, code });
+    this.render();
+  }
+
+  clearOverlayAvailability() {
+    this.overlayAvailability.clear();
+    this.render();
+  }
+
+  setRetryPending(issueId, pending) {
+    if (typeof issueId !== "string" || !issueId) return;
+    if (pending) this.retryingOverlayIssues.add(issueId);
+    else this.retryingOverlayIssues.delete(issueId);
+    this.render();
+  }
+
+  /** Issue-local readiness guard.  It never changes the decision ordering. */
+  canSubmit(issue) {
+    if (!this.canSubmitIssue(issue)) return false;
+    const overlay = issue?.overlay;
+    if (!overlay || typeof overlay !== "object") return true;
+    if (overlay.status !== "ready") return false;
+    return this.overlayAvailability.get(issue.id)?.available !== false;
   }
 
   resetDraft() {
@@ -351,7 +382,7 @@ export class ReviewPanel {
     const readOnly = task?.lease?.read_only === true;
     const gate = completionGate(task);
     const draft = this.reasonDraft();
-    const targetDisabled = readOnly || target === null || this.isBusy || !this.canSubmitIssue(target);
+    const targetDisabled = readOnly || target === null || this.isBusy || !this.canSubmit(target);
     const reasonDisabled = readOnly || this.isBusy || (target === null && gate.mode !== "early_fail");
     const interval = active.length
       ? `${Math.min(...active.map((issue) => asFrameRange(issue).start))}–${Math.max(...active.map((issue) => asFrameRange(issue).end - 1))}`
@@ -399,8 +430,15 @@ export class ReviewPanel {
           <input data-reason-other type="text" required value="${escapeHtml(this.otherText)}" placeholder="请输入其他原因" ${reasonDisabled ? "disabled" : ""}>
         </label>`
       : "";
-    const overlayNotice = target?.overlay && target.overlay.status !== "ready"
-      ? `<p class="overlay-state" data-overlay-state>叠加证据${escapeHtml(target.overlay.status)}，当前仍可查看原视频。</p>`
+    const overlay = target?.overlay;
+    const localOverlay = target ? this.overlayAvailability.get(target.id) : null;
+    const overlayNotice = overlay && (
+      overlay.status !== "ready" || localOverlay?.available === false
+    )
+      ? `<p class="overlay-state" data-overlay-state>${escapeHtml(this._overlayMessage(overlay, localOverlay))}</p>`
+      : "";
+    const retryButton = overlay?.status === "failed" && overlay.retryable === true
+      ? `<button type="button" class="overlay-retry" data-action="retry-overlay" data-issue-id="${escapeHtml(target.id)}" ${this.retryingOverlayIssues.has(target.id) || readOnly || this.isBusy ? "disabled" : ""}>重试 Overlay</button>`
       : "";
 
     this.root.innerHTML = `<section class="warning-status-list" aria-label="Warning 复核状态">${statusRows}</section>
@@ -413,6 +451,7 @@ export class ReviewPanel {
         <div class="reason-chips">${chips}</div>
         ${otherField}
         ${overlayNotice}
+        ${retryButton}
       </section>
       <section class="verdict-actions" aria-label="判定操作">
         <button type="button" class="pass-button" data-action="verdict-pass" ${targetDisabled ? "disabled" : ""}>Pass</button>
@@ -439,6 +478,11 @@ export class ReviewPanel {
       this.onSelectIssue(selected);
       return;
     }
+    if (action === "retry-overlay") {
+      const issueId = actionElement.dataset.issueId;
+      if (issueId) this.onRetryOverlay(issueId);
+      return;
+    }
     if (action === "verdict-pass" || action === "verdict-fail") {
       const issueId = this.decisionTargetId();
       if (issueId) this.submit(issueId, action === "verdict-pass" ? "pass" : "fail");
@@ -449,6 +493,18 @@ export class ReviewPanel {
 
   _handleInput(event) {
     if (!this.isBusy && event?.target?.matches?.("[data-reason-other]")) this.setOtherText(event.target.value);
+  }
+
+  _overlayMessage(overlay, local) {
+    if (overlay?.status === "pending") return "Overlay 已排队，当前 Warning 暂不可判定。";
+    if (overlay?.status === "generating") return "Overlay 生成中，当前 Warning 暂不可判定。";
+    if (overlay?.status === "failed") {
+      return overlay.retryable === true
+        ? "Overlay 暂不可用，其他 Warning 可继续复核。"
+        : "Overlay 无法生成，请联系管理员。";
+    }
+    if (local?.available === false) return "Overlay 加载中，当前 Warning 暂不可判定。";
+    return "当前 Warning 的 Overlay 暂不可用。";
   }
 }
 

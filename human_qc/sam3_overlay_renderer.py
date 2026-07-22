@@ -1050,6 +1050,15 @@ class UnavailableOverlayProvider:
             for item in selected
         }
 
+    def retry_asset_overlays(
+        self,
+        asset_id: str,
+        selected: tuple[OverlayIssueInput, ...],
+    ) -> Mapping[str, object]:
+        """Remain non-blocking when process-level setup is still unavailable."""
+
+        return self.get_asset_overlays(asset_id, selected)
+
 
 class ProductionWorkerOverlayProvider(WorkerOverlayProvider):
     """Worker adapter that turns strict setup failures into terminal views."""
@@ -1208,6 +1217,56 @@ class ProductionWorkerOverlayProvider(WorkerOverlayProvider):
             request_factory=lambda requested_asset, requested_selected: request,
         )
         return delegate.get_asset_overlays(asset_id, selected)
+
+    def retry_asset_overlays(
+        self,
+        asset_id: str,
+        selected: tuple[OverlayIssueInput, ...],
+    ) -> Mapping[str, object]:
+        """Retry exactly the same asset-level union request without blocking."""
+
+        try:
+            request = self._production_request_factory(asset_id, selected)
+        except OverlaySetupError as exc:
+            return UnavailableOverlayProvider(exc.code).get_asset_overlays(
+                asset_id, selected
+            )
+
+        worker = self._production_worker
+
+        class AtomicRetryViewWorker:
+            @staticmethod
+            def retry(value: OverlayRequest) -> object:
+                view = worker.retry(value)
+                if getattr(view, "status", None) != "failed":
+                    if getattr(view, "status", None) == "ready":
+                        self._publish_ready_lease(asset_id, request, view)
+                    return view
+                code = getattr(view, "code", None) or "overlay_render_failed"
+                retryable = getattr(view, "retryable", False) is True
+                segments = tuple(
+                    replace(
+                        segment,
+                        status="failed",
+                        path=None,
+                        code=code,
+                        retryable=retryable,
+                        content_sha256=None,
+                        metadata=None,
+                    )
+                    for segment in view.segments
+                )
+                return replace(view, segments=segments)
+
+            # The generic facade validates the narrow worker protocol at
+            # construction time; retry remains the only operation invoked.
+            submit = retry
+
+        delegate = WorkerOverlayProvider(
+            worker=AtomicRetryViewWorker(),
+            request_factory=lambda requested_asset, requested_selected: request,
+        )
+        return delegate.retry_asset_overlays(asset_id, selected)
 
 
 def _model_hash(model_path: Path) -> str:

@@ -284,6 +284,26 @@ test("emits playback state without owning warning or verdict state", () => {
 });
 
 
+test("subscribers receive source, frame and native media events without taking keyboard ownership", () => {
+  const events = [];
+  const { controller, video, root } = createController();
+  const unsubscribe = controller.subscribe((event) => events.push(event));
+  controller.setMedia(canonicalVideo());
+  controller.seekToFrame(120);
+  video.dispatch("seeked");
+  video.dispatch("ratechange");
+
+  assert.equal(events.some((event) => event.type === "source"), true);
+  assert.equal(events.some((event) => event.type === "seeked" && event.currentFrame === 120), true);
+  assert.equal(events.some((event) => event.type === "ratechange"), true);
+  assert.equal(root.listenerCount("keydown"), 1);
+  unsubscribe();
+  const count = events.length;
+  video.dispatch("timeupdate");
+  assert.equal(events.length, count);
+});
+
+
 test("releases all DOM listeners when destroyed", () => {
   const { controller, root, video } = createController();
   controller.setMedia(canonicalVideo());

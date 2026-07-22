@@ -10,6 +10,7 @@
 import { ReviewPanel, completionGate, nextDecisionTarget } from "./review_panel.js";
 import { VideoController } from "./video_controller.js";
 import { WarningTimeline } from "./warning_timeline.js";
+import { OverlayController } from "./overlay_controller.js";
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
@@ -78,7 +79,10 @@ export class WarnReviewApp {
     panelFactory = (options) => new ReviewPanel(options),
     timelineFactory = (options) => new WarningTimeline(options),
     videoControllerFactory = (options) => new VideoController(options),
+    overlayControllerFactory = (options) => new OverlayController(options),
     canSubmitIssue = () => true,
+    scheduler = globalThis,
+    random = Math.random,
   } = {}) {
     this.baseUrl = String(baseUrl).replace(/\/$/, "");
     this.fetcher = fetcher;
@@ -87,7 +91,10 @@ export class WarnReviewApp {
     this.panelFactory = panelFactory;
     this.timelineFactory = timelineFactory;
     this.videoControllerFactory = videoControllerFactory;
+    this.overlayControllerFactory = overlayControllerFactory;
     this.canSubmitIssue = typeof canSubmitIssue === "function" ? canSubmitIssue : () => true;
+    this.scheduler = scheduler && typeof scheduler.setTimeout === "function" ? scheduler : globalThis;
+    this.random = typeof random === "function" ? random : Math.random;
     this.task = null;
     this.assetId = null;
     this.assets = [];
@@ -95,13 +102,22 @@ export class WarnReviewApp {
     this.explicitIssueId = null;
     this.lastError = null;
     this.videoController = null;
+    this.overlayController = null;
+    this._videoUnsubscribe = null;
     this.timeline = null;
+    this._overlayAvailability = new Map();
+    this._overlayPollTimer = null;
+    this._overlayPollGeneration = 0;
+    this._overlayPollDelay = 1000;
+    this._overlayAbort = null;
+    this._overlayRetrying = new Set();
     this.panel = this.panelFactory({
       documentRef: this.document,
       onVerdict: (issueId, verdict, payload) => this.submitVerdict(issueId, verdict, payload),
       onComplete: () => this.completeReview(),
       onSelectIssue: (issueId) => this._acceptStatusSelection(issueId),
-      canSubmitIssue: (issue) => this.canSubmitIssue(issue),
+      onRetryOverlay: (issueId) => this.retryOverlay(issueId),
+      canSubmitIssue: (issue) => this._canSubmitIssue(issue),
     });
     this._mediaKey = null;
     this._chromeBound = false;
@@ -117,9 +133,9 @@ export class WarnReviewApp {
     return `${this.baseUrl}${path}`;
   }
 
-  async requestJson(path, { method = "GET", body = undefined } = {}) {
+  async requestJson(path, { method = "GET", body = undefined, signal = undefined } = {}) {
     if (typeof this.fetcher !== "function") throw new Error("fetch is not available");
-    const options = { method, headers: { Accept: "application/json" } };
+    const options = { method, headers: { Accept: "application/json" }, signal };
     if (body !== undefined) {
       options.headers["Content-Type"] = "application/json";
       options.body = JSON.stringify(body);
@@ -183,6 +199,13 @@ export class WarnReviewApp {
 
   applyServerTask(task, { restoreDraft = true } = {}) {
     if (!canonicalTask(task)) throw new TypeError("server task must be a canonical Warn task DTO");
+    const assetChanged = this.assetId !== null && this.assetId !== task.asset_id;
+    this._invalidateOverlayPoll();
+    if (assetChanged) {
+      this._overlayAvailability.clear();
+      this.panel.clearOverlayAvailability?.();
+      this.overlayController?.setEvidence([]);
+    }
     this.task = task;
     this.assetId = task.asset_id;
     if (!Array.isArray(this.assets) || !this.assets.includes(this.assetId)) {
@@ -195,6 +218,8 @@ export class WarnReviewApp {
     if (restoreDraft) this.panel.setDraftFromFailureReason(task.failure_reason);
     this.panel.setExplicitIssueId(this.explicitIssueId);
     this.panel.setCurrentFrame(this.currentFrame);
+    this._configureOverlayEvidence(task);
+    this._scheduleOverlayPoll({ reset: true });
     this.render();
     return task;
   }
@@ -205,6 +230,7 @@ export class WarnReviewApp {
     if (!fromVideo) this.videoController?.seekToFrame(this.currentFrame);
     this.timeline?.setCurrentFrame(this.currentFrame);
     this.panel.setCurrentFrame(this.currentFrame);
+    this.overlayController?.updateForFrame(this.currentFrame);
     this._renderVideoState();
     return this.currentFrame;
   }
@@ -284,6 +310,7 @@ export class WarnReviewApp {
     if (!this.task || !this.assetId) throw new Error("尚未加载 Warn 任务");
     const target = this.task.issues.find((issue) => issue.id === issueId);
     if (!target) throw new Error("当前 Warn 不存在");
+    if (!this._canSubmitIssue(target)) throw new Error("当前 Warning 的 Overlay 尚未就绪");
     const payload = suppliedPayload ?? this.panel.payloadForVerdict(issueId, verdict);
     return this._runMutation("verdict", async () => {
       const value = await this.requestJson(
@@ -359,6 +386,7 @@ export class WarnReviewApp {
     this.root = root ?? null;
     if (!this.root) return this;
     const video = this.root.querySelector?.("[data-video]");
+    const overlayVideo = this.root.querySelector?.("[data-overlay-video]");
     const videoRoot = this.root.querySelector?.("[data-video-root]");
     const panelRoot = this.root.querySelector?.("[data-review-panel]");
     const timelineRoot = this.root.querySelector?.("[data-warning-timeline]");
@@ -371,6 +399,18 @@ export class WarnReviewApp {
         onPlaybackStateChange: () => this._renderVideoState(),
       });
     }
+    if (video && overlayVideo && !this.overlayController) {
+      this.overlayController = this.overlayControllerFactory({
+        baseVideo: video,
+        overlayVideo,
+        fps: Number(this.task?.video?.fps) || 1,
+        onAvailabilityChange: (value) => this._setOverlayAvailability(value),
+      });
+      this._videoUnsubscribe = this.videoController?.subscribe?.((event) => {
+        if (event?.type === "source") this.overlayController?.updateForFrame(event.currentFrame);
+      }) ?? null;
+      if (this.task) this._configureOverlayEvidence(this.task);
+    }
     if (panelRoot) this.panel.mount(panelRoot);
     if (timelineRoot && this.task) this._configureTimeline(this.task);
     this._bindChrome();
@@ -379,6 +419,7 @@ export class WarnReviewApp {
   }
 
   destroy() {
+    this._invalidateOverlayPoll();
     for (const [target, type, listener] of this._chromeListeners.splice(0)) {
       target.removeEventListener?.(type, listener);
     }
@@ -386,8 +427,12 @@ export class WarnReviewApp {
     this.panel.destroy?.();
     this.timeline?.destroy?.();
     this.videoController?.destroy?.();
+    this._videoUnsubscribe?.();
+    this._videoUnsubscribe = null;
+    this.overlayController?.destroy?.();
     this.timeline = null;
     this.videoController = null;
+    this.overlayController = null;
     this._mediaKey = null;
     this.root = null;
   }
@@ -427,6 +472,138 @@ export class WarnReviewApp {
     this.videoController.setMedia(task.video);
     const placeholder = this.root?.querySelector?.("[data-video-placeholder]");
     if (placeholder) placeholder.hidden = true;
+  }
+
+  _configureOverlayEvidence(task) {
+    if (!this.overlayController || !task?.video) return;
+    const fps = Number(task.video.fps);
+    if (Number.isFinite(fps) && fps > 0) this.overlayController.fps = fps;
+    this.overlayController.setEvidence(task.issues);
+    this.overlayController.updateForFrame(this.currentFrame);
+  }
+
+  _canSubmitIssue(issue) {
+    if (!this.canSubmitIssue(issue)) return false;
+    const overlay = issue?.overlay;
+    if (!overlay || typeof overlay !== "object") return true;
+    if (overlay.status !== "ready") return false;
+    const availability = this._overlayAvailability.get(issue.id);
+    return availability?.available !== false;
+  }
+
+  _setOverlayAvailability(value) {
+    const issueId = typeof value?.issueId === "string" ? value.issueId : null;
+    if (!issueId) return;
+    const next = { available: value.available === true, code: value.code ?? null };
+    const previous = this._overlayAvailability.get(issueId);
+    if (previous?.available === next.available && previous?.code === next.code) return;
+    this._overlayAvailability.set(issueId, next);
+    this.panel.setOverlayAvailability?.(issueId, next.available, next.code);
+  }
+
+  _overlayIssuesToPoll() {
+    return (Array.isArray(this.task?.issues) ? this.task.issues : []).filter((issue) => (
+      issue?.overlay && ["pending", "generating"].includes(issue.overlay.status) && typeof issue.id === "string"
+    ));
+  }
+
+  _invalidateOverlayPoll() {
+    this._overlayPollGeneration += 1;
+    if (this._overlayPollTimer !== null) this.scheduler.clearTimeout?.(this._overlayPollTimer);
+    this._overlayPollTimer = null;
+    this._overlayAbort?.abort?.();
+    this._overlayAbort = null;
+  }
+
+  _scheduleOverlayPoll({ reset = false } = {}) {
+    if (!this.task || !this.assetId || !this._overlayIssuesToPoll().length) return;
+    if (reset) this._overlayPollDelay = 1000;
+    if (this._overlayPollTimer !== null) return;
+    const jitter = 0.8 + Math.min(Math.max(Number(this.random()) || 0.5, 0), 1) * 0.4;
+    const delay = Math.round(Math.min(5000, Math.max(500, this._overlayPollDelay)) * jitter);
+    const generation = this._overlayPollGeneration;
+    this._overlayPollTimer = this.scheduler.setTimeout(() => {
+      this._overlayPollTimer = null;
+      return this._pollOverlayStatuses(generation);
+    }, delay);
+  }
+
+  async _overlayRequest(path, signal) {
+    if (typeof this.fetcher !== "function") throw new Error("fetch is not available");
+    const response = await this.fetcher(this.endpoint(path), {
+      method: "GET",
+      signal,
+      headers: { Accept: "application/json" },
+    });
+    let body = null;
+    try { body = await response.json(); } catch { body = null; }
+    if (!response.ok) throw responseError(response, body);
+    return body;
+  }
+
+  _replaceIssueOverlay(assetId, issueId, overlay) {
+    if (assetId !== this.assetId || !this.task || !isObject(overlay)) return false;
+    const index = this.task.issues.findIndex((issue) => issue.id === issueId);
+    if (index < 0) return false;
+    const issues = this.task.issues.map((issue, candidate) => (
+      candidate === index ? { ...issue, overlay } : issue
+    ));
+    this.task = { ...this.task, issues };
+    this.panel.setTask(this.task);
+    this.panel.setExplicitIssueId(this.explicitIssueId);
+    this.panel.setCurrentFrame(this.currentFrame);
+    this._configureOverlayEvidence(this.task);
+    this.render();
+    return true;
+  }
+
+  async _pollOverlayStatuses(generation) {
+    const assetId = this.assetId;
+    if (!assetId || generation !== this._overlayPollGeneration) return;
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    this._overlayAbort = controller;
+    let changed = false;
+    try {
+      for (const issue of this._overlayIssuesToPoll()) {
+        const value = await this._overlayRequest(
+          `/api/warn/assets/${encodeURIComponent(assetId)}/overlays/${encodeURIComponent(issue.id)}/status`,
+          controller?.signal,
+        );
+        if (generation !== this._overlayPollGeneration || this.assetId !== assetId) return;
+        if (value?.asset_id !== assetId || value?.issue_id !== issue.id || !isObject(value?.overlay)) continue;
+        changed = this._replaceIssueOverlay(assetId, issue.id, value.overlay) || changed;
+      }
+      this._overlayPollDelay = changed ? 1000 : Math.min(5000, this._overlayPollDelay * 2);
+    } catch (error) {
+      if (generation !== this._overlayPollGeneration || error?.name === "AbortError") return;
+      this._overlayPollDelay = Math.min(5000, this._overlayPollDelay * 2);
+    } finally {
+      if (this._overlayAbort?.signal === controller?.signal) this._overlayAbort = null;
+    }
+    if (generation === this._overlayPollGeneration) this._scheduleOverlayPoll();
+  }
+
+  async retryOverlay(issueId) {
+    if (this._overlayRetrying.has(issueId) || !this.task || !this.assetId) return null;
+    const issue = this.task.issues.find((candidate) => candidate.id === issueId);
+    if (issue?.overlay?.status !== "failed" || issue.overlay.retryable !== true) return null;
+    this._overlayRetrying.add(issueId);
+    this.panel.setRetryPending?.(issueId, true);
+    try {
+      const value = await this.requestJson(
+        `/api/warn/assets/${encodeURIComponent(this.assetId)}/overlays/${encodeURIComponent(issueId)}/retry`,
+        { method: "POST", body: this.mutationBody({}) },
+      );
+      if (value?.asset_id === this.assetId && value?.issue_id === issueId && isObject(value?.overlay)) {
+        this._replaceIssueOverlay(this.assetId, issueId, value.overlay);
+        this._overlayPollDelay = 1000;
+        this._scheduleOverlayPoll({ reset: true });
+      }
+      return value;
+    } finally {
+      this._overlayRetrying.delete(issueId);
+      this.panel.setRetryPending?.(issueId, false);
+    }
   }
 
   _configureTimeline(task) {

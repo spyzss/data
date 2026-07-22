@@ -98,6 +98,69 @@ test("the earliest pending active warning wins even when active ids arrive in an
 });
 
 
+test("only a non-ready continuous overlay locks its own issue without changing first-pass order", () => {
+  const task = canonicalTask({
+    issues: canonicalTask().issues.map((issue) => (
+      issue.id === "exposure"
+        ? { ...issue, overlay: { status: "generating", segments: [] } }
+        : issue
+    )),
+  });
+  const panel = new ReviewPanel();
+  panel.setTask(task);
+  panel.setCurrentFrame(142);
+  assert.equal(panel.decisionTargetId(), "exposure");
+  assert.equal(panel.canSubmit(task.issues[0]), false);
+  assert.equal(panel.canSubmit(task.issues[1]), true);
+  panel.setExplicitIssueId("shake");
+  assert.equal(panel.decisionTargetId(), "shake");
+});
+
+
+test("overlay polling replaces only the selected issue status without reloading task or clearing reason draft", async () => {
+  const initial = canonicalTask({
+    issues: canonicalTask().issues.map((issue) => (
+      issue.id === "exposure"
+        ? { ...issue, overlay: { status: "generating", segments: [] } }
+        : issue
+    )),
+  });
+  const calls = [];
+  const timers = [];
+  const app = new WarnReviewApp({
+    scheduler: { setTimeout: (fn) => { timers.push(fn); return fn; }, clearTimeout() {} },
+    random: () => 0.5,
+    fetcher: async (path) => {
+      calls.push(path);
+      if (path.endsWith("/task")) return { ok: true, status: 200, json: async () => ({ task: initial }) };
+      if (path.endsWith("/status")) return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          asset_id: "asset-1",
+          issue_id: "exposure",
+          overlay: {
+            status: "ready",
+            segments: [{ start_frame: 120, end_frame_exclusive: 169, status: "ready", url: "/media/overlay" }],
+          },
+        }),
+      };
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+  await app.loadAsset("asset-1");
+  app.setCurrentFrame(120);
+  app.panel.toggleReason("occlusion");
+  assert.equal(timers.length, 1);
+  await timers.shift()();
+  assert.equal(app.task.report_revision, 7);
+  assert.equal(app.task.issues.find((issue) => issue.id === "exposure").overlay.status, "ready");
+  assert.deepEqual(app.panel.reasonDraft().reasonCodes, ["occlusion"]);
+  assert.deepEqual(calls.filter((path) => path.endsWith("/task")), ["/api/warn/assets/asset-1/task"]);
+  app.destroy();
+});
+
+
 test("completion only opens for a saved fail or when every warning has passed", () => {
   const onePass = applySavedReview(canonicalTask(), "exposure", "pass");
   assert.deepEqual(completionGate(onePass), { enabled: false, mode: null });

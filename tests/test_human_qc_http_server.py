@@ -110,6 +110,47 @@ class FakeFacade:
         self.calls.append(("warn_complete", asset_id, payload))
         return self.task
 
+    def overlay_status(self, asset_id: str, issue_id: str):
+        self.calls.append(("overlay_status", asset_id, issue_id))
+        if asset_id != "asset-1" or issue_id != "warn-1":
+            raise KeyError("/private/overlay/request")
+        return {
+            "asset_id": asset_id,
+            "issue_id": issue_id,
+            "overlay": {
+                "status": "generating",
+                "frame_range": {"start_frame": 120, "end_frame_exclusive": 169},
+                "url": None,
+                "code": None,
+                "poll_after_ms": 1000,
+            },
+        }
+
+    def retry_overlay(
+        self,
+        asset_id: str,
+        *,
+        issue_id: str,
+        expected_revision: int,
+        lease_token: str,
+    ):
+        self.calls.append(
+            ("retry_overlay", asset_id, issue_id, expected_revision, lease_token)
+        )
+        if issue_id != "warn-1":
+            raise KeyError("/private/overlay/request")
+        return {
+            "asset_id": asset_id,
+            "issue_id": issue_id,
+            "overlay": {
+                "status": "pending",
+                "frame_range": {"start_frame": 120, "end_frame_exclusive": 169},
+                "url": None,
+                "code": None,
+                "poll_after_ms": 1000,
+            },
+        }
+
 
 def _request_raw(
     server,
@@ -172,11 +213,72 @@ def test_warn_routes_are_canonical_and_task_header_auto_renews() -> None:
             "/api/assets/asset-1/task",
             "/api/semantic/assets/asset-1/task",
             "/evidence/sam3/frame.png",
-            "/api/warn/assets/asset-1/overlays/warn-1/status",
         ):
             status, _, value = _request_json(server, "GET", old_path)
             assert status == 404
             assert value["error"]["code"] == "not_found"
+    finally:
+        _stop(server, thread)
+
+
+def test_overlay_status_and_retry_are_narrow_safe_and_lease_protected() -> None:
+    facade = FakeFacade()
+    server, thread = _running_server(facade)
+    try:
+        status, headers, value = _request_json(
+            server,
+            "GET",
+            "/api/warn/assets/asset-1/overlays/warn-1/status",
+        )
+        assert status == 200
+        assert headers["Retry-After"] == "1"
+        assert value == {
+            "asset_id": "asset-1",
+            "issue_id": "warn-1",
+            "overlay": {
+                "status": "generating",
+                "frame_range": {"start_frame": 120, "end_frame_exclusive": 169},
+                "url": None,
+                "code": None,
+                "poll_after_ms": 1000,
+            },
+        }
+        assert "private" not in json.dumps(value)
+
+        status, _, missing = _request_json(
+            server,
+            "GET",
+            "/api/warn/assets/asset-1/overlays/not-selected/status",
+        )
+        assert status == 404 and missing["error"]["code"] == "not_found"
+
+        status, _, bad_request = _request_json(
+            server,
+            "POST",
+            "/api/warn/assets/asset-1/overlays/warn-1/retry",
+            {},
+        )
+        assert status == 400 and bad_request["error"]["code"] == "bad_request"
+        assert not any(call[0] == "retry_overlay" for call in facade.calls)
+
+        status, _, stale = _request_json(
+            server,
+            "POST",
+            "/api/warn/assets/asset-1/overlays/warn-1/retry",
+            {"expected_revision": 2, "lease_token": "lease-1"},
+        )
+        assert status == 409 and stale["error"]["code"] == "stale_revision"
+        assert not any(call[0] == "retry_overlay" for call in facade.calls)
+
+        status, _, result = _request_json(
+            server,
+            "POST",
+            "/api/warn/assets/asset-1/overlays/warn-1/retry",
+            {"expected_revision": 3, "lease_token": "lease-1"},
+        )
+        assert status == 202
+        assert result["overlay"]["status"] == "pending"
+        assert ("retry_overlay", "asset-1", "warn-1", 3, "lease-1") in facade.calls
     finally:
         _stop(server, thread)
 

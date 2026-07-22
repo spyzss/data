@@ -28,7 +28,11 @@ from .media import (
     parse_byte_range,
 )
 from .warn_service import WarnLeaseError, WarnRevisionError, WarnStateError
-from .warn_workbench_service import InvalidIssueRangeError, WarnWorkbenchService
+from .warn_workbench_service import (
+    InvalidIssueRangeError,
+    OverlayNotRetryableError,
+    WarnWorkbenchService,
+)
 
 
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
@@ -50,6 +54,9 @@ _SAFE_MESSAGES = {
     "source_video_unavailable": "the source video is unavailable",
     "stale_revision": "the report revision is stale",
     "state_conflict": "the task cannot accept this operation",
+    "overlay_not_retryable": "the overlay cannot be retried",
+    "overlay_queue_full": "the overlay queue is busy",
+    "overlay_cache_full": "the overlay cache is busy",
 }
 
 _SESSION_COOKIE = "warn_reviewer_session"
@@ -91,6 +98,14 @@ def _allowed_methods(parts: tuple[str, ...] | None) -> tuple[str, ...] | None:
         return ("GET", "HEAD")
     if (
         parts is not None
+        and len(parts) == 7
+        and parts[:3] == ("api", "warn", "assets")
+        and parts[4] == "overlays"
+        and parts[6] == "status"
+    ):
+        return ("GET",)
+    if (
+        parts is not None
         and len(parts) == 5
         and parts[:2] == ("media", "assets")
         and parts[3] == "overlays"
@@ -111,6 +126,10 @@ def _allowed_methods(parts: tuple[str, ...] | None) -> tuple[str, ...] | None:
             len(route) == 3
             and route[0] == "issues"
             and route[2] == "verdict"
+        ) or (
+            len(route) == 3
+            and route[0] == "overlays"
+            and route[2] == "retry"
         ):
             return ("POST",)
     return None
@@ -125,6 +144,8 @@ def _error_details(exc: Exception) -> tuple[int, str]:
         return HTTPStatus.CONFLICT, "stale_revision"
     if isinstance(exc, InvalidIssueRangeError):
         return HTTPStatus.CONFLICT, "invalid_issue_range"
+    if isinstance(exc, OverlayNotRetryableError):
+        return HTTPStatus.CONFLICT, "overlay_not_retryable"
     if isinstance(exc, MediaUnavailableError):
         return HTTPStatus.NOT_FOUND, "source_video_unavailable"
     if isinstance(exc, (MediaNotFoundError, KeyError, FileNotFoundError)):
@@ -191,6 +212,23 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
                     else None
                 ),
             )
+            return
+        if (
+            parts is not None
+            and len(parts) == 7
+            and parts[:3] == ("api", "warn", "assets")
+            and parts[4] == "overlays"
+            and parts[6] == "status"
+        ):
+            asset_id, issue_id = parts[3], parts[5]
+            try:
+                value = self.server.service.overlay_status(asset_id, issue_id)
+                overlay = value.get("overlay") if isinstance(value, Mapping) else None
+                status = overlay.get("status") if isinstance(overlay, Mapping) else None
+                headers = {"Retry-After": "1"} if status in {"pending", "generating"} else None
+                self._send_json(value, headers=headers)
+            except Exception as exc:
+                self._handle_exception(exc, asset_id)
             return
         if (
             parts is not None
@@ -274,12 +312,15 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
         is_verdict = (
             len(route) == 3 and route[0] == "issues" and route[2] == "verdict"
         )
+        is_overlay_retry = (
+            len(route) == 3 and route[0] == "overlays" and route[2] == "retry"
+        )
         if route not in {
             ("lease", "acquire"),
             ("lease", "renew"),
             ("lease", "release"),
             ("complete",),
-        } and not is_verdict:
+        } and not is_verdict and not is_overlay_retry:
             self._send_route_error(parts, asset_id=asset_id)
             return
         try:
@@ -305,6 +346,23 @@ class HumanQcRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self.server.service.validate_lease(asset_id, token)
+            if is_overlay_retry:
+                result = self.server.service.retry_overlay(
+                    asset_id,
+                    issue_id=route[1],
+                    expected_revision=expected_revision,
+                    lease_token=token,
+                )
+                overlay = result.get("overlay") if isinstance(result, Mapping) else None
+                overlay_status = overlay.get("status") if isinstance(overlay, Mapping) else None
+                overlay_code = overlay.get("code") if isinstance(overlay, Mapping) else None
+                if overlay_status in {"pending", "generating"}:
+                    self._send_json(result, status=HTTPStatus.ACCEPTED, headers={"Retry-After": "1"})
+                elif overlay_code in {"overlay_queue_full", "overlay_cache_full"}:
+                    self._send_json(result, status=HTTPStatus.SERVICE_UNAVAILABLE, headers={"Retry-After": "1"})
+                else:
+                    self._send_json(result)
+                return
             if is_verdict:
                 issue_id = route[1]
                 body_issue_id = payload.get("issue_id")

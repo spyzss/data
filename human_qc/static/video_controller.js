@@ -104,6 +104,7 @@ export class VideoController {
     this._pendingFrame = null;
     this._rootOwnsFocus = false;
     this._listeners = [];
+    this._subscribers = new Set();
 
     this._makeRootFocusable();
     this._bindEvents();
@@ -124,7 +125,15 @@ export class VideoController {
     this._applyPlaybackRate();
     this._emitFrameChange(true);
     this._emitPlaybackState();
+    this._notify("source");
     return this.playbackState;
+  }
+
+  /** Observe canonical base-media transitions without owning any controls. */
+  subscribe(listener) {
+    if (typeof listener !== "function") throw new TypeError("subscriber must be a function");
+    this._subscribers.add(listener);
+    return () => this._subscribers.delete(listener);
   }
 
   /** Seek using a source-frame coordinate, never a visual timeline percentage. */
@@ -202,6 +211,7 @@ export class VideoController {
     for (const [target, type, listener] of this._listeners.splice(0)) {
       target.removeEventListener?.(type, listener);
     }
+    this._subscribers.clear();
     this._rootOwnsFocus = false;
   }
 
@@ -211,12 +221,21 @@ export class VideoController {
   }
 
   _bindEvents() {
-    this._listen(this.video, "timeupdate", () => this._syncFrameFromVideo(false));
-    this._listen(this.video, "seeked", () => this._syncFrameFromVideo(true));
-    this._listen(this.video, "loadedmetadata", () => this._reapplyRateAfterMetadata());
-    this._listen(this.video, "play", () => this._emitPlaybackState());
-    this._listen(this.video, "pause", () => this._emitPlaybackState());
-    this._listen(this.video, "ended", () => this._emitPlaybackState());
+    this._listen(this.video, "timeupdate", () => {
+      this._syncFrameFromVideo(false);
+      this._notify("timeupdate");
+    });
+    this._listen(this.video, "seeked", () => {
+      this._syncFrameFromVideo(true);
+      this._notify("seeked");
+    });
+    this._listen(this.video, "loadedmetadata", () => {
+      this._reapplyRateAfterMetadata();
+      this._notify("loadedmetadata");
+    });
+    this._listen(this.video, "play", () => this._emitPlaybackState("play"));
+    this._listen(this.video, "pause", () => this._emitPlaybackState("pause"));
+    this._listen(this.video, "ended", () => this._emitPlaybackState("ended"));
     this._listen(this.video, "ratechange", () => this._syncNativeRate());
     this._listen(this.root, "focus", (event) => {
       if (event.target === this.root) this._rootOwnsFocus = true;
@@ -275,7 +294,7 @@ export class VideoController {
       this.playbackRate = nativeRate;
       this._persistRate();
     }
-    this._emitPlaybackState();
+    this._emitPlaybackState("ratechange");
   }
 
   _reapplyRateAfterMetadata() {
@@ -307,9 +326,16 @@ export class VideoController {
 
   _emitFrameChange(force = false) {
     if (force || this.totalFrames > 0) this.onFrameChange(this.currentFrame);
+    this._notify("frame");
   }
 
-  _emitPlaybackState() {
+  _emitPlaybackState(type = "playback") {
     this.onPlaybackStateChange(this.playbackState);
+    this._notify(type);
+  }
+
+  _notify(type) {
+    const event = { type, ...this.playbackState };
+    for (const listener of [...this._subscribers]) listener(event);
   }
 }

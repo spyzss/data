@@ -58,6 +58,10 @@ class InvalidIssueRangeError(WarnStateError):
     """A selected issue cannot be represented as a non-empty half-open range."""
 
 
+class OverlayNotRetryableError(WarnStateError):
+    """The public overlay retry endpoint cannot schedule this terminal view."""
+
+
 @dataclass(frozen=True)
 class FrameRangeDto:
     start_frame: int
@@ -256,6 +260,11 @@ class AssetOverlayProvider(Protocol):
     ) -> Mapping[str, object] | None:
         """Return internal per-issue handles keyed by trusted issue id."""
 
+    def retry_asset_overlays(
+        self, asset_id: str, selected: tuple[OverlayIssueInput, ...]
+    ) -> Mapping[str, object] | None:
+        """Retry one failed asset-union job without waiting for rendering."""
+
 
 class WorkerOverlayProvider:
     """Adapt :class:`BoundedOverlayWorker` to the Warn facade without HTTP work.
@@ -351,6 +360,34 @@ class WorkerOverlayProvider:
         except Exception:
             # Request factories/workers operate on private paths and renderer
             # details.  Keep their failures out of public task/error payloads.
+            raise WarnStateError("overlay_provider_unavailable") from None
+        return {
+            item.issue_id: self._issue_handle(item.frame_range, segments)
+            for item in selected
+        }
+
+    def retry_asset_overlays(
+        self, asset_id: str, selected: tuple[OverlayIssueInput, ...]
+    ) -> Mapping[str, object]:
+        """Delegate a retry to the same trusted asset-union request."""
+
+        retry = getattr(self._worker, "retry", None)
+        if not callable(retry):
+            raise WarnStateError("overlay_retry_unavailable")
+        try:
+            request = self._request_factory(asset_id, selected)
+            if getattr(request, "asset_id", None) != asset_id:
+                raise WarnStateError("overlay_request_asset_mismatch")
+            view = retry(request)
+            raw_segments = getattr(view, "segments", None)
+            if isinstance(raw_segments, (str, bytes, bytearray)) or not isinstance(
+                raw_segments, Sequence
+            ):
+                raise WarnStateError("invalid overlay job view")
+            segments = tuple(self._worker_segment(segment) for segment in raw_segments)
+        except WarnStateError:
+            raise
+        except Exception:
             raise WarnStateError("overlay_provider_unavailable") from None
         return {
             item.issue_id: self._issue_handle(item.frame_range, segments)
@@ -1067,6 +1104,90 @@ class WarnWorkbenchService:
             if item.issue_id in value
         }
 
+    def _asset_overlay_retry_values(
+        self,
+        asset_id: str,
+        selected: tuple[OverlayIssueInput, ...],
+    ) -> Mapping[str, object]:
+        retry = getattr(self.overlay_provider, "retry_asset_overlays", None)
+        if not callable(retry):
+            raise WarnStateError("overlay_retry_unavailable")
+        try:
+            value = retry(asset_id, selected)
+        except WarnStateError:
+            raise
+        except Exception:
+            raise WarnStateError("overlay_provider_unavailable") from None
+        if not isinstance(value, Mapping):
+            raise WarnStateError("invalid overlay provider result")
+        return {
+            item.issue_id: value[item.issue_id]
+            for item in selected
+            if item.issue_id in value
+        }
+
+    def _selected_sam3_inputs(
+        self,
+        asset_id: str,
+        report: Mapping[str, Any],
+        *,
+        total_frames: int,
+    ) -> tuple[tuple[OverlayIssueInput, ...], dict[str, OverlayIssueInput]]:
+        """Resolve public selected IDs back to the trusted asset-union inputs."""
+
+        del asset_id
+        selected, raw_to_public, _ = _selected_issue_maps(self._manual(report))
+        raw_issues = report.get("issues")
+        if not isinstance(raw_issues, (list, tuple)):
+            raise WarnStateError("report issues must be a sequence")
+        by_id = {
+            issue["issue_id"]: issue
+            for issue in raw_issues
+            if isinstance(issue, Mapping) and isinstance(issue.get("issue_id"), str)
+        }
+        inputs: list[OverlayIssueInput] = []
+        by_public: dict[str, OverlayIssueInput] = {}
+        for raw_issue_id in selected:
+            issue = by_id.get(raw_issue_id)
+            if issue is None:
+                raise WarnStateError("selected issue is missing from report")
+            if not _is_sam3_issue(issue):
+                continue
+            item = OverlayIssueInput(
+                raw_issue_id,
+                normalize_issue_range(issue, total_frames),
+            )
+            inputs.append(item)
+            by_public[raw_to_public[raw_issue_id]] = item
+        return tuple(inputs), by_public
+
+    def _overlay_response_for_issue(
+        self,
+        asset_id: str,
+        item: OverlayIssueInput,
+        values: Mapping[str, object],
+    ) -> OverlayDto:
+        value = values.get(item.issue_id)
+        if value is None:
+            return OverlayDto("pending", item.frame_range, None, None)
+        return self._overlay_from_value(
+            asset_id,
+            item.frame_range,
+            value,
+            require_segment_coverage=True,
+        )
+
+    @staticmethod
+    def _overlay_status_response(
+        asset_id: str,
+        issue_id: str,
+        overlay: OverlayDto,
+    ) -> dict[str, object]:
+        projected = overlay.to_dict()
+        if overlay.status in {"pending", "generating"}:
+            projected["poll_after_ms"] = 1000
+        return {"asset_id": asset_id, "issue_id": issue_id, "overlay": projected}
+
     def _legacy_overlay(
         self,
         asset_id: str,
@@ -1207,6 +1328,56 @@ class WarnWorkbenchService:
         )
         return dto.to_dict()
 
+    def overlay_status(self, asset_id: str, issue_id: str) -> dict[str, object]:
+        """Return one selected continuous-SAM3 issue's non-blocking safe view."""
+
+        asset_id = _non_empty(asset_id, "asset_id")
+        issue_id = _non_empty(issue_id, "issue_id")
+        report = self._report(asset_id)
+        source = self.media_catalog.source(asset_id)
+        selected, by_public = self._selected_sam3_inputs(
+            asset_id, report, total_frames=source.total_frames
+        )
+        item = by_public.get(issue_id)
+        if item is None:
+            raise KeyError("overlay_issue_not_found")
+        values = self._asset_overlay_values(asset_id, selected)
+        overlay = self._overlay_response_for_issue(asset_id, item, values)
+        return self._overlay_status_response(asset_id, issue_id, overlay)
+
+    def retry_overlay(
+        self,
+        asset_id: str,
+        *,
+        issue_id: str,
+        expected_revision: int,
+        lease_token: str,
+    ) -> dict[str, object]:
+        """Lease/revision-protected asynchronous retry of the asset-union job."""
+
+        asset_id = _non_empty(asset_id, "asset_id")
+        issue_id = _non_empty(issue_id, "issue_id")
+        self._prepare_mutation(asset_id, expected_revision, lease_token)
+        report = self._report(asset_id)
+        source = self.media_catalog.source(asset_id)
+        selected, by_public = self._selected_sam3_inputs(
+            asset_id, report, total_frames=source.total_frames
+        )
+        item = by_public.get(issue_id)
+        if item is None:
+            raise KeyError("overlay_issue_not_found")
+        current = self._overlay_response_for_issue(
+            asset_id, item, self._asset_overlay_values(asset_id, selected)
+        )
+        if current.status in {"pending", "generating", "ready"}:
+            return self._overlay_status_response(asset_id, issue_id, current)
+        if not current.retryable:
+            raise OverlayNotRetryableError("overlay_not_retryable")
+        retried = self._overlay_response_for_issue(
+            asset_id, item, self._asset_overlay_retry_values(asset_id, selected)
+        )
+        return self._overlay_status_response(asset_id, issue_id, retried)
+
     def acquire_lease(self, asset_id: str, ttl_seconds: int | None = None) -> Lease:
         report = self._report(asset_id)
         if not self._is_editable(report):
@@ -1340,6 +1511,7 @@ __all__ = [
     "OverlayHandle",
     "OverlayDto",
     "OverlayIssueInput",
+    "OverlayNotRetryableError",
     "OverlaySegmentDto",
     "OverlaySegmentHandle",
     "REASON_OPTIONS",

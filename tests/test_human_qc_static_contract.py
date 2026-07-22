@@ -20,7 +20,8 @@ def test_human_static_bundle_is_canonical_warn_only() -> None:
             "index.html",
             "review_panel.js",
             "warning_timeline.js",
-            "video_controller.js",
+        "video_controller.js",
+        "overlay_controller.js",
         )
     )
     for forbidden in (
@@ -60,10 +61,11 @@ def test_warn_layout_has_one_current_frame_and_required_bottom_action_order() ->
     assert "aria-pressed" in panel
     assert "aria-describedby" in panel
     assert "canSubmitIssue" in panel
+    assert "retry-overlay" in panel
 
     app = _read("app.js")
     assert "canSubmitIssue" in app
-    assert "overlay-status" not in app
+    assert "/overlays/" in app
     assert "setInterval" not in app
 
 
