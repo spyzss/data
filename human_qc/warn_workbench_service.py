@@ -9,7 +9,7 @@ import hashlib
 import math
 from pathlib import Path
 import re
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
 from qc_common.report import load_asset_qc_report
@@ -48,6 +48,7 @@ _COMPLETION_MODES = frozenset({"all_reviewed", "early_fail"})
 _THRESHOLD_OPERATORS = frozenset({"<", "<=", ">", ">=", "==", "!="})
 _REVIEW_VERDICTS = frozenset({"pass", "fail", "warn"})
 _AUDIT_ACTIONS = frozenset({"resubmitted", "failure_reason_changed"})
+_OVERLAY_STATUSES = frozenset({"pending", "generating", "ready", "failed"})
 
 
 class InvalidIssueRangeError(WarnStateError):
@@ -116,13 +117,45 @@ class OverlayDto:
     frame_range: FrameRangeDto
     url: str | None
     code: str | None
+    segments: tuple["OverlaySegmentDto", ...] = ()
+    retryable: bool = False
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "status": self.status,
             "frame_range": self.frame_range.to_dict(),
             "url": self.url,
             "code": self.code,
+        }
+        # Keep the original single-overlay wire shape stable for legacy callers.
+        # Asset-level SAM3 jobs add segment detail only when it exists.
+        if self.segments:
+            result["segments"] = [segment.to_dict() for segment in self.segments]
+        if self.retryable:
+            result["retryable"] = True
+        return result
+
+
+@dataclass(frozen=True)
+class OverlaySegmentDto:
+    """Browser-safe status for one continuous source-frame overlay segment."""
+
+    frame_range: FrameRangeDto
+    status: Literal["pending", "generating", "ready", "failed"]
+    overlay_id: str | None
+    url: str | None
+    code: str | None
+    retryable: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "start_frame": self.frame_range.start_frame,
+            "end_frame_exclusive": self.frame_range.end_frame_exclusive,
+            "status": self.status,
+            "overlay_id": self.overlay_id,
+            "url": self.url,
+            "code": self.code,
+            "retryable": self.retryable,
         }
 
 
@@ -134,6 +167,147 @@ class OverlayHandle:
     overlay_id: str | None = None
     path: str | Path | None = None
     code: str | None = None
+    segments: tuple["OverlaySegmentHandle", ...] = ()
+    retryable: bool = False
+
+
+@dataclass(frozen=True)
+class OverlaySegmentHandle:
+    """Server-side-only handle for one generated continuous overlay segment."""
+
+    frame_range: FrameRangeDto
+    status: Literal["pending", "generating", "ready", "failed"]
+    overlay_id: str | None = None
+    path: str | Path | None = None
+    code: str | None = None
+    retryable: bool = False
+
+
+@dataclass(frozen=True)
+class OverlayIssueInput:
+    """The only selected SAM3 data passed from the facade to an asset provider.
+
+    ``issue_id`` is a trusted server-side identifier.  It is deliberately not
+    serialized and callers receive only the public projection built later.
+    """
+
+    issue_id: str
+    frame_range: FrameRangeDto
+
+
+class AssetOverlayProvider(Protocol):
+    """Submit/read one asset-level SAM3 overlay job for selected issue windows."""
+
+    def get_asset_overlays(
+        self, asset_id: str, selected: tuple[OverlayIssueInput, ...]
+    ) -> Mapping[str, object] | None:
+        """Return internal per-issue handles keyed by trusted issue id."""
+
+
+class WorkerOverlayProvider:
+    """Adapt :class:`BoundedOverlayWorker` to the Warn facade without HTTP work.
+
+    The request factory owns trusted cache/model/render configuration.  The
+    facade passes only selected raw issue identifiers and normalized ranges;
+    this adapter submits exactly one union job and maps its segments back to
+    each issue.  ``submit`` is intentionally the only worker operation used
+    here, so a task GET never waits for a renderer.
+    """
+
+    def __init__(
+        self,
+        *,
+        worker: object,
+        request_factory: Callable[[str, tuple[OverlayIssueInput, ...]], object],
+    ) -> None:
+        submit = getattr(worker, "submit", None)
+        if not callable(submit):
+            raise TypeError("worker must expose submit")
+        if not callable(request_factory):
+            raise TypeError("request_factory must be callable")
+        self._worker = worker
+        self._request_factory = request_factory
+
+    @staticmethod
+    def _worker_segment(value: object) -> OverlaySegmentHandle:
+        start = getattr(value, "start_frame", None)
+        end = getattr(value, "end_frame_exclusive", None)
+        status = getattr(value, "status", None)
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or start < 0
+            or end <= start
+            or status not in {"pending", "generating", "ready", "failed"}
+        ):
+            raise WarnStateError("invalid overlay segment")
+        overlay_id = _safe_overlay_id(getattr(value, "overlay_id", None))
+        path = getattr(value, "path", None)
+        code = _safe_code(getattr(value, "code", None))
+        retryable = getattr(value, "retryable", False) is True
+        return OverlaySegmentHandle(
+            FrameRangeDto(start, end),
+            status,
+            overlay_id,
+            path if isinstance(path, (str, Path)) else None,
+            code,
+            retryable,
+        )
+
+    @staticmethod
+    def _issue_handle(
+        frame_range: FrameRangeDto, segments: tuple[OverlaySegmentHandle, ...]
+    ) -> OverlayHandle:
+        relevant = tuple(
+            segment
+            for segment in segments
+            if segment.frame_range.start_frame < frame_range.end_frame_exclusive
+            and frame_range.start_frame < segment.frame_range.end_frame_exclusive
+        )
+        if not relevant:
+            return OverlayHandle("failed", code="overlay_unavailable", retryable=True)
+        if all(segment.status == "ready" for segment in relevant):
+            status: Literal["pending", "generating", "ready", "failed"] = "ready"
+        elif any(segment.status == "failed" for segment in relevant):
+            status = "failed"
+        elif any(segment.status == "generating" for segment in relevant):
+            status = "generating"
+        else:
+            status = "pending"
+        failed = next((segment for segment in relevant if segment.status == "failed"), None)
+        return OverlayHandle(
+            status,
+            code=failed.code if failed is not None else None,
+            segments=relevant,
+            retryable=any(segment.retryable for segment in relevant),
+        )
+
+    def get_asset_overlays(
+        self, asset_id: str, selected: tuple[OverlayIssueInput, ...]
+    ) -> Mapping[str, object]:
+        try:
+            request = self._request_factory(asset_id, selected)
+            if getattr(request, "asset_id", None) != asset_id:
+                raise WarnStateError("overlay_request_asset_mismatch")
+            view = self._worker.submit(request)
+            raw_segments = getattr(view, "segments", None)
+            if isinstance(raw_segments, (str, bytes, bytearray)) or not isinstance(
+                raw_segments, Sequence
+            ):
+                raise WarnStateError("invalid overlay job view")
+            segments = tuple(self._worker_segment(segment) for segment in raw_segments)
+        except WarnStateError:
+            raise
+        except Exception:
+            # Request factories/workers operate on private paths and renderer
+            # details.  Keep their failures out of public task/error payloads.
+            raise WarnStateError("overlay_provider_unavailable") from None
+        return {
+            item.issue_id: self._issue_handle(item.frame_range, segments)
+            for item in selected
+        }
 
 
 @dataclass(frozen=True)
@@ -274,11 +448,47 @@ def _safe_code(value: object) -> str | None:
     return value if isinstance(value, str) and _STABLE_CODE(value) else None
 
 
+def _is_sam3_issue(issue: Mapping[str, Any]) -> bool:
+    """Classify trusted report issues without consulting browser-facing text."""
+
+    values: list[object] = [
+        issue.get("module"),
+        issue.get("producer"),
+        issue.get("evidence_type"),
+        issue.get("kind"),
+    ]
+    evidence = issue.get("evidence")
+    if isinstance(evidence, Mapping):
+        evidence = [evidence]
+    if isinstance(evidence, Sequence) and not isinstance(
+        evidence, (str, bytes, bytearray)
+    ):
+        for row in evidence:
+            if isinstance(row, Mapping):
+                values.extend(
+                    row.get(key)
+                    for key in ("module", "producer", "evidence_type", "kind")
+                )
+    return any(
+        isinstance(value, str) and "sam3" in value.lower() for value in values
+    )
+
+
 def _public_issue_id(value: str) -> str:
     if _PUBLIC_ISSUE_ID(value) and _UNSAFE_ISSUE_ID_TEXT(value) is None:
         return value
     digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
     return f"issue-{digest}"
+
+
+def _safe_overlay_id(value: object) -> str | None:
+    if (
+        isinstance(value, str)
+        and value not in {".", ".."}
+        and _PUBLIC_ISSUE_ID(value) is not None
+    ):
+        return value
+    return None
 
 
 def _selected_issue_maps(
@@ -581,7 +791,209 @@ class WarnWorkbenchService:
             for review in selected_reviews
         )
 
-    def _overlay(
+    @staticmethod
+    def _overlay_status(value: object) -> Literal["pending", "generating", "ready", "failed"]:
+        if value not in _OVERLAY_STATUSES:
+            raise WarnStateError("invalid overlay status")
+        return value  # type: ignore[return-value]
+
+    @staticmethod
+    def _overlay_segment_handle(value: object) -> OverlaySegmentHandle:
+        if isinstance(value, OverlaySegmentHandle):
+            frame_range = value.frame_range
+            if (
+                not isinstance(frame_range, FrameRangeDto)
+                or isinstance(frame_range.start_frame, bool)
+                or not isinstance(frame_range.start_frame, int)
+                or isinstance(frame_range.end_frame_exclusive, bool)
+                or not isinstance(frame_range.end_frame_exclusive, int)
+                or frame_range.start_frame < 0
+                or frame_range.end_frame_exclusive <= frame_range.start_frame
+            ):
+                raise WarnStateError("invalid overlay segment")
+            return OverlaySegmentHandle(
+                frame_range=frame_range,
+                status=WarnWorkbenchService._overlay_status(value.status),
+                overlay_id=_safe_overlay_id(value.overlay_id),
+                path=value.path if isinstance(value.path, (str, Path)) else None,
+                code=_safe_code(value.code),
+                retryable=value.retryable is True,
+            )
+        if not isinstance(value, Mapping):
+            raise WarnStateError("invalid overlay segment")
+        raw_range = value.get("frame_range")
+        if isinstance(raw_range, FrameRangeDto):
+            frame_range = raw_range
+        else:
+            range_mapping = raw_range if isinstance(raw_range, Mapping) else value
+            start = range_mapping.get("start_frame")
+            end = range_mapping.get("end_frame_exclusive")
+            if (
+                isinstance(start, bool)
+                or not isinstance(start, int)
+                or isinstance(end, bool)
+                or not isinstance(end, int)
+                or start < 0
+                or end <= start
+            ):
+                raise WarnStateError("invalid overlay segment")
+            frame_range = FrameRangeDto(start, end)
+        return OverlaySegmentHandle(
+            frame_range=frame_range,
+            status=WarnWorkbenchService._overlay_status(value.get("status")),
+            overlay_id=_safe_overlay_id(value.get("overlay_id")),
+            path=(
+                value.get("path")
+                if isinstance(value.get("path"), (str, Path))
+                else None
+            ),
+            code=_safe_code(value.get("code")),
+            retryable=value.get("retryable") is True,
+        )
+
+    def _overlay_segment_dto(
+        self, asset_id: str, value: OverlaySegmentHandle
+    ) -> OverlaySegmentDto:
+        url: str | None = None
+        if value.status == "ready":
+            if not isinstance(value.overlay_id, str) or not isinstance(
+                value.path, (str, Path)
+            ):
+                raise WarnStateError("ready overlay is missing its opaque handle")
+            self.media_catalog.allow_overlay(asset_id, value.overlay_id, value.path)
+            url = (
+                f"/media/assets/{quote(asset_id, safe='')}/overlays/"
+                f"{quote(value.overlay_id, safe='')}"
+            )
+        return OverlaySegmentDto(
+            frame_range=value.frame_range,
+            status=value.status,
+            overlay_id=value.overlay_id,
+            url=url,
+            code=value.code,
+            retryable=value.retryable,
+        )
+
+    @staticmethod
+    def _combined_overlay_status(
+        segments: Sequence[OverlaySegmentHandle],
+    ) -> Literal["pending", "generating", "ready", "failed"]:
+        if segments and all(segment.status == "ready" for segment in segments):
+            return "ready"
+        if any(segment.status == "failed" for segment in segments):
+            return "failed"
+        if any(segment.status == "generating" for segment in segments):
+            return "generating"
+        return "pending"
+
+    def _overlay_from_value(
+        self,
+        asset_id: str,
+        frame_range: FrameRangeDto,
+        value: object,
+    ) -> OverlayDto:
+        if isinstance(value, OverlayHandle):
+            status = self._overlay_status(value.status)
+            overlay_id = value.overlay_id
+            path = value.path
+            code = _safe_code(value.code)
+            raw_segments: object = value.segments
+            retryable = value.retryable is True
+        elif isinstance(value, Mapping):
+            status = self._overlay_status(value.get("status"))
+            overlay_id = value.get("overlay_id")
+            path = value.get("path")
+            code = _safe_code(value.get("code"))
+            raw_segments = value.get("segments", ())
+            retryable = value.get("retryable") is True
+        else:
+            raise TypeError("overlay provider result must be a mapping")
+
+        if isinstance(raw_segments, (str, bytes, bytearray)) or not isinstance(
+            raw_segments, Sequence
+        ):
+            raise WarnStateError("invalid overlay segments")
+        if raw_segments:
+            handles = tuple(
+                self._overlay_segment_handle(segment) for segment in raw_segments
+            )
+            relevant = tuple(
+                segment
+                for segment in handles
+                if segment.frame_range.start_frame < frame_range.end_frame_exclusive
+                and frame_range.start_frame < segment.frame_range.end_frame_exclusive
+            )
+            if not relevant:
+                return OverlayDto(
+                    "failed",
+                    frame_range,
+                    None,
+                    "overlay_unavailable",
+                    retryable=True,
+                )
+            status = self._combined_overlay_status(relevant)
+            failed = next(
+                (segment for segment in relevant if segment.status == "failed"), None
+            )
+            if failed is not None:
+                code = failed.code or code
+            segment_dtos = tuple(
+                self._overlay_segment_dto(asset_id, segment) for segment in relevant
+            )
+            url = (
+                segment_dtos[0].url
+                if status == "ready" and len(segment_dtos) == 1
+                else None
+            )
+            return OverlayDto(
+                status,
+                frame_range,
+                url,
+                code,
+                segment_dtos,
+                retryable or any(segment.retryable for segment in relevant),
+            )
+
+        url: str | None = None
+        if status == "ready":
+            if not isinstance(overlay_id, str) or not isinstance(path, (str, Path)):
+                raise WarnStateError("ready overlay is missing its opaque handle")
+            self.media_catalog.allow_overlay(asset_id, overlay_id, path)
+            url = (
+                f"/media/assets/{quote(asset_id, safe='')}/overlays/"
+                f"{quote(overlay_id, safe='')}"
+            )
+        return OverlayDto(status, frame_range, url, code, retryable=retryable)
+
+    def _asset_overlay_getter(self) -> Callable[..., object] | None:
+        provider = self.overlay_provider
+        getter = getattr(provider, "get_asset_overlays", None)
+        return getter if callable(getter) else None
+
+    def _asset_overlay_values(
+        self,
+        asset_id: str,
+        selected: tuple[OverlayIssueInput, ...],
+    ) -> Mapping[str, object]:
+        getter = self._asset_overlay_getter()
+        if getter is None:
+            return {}
+        try:
+            value = getter(asset_id, selected)
+        except Exception:
+            raise WarnStateError("overlay_provider_unavailable") from None
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise WarnStateError("invalid overlay provider result")
+        # Do not pass arbitrary provider keys farther into task construction.
+        return {
+            item.issue_id: value[item.issue_id]
+            for item in selected
+            if item.issue_id in value
+        }
+
+    def _legacy_overlay(
         self,
         asset_id: str,
         issue: Mapping[str, Any],
@@ -590,42 +1002,19 @@ class WarnWorkbenchService:
     ) -> OverlayDto | None:
         provider = self.overlay_provider
         if provider is None:
-            module = issue.get("module")
-            if isinstance(module, str) and "sam3" in module.lower():
-                return OverlayDto("pending", frame_range, None, None)
-            return None
+            return (
+                OverlayDto("pending", frame_range, None, None)
+                if _is_sam3_issue(issue)
+                else None
+            )
         getter = provider if callable(provider) else getattr(provider, "get_overlay", None)
         if not callable(getter):
             raise TypeError("overlay_provider must be callable or expose get_overlay")
-        value = getter(asset_id, issue_id, frame_range)
-        if value is None:
-            return None
-        if isinstance(value, OverlayHandle):
-            value = {
-                "status": value.status,
-                "overlay_id": value.overlay_id,
-                "path": value.path,
-                "code": value.code,
-            }
-        if not isinstance(value, Mapping):
-            raise TypeError("overlay provider result must be a mapping")
-        status = value.get("status")
-        if status not in {"pending", "generating", "ready", "failed"}:
-            raise WarnStateError("invalid overlay status")
-        code = value.get("code")
-        stable_code = code if isinstance(code, str) and _STABLE_CODE(code) else None
-        url: str | None = None
-        if status == "ready":
-            overlay_id = value.get("overlay_id")
-            path = value.get("path")
-            if not isinstance(overlay_id, str) or not isinstance(path, (str, Path)):
-                raise WarnStateError("ready overlay is missing its opaque handle")
-            self.media_catalog.allow_overlay(asset_id, overlay_id, path)
-            url = (
-                f"/media/assets/{quote(asset_id, safe='')}/overlays/"
-                f"{quote(overlay_id, safe='')}"
-            )
-        return OverlayDto(status, frame_range, url, stable_code)  # type: ignore[arg-type]
+        try:
+            value = getter(asset_id, issue_id, frame_range)
+        except Exception:
+            raise WarnStateError("overlay_provider_unavailable") from None
+        return None if value is None else self._overlay_from_value(asset_id, frame_range, value)
 
     def _issues(
         self,
@@ -646,18 +1035,42 @@ class WarnWorkbenchService:
         reviews = manual.get("issue_reviews")
         if not isinstance(reviews, Mapping):
             reviews = {}
-        result: list[WarnIssueDto] = []
+        projected: list[tuple[str, str, Mapping[str, Any], FrameRangeDto]] = []
         for issue_id in selected:
             issue = by_id.get(issue_id)
             if issue is None:
                 raise WarnStateError("selected issue is missing from report")
             frame_range = normalize_issue_range(issue, total_frames)
             public_issue_id = raw_to_public[issue_id]
+            projected.append((issue_id, public_issue_id, issue, frame_range))
+
+        sam3_selected = tuple(
+            OverlayIssueInput(issue_id, frame_range)
+            for issue_id, _, issue, frame_range in projected
+            if _is_sam3_issue(issue)
+        )
+        asset_overlay_values: Mapping[str, object] | None = None
+        if sam3_selected and self._asset_overlay_getter() is not None:
+            asset_overlay_values = self._asset_overlay_values(asset_id, sam3_selected)
+
+        result: list[WarnIssueDto] = []
+        for issue_id, public_issue_id, issue, frame_range in projected:
             code = (
                 _safe_code(issue.get("code"))
                 or (_safe_code(issue_id) if public_issue_id == issue_id else None)
                 or "issue"
             )
+            if asset_overlay_values is not None and _is_sam3_issue(issue):
+                overlay_value = asset_overlay_values.get(issue_id)
+                overlay = (
+                    self._overlay_from_value(asset_id, frame_range, overlay_value)
+                    if overlay_value is not None
+                    else OverlayDto("pending", frame_range, None, None)
+                )
+            elif asset_overlay_values is not None:
+                overlay = None
+            else:
+                overlay = self._legacy_overlay(asset_id, issue, issue_id, frame_range)
             result.append(
                 WarnIssueDto(
                     id=public_issue_id,
@@ -674,7 +1087,7 @@ class WarnWorkbenchService:
                     threshold=_threshold(issue),
                     evidence_type="source_video",
                     review=_review(reviews.get(issue_id)),
-                    overlay=self._overlay(asset_id, issue, issue_id, frame_range),
+                    overlay=overlay,
                 )
             )
         return tuple(result)
@@ -837,11 +1250,15 @@ class WarnWorkbenchService:
 
 
 __all__ = [
+    "AssetOverlayProvider",
     "FrameRangeDto",
     "InvalidIssueRangeError",
     "LeaseDto",
     "OverlayHandle",
     "OverlayDto",
+    "OverlayIssueInput",
+    "OverlaySegmentDto",
+    "OverlaySegmentHandle",
     "REASON_OPTIONS",
     "ReasonOptionDto",
     "ReviewAuditDto",
@@ -849,5 +1266,6 @@ __all__ = [
     "WarnIssueDto",
     "WarnTaskDto",
     "WarnWorkbenchService",
+    "WorkerOverlayProvider",
     "normalize_issue_range",
 ]

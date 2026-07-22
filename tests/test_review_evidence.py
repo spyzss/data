@@ -340,3 +340,293 @@ def test_warn_dto_uses_opaque_overlay_handle_without_legacy_evidence_resolution(
     }
     assert str(overlay) not in json.dumps(task)
     assert service.overlay_media("asset-1", "opaque-continuous-1").path == overlay
+
+
+def test_asset_overlay_provider_projects_one_union_job_without_sync_rendering(
+    tmp_path: Path,
+) -> None:
+    """A Warn task projects one server-side SAM3 union, never one job per issue."""
+
+    from human_qc.overlay_worker import (
+        OverlayJobView,
+        OverlayRequest,
+        OverlaySegmentView,
+    )
+    from human_qc.warn_workbench_service import WorkerOverlayProvider
+    from tests.test_human_qc_workbench import _service
+
+    class ExplodingRenderer:
+        calls = 0
+
+        def render_interval(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("task GET must not render an overlay synchronously")
+
+    class RecordingWorker:
+        def __init__(self, segments):
+            self.requests = []
+            self._segments = segments
+
+        def submit(self, request):
+            self.requests.append(request)
+            return OverlayJobView(
+                cache_key=request.cache_key,
+                status="ready",
+                segments=self._segments,
+            )
+
+    service, _, _, context = _service(tmp_path)
+    report = json.loads(context.report_path.read_text(encoding="utf-8"))
+    report["issues"] = [
+        {
+            "issue_id": "sam3-first",
+            "code": "first_sam3",
+            "module": "sam3_containment",
+            "context": {"start_frame": 120, "end_frame": 168},
+            "source_path": "/private/first.mp4",
+        },
+        {
+            "issue_id": "sam3-overlap",
+            "code": "overlap_sam3",
+            "module": "sam3_containment",
+            "context": {"start_frame": 142, "end_frame": 181},
+            "command": "ffmpeg /private/overlap.mp4",
+        },
+        {
+            "issue_id": "sam3-later",
+            "code": "later_sam3",
+            "module": "sam3_containment",
+            "context": {"start_frame": 390, "end_frame": 426},
+        },
+        {
+            "issue_id": "plain-warn",
+            "code": "plain",
+            "module": "video_quality",
+            "context": {"start_frame": 10, "end_frame": 11},
+        },
+    ]
+    report["manual_review"]["selected_issue_ids"] = [
+        "sam3-first",
+        "sam3-overlap",
+        "sam3-later",
+        "plain-warn",
+    ]
+    report["manual_review"]["candidate_issue_ids"] = list(
+        report["manual_review"]["selected_issue_ids"]
+    )
+    report["manual_review"]["issue_reviews"] = {}
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    overlay_dir = tmp_path / "overlays"
+    overlay_dir.mkdir()
+    first_output = overlay_dir / "union-120-182.mp4"
+    later_output = overlay_dir / "union-390-427.mp4"
+    first_output.write_bytes(b"first")
+    later_output.write_bytes(b"later")
+    renderer = ExplodingRenderer()
+    worker = RecordingWorker(
+        (
+            OverlaySegmentView(
+                start_frame=120,
+                end_frame_exclusive=182,
+                status="ready",
+                overlay_id="overlay-union-120-182",
+                path=first_output,
+            ),
+            OverlaySegmentView(
+                start_frame=390,
+                end_frame_exclusive=427,
+                status="ready",
+                overlay_id="overlay-union-390-427",
+                path=later_output,
+            ),
+        )
+    )
+
+    def request_factory(asset_id, selected):
+        assert [set(item.__dict__) for item in selected] == [
+            {"issue_id", "frame_range"},
+            {"issue_id", "frame_range"},
+            {"issue_id", "frame_range"},
+        ]
+        assert all("/private/" not in repr(item) for item in selected)
+        return OverlayRequest(
+            asset_id=asset_id,
+            cache_root=tmp_path / ".overlay-cache",
+            source_sha256="sha256:" + "a" * 64,
+            intervals=tuple(
+                (item.frame_range.start_frame, item.frame_range.end_frame_exclusive)
+                for item in selected
+            ),
+            fps=30.0,
+            total_frames=1800,
+            model_hash="model-v1",
+            config_hash="config-v1",
+            input_fingerprint_hash="inputs-v1",
+            renderer_version="renderer-v1",
+            renderer=renderer,
+        )
+
+    service.overlay_provider = WorkerOverlayProvider(
+        worker=worker,
+        request_factory=request_factory,
+    )
+
+    task = service.get_asset_task("asset-1")
+
+    assert len(worker.requests) == 1
+    request = worker.requests[0]
+    assert request.intervals == ((120, 182), (390, 427))
+    assert renderer.calls == 0
+    shared = {
+        "start_frame": 120,
+        "end_frame_exclusive": 182,
+        "status": "ready",
+        "overlay_id": "overlay-union-120-182",
+        "url": "/media/assets/asset-1/overlays/overlay-union-120-182",
+        "code": None,
+        "retryable": False,
+    }
+    assert task["issues"][0]["overlay"]["segments"] == [shared]
+    assert task["issues"][1]["overlay"]["segments"] == [shared]
+    assert task["issues"][2]["overlay"]["segments"] == [
+        {
+            "start_frame": 390,
+            "end_frame_exclusive": 427,
+            "status": "ready",
+            "overlay_id": "overlay-union-390-427",
+            "url": "/media/assets/asset-1/overlays/overlay-union-390-427",
+            "code": None,
+            "retryable": False,
+        }
+    ]
+    assert task["issues"][3]["overlay"] is None
+    serialized = json.dumps(task)
+    for forbidden in ("/private/", "ffmpeg", "cache_key", "model-v1", "inputs-v1"):
+        assert forbidden not in serialized
+
+
+def test_asset_overlay_projection_waits_for_every_relevant_segment(
+    tmp_path: Path,
+) -> None:
+    from human_qc.warn_workbench_service import (
+        FrameRangeDto,
+        OverlayHandle,
+        OverlaySegmentHandle,
+    )
+    from tests.test_human_qc_workbench import _service
+
+    class Provider:
+        def get_asset_overlays(self, _asset_id, selected):
+            assert len(selected) == 1
+            return {
+                selected[0].issue_id: OverlayHandle(
+                    status="generating",
+                    segments=(
+                        OverlaySegmentHandle(
+                            frame_range=FrameRangeDto(120, 182),
+                            status="generating",
+                            overlay_id="current-part",
+                        ),
+                        OverlaySegmentHandle(
+                            frame_range=FrameRangeDto(390, 427),
+                            status="ready",
+                            overlay_id="later-part",
+                            path=tmp_path / "later.mp4",
+                        ),
+                    ),
+                )
+            }
+
+    service, _, _, context = _service(tmp_path)
+    (tmp_path / "later.mp4").write_bytes(b"later")
+    report = json.loads(context.report_path.read_text(encoding="utf-8"))
+    report["issues"] = [
+        {
+            "issue_id": "sam3-spanning",
+            "code": "spanning",
+            "module": "sam3_containment",
+            "context": {"start_frame": 120, "end_frame": 168},
+        }
+    ]
+    report["manual_review"]["selected_issue_ids"] = ["sam3-spanning"]
+    report["manual_review"]["candidate_issue_ids"] = ["sam3-spanning"]
+    report["manual_review"]["issue_reviews"] = {}
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    service.overlay_provider = Provider()
+
+    overlay = service.get_asset_task("asset-1")["issues"][0]["overlay"]
+
+    assert overlay["status"] == "generating"
+    assert overlay["url"] is None
+    assert overlay["segments"] == [{
+        "start_frame": 120,
+        "end_frame_exclusive": 182,
+        "status": "generating",
+        "overlay_id": "current-part",
+        "url": None,
+        "code": None,
+        "retryable": False,
+    }]
+
+
+def test_asset_overlay_segments_must_stay_under_the_asset_batch_root(
+    tmp_path: Path,
+) -> None:
+    from human_qc.media import MediaNotFoundError
+    from human_qc.warn_workbench_service import OverlayHandle, OverlaySegmentHandle
+    from tests.test_human_qc_workbench import _service
+
+    class Provider:
+        def get_asset_overlays(self, _asset_id, selected):
+            return {
+                selected[0].issue_id: OverlayHandle(
+                    status="ready",
+                    segments=(
+                        OverlaySegmentHandle(
+                            frame_range=selected[0].frame_range,
+                            status="ready",
+                            overlay_id="escaped-overlay",
+                            path=tmp_path.parent / "outside.mp4",
+                        ),
+                    ),
+                )
+            }
+
+    service, _, _, _ = _service(tmp_path)
+    service.overlay_provider = Provider()
+    (tmp_path.parent / "outside.mp4").write_bytes(b"outside")
+
+    with pytest.raises(MediaNotFoundError, match="media_not_found"):
+        service.get_asset_task("asset-1")
+
+
+def test_asset_overlay_projection_drops_unsafe_pending_segment_identifier(
+    tmp_path: Path,
+) -> None:
+    from human_qc.warn_workbench_service import OverlayHandle, OverlaySegmentHandle
+    from tests.test_human_qc_workbench import _service
+
+    class Provider:
+        def get_asset_overlays(self, _asset_id, selected):
+            return {
+                selected[0].issue_id: OverlayHandle(
+                    status="pending",
+                    segments=(
+                        OverlaySegmentHandle(
+                            frame_range=selected[0].frame_range,
+                            status="pending",
+                            overlay_id="/private/cache-key",
+                        ),
+                    ),
+                )
+            }
+
+    service, _, _, _ = _service(tmp_path)
+    service.overlay_provider = Provider()
+
+    task = service.get_asset_task("asset-1")
+
+    segment = task["issues"][0]["overlay"]["segments"][0]
+    assert segment["overlay_id"] is None
+    assert "/private/" not in json.dumps(task)
