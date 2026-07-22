@@ -315,9 +315,78 @@ def test_worker_reports_cache_full_without_publishing_a_ready_manifest(tmp_path:
 
         assert failed.status == "failed"
         assert failed.code == "overlay_cache_full"
-        manifest = request.cache_root / request.cache_key.digest / "manifest.json"
-        assert json.loads(manifest.read_text(encoding="utf-8"))["status"] == "failed"
         assert not any(segment.status == "ready" for segment in failed.segments)
+        assert worker.get(request).code == "overlay_cache_full"
+        assert not (request.cache_root / request.cache_key.digest).exists()
+    finally:
+        worker.shutdown()
+
+
+def test_failed_job_eviction_does_not_release_a_ready_job_slot(tmp_path: Path) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    failed_request = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=FailingRenderer(),
+        source_sha256="sha256:" + "1" * 64,
+    )
+    first_ready_request = _request(
+        tmp_path,
+        intervals=((1, 2),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "2" * 64,
+    )
+    second_ready_request = _request(
+        tmp_path,
+        intervals=((2, 3),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "3" * 64,
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=1, max_ready_jobs=1)
+    try:
+        worker.submit(failed_request)
+        assert _wait_until_terminal(worker, failed_request).status == "failed"
+        worker.submit(first_ready_request)
+        assert _wait_until_terminal(worker, first_ready_request).status == "ready"
+        worker.submit(second_ready_request)
+        assert _wait_until_terminal(worker, second_ready_request).status == "ready"
+
+        statuses = [
+            json.loads(path.read_text(encoding="utf-8"))["status"]
+            for path in failed_request.cache_root.glob("*/manifest.json")
+        ]
+        assert statuses.count("ready") == 1
+    finally:
+        worker.shutdown()
+
+
+def test_distinct_failed_keys_do_not_accumulate_empty_job_directories_under_tiny_quota(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=1, max_cache_bytes=1)
+    requests = [
+        _request(
+            tmp_path,
+            intervals=((0, 1),),
+            renderer=FailingRenderer(),
+            source_sha256="sha256:" + f"{index:064x}",
+        )
+        for index in range(1, 4)
+    ]
+    try:
+        for request in requests:
+            worker.submit(request)
+            failed = _wait_until_terminal(worker, request)
+            assert failed.status == "failed"
+            assert worker.get(request).status == "failed"
+            assert not [
+                path
+                for path in request.cache_root.glob("*")
+                if path.is_dir() and len(path.name) == 64
+            ]
     finally:
         worker.shutdown()
 

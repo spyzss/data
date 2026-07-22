@@ -4,6 +4,7 @@ from dataclasses import replace
 import importlib
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import numpy as np
@@ -133,6 +134,7 @@ def _renderer(
             fps_den=1,
             codec="mpeg4",
             container_format="mov,mp4,m4a,3gp,3g2,mj2",
+            container_major_brand="isom",
         ),
     )
     return renderer, frame_provider, runtime, concrete_segmenter, observed
@@ -250,6 +252,7 @@ def test_renderer_consumes_every_explicit_source_frame_once_and_uses_shared_runt
         "height_px": 4,
         "codec": "mpeg4",
         "container_format": "mov,mp4,m4a,3gp,3g2,mj2",
+        "container_major_brand": "isom",
         "first_source_frame": 120,
         "end_source_frame_exclusive": 182,
         "mapping": "explicit",
@@ -861,6 +864,81 @@ def test_renderer_rejects_mpeg4_stream_inside_non_mp4_container(tmp_path: Path) 
         )
 
     assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("muxer", "forced_brand", "accepted", "expected_brand"),
+    [
+        pytest.param("mov", None, False, "qt  ", id="quicktime-mov-renamed-mp4"),
+        pytest.param("3gp", None, False, "3gp4", id="3gp-renamed-mp4"),
+        pytest.param("mp4", "M4A ", False, "M4A ", id="m4a-brand-with-video"),
+        pytest.param("mp4", None, True, "isom", id="normal-mp4"),
+    ],
+)
+def test_renderer_requires_an_mp4_compatible_major_brand_from_real_ffmpeg(
+    tmp_path: Path,
+    muxer: str,
+    forced_brand: str | None,
+    accepted: bool,
+    expected_brand: str,
+) -> None:
+    module = _renderer_module()
+
+    class FfmpegMuxEncoder:
+        def __init__(self, output_path: Path, fps: float, size: tuple[int, int]) -> None:
+            self.output_path = output_path
+            self.fps = fps
+            self.size = size
+            self.frame_count = 0
+
+        def write(self, _frame: np.ndarray) -> None:
+            self.frame_count += 1
+
+        def close(self) -> None:
+            argv = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=black:s={self.size[0]}x{self.size[1]}:r={self.fps}",
+                "-frames:v",
+                str(self.frame_count),
+                "-c:v",
+                "mpeg4",
+            ]
+            if forced_brand is not None:
+                argv.extend(("-brand", forced_brand))
+            argv.extend(("-f", muxer, str(self.output_path)))
+            subprocess.run(
+                argv,
+                shell=False,
+                capture_output=True,
+                check=True,
+            )
+
+    renderer = module.Sam3OverlayRenderer(
+        frame_provider=FakeFrameProvider(),
+        runtime_provider=RecordingRuntimeProvider(RecordingSegmenter()),
+        model_path=tmp_path / "model",
+        runtime_config={},
+        queries=("hand",),
+        encoder_factory=FfmpegMuxEncoder,
+    )
+    output = tmp_path / f"{muxer}-container-named.mp4"
+    request = _request(tmp_path, renderer, interval=(0, 2))
+
+    if not accepted:
+        with pytest.raises(module.OverlayRenderError, match="overlay_encoder_failed"):
+            renderer.render_interval(request, 0, 2, output)
+        assert not output.exists()
+        return
+
+    metadata = renderer.render_interval(request, 0, 2, output)
+    assert metadata["container_major_brand"] == expected_brand
+    assert output.is_file()
 
 
 def test_renderer_closes_frame_provider_after_each_bounded_interval(tmp_path: Path) -> None:

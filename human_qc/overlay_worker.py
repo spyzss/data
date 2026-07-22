@@ -830,7 +830,7 @@ class BoundedOverlayWorker:
     def _release_owner(self, request: OverlayRequest, token: str) -> None:
         owner_path = self._owner_path(request)
         try:
-            with self._key_lock(request) as acquired:
+            with self._key_lock(request, create=False) as acquired:
                 if acquired and self._owns_owner_locked(request, token):
                     owner_path.unlink(missing_ok=True)
                     self._fsync_directory(owner_path.parent)
@@ -870,13 +870,28 @@ class BoundedOverlayWorker:
         return view
 
     @contextmanager
-    def _key_lock(self, request: OverlayRequest, *, blocking: bool = True):
+    def _key_lock(
+        self,
+        request: OverlayRequest,
+        *,
+        blocking: bool = True,
+        create: bool = True,
+    ):
         """Acquire only a short per-key state lock, never a renderer lock."""
 
         job_dir = self._job_dir(request)
-        job_dir.mkdir(parents=True, exist_ok=True)
+        if create:
+            job_dir.mkdir(parents=True, exist_ok=True)
         lock_path = job_dir / ".generation.lock"
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            descriptor = os.open(
+                lock_path,
+                (os.O_CREAT if create else 0) | os.O_RDWR,
+                0o600,
+            )
+        except FileNotFoundError:
+            yield False
+            return
         acquired = True
         try:
             try:
@@ -1118,7 +1133,7 @@ class BoundedOverlayWorker:
             candidates = [path for path in root.iterdir() if path.is_dir() and _DIGEST(path.name)]
         except OSError:
             return False
-        ready: list[tuple[float, int, Path, bool]] = []
+        ready: list[tuple[float, int, Path, bool, bool]] = []
         total_size = 0
         ready_count = 0
         for path in candidates:
@@ -1152,6 +1167,7 @@ class BoundedOverlayWorker:
                     size,
                     path,
                     not is_ready or not self._has_live_pin(root, path.name),
+                    is_ready,
                 )
             )
         ready.sort(key=lambda item: item[0])
@@ -1161,15 +1177,20 @@ class BoundedOverlayWorker:
             or (self._max_ready_jobs is not None and target_count > self._max_ready_jobs)
         ):
             victim_index = next(
-                (index for index, (_, _, _, evictable) in enumerate(ready) if evictable),
+                (
+                    index
+                    for index, (_, _, _, evictable, _) in enumerate(ready)
+                    if evictable
+                ),
                 None,
             )
             if victim_index is None:
                 break
-            _, size, victim, _ = ready.pop(victim_index)
+            _, size, victim, _, victim_is_ready = ready.pop(victim_index)
             self._safe_remove_job(root, victim)
             total_size -= size
-            target_count -= 1
+            if victim_is_ready:
+                target_count -= 1
         if self._max_cache_bytes is not None and total_size + current_job_size > self._max_cache_bytes:
             return False
         return self._max_ready_jobs is None or target_count <= self._max_ready_jobs
@@ -1407,17 +1428,6 @@ class BoundedOverlayWorker:
                         ),
                     )
                     final = candidate
-                    manifest_size = len(
-                        json.dumps(
-                            self._manifest_payload(request, candidate),
-                            ensure_ascii=True,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    )
-                    if not self._evict_failed_for(request, manifest_size):
-                        self._safe_remove_job(self._root(request), self._job_dir(request))
-                        return final
                 elif not self._evict_for(
                     request, self._job_size(self._job_dir(request))
                 ):
@@ -1440,6 +1450,18 @@ class BoundedOverlayWorker:
                         retryable=True,
                         segments=failed_segments,
                     )
+                if final.status == "failed":
+                    manifest_size = len(
+                        json.dumps(
+                            self._manifest_payload(request, final),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
+                    if not self._evict_failed_for(request, manifest_size):
+                        self._safe_remove_job(self._root(request), self._job_dir(request))
+                        return final
                 self._persist(request, final)
                 return final
 

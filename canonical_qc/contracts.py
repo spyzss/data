@@ -88,6 +88,7 @@ class ProbedVideo:
     pixel_format: str
     timestamps_ns: tuple[int, ...]
     container_format: str | None = None
+    container_major_brand: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "timestamps_ns", tuple(self.timestamps_ns))

@@ -63,6 +63,10 @@ def _ffprobe_payload() -> dict[str, object]:
                 "time_base": "1/90000",
             }
         ],
+        "format": {
+            "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+            "tags": {"major_brand": "isom"},
+        },
     }
 
 
@@ -123,12 +127,16 @@ def test_probe_video_reads_metadata_rational_fps_and_normalized_pts(
     assert (video.fps_num, video.fps_den) == (30000, 1001)
     assert video.codec == "h264"
     assert video.pixel_format == "yuv420p"
+    assert video.container_format == "mov,mp4,m4a,3gp,3g2,mj2"
+    assert video.container_major_brand == "isom"
     assert video.timestamps_ns == (0, 33_366_667, 66_733_333)
     argv = observed["argv"]
     kwargs = observed["kwargs"]
     assert isinstance(argv, list)
     assert argv[-1] == str(path)
     assert "-show_frames" in argv
+    show_entries = argv[argv.index("-show_entries") + 1]
+    assert "format_tags=major_brand" in show_entries
     assert kwargs["shell"] is False
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True

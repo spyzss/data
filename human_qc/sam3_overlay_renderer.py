@@ -47,6 +47,23 @@ PARQUET_REFERENCE_SCHEMA = "parquet_columns.v2"
 JSON_REFERENCE_SCHEMA = "json_keypoints.v1"
 KEYPOINT_SIDECAR_SCHEMA = "sam3_overlay_keypoints.v1"
 DEFAULT_OVERLAY_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024
+_MP4_VIDEO_MAJOR_BRANDS = frozenset(
+    {
+        "isom",
+        "iso2",
+        "iso3",
+        "iso4",
+        "iso5",
+        "iso6",
+        "iso7",
+        "iso8",
+        "iso9",
+        "mp41",
+        "mp42",
+        "avc1",
+        "m4v",
+    }
+)
 PUBLIC_OVERLAY_FAILURE_CODES = frozenset(
     {
         "overlay_model_unavailable",
@@ -407,6 +424,7 @@ class Sam3OverlayRenderer:
             fps_den = getattr(probed, "fps_den")
             codec = getattr(probed, "codec")
             container_format = getattr(probed, "container_format")
+            container_major_brand = getattr(probed, "container_major_brand")
             actual_fps = float(fps_num) / float(fps_den)
         except Exception as exc:
             self._remove_partial(output_path)
@@ -427,6 +445,8 @@ class Sam3OverlayRenderer:
                 for item in container_format.split(",")
                 if item.strip()
             }
+            or not isinstance(container_major_brand, str)
+            or container_major_brand.strip().lower() not in _MP4_VIDEO_MAJOR_BRANDS
         ):
             self._remove_partial(output_path)
             raise self._render_error("overlay_encoder_failed")
@@ -437,6 +457,7 @@ class Sam3OverlayRenderer:
             "height_px": height,
             "codec": codec,
             "container_format": container_format,
+            "container_major_brand": container_major_brand,
             "first_source_frame": start_frame,
             "end_source_frame_exclusive": end_frame_exclusive,
             "mapping": "explicit",

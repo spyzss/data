@@ -92,7 +92,7 @@ def _probe_payload(path: Path, *, pass_fds: tuple[int, ...] = ()) -> dict[str, A
         (
             "stream=codec_name,codec_type,width,height,pix_fmt,avg_frame_rate,"
             "time_base:frame=media_type,best_effort_timestamp,"
-            "best_effort_timestamp_time:format=format_name"
+            "best_effort_timestamp_time:format=format_name:format_tags=major_brand"
         ),
         "-show_streams",
         "-show_frames",
@@ -208,6 +208,15 @@ def probe_video(path: Path, *, file_descriptor: int | None = None) -> ProbedVide
         if isinstance(raw_container, str) and raw_container.strip()
         else None
     )
+    raw_tags = raw_format.get("tags") if isinstance(raw_format, dict) else None
+    raw_major_brand = (
+        raw_tags.get("major_brand") if isinstance(raw_tags, dict) else None
+    )
+    container_major_brand = (
+        raw_major_brand
+        if isinstance(raw_major_brand, str) and raw_major_brand.strip()
+        else None
+    )
     fps = _fraction(stream.get("avg_frame_rate"), field="main_video.fps")
     raw_time_base = stream.get("time_base")
     time_base: Fraction | None = None
@@ -255,4 +264,5 @@ def probe_video(path: Path, *, file_descriptor: int | None = None) -> ProbedVide
         ),
         timestamps_ns=timestamps_ns,
         container_format=container_format,
+        container_major_brand=container_major_brand,
     )

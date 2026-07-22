@@ -484,3 +484,107 @@ git diff --check
 - 提交主题：`fix(sam3): bound overlay production lifecycle`（最终 SHA 见任务回报）。
 - 本机仍无真实 SAM3 权重/GPU，真实模型加载和 GPU 推理需部署环境验收；本任务已覆盖
   real MP4/ffprobe、真实 JDT report -> launcher -> bounded worker ready 链路。
+
+---
+
+# Task 9C final review Important repair
+
+## 状态与范围
+
+DONE
+
+本轮只修复最终审查遗留的两项 Important：overlay cache 的 terminal quota/空目录
+边界，以及 ISO BMFF `format_name` 无法证明实际 MP4 container 的问题。未修改
+runner、recipe、launcher、HTTP、browser JS、OpenSpec、主计划或 `.comet`。
+
+基线：`0adc80c157550aae75ac0fe39cde84a73a89115f`。本轮提交主题：
+`fix(sam3): close overlay quota and container gaps`；包含本报告的最终提交 SHA 以任务
+回报中的 `git rev-parse HEAD` 结果为准（Git commit 无法在自身已跟踪内容中嵌入其
+最终 SHA）。
+
+## Root cause
+
+1. `_evict_for()` 同时扫描 ready/failed terminal job，但每淘汰一个 victim 都无条件
+   递减 ready `target_count`。当较旧 failed manifest 先被淘汰时，代码错误地认为已
+   释放 ready slot，`max_ready_jobs=1` 可以最终留下两个 ready manifest。
+2. ready candidate 因 byte quota 失败转成 `overlay_cache_full` 后，旧分支直接
+   `_persist()` failed manifest，没有再次走 failed-byte quota。对无法容纳最小 failed
+   manifest 的极小 quota，删除 current job 后，finally 中 owner cleanup 又通过会
+   `mkdir` 的 `_key_lock()` 重建 digest 目录，留下仅 lock 的不可扫描空目录；不同失败
+   key 会持续累积。
+3. ffprobe 对正常 MP4、QuickTime MOV 和 3GP 都返回
+   `format_name=mov,mp4,m4a,3gp,3g2,mj2`。真实 ffmpeg 样本的可区分字段分别为
+   `major_brand=isom`、`qt  `、`3gp4`；原 renderer 只检查 `format_name` 中含
+   `mp4`，因此 MOV/3GP 改名 `.mp4` 后仍被误收。
+
+## 最小修复
+
+- ready quota 只在真实 ready victim 被淘汰时递减；failed victim 仍可先释放 byte，
+  但不释放 ready-count。
+- render 的所有 failed 终态（含 ready -> cache-full）在持久化前统一通过
+  `_evict_failed_for()`。若最小 failed manifest 也放不下，保留无 path 的进程内安全
+  failed view，不落盘超额内容。
+- owner release 使用不创建 lock 的模式；current job 已被 quota cleanup 删除时不再
+  重建 digest 目录。
+- `ProbedVideo`/ffprobe contract 新增 `container_major_brand`。renderer 在既有
+  format/codec/frame/size/fps 检查之外，只接受明确的 MP4 video major-brand allowlist；
+  `qt`、`3gp*`、`M4A` 等均 fail closed，并继续映射稳定
+  `overlay_encoder_failed`。
+
+## TDD RED / GREEN 证据
+
+先只修改测试并运行：
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_worker.py::test_worker_reports_cache_full_without_publishing_a_ready_manifest \
+  tests/test_sam3_overlay_worker.py::test_failed_job_eviction_does_not_release_a_ready_job_slot \
+  tests/test_sam3_overlay_worker.py::test_distinct_failed_keys_do_not_accumulate_empty_job_directories_under_tiny_quota \
+  tests/test_canonical_video_probe.py::test_probe_video_reads_metadata_rational_fps_and_normalized_pts \
+  tests/test_sam3_overlay_renderer.py::test_renderer_requires_an_mp4_compatible_major_brand_from_real_ffmpeg
+```
+
+RED：`7 failed`。精确失败分别为：tiny quota 后 digest 目录仍存在；混合
+failed/ready 下 ready manifest 为 2；不同 failed key 留下空 digest 目录；probe
+contract 缺少 major brand；真实 QuickTime/3GP 未拒绝；正常 MP4 metadata 缺少
+major brand。
+
+最小实现后，同一选择 GREEN：`7 passed in 2.85s`。随后加入真实 ffmpeg
+`M4A ` major-brand 视频 case，与 MOV/3GP/正常 MP4 四项合跑：
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_renderer.py::test_renderer_requires_an_mp4_compatible_major_brand_from_real_ffmpeg
+# 4 passed in 0.64s
+```
+
+## 最终验证
+
+Task 9C 聚焦组合（原报告 155 项，加本轮新增参数化回归后为 161 项）：
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py \
+  tests/test_sam3_overlay_worker.py tests/test_review_evidence.py \
+  tests/test_qc_pipeline_sam3_runner.py tests/test_canonical_qc_runner_bridge.py \
+  tests/test_human_qc_media.py
+# 161 passed in 5.15s
+```
+
+邻接测试：
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_workbench.py tests/test_human_qc_http_server.py \
+  tests/test_canonical_video_probe.py
+# 110 passed in 6.52s
+```
+
+全量：
+
+```bash
+.venv/bin/python -m pytest -q
+# 1854 passed, 1 skipped in 120.71s
+```
+
+`py_compile`（4 个业务文件和 3 个聚焦测试文件）及 `git diff --check` 均 exit 0。
