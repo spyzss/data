@@ -50,7 +50,7 @@
 
 - [ ] 8.1 将语义领域代码、API、静态页面和启动入口迁入独立 `semantic_calibration` 包
 - [ ] 8.2 将 `human_qc` 收敛为 Warn-only，移除对语义 Service、adapter、DOM 和 HDF5 API 的运行时依赖
-- [ ] 8.3 调整 pipeline 为自动 QC → Warn 人工复核 → 语义校准，并覆盖无候选、全 Pass、early Fail 和自动 hard-fail profile 场景
+- [x] 8.3 调整 pipeline 为自动 QC → Warn 人工复核 → 语义校准，并覆盖无候选、全 Pass、early Fail 和自动 hard-fail profile 场景
 - [ ] 8.4 保留自动 lease/revision 并为两个独立服务验证路由与依赖边界
 
 ## 9. 整段视频与 Warning 时间轴

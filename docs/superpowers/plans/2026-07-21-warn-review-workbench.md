@@ -184,7 +184,7 @@ git commit -m "feat(human-qc): support explicit early-fail completion"
 - Produces: server-side `semantic_eligibility(report) -> Literal["ready", "blocked", "skipped_due_to_fail"]`
 - Preserves: acceptance automatic hard-stop and supplier-evaluation hard-fail precedence.
 
-- [ ] **Step 1: Write failing routing tests**
+- [x] **Step 1: Write failing routing tests**
 
 Cover four exact traces:
 
@@ -197,7 +197,7 @@ assert report_early_fail["semantic_calibration"]["state"] == "skipped_due_to_fai
 
 Also assert that a direct semantic task request cannot bypass an incomplete manual review.
 
-- [ ] **Step 2: Run tests and verify Red**
+- [x] **Step 2: Run tests and verify Red**
 
 ```bash
 pytest -q tests/test_human_qc_profile_routing.py tests/test_qc_pipeline_profiles_e2e.py tests/test_report_mutation.py
@@ -205,7 +205,7 @@ pytest -q tests/test_human_qc_profile_routing.py tests/test_qc_pipeline_profiles
 
 Expected: FAIL because the current order and Warn service guard require semantic completion first.
 
-- [ ] **Step 3: Implement the state transition order**
+- [x] **Step 3: Implement the state transition order**
 
 Update configured external-module order and `resume_after_external()` so that:
 
@@ -223,11 +223,11 @@ def semantic_eligibility(report: Mapping[str, Any]) -> str:
 
 Remove `_assert_semantic_ready()` from Warn mutation paths and replace it with a manual-review cursor guard. Make transitions idempotent under restart and expected revision.
 
-- [ ] **Step 4: Run focused tests and verify Green**
+- [x] **Step 4: Run focused tests and verify Green**
 
 Run the Step 2 command. Expected: PASS.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```bash
 git add qc_common/config.py qc_common/manual_review.py qc_pipeline/orchestrator.py human_qc/warn_service.py tests/test_human_qc_profile_routing.py tests/test_qc_pipeline_profiles_e2e.py tests/test_report_mutation.py openspec/changes/add-human-semantic-warn-review/tasks.md
