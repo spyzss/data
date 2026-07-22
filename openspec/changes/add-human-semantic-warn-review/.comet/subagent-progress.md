@@ -15,8 +15,8 @@
 
 ## Current Task
 
-- Plan task: `Task 10: 同步播放 Overlay 并实施局部就绪门禁`
-- OpenSpec mapping: `10.3/10.4 浏览器同步播放、状态/重试与局部门禁`
+- Plan task: `Task 11: 集成验收与回归修复`
+- OpenSpec mapping: `11.1 Python、Node、DOM、API 与浏览器测试`
 - Stage: `build`
 - Review mode: `thorough`
 - Review/fix round: `Task 9A 3/3 approved; Task 9B 2/2 approved; Task 9C explicit user-authorized fourth narrow repair`
@@ -73,6 +73,13 @@
 - Task 9C fence-release accounting commit: `0a8b0e0` reports ready/failed victim and unlock/close-error RED `8 failed`, Green `17 passed`, worker `53 passed`, Task 9C focused `195 passed`, neighbors `110 passed`, and full Python `1888 passed, 1 skipped`. Confirmed deletion is now returned through fence exit errors; pre-delete fence errors and deletion failures remain false.
 - Task 9C final production approval dispatch: independent reviewer `/root/fix_task6_round1` is reviewing `fbdbd96..0a8b0e0` plus all cumulative cache/owner/fence invariants. Task 9C and OpenSpec 10.1/10.2 may only be checked off after an APPROVED result.
 - Task 9C final production approval: APPROVED after `0a8b0e0`. The final reviewer confirmed fence-exit accounting distinguishes confirmed deletion from pre-delete errors; all prior quota, removal, owner-successor, expired-fence, and MP4 major-brand regressions remain covered. Final evidence: worker `53 passed`, Task 9C focused `195 passed`, neighbors `110 passed`, full Python `1888 passed, 1 skipped`, and diff-check pass. Plan Steps 6–10 and OpenSpec 10.1/10.2 are now checked off.
+- Task 10 implementation: `93aadee` added safe status/retry routes and union retry seam, one overlay video controller, VideoController subscriptions, local overlay gating, polling/retry UI, and CSS. Implementer evidence: Node `54 passed`, focused/neighbor Python `134 passed`; coordinator independently reproduced both suites.
+- Task 10 review: CHANGES_REQUESTED with no Critical and two Important polling/retry defects. Equivalent generating status responses reset backoff to 1s instead of 1/2/4/5s, and retry 503 `Retry-After` responses immediately clear single-flight state allowing repeated posts; status network/5xx also lacked a safe retrying notice.
+- Task 10 polling/retry repair dispatch: `/root/implement_task10_overlay_sync` must TDD the unchanged-projection backoff, 503 `Retry-After` busy/lock behavior, and safe status retry notice. Scope is App/static tests/report only; fresh review is required before 10.3/10.4 checkoff.
+- Task 10 polling/retry repair commit: `c1987a6` reports Node static `57 passed` and related Python `34 passed`; unchanged generating responses now back off 1/2/4/5s, retry 503 honors safe `Retry-After`, and status transport failures show a safe retry notice.
+- Task 10 polling/retry re-review: CHANGES_REQUESTED with no Critical and one Important poll-reentry race. An in-flight status poll clears its timer before the request completes; a retry success can schedule and execute another poll in the same generation before the old request returns. Abort/generation alone does not serialize this case.
+- Task 10 poll-serialization repair dispatch: existing Task10 agent must add an in-flight/queued poll invariant, TDD the hanging-status-plus-retry race, preserve all backoff/503/draft semantics, and return for one more independent approval before 10.3/10.4 checkoff.
+- Task 10 final approval: APPROVED after `b26ae0a`. The final reviewer confirmed same-generation polls serialize through a single in-flight promise, queued reset runs exactly once after completion, asset switch/destroy invalidate late work, and backoff/503/safe notice/draft/API/overlay/gating behavior remain intact. Evidence: Node `59 passed`, focused Python `81 passed`, and syntax/diff checks pass. Plan Task 10 and OpenSpec 10.3/10.4 are now checked off.
 - Binding downstream decisions:
   - Build a new `WarnWorkbenchService`; do not extend the shared legacy facade or use raw `jsonable()` projection.
   - Warn task DTOs are strict allowlists: source video, normalized half-open selected issue ranges, threshold/reason/review/overlay state, completion and safe lease state only.

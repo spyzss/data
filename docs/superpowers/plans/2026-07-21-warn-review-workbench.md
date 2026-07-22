@@ -720,7 +720,7 @@ git commit -m "feat(sam3): wire bounded overlays into warn workbench"
 - Exposes: overlay status polling and retry routes.
 - Enforces: only the affected SAM3 issue is non-reviewable until `ready`.
 
-- [ ] **Step 1: Write failing synchronization and API tests**
+- [x] **Step 1: Write failing synchronization and API tests**
 
 Assert base/overlay parity for play, pause, seek, frame step and speed:
 
@@ -737,7 +737,7 @@ assert.equal(overlay.hidden, true);
 
 Assert the review panel disables only the generating SAM3 issue; polling `ready` unlocks without reloading the asset; failed status exposes retry but no traceback.
 
-- [ ] **Step 2: Run tests and verify Red**
+- [x] **Step 2: Run tests and verify Red**
 
 ```bash
 node --test human_qc/static/overlay_controller.test.mjs human_qc/static/video_controller.test.mjs human_qc/static/workbench.test.mjs
@@ -746,15 +746,15 @@ pytest -q tests/test_human_qc_http_server.py
 
 Expected: FAIL because no overlay video controller or readiness route exists.
 
-- [ ] **Step 3: Implement overlay synchronization and readiness polling**
+- [x] **Step 3: Implement overlay synchronization and readiness polling**
 
 Maintain one muted, no-controls overlay video element. Translate base time to overlay-local time with `(currentFrame - startFrame) / fps`; hide outside the half-open interval. Correct drift greater than one frame on `timeupdate`, and hard-sync on `seeked`, `ratechange`, frame step and source change. `ReviewPanel.canSubmit(issue)` must require `overlay.status === "ready"` only when the issue declares continuous SAM3 evidence.
 
-- [ ] **Step 4: Run focused tests and verify Green**
+- [x] **Step 4: Run focused tests and verify Green**
 
 Run the Step 2 command. Expected: PASS.
 
-- [ ] **Step 5: Commit Task 10**
+- [x] **Step 5: Commit Task 10**
 
 ```bash
 git add human_qc/warn_workbench_service.py human_qc/http_server.py human_qc/static tests/test_human_qc_http_server.py openspec/changes/add-human-semantic-warn-review/tasks.md

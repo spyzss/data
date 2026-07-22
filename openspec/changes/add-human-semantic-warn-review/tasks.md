@@ -66,8 +66,8 @@
 
 - [x] 10.1 扩展 evidence worker，只对 SAM3 问题帧并集生成连续 overlay，并去重重叠帧
 - [x] 10.2 实现基于源视频、区间、模型/config 和 renderer 版本的有界缓存、异步状态和失败恢复
-- [ ] 10.3 在浏览器中将无控制条 overlay 层与原视频的播放、暂停、seek、逐帧和倍速同步
-- [ ] 10.4 只预加载当前和下一个 overlay，并仅在非 ready 时锁定对应 SAM3 Warning
+- [x] 10.3 在浏览器中将无控制条 overlay 层与原视频的播放、暂停、seek、逐帧和倍速同步
+- [x] 10.4 只预加载当前和下一个 overlay，并仅在非 ready 时锁定对应 SAM3 Warning
 
 ## 11. 验证与文档同步
 
