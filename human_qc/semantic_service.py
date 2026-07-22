@@ -19,7 +19,7 @@ import uuid
 from typing import Any
 
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report
-from qc_common.manual_review import select_pending_manual_review_candidates
+from qc_common.manual_review import semantic_eligibility
 
 from .contracts import BoundaryEdit, BoundaryError, SegmentSnapshot, SubtaskSegment
 from .hdf5_commit import (
@@ -567,45 +567,11 @@ def _validate_stable_segment_identity(
 
 
 def _advance_pipeline_after_semantic(candidate: dict[str, Any]) -> None:
-    """Advance only from the semantic external cursor.
-
-    A completed semantic stage with no warn candidates closes the pipeline;
-    candidates deliberately keep it paused at the manual-review stage.
-    """
+    """Complete a config-less semantic cursor after manual review."""
 
     pipeline = _require_semantic_pipeline_cursor(candidate)
-    manual = candidate.get("manual_review")
-    candidate_ids = (
-        manual.get("candidate_issue_ids", [])
-        if isinstance(manual, Mapping)
-        else []
-    )
-    if isinstance(candidate_ids, (str, bytes, bytearray)) or not isinstance(
-        candidate_ids, Sequence
-    ):
-        raise TaskStateError("manual candidate_issue_ids must be a sequence")
     pipeline["last_completed_module"] = "semantic_consistency"
     pipeline["stop_reason"] = None
-    if candidate_ids:
-        pipeline["status"] = "awaiting_external"
-        pipeline["next_module"] = "manual_review"
-        candidate["pipeline_state"] = pipeline
-        select_pending_manual_review_candidates(candidate)
-        return
-
-    if not isinstance(manual, dict):
-        manual = {
-            "required": False,
-            "state": "not_required",
-            "candidate_issue_ids": [],
-            "failures_for_batch_stats_issue_ids": [],
-        }
-        candidate["manual_review"] = manual
-    manual.setdefault("selected_issue_ids", [])
-    manual.setdefault("selected_issue_id", None)
-    manual.setdefault("issue_reviews", {})
-    manual["state"] = "not_required"
-    manual["completed_at"] = None
     pipeline["status"] = "completed"
     pipeline["next_module"] = None
     candidate["pipeline_state"] = pipeline
@@ -625,6 +591,10 @@ def _require_semantic_pipeline_cursor(value: Mapping[str, Any]) -> dict[str, Any
     if pipeline.get("next_module") != "semantic_consistency":
         raise TaskStateError(
             "semantic completion requires pipeline next_module=semantic_consistency"
+        )
+    if semantic_eligibility(value) != "ready":
+        raise TaskStateError(
+            "semantic task is blocked until manual review is completed or not_required"
         )
     return pipeline
 
@@ -831,6 +801,21 @@ class SemanticCalibrationService:
     def get_task(self, asset_id: str) -> SemanticTaskView:
         asset_id = _non_empty(asset_id, "asset_id")
         self._assert_navigation(asset_id)
+        report_path = self._reports.get(asset_id)
+        if report_path is not None:
+            report = load_asset_qc_report(report_path)
+            if report is None:
+                raise FileNotFoundError(report_path)
+            semantic = report.get("semantic_calibration")
+            pipeline = report.get("pipeline_state")
+            completed_read = (
+                isinstance(semantic, Mapping)
+                and semantic.get("state") == "completed"
+                and isinstance(pipeline, Mapping)
+                and pipeline.get("status") == "completed"
+            )
+            if not completed_read:
+                _require_semantic_pipeline_cursor(report)
         state = self._load_state(asset_id)
         return self._view(state)
 
@@ -861,6 +846,7 @@ class SemanticCalibrationService:
         )
 
     def _require_mutable(self, state: _AssetState, expected_revision: int, lease_token: str) -> None:
+        _require_semantic_pipeline_cursor(state.report)
         self._check_lease(state, lease_token)
         if state.revision != expected_revision:
             raise StaleSemanticRevisionError(

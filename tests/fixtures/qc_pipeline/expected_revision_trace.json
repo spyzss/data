@@ -17,12 +17,22 @@
     "result_verdict": "pass",
     "exit_state": "continue",
     "overall_decision": null,
+    "next_module": "manual_review"
+  },
+  {
+    "asset_id": "pass",
+    "module": "manual_review",
+    "revision": 3,
+    "pipeline_status": "running",
+    "result_verdict": null,
+    "exit_state": null,
+    "overall_decision": null,
     "next_module": "semantic_consistency"
   },
   {
     "asset_id": "pass",
     "module": "semantic_consistency",
-    "revision": 3,
+    "revision": 4,
     "pipeline_status": "awaiting_external",
     "result_verdict": null,
     "exit_state": "awaiting_external",
@@ -47,17 +57,17 @@
     "result_verdict": "warn",
     "exit_state": "continue",
     "overall_decision": null,
-    "next_module": "semantic_consistency"
+    "next_module": "manual_review"
   },
   {
     "asset_id": "warn",
-    "module": "semantic_consistency",
+    "module": "manual_review",
     "revision": 3,
     "pipeline_status": "awaiting_external",
     "result_verdict": null,
     "exit_state": "awaiting_external",
     "overall_decision": null,
-    "next_module": "semantic_consistency"
+    "next_module": "manual_review"
   },
   {
     "asset_id": "hard-fail",

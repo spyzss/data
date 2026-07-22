@@ -3,11 +3,67 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from copy import deepcopy
+from typing import Any, Literal
 
 
 ALL_CANDIDATES_SELECTION_POLICY = "all_candidates"
 _PENDING_PIPELINE_STATUSES = frozenset({"pending", "running", "awaiting_external"})
+
+
+def semantic_eligibility(
+    report: Mapping[str, Any],
+) -> Literal["ready", "blocked", "skipped_due_to_fail"]:
+    """Derive semantic-stage eligibility from the persisted manual result.
+
+    A cursor, URL, or in-memory task projection cannot make an incomplete
+    manual review eligible.  Historical or malformed completed records that
+    lack a canonical completion mode fail closed.
+    """
+
+    manual = report.get("manual_review")
+    if not isinstance(manual, Mapping):
+        return "blocked"
+    state = manual.get("state")
+    if state == "not_required":
+        return "ready"
+    if state == "skipped_due_to_fail":
+        return "skipped_due_to_fail"
+    if state != "completed":
+        return "blocked"
+    mode = manual.get("completion_mode")
+    if mode == "all_reviewed":
+        return "ready"
+    if mode == "early_fail":
+        return "skipped_due_to_fail"
+    return "blocked"
+
+
+def mark_semantic_skipped_due_to_fail(report: dict[str, Any]) -> None:
+    """Persist the canonical semantic skip block without erasing extensions."""
+
+    existing = report.get("semantic_calibration")
+    if existing is None:
+        semantic: dict[str, Any] = {}
+    elif isinstance(existing, Mapping):
+        semantic = deepcopy(dict(existing))
+    else:
+        raise ValueError("semantic_calibration must be an object")
+    defaults: dict[str, Any] = {
+        "source_dataset_path": None,
+        "base_hdf5_sha256": None,
+        "final_hdf5_sha256": None,
+        "timeline_edit_count": 0,
+        "subtask_text_edit_count": 0,
+        "pending_edit": None,
+        "audit": [],
+    }
+    for key, value in defaults.items():
+        semantic.setdefault(key, deepcopy(value))
+    semantic["state"] = "skipped_due_to_fail"
+    semantic["pending_edit"] = None
+    semantic.pop("orchestrator_resume_required", None)
+    report["semantic_calibration"] = semantic
 
 
 def _issue_ids(value: object, field: str) -> list[str]:
@@ -74,5 +130,7 @@ def select_pending_manual_review_candidates(
 
 __all__ = [
     "ALL_CANDIDATES_SELECTION_POLICY",
+    "mark_semantic_skipped_due_to_fail",
     "select_pending_manual_review_candidates",
+    "semantic_eligibility",
 ]

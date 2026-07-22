@@ -150,6 +150,8 @@ def test_import_writes_manual_block_audit_and_completes_selected_reviews(
     assert persisted["issues"] == machine_before
     manual = persisted["manual_review"]
     assert manual["state"] == "completed"
+    assert manual["completion_mode"] == "early_fail"
+    assert manual["failure_reason"] is None
     assert manual["issue_reviews"]["warn-1"]["verdict"] == "pass"
     assert manual["issue_reviews"]["warn-2"]["verdict"] == "fail"
     assert manual["issue_reviews"]["warn-1"]["source"] == "legacy_manual_review_import"

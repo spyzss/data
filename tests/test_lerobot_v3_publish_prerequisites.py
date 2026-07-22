@@ -229,7 +229,7 @@ def _add_passing_source_gate(report: dict[str, object]) -> None:
         "runtime": {
             "canonical_config": {
                 "schema_version": "canonical_qc_config_schema.v1",
-                "config_version": "canonical_qc_v1.2.0",
+                "config_version": "canonical_qc_v1.3.0",
                 "config_path": str(config_path.resolve()),
                 "config_hash": f"sha256:{config_hash}",
             }

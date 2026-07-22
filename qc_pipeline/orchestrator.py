@@ -16,7 +16,11 @@ from qc_common.module_registry import (
     ModuleRegistry,
     ModuleUnavailableError,
 )
-from qc_common.manual_review import select_pending_manual_review_candidates
+from qc_common.manual_review import (
+    mark_semantic_skipped_due_to_fail,
+    select_pending_manual_review_candidates,
+    semantic_eligibility,
+)
 from qc_common.report import (
     StaleReportRevisionError,
     load_asset_qc_report,
@@ -334,6 +338,13 @@ def run_asset(
                         now=timestamp,
                     )
                     continue
+            elif module_name == "semantic_consistency":
+                eligibility = semantic_eligibility(report)
+                if eligibility != "ready":
+                    raise ValueError(
+                        "semantic_consistency requires completed or not-required "
+                        f"manual review, got {eligibility}"
+                    )
             report = record_awaiting_external(
                 context.report_path,
                 context=context,
@@ -534,6 +545,41 @@ def resume_after_external(
         raise ValueError("execution.module_states must be an object")
     module_states[completed_module] = {"state": "completed"}
     execution["updated_at"] = timestamp
+
+    if completed_module == "manual_review":
+        eligibility = semantic_eligibility(candidate)
+        if eligibility == "blocked":
+            raise ValueError(
+                "manual_review completion requires all_reviewed or early_fail"
+            )
+        if eligibility == "skipped_due_to_fail":
+            mark_semantic_skipped_due_to_fail(candidate)
+            pipeline_state = dict(pipeline)
+            pipeline_state.update(
+                {
+                    "status": "stopped",
+                    "last_completed_module": "manual_review",
+                    "next_module": None,
+                    "stop_reason": "manual_review_failed",
+                }
+            )
+            pipeline_state.pop("external_resume", None)
+            candidate["pipeline_state"] = pipeline_state
+            candidate["overall_decision"] = "fail"
+            candidate["report_revision"] = expected_revision + 1
+            write_asset_qc_report(
+                context.report_path,
+                candidate,
+                expected_revision=expected_revision,
+                profile=profile,
+            )
+            return RunOutcome(candidate, (completed_module,), "stopped", config)
+    elif completed_module == "semantic_consistency":
+        eligibility = semantic_eligibility(candidate)
+        if eligibility != "ready":
+            raise ValueError(
+                "semantic completion requires eligible manual review"
+            )
 
     next_module = _successor(config.pipeline_modules, completed_module)
     incomplete = next_module is None and has_required_incomplete_module(candidate)

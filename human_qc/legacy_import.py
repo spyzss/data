@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from qc_common.manual_review import mark_semantic_skipped_due_to_fail
 from qc_common.report import load_asset_qc_report
 
 from .report_updates import reduce_overall_decision, update_human_state
@@ -523,6 +524,17 @@ def import_legacy_manual_review(
         all_reviewed = bool(selected) and set(selected).issubset(reviews)
         block["state"] = "completed" if all_reviewed else "in_progress"
         block["completed_at"] = reviewed_at if all_reviewed else None
+        if all_reviewed:
+            has_fail = any(
+                isinstance(reviews.get(issue_id), Mapping)
+                and reviews[issue_id].get("verdict") == "fail"
+                for issue_id in selected
+            )
+            block["completion_mode"] = "early_fail" if has_fail else "all_reviewed"
+            block["failure_reason"] = None
+        else:
+            block.pop("completion_mode", None)
+            block.pop("failure_reason", None)
         audit = block.setdefault("import_audit", [])
         if not isinstance(audit, list):
             raise ValueError("manual_review.import_audit must be a list")
@@ -544,14 +556,34 @@ def import_legacy_manual_review(
         if all_reviewed:
             pipeline = candidate.get("pipeline_state")
             if isinstance(pipeline, dict) and pipeline.get("next_module") == "manual_review":
-                pipeline.update(
-                    {
-                        "status": "completed",
-                        "last_completed_module": "manual_review",
-                        "next_module": None,
-                        "stop_reason": None,
-                    }
+                semantic = candidate.get("semantic_calibration")
+                semantic_completed = (
+                    isinstance(semantic, dict) and semantic.get("state") == "completed"
                 )
+                if has_fail:
+                    pipeline.update(
+                        {
+                            "status": "stopped",
+                            "last_completed_module": "manual_review",
+                            "next_module": None,
+                            "stop_reason": "manual_review_failed",
+                        }
+                    )
+                    if not semantic_completed:
+                        mark_semantic_skipped_due_to_fail(candidate)
+                else:
+                    pipeline.update(
+                        {
+                            "status": (
+                                "completed" if semantic_completed else "awaiting_external"
+                            ),
+                            "last_completed_module": "manual_review",
+                            "next_module": (
+                                None if semantic_completed else "semantic_consistency"
+                            ),
+                            "stop_reason": None,
+                        }
+                    )
             execution = candidate.get("execution")
             if isinstance(execution, dict):
                 execution["updated_at"] = reviewed_at

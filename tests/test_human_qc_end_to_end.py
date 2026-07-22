@@ -175,14 +175,14 @@ def build_file_asset(
     report["pipeline_state"] = {
         "status": "awaiting_external",
         "last_completed_module": "video_quality",
-        "next_module": "semantic_consistency",
+        "next_module": "manual_review" if selected_warn_ids else "semantic_consistency",
         "stop_reason": None,
     }
     report["source_files"] = {"hdf5": {"path": str(hdf5_path)}}
     report["issues"] = issues
     report["manual_review"] = {
         "required": bool(selected_warn_ids),
-        "state": "queued" if selected_warn_ids else "not_evaluated",
+        "state": "queued" if selected_warn_ids else "not_required",
         "candidate_issue_ids": candidates,
         "failures_for_batch_stats_issue_ids": [],
         "selected_issue_ids": list(selected_warn_ids),
@@ -273,7 +273,7 @@ def _assert_half_open_coverage(annotations: list[dict[str, Any]], frame_count: i
     assert all(left[1] == right[0] for left, right in zip(half_open, half_open[1:]))
 
 
-def test_file_level_semantic_then_warn_workflow_preserves_source_fidelity(tmp_path: Path) -> None:
+def test_file_level_warn_then_semantic_workflow_preserves_source_fidelity(tmp_path: Path) -> None:
     asset = build_file_asset(tmp_path)
     before_hdf5 = snapshot_hdf5(asset.hdf5_path)
     before_report = load_asset_qc_report(asset.report_path)
@@ -283,14 +283,48 @@ def test_file_level_semantic_then_warn_workflow_preserves_source_fidelity(tmp_pa
     lease = workbench.acquire_lease(asset.asset_id, "alice", 120)
 
     task = workbench.get_asset_task(asset.asset_id)
-    assert task["task_type"] == "semantic_calibration"
-    assert len(task["semantic"]["timeline"]["segments"]) == 3
+    assert task["task_type"] == "warn_review"
+    assert task["warn"]["selected_issue_ids"] == ["warn-left", "warn-right"]
+
+    first_review = workbench.warn_verdict(
+        asset.asset_id,
+        issue_id="warn-left",
+        verdict="pass",
+        reason="false positive",
+        expected_revision=task["revision"],
+        lease_token=lease.token,
+    )
+    with pytest.raises(WarnStateError, match="every selected issue"):
+        workbench.warn_complete(
+            asset.asset_id,
+            expected_revision=first_review["revision"],
+            lease_token=lease.token,
+        )
+    incomplete = load_asset_qc_report(asset.report_path)
+    assert incomplete is not None
+    assert incomplete["manual_review"]["state"] == "in_progress"
+    assert incomplete["overall_decision"] is None
+    second_review = workbench.warn_verdict(
+        asset.asset_id,
+        issue_id="warn-right",
+        verdict="pass",
+        reason="false positive",
+        expected_revision=first_review["revision"],
+        lease_token=lease.token,
+    )
+    semantic_task = workbench.warn_complete(
+        asset.asset_id,
+        expected_revision=second_review["revision"],
+        lease_token=lease.token,
+    )
+    assert semantic_task["task_type"] == "semantic_calibration"
+    assert len(semantic_task["semantic"]["timeline"]["segments"]) == 3
 
     left = workbench.semantic_boundary_pending(
         asset.asset_id,
         boundary_index=1,
         new_frame_exclusive=35,
-        expected_revision=task["revision"],
+        expected_revision=semantic_task["revision"],
         lease_token=lease.token,
         reviewer="alice",
     )
@@ -341,43 +375,9 @@ def test_file_level_semantic_then_warn_workflow_preserves_source_fidelity(tmp_pa
         lease_token=lease.token,
     )
     assert text_confirmed["semantic"]["subtask_text_edit_count"] == 1
-    warn_task = workbench.semantic_complete(
+    completed = workbench.semantic_complete(
         asset.asset_id,
         expected_revision=text_confirmed["revision"],
-        lease_token=lease.token,
-    )
-    assert warn_task["task_type"] == "warn_review"
-    assert warn_task["warn"]["selected_issue_ids"] == ["warn-left", "warn-right"]
-
-    first_review = workbench.warn_verdict(
-        asset.asset_id,
-        issue_id="warn-left",
-        verdict="pass",
-        reason="false positive",
-        expected_revision=warn_task["revision"],
-        lease_token=lease.token,
-    )
-    with pytest.raises(WarnStateError, match="every selected issue"):
-        workbench.warn_complete(
-            asset.asset_id,
-            expected_revision=first_review["revision"],
-            lease_token=lease.token,
-        )
-    incomplete = load_asset_qc_report(asset.report_path)
-    assert incomplete is not None
-    assert incomplete["manual_review"]["state"] == "in_progress"
-    assert incomplete["overall_decision"] is None
-    second_review = workbench.warn_verdict(
-        asset.asset_id,
-        issue_id="warn-right",
-        verdict="fail",
-        reason="confirmed blur",
-        expected_revision=first_review["revision"],
-        lease_token=lease.token,
-    )
-    completed = workbench.warn_complete(
-        asset.asset_id,
-        expected_revision=second_review["revision"],
         lease_token=lease.token,
     )
     assert completed["task_type"] == "completed"
@@ -386,19 +386,19 @@ def test_file_level_semantic_then_warn_workflow_preserves_source_fidelity(tmp_pa
     assert persisted is not None
     assert persisted["issues"] == machine_issues
     assert persisted["manual_review"]["issue_reviews"]["warn-left"]["effective_verdict"] == "pass"
-    assert persisted["manual_review"]["issue_reviews"]["warn-right"]["effective_verdict"] == "fail"
-    assert persisted["manual_review"]["completion_mode"] == "early_fail"
+    assert persisted["manual_review"]["issue_reviews"]["warn-right"]["effective_verdict"] == "pass"
+    assert persisted["manual_review"]["completion_mode"] == "all_reviewed"
     assert persisted["manual_review"]["failure_reason"] is None
     assert persisted["overall_decision"] == "fail"
-    assert persisted["pipeline_state"]["status"] == "stopped"
+    assert persisted["pipeline_state"]["status"] == "completed"
     assert persisted["pipeline_state"]["next_module"] is None
-    assert persisted["semantic_calibration"]["state"] == "skipped_due_to_fail"
+    assert persisted["semantic_calibration"]["state"] == "completed"
     assert persisted["semantic_calibration"]["timeline_edit_count"] == 1
     assert persisted["semantic_calibration"]["subtask_text_edit_count"] == 1
 
     projection = project_quality_archive(asset.report_path.parent)
     asset_row = next(row for row in projection.asset_rows if row["asset_id"] == asset.asset_id)
-    assert asset_row["status"] == "stopped"
+    assert asset_row["status"] == "completed"
     assert asset_row["decision"] == "fail"
     batch = aggregate_projection(projection)
     assert batch["overall"]["final_fail_assets"] == 1
@@ -432,12 +432,7 @@ def test_only_selected_warn_is_reviewable_and_all_pass_cannot_override_hard_fail
     )
     workbench = make_workbench(asset)
     lease = workbench.acquire_lease(asset.asset_id, "alice", 120)
-    semantic = workbench.get_asset_task(asset.asset_id)
-    warn_task = workbench.semantic_complete(
-        asset.asset_id,
-        expected_revision=semantic["revision"],
-        lease_token=lease.token,
-    )
+    warn_task = workbench.get_asset_task(asset.asset_id)
 
     assert warn_task["warn"]["selected_issue_ids"] == ["warn-left"]
     assert [issue["issue_id"] for issue in warn_task["warn"]["issues"]] == ["warn-left"]
@@ -456,9 +451,14 @@ def test_only_selected_warn_is_reviewable_and_all_pass_cannot_override_hard_fail
         expected_revision=warn_task["revision"],
         lease_token=lease.token,
     )
-    workbench.warn_complete(
+    semantic_task = workbench.warn_complete(
         asset.asset_id,
         expected_revision=reviewed["revision"],
+        lease_token=lease.token,
+    )
+    workbench.semantic_complete(
+        asset.asset_id,
+        expected_revision=semantic_task["revision"],
         lease_token=lease.token,
     )
 
@@ -468,9 +468,9 @@ def test_only_selected_warn_is_reviewable_and_all_pass_cannot_override_hard_fail
     assert "warn-right" not in report["manual_review"]["issue_reviews"]
     assert report["manual_review"]["completion_mode"] == "all_reviewed"
     assert report["manual_review"]["failure_reason"] is None
-    assert report["pipeline_state"]["status"] == "awaiting_external"
-    assert report["pipeline_state"]["next_module"] == "semantic_consistency"
-    assert report["overall_decision"] is None
+    assert report["pipeline_state"]["status"] == "completed"
+    assert report["pipeline_state"]["next_module"] is None
+    assert report["overall_decision"] == "fail"
     assert reduce_overall_decision(report) == "fail"
 
 

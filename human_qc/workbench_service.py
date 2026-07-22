@@ -19,6 +19,7 @@ from typing import Any
 
 from qc_common.config import LoadedQcConfig
 from qc_common.module_registry import ModuleRegistry
+from qc_common.manual_review import semantic_eligibility
 from qc_common.report import load_asset_qc_report
 from qc_pipeline.context import AssetContext
 from qc_pipeline.default_registry import build_default_registry
@@ -165,7 +166,7 @@ class WorkbenchService:
             return False
         next_module = pipeline.get("next_module")
         if next_module == "semantic_consistency":
-            return True
+            return semantic_eligibility(report) == "ready"
         if next_module != "manual_review":
             return False
         manual = report.get("manual_review")
@@ -259,9 +260,15 @@ class WorkbenchService:
         if pipeline_status in {"stopped", "completed", "error"} or report_is_noneditable:
             semantic = None
             warn = None
-        else:
+        elif pipeline_next == "semantic_consistency":
             semantic = self._get_task(self.semantic_service, asset_id)
+            warn = None
+        elif pipeline_next == "manual_review":
+            semantic = None
             warn = self._get_task(self.warn_service, asset_id)
+        else:
+            semantic = None
+            warn = None
         if semantic is None and warn is None and report is None and context is None:
             raise KeyError(f"unknown asset: {asset_id}")
 
@@ -450,6 +457,8 @@ class WorkbenchService:
         report = self._report(asset_id, context)
         if not isinstance(report, Mapping):
             raise FileNotFoundError(context.report_path)
+        if completed_module == "manual_review" and semantic_eligibility(report) == "skipped_due_to_fail":
+            return
         execution = report.get("execution")
         report_profile = (
             execution.get("profile") if isinstance(execution, Mapping) else None
@@ -714,7 +723,9 @@ class WorkbenchService:
                 lease_token,
                 advance_pipeline=False,
             )
-            self._resume_external(asset_id, "manual_review")
+            latest = self._report(asset_id, self._context(asset_id))
+            if semantic_eligibility(latest or {}) == "ready":
+                self._resume_external(asset_id, "manual_review")
         return self._latest(asset_id)
 
 
