@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from typing import Any
 
@@ -33,6 +34,15 @@ from tests.qc_report_fixtures import make_v2_report
 CHROME_BIN = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 FPS = 30
 TOTAL_FRAMES = 1800
+
+
+class _QuietHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 - stdlib hook.
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        del format, args
 
 
 def _run_ffmpeg(*args: str) -> None:
@@ -210,17 +220,114 @@ def browser_workbench(tmp_path: Path):
 
 
 def _run_browser_scenario(base_url: str, tmp_path: Path) -> dict[str, object]:
-    driver = Path(__file__).with_name("browser") / "cdp_driver.mjs"
-    completed = subprocess.run(
-        ["node", str(driver), base_url, str(tmp_path / "chrome")],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=40,
-        env=os.environ.copy(),
-    )
+    completed = _run_browser_process(base_url, tmp_path / "chrome")
     assert completed.returncode == 0, completed.stderr or completed.stdout
     return json.loads(completed.stdout)
+
+
+class BrowserDriverTimeout(TimeoutError):
+    def __init__(
+        self,
+        *,
+        cleaned_after_sigterm: bool,
+        returncode: int | None,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        state = "after SIGTERM cleanup" if cleaned_after_sigterm else "after SIGKILL escalation"
+        super().__init__(f"browser driver timed out and exited {state}")
+        self.cleaned_after_sigterm = cleaned_after_sigterm
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _run_browser_process(
+    base_url: str,
+    profile_dir: Path,
+    *,
+    timeout_seconds: float = 40,
+    terminate_grace_seconds: float = 5,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run Node without bypassing its SIGTERM child-reaping handler on timeout."""
+
+    driver = Path(__file__).with_name("browser") / "cdp_driver.mjs"
+    process = subprocess.Popen(
+        ["node", str(driver), base_url, str(profile_dir)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy() if environment is None else environment,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            stdout, stderr = process.communicate(timeout=terminate_grace_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise BrowserDriverTimeout(
+                cleaned_after_sigterm=False,
+                returncode=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            ) from None
+        raise BrowserDriverTimeout(
+            cleaned_after_sigterm=True,
+            returncode=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        ) from None
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+
+def test_outer_python_timeout_terminates_driver_before_killing_and_reaps_chrome_and_server(
+    tmp_path: Path,
+) -> None:
+    """A parent timeout gives Node's SIGTERM cleanup a chance to reap Chrome."""
+
+    sandbox = tmp_path / "outer-timeout"
+    sandbox.mkdir()
+    pid_path = sandbox / "fake-chrome.pid"
+    fake_chrome = sandbox / "fake-chrome.py"
+    fake_chrome.write_text(
+        "\n".join(
+            (
+                f"#!{sys.executable}",
+                "import os, signal, sys, time",
+                f"open({str(pid_path)!r}, 'w', encoding='utf-8').write(str(os.getpid()))",
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))",
+                "while True: time.sleep(1)",
+            )
+        ),
+        encoding="utf-8",
+    )
+    fake_chrome.chmod(0o755)
+    server = HTTPServer(("127.0.0.1", 0), _QuietHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(BrowserDriverTimeout) as raised:
+            _run_browser_process(
+                f"http://127.0.0.1:{server.server_port}/",
+                sandbox / "profile",
+                timeout_seconds=1,
+                terminate_grace_seconds=3,
+                environment={**os.environ, "CHROME_BIN": str(fake_chrome)},
+            )
+        assert raised.value.cleaned_after_sigterm is True
+        assert raised.value.returncode == 143
+        chrome_pid = int(pid_path.read_text(encoding="utf-8"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(chrome_pid, 0)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+    assert thread.is_alive() is False
 
 
 def test_real_browser_preserves_overlap_geometry_focus_and_overlay_boundaries(

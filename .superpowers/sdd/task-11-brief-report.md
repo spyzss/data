@@ -93,3 +93,25 @@ Focused Python suite: 64 passed in 3.55s
 Node static + driver suite: 67 passed
 git diff --check: clean
 ```
+
+## Outer Python timeout repair
+
+The browser contract no longer uses `subprocess.run(..., timeout=...)`, whose
+POSIX timeout path kills the Node driver before its `finally` and SIGTERM
+handler can reap Chrome.  `_run_browser_process` now uses `Popen` plus
+`communicate`: on timeout it sends Node SIGTERM and waits a bounded grace
+period for the driver's cleanup; only an unresponsive driver is SIGKILLed.
+
+The regression test starts an actual driver with a controlled executable fake
+Chrome and a live HTTP server thread.  It triggers the outer Python timeout,
+asserts the driver exits after SIGTERM cleanup (not parent SIGKILL), verifies
+the fake Chrome PID no longer exists, then shuts down and joins the server
+thread.
+
+```text
+Chrome contract including the outer-timeout regression, run 1: 2 passed in 3.71s
+Chrome contract including the outer-timeout regression, run 2: 2 passed in 3.47s
+Focused Python suite: 65 passed in 5.25s
+Node static + driver suite: 67 passed
+git diff --check: clean
+```
