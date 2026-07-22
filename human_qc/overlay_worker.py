@@ -19,16 +19,23 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import tempfile
 from threading import BoundedSemaphore, RLock
 from typing import Literal, Protocol
+import uuid
 
 
 _STATUS = frozenset({"pending", "generating", "ready", "failed"})
 _STABLE_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}").fullmatch
 _DIGEST = re.compile(r"[0-9a-f]{64}").fullmatch
 _MANIFEST_NAME = "manifest.json"
+_OWNER_NAME = ".generation.owner.json"
+_PUBLISH_LOCK_NAME = ".overlay-publish.lock"
 _SCHEMA_VERSION = 1
+_PROCESS_INSTANCE_ID = uuid.uuid4().hex
+_LOCAL_OWNER_LOCK = RLock()
+_LOCAL_OWNER_TOKENS: set[tuple[str, str]] = set()
 
 FrameInterval = tuple[int, int]
 OverlayStatus = Literal["pending", "generating", "ready", "failed"]
@@ -60,7 +67,13 @@ class OverlayRenderer(Protocol):
         start_frame: int,
         end_frame_exclusive: int,
         output_path: Path,
-    ) -> None: ...
+    ) -> Mapping[str, object]:
+        """Write one segment and return verified output metadata.
+
+        ``frame_count`` and ``fps`` must describe the produced media exactly.
+        Concrete MP4 renderers normally obtain those values from ffprobe after
+        closing the encoder; the core worker deliberately stays codec agnostic.
+        """
 
 
 def _is_int(value: object) -> bool:
@@ -216,6 +229,8 @@ class OverlaySegmentView:
     path: Path | None = None
     code: str | None = None
     retryable: bool = False
+    content_sha256: str | None = None
+    metadata: Mapping[str, object] | None = None
 
     def to_safe_dict(self) -> dict[str, object]:
         return {
@@ -281,6 +296,7 @@ class BoundedOverlayWorker:
         self._max_ready_jobs = max_ready_jobs
         self._lock = RLock()
         self._inflight: dict[tuple[str, str], Future[None]] = {}
+        self._scheduled: set[tuple[str, str]] = set()
         self._views: dict[tuple[str, str], OverlayJobView] = {}
         self._pinned: set[tuple[str, str]] = set()
         self._closed = False
@@ -298,9 +314,80 @@ class BoundedOverlayWorker:
     def _manifest_path(self, request: OverlayRequest) -> Path:
         return self._job_dir(request) / _MANIFEST_NAME
 
+    def _owner_path(self, request: OverlayRequest) -> Path:
+        return self._job_dir(request) / _OWNER_NAME
+
     @staticmethod
     def _overlay_id(key: OverlayCacheKey, index: int) -> str:
         return f"overlay-{key.digest[:24]}-{index}"
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _json_metadata(value: object) -> object:
+        """Return a finite, JSON-safe metadata value or reject it.
+
+        The renderer owns codec-specific metadata, but a manifest must never
+        contain objects whose later JSON encoding silently changes semantics.
+        """
+
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("metadata numbers must be finite")
+            return value
+        if isinstance(value, list):
+            return [BoundedOverlayWorker._json_metadata(item) for item in value]
+        if isinstance(value, tuple):
+            return [BoundedOverlayWorker._json_metadata(item) for item in value]
+        if isinstance(value, Mapping):
+            normalized: dict[str, object] = {}
+            for key, item in value.items():
+                if not isinstance(key, str) or not key:
+                    raise ValueError("metadata keys must be non-empty strings")
+                normalized[key] = BoundedOverlayWorker._json_metadata(item)
+            return normalized
+        raise ValueError("metadata must be JSON-safe")
+
+    @classmethod
+    def _validated_segment_metadata(
+        cls,
+        value: object,
+        request: OverlayRequest,
+        start_frame: int,
+        end_frame_exclusive: int,
+    ) -> Mapping[str, object]:
+        if not isinstance(value, Mapping):
+            raise OverlayRenderError("overlay_metadata_invalid")
+        try:
+            normalized = cls._json_metadata(value)
+        except ValueError as exc:
+            raise OverlayRenderError("overlay_metadata_invalid") from exc
+        assert isinstance(normalized, Mapping)
+        frame_count = normalized.get("frame_count")
+        fps = normalized.get("fps")
+        if (
+            not _is_int(frame_count)
+            or frame_count != end_frame_exclusive - start_frame
+            or isinstance(fps, bool)
+            or not isinstance(fps, (int, float))
+            or not math.isfinite(float(fps))
+            or not math.isclose(float(fps), request.fps, rel_tol=0.0, abs_tol=1e-9)
+        ):
+            raise OverlayRenderError("overlay_metadata_invalid")
+        # Persist canonical expected values rather than renderer numeric aliases
+        # such as ``30`` vs ``30.0``.
+        result = dict(normalized)
+        result["frame_count"] = end_frame_exclusive - start_frame
+        result["fps"] = request.fps
+        return result
 
     def _empty_segments(self, request: OverlayRequest, status: OverlayStatus) -> tuple[OverlaySegmentView, ...]:
         return tuple(
@@ -392,11 +479,23 @@ class BoundedOverlayWorker:
         for segment in view.segments:
             relative = self._safe_relative(job_dir, segment.path)
             size_bytes: int | None = None
+            content_sha256: str | None = None
+            metadata: Mapping[str, object] | None = None
             if segment.path is not None:
                 try:
                     size_bytes = segment.path.stat().st_size
                 except OSError:
                     relative = None
+                else:
+                    if segment.status == "ready":
+                        content_sha256 = segment.content_sha256 or self._sha256(segment.path)
+                        if segment.metadata is not None:
+                            metadata = self._validated_segment_metadata(
+                                segment.metadata,
+                                request,
+                                segment.start_frame,
+                                segment.end_frame_exclusive,
+                            )
             segments.append(
                 {
                     "start_frame": segment.start_frame,
@@ -405,6 +504,8 @@ class BoundedOverlayWorker:
                     "overlay_id": segment.overlay_id,
                     "relative_path": relative,
                     "size_bytes": size_bytes,
+                    "sha256": content_sha256,
+                    "metadata": metadata,
                     "code": segment.code,
                     "retryable": segment.retryable,
                 }
@@ -476,10 +577,20 @@ class BoundedOverlayWorker:
             stable_code = code if isinstance(code, str) and _STABLE_CODE(code) else None
             retryable = value.get("retryable") is True
             candidate: Path | None = None
+            content_sha256: str | None = None
+            metadata: Mapping[str, object] | None = None
             if segment_status == "ready":
                 relative = value.get("relative_path")
                 size = value.get("size_bytes")
-                if not isinstance(relative, str) or not _is_int(size) or size <= 0:
+                digest = value.get("sha256")
+                raw_metadata = value.get("metadata")
+                if (
+                    not isinstance(relative, str)
+                    or not _is_int(size)
+                    or size <= 0
+                    or not isinstance(digest, str)
+                    or _DIGEST(digest) is None
+                ):
                     return self._failed_view(request, "overlay_cache_invalid", retryable=True)
                 candidate = (job_dir / relative).resolve()
                 try:
@@ -489,6 +600,18 @@ class BoundedOverlayWorker:
                     return self._failed_view(request, "overlay_cache_invalid", retryable=True)
                 if not candidate.is_file() or stat.st_size != size:
                     return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+                try:
+                    content_sha256 = self._sha256(candidate)
+                    metadata = self._validated_segment_metadata(
+                        raw_metadata,
+                        request,
+                        interval[0],
+                        interval[1],
+                    )
+                except (OSError, OverlayRenderError):
+                    return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+                if content_sha256 != digest:
+                    return self._failed_view(request, "overlay_cache_invalid", retryable=True)
             segments.append(
                 OverlaySegmentView(
                     *interval,
@@ -497,6 +620,8 @@ class BoundedOverlayWorker:
                     path=candidate,
                     code=stable_code,
                     retryable=retryable,
+                    content_sha256=content_sha256,
+                    metadata=metadata,
                 )
             )
         all_ready = all(segment.status == "ready" for segment in segments)
@@ -511,9 +636,11 @@ class BoundedOverlayWorker:
             retryable=raw.get("retryable") is True,
         )
 
-    def _recover_if_interrupted(self, request: OverlayRequest, view: OverlayJobView) -> OverlayJobView:
-        if view.status not in {"pending", "generating"}:
-            return view
+    def _recover_interrupted_locked(
+        self, request: OverlayRequest, view: OverlayJobView
+    ) -> OverlayJobView:
+        """Persist a restart recovery while the short per-key state lock is held."""
+
         interrupted_segments = tuple(
             segment
             if segment.status == "ready"
@@ -534,6 +661,116 @@ class BoundedOverlayWorker:
         self._persist(request, recovered)
         return recovered
 
+    def _read_owner_locked(self, request: OverlayRequest) -> Mapping[str, object] | None:
+        try:
+            raw = json.loads(self._owner_path(request).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return raw if isinstance(raw, Mapping) else {}
+
+    def _owner_is_live_locked(self, request: OverlayRequest) -> bool:
+        """Conservatively decide whether a durable owner marker is still live.
+
+        A marker created by this interpreter is tracked by an instance token,
+        avoiding false liveness from a reused PID.  For another local process,
+        ``kill(pid, 0)`` is the portable POSIX liveness probe.  An owner on an
+        unknown host is intentionally treated as live: that is safer than
+        clobbering a renderer on a shared cache mount.
+        """
+
+        owner = self._read_owner_locked(request)
+        if owner is None:
+            return False
+        process_instance = owner.get("process_instance")
+        token = owner.get("token")
+        pid = owner.get("pid")
+        host = owner.get("host")
+        if (
+            not isinstance(process_instance, str)
+            or not isinstance(token, str)
+            or not _is_int(pid)
+            or pid <= 0
+            or not isinstance(host, str)
+        ):
+            return False
+        marker = (str(self._owner_path(request)), token)
+        if process_instance == _PROCESS_INSTANCE_ID:
+            with _LOCAL_OWNER_LOCK:
+                return marker in _LOCAL_OWNER_TOKENS
+        if host != socket.gethostname():
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _claim_owner_locked(self, request: OverlayRequest) -> str | None:
+        """Atomically claim durable generation ownership or observe a live peer."""
+
+        if self._owner_is_live_locked(request):
+            return None
+        owner_path = self._owner_path(request)
+        try:
+            owner_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise OverlayWorkerError("overlay_cache_invalid") from exc
+        token = uuid.uuid4().hex
+        payload = {
+            "schema_version": _SCHEMA_VERSION,
+            "process_instance": _PROCESS_INSTANCE_ID,
+            "token": token,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+        }
+        self._atomic_json(owner_path, payload)
+        with _LOCAL_OWNER_LOCK:
+            _LOCAL_OWNER_TOKENS.add((str(owner_path), token))
+        return token
+
+    def _owns_owner_locked(self, request: OverlayRequest, token: str) -> bool:
+        owner = self._read_owner_locked(request)
+        return bool(
+            owner
+            and owner.get("process_instance") == _PROCESS_INSTANCE_ID
+            and owner.get("token") == token
+        )
+
+    def _release_owner(self, request: OverlayRequest, token: str) -> None:
+        owner_path = self._owner_path(request)
+        try:
+            with self._key_lock(request) as acquired:
+                if acquired and self._owns_owner_locked(request, token):
+                    owner_path.unlink(missing_ok=True)
+                    self._fsync_directory(owner_path.parent)
+        finally:
+            with _LOCAL_OWNER_LOCK:
+                _LOCAL_OWNER_TOKENS.discard((str(owner_path), token))
+
+    def _recover_if_interrupted(self, request: OverlayRequest, view: OverlayJobView) -> OverlayJobView:
+        if view.status not in {"pending", "generating"}:
+            return view
+        # Do not hold a lock while rendering.  The owner marker is created
+        # before pending state is published, so an observer can safely retain a
+        # live view without acquiring renderer ownership.
+        with self._key_lock(request, blocking=False) as acquired:
+            if not acquired:
+                return view
+            latest = self._parse_manifest(request)
+            if latest is None or latest.status not in {"pending", "generating"}:
+                return latest or view
+            if self._owner_is_live_locked(request):
+                return latest
+            try:
+                self._owner_path(request).unlink(missing_ok=True)
+            except OSError:
+                return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+            return self._recover_interrupted_locked(request, latest)
+
     def _load_durable(self, request: OverlayRequest, *, recover: bool) -> OverlayJobView | None:
         view = self._parse_manifest(request)
         if view is not None and recover:
@@ -541,13 +778,45 @@ class BoundedOverlayWorker:
         return view
 
     @contextmanager
-    def _key_lock(self, request: OverlayRequest):
-        """Use an advisory per-key lock for cross-process cache publication."""
+    def _key_lock(self, request: OverlayRequest, *, blocking: bool = True):
+        """Acquire only a short per-key state lock, never a renderer lock."""
 
         job_dir = self._job_dir(request)
         job_dir.mkdir(parents=True, exist_ok=True)
         lock_path = job_dir / ".generation.lock"
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        acquired = True
+        try:
+            try:
+                import fcntl
+
+                flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(descriptor, flags)
+                except BlockingIOError:
+                    acquired = False
+            except ImportError:  # pragma: no cover - Unix worker deployment uses fcntl.
+                pass
+            yield acquired
+        finally:
+            try:
+                try:
+                    import fcntl
+
+                    if acquired:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except ImportError:  # pragma: no cover
+                    pass
+            finally:
+                os.close(descriptor)
+
+    @contextmanager
+    def _root_publish_lock(self, request: OverlayRequest):
+        """Serialize only ready-cache recheck, eviction, and publication."""
+
+        root = self._root(request)
+        root.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(root / _PUBLISH_LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             try:
                 import fcntl
@@ -573,8 +842,11 @@ class BoundedOverlayWorker:
 
     def _release_slot(self, request: OverlayRequest) -> None:
         with self._lock:
-            future = self._inflight.pop(self._job_id(request), None)
-        if future is not None:
+            job_id = self._job_id(request)
+            self._inflight.pop(job_id, None)
+            was_scheduled = job_id in self._scheduled
+            self._scheduled.discard(job_id)
+        if was_scheduled:
             self._capacity.release()
 
     def _segment_filename(self, index: int, interval: FrameInterval) -> str:
@@ -637,7 +909,7 @@ class BoundedOverlayWorker:
             if path == self._job_dir(request):
                 continue
             key = (str(root), path.name)
-            if key in self._pinned or key in self._inflight:
+            if key in self._pinned or key in self._scheduled:
                 continue
             manifest = path / _MANIFEST_NAME
             try:
@@ -675,20 +947,6 @@ class BoundedOverlayWorker:
             for segment in initial.segments
             if segment.status == "ready" and segment.path is not None and segment.path.is_file()
         }
-        generating = OverlayJobView(
-            cache_key=request.cache_key,
-            status="generating",
-            segments=tuple(
-                reusable.get(interval)
-                or OverlaySegmentView(
-                    *interval,
-                    status="generating",
-                    overlay_id=self._overlay_id(request.cache_key, index),
-                )
-                for index, interval in enumerate(request.intervals)
-            ),
-        )
-        self._persist(request, generating)
         produced: list[OverlaySegmentView] = []
         for index, interval in enumerate(request.intervals):
             cached = reusable.get(interval)
@@ -701,7 +959,12 @@ class BoundedOverlayWorker:
             try:
                 renderer = request.renderer
                 assert renderer is not None
-                renderer.render_interval(request, start, end, temporary)
+                metadata = self._validated_segment_metadata(
+                    renderer.render_interval(request, start, end, temporary),
+                    request,
+                    start,
+                    end,
+                )
                 if not temporary.is_file() or temporary.stat().st_size <= 0:
                     raise OverlayRenderError("overlay_render_failed")
                 self._fsync_file(temporary)
@@ -714,6 +977,8 @@ class BoundedOverlayWorker:
                         "ready",
                         self._overlay_id(request.cache_key, index),
                         path=final,
+                        content_sha256=self._sha256(final),
+                        metadata=metadata,
                     )
                 )
             except BaseException as exc:
@@ -733,29 +998,6 @@ class BoundedOverlayWorker:
                     )
                 )
         if all(segment.status == "ready" for segment in produced):
-            if not self._evict_for(request, self._job_size(job_dir)):
-                for segment in produced:
-                    if segment.path is not None:
-                        try:
-                            segment.path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                failed_segments = tuple(
-                    replace(
-                        segment,
-                        status="failed",
-                        path=None,
-                        code="overlay_cache_full",
-                        retryable=True,
-                    )
-                    for segment in produced
-                )
-                return self._failed_view(
-                    request,
-                    "overlay_cache_full",
-                    retryable=True,
-                    segments=failed_segments,
-                )
             return OverlayJobView(
                 cache_key=request.cache_key,
                 status="ready",
@@ -772,21 +1014,129 @@ class BoundedOverlayWorker:
             segments=tuple(produced),
         )
 
-    def _run(self, request: OverlayRequest, initial: OverlayJobView) -> None:
-        try:
-            with self._key_lock(request):
-                durable = self._load_durable(request, recover=False)
+    def _generating_view(
+        self, request: OverlayRequest, previous: OverlayJobView | None
+    ) -> OverlayJobView:
+        """Build an active view without exposing completed media early."""
+
+        reusable = () if previous is None else tuple(
+            segment
+            if segment.status == "ready"
+            else replace(segment, status="generating", code=None, retryable=False, path=None)
+            for segment in previous.segments
+        )
+        return OverlayJobView(
+            cache_key=request.cache_key,
+            status="generating",
+            segments=reusable or self._empty_segments(request, "generating"),
+        )
+
+    def _discard_segments(
+        self,
+        segments: Iterable[OverlaySegmentView],
+        *,
+        keep_paths: Iterable[Path] = (),
+    ) -> None:
+        preserved = {path.resolve() for path in keep_paths}
+        for segment in segments:
+            if segment.path is not None and segment.path.resolve() not in preserved:
+                try:
+                    segment.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _publish_rendered(
+        self,
+        request: OverlayRequest,
+        candidate: OverlayJobView,
+        owner_token: str,
+    ) -> OverlayJobView:
+        """Publish one terminal view under the root-wide cache quota lock.
+
+        Rendering has already completed before this method runs.  The lock only
+        spans durable ready recheck, eviction, and the ready/failed manifest
+        write, so unrelated encoders never serialize behind it.
+        """
+
+        with self._root_publish_lock(request):
+            with self._key_lock(request) as acquired:
+                if not acquired or not self._owns_owner_locked(request, owner_token):
+                    durable = self._parse_manifest(request)
+                    return durable or self._failed_view(
+                        request, "overlay_interrupted", retryable=True
+                    )
+                durable = self._parse_manifest(request)
                 if durable is not None and durable.status == "ready":
-                    final = replace(durable, cache_hit=True)
+                    self._discard_segments(
+                        candidate.segments,
+                        keep_paths=(
+                            segment.path
+                            for segment in durable.segments
+                            if segment.path is not None
+                        ),
+                    )
+                    return replace(durable, cache_hit=True)
+                final = candidate
+                if candidate.status == "ready" and not self._evict_for(
+                    request, self._job_size(self._job_dir(request))
+                ):
+                    self._discard_segments(candidate.segments)
+                    failed_segments = tuple(
+                        replace(
+                            segment,
+                            status="failed",
+                            path=None,
+                            code="overlay_cache_full",
+                            retryable=True,
+                            content_sha256=None,
+                            metadata=None,
+                        )
+                        for segment in candidate.segments
+                    )
+                    final = self._failed_view(
+                        request,
+                        "overlay_cache_full",
+                        retryable=True,
+                        segments=failed_segments,
+                    )
+                self._persist(request, final)
+                return final
+
+    def _run(
+        self, request: OverlayRequest, initial: OverlayJobView, owner_token: str
+    ) -> None:
+        final: OverlayJobView
+        try:
+            generating: OverlayJobView | None = None
+            with self._key_lock(request) as acquired:
+                if not acquired or not self._owns_owner_locked(request, owner_token):
+                    durable = self._parse_manifest(request)
+                    final = durable or self._failed_view(
+                        request, "overlay_interrupted", retryable=True
+                    )
                 else:
-                    final = self._render(request, initial)
-                    self._persist(request, final)
+                    durable = self._parse_manifest(request)
+                    if durable is not None and durable.status == "ready":
+                        final = replace(durable, cache_hit=True)
+                    else:
+                        generating = self._generating_view(request, initial)
+                        self._persist(request, generating)
+                        final = generating
+            if generating is not None:
+                self._publish_view(request, generating)
+                rendered = self._render(request, generating)
+                final = self._publish_rendered(request, rendered, owner_token)
         except BaseException:
             final = self._failed_view(request, "overlay_render_failed", retryable=True)
             try:
-                self._persist(request, final)
+                with self._root_publish_lock(request):
+                    with self._key_lock(request) as acquired:
+                        if acquired and self._owns_owner_locked(request, owner_token):
+                            self._persist(request, final)
             except BaseException:
                 pass
+        finally:
+            self._release_owner(request, owner_token)
         self._publish_view(request, final)
         self._release_slot(request)
 
@@ -802,10 +1152,36 @@ class BoundedOverlayWorker:
             status="pending",
             segments=reusable or self._empty_segments(request, "pending"),
         )
+        owner_token: str | None = None
         try:
-            self._persist(request, pending)
-            future = self._executor.submit(self._run, request, pending)
+            with self._key_lock(request) as acquired:
+                if not acquired:
+                    self._capacity.release()
+                    return self._failed_view(request, "overlay_queue_full", retryable=True)
+                durable = self._parse_manifest(request)
+                if durable is not None and durable.status == "ready":
+                    self._capacity.release()
+                    return replace(durable, cache_hit=True)
+                if durable is not None and durable.status in {"pending", "generating"}:
+                    if self._owner_is_live_locked(request):
+                        self._capacity.release()
+                        return replace(durable, deduplicated=True)
+                    durable = self._recover_interrupted_locked(request, durable)
+                owner_token = self._claim_owner_locked(request)
+                if owner_token is None:
+                    active = self._parse_manifest(request)
+                    self._capacity.release()
+                    return replace(active or pending, deduplicated=True)
+                self._persist(request, pending)
+            job_id = self._job_id(request)
+            # Register capacity ownership before the executor can run a very
+            # fast task and release the slot on another thread.
+            self._scheduled.add(job_id)
+            future = self._executor.submit(self._run, request, pending, owner_token)
         except BaseException:
+            if owner_token is not None:
+                self._release_owner(request, owner_token)
+            self._scheduled.discard(self._job_id(request))
             self._capacity.release()
             return self._failed_view(request, "overlay_render_failed", retryable=True)
         self._views[self._job_id(request)] = pending
@@ -822,16 +1198,22 @@ class BoundedOverlayWorker:
             if self._closed:
                 raise OverlayWorkerError("overlay_worker_closed")
             current = self._views.get(job_id)
-            if current is not None and job_id in self._inflight:
+            if current is not None and job_id in self._scheduled:
                 return replace(current, deduplicated=True)
-            if current is None:
-                current = self._load_durable(request, recover=True)
-                if current is not None:
+            if current is None or current.status == "ready" or current.status in {"pending", "generating"}:
+                durable = self._load_durable(request, recover=True)
+                if durable is not None:
+                    current = durable
                     self._views[job_id] = current
+                elif current is not None and current.status == "ready":
+                    current = None
+                    self._views.pop(job_id, None)
             if current is not None:
+                if current.status in {"pending", "generating"}:
+                    return replace(current, deduplicated=True)
                 if current.status == "ready":
                     return replace(current, cache_hit=True)
-                if current.status == "failed":
+                if current.status == "failed" and current.code != "overlay_cache_invalid":
                     return current
             if not self._capacity.acquire(blocking=False):
                 return self._failed_view(request, "overlay_queue_full", retryable=True)
@@ -845,7 +1227,11 @@ class BoundedOverlayWorker:
         job_id = self._job_id(request)
         with self._lock:
             current = self._views.get(job_id)
-            if current is not None:
+            if current is not None and job_id in self._scheduled:
+                return current
+            if current is not None and current.status == "failed":
+                return current
+            if current is not None and current.status not in {"pending", "generating", "ready"}:
                 return current
             durable = self._load_durable(request, recover=True)
             if durable is None:
@@ -862,11 +1248,15 @@ class BoundedOverlayWorker:
         with self._lock:
             if self._closed:
                 raise OverlayWorkerError("overlay_worker_closed")
-            current = self._views.get(job_id) or self._load_durable(request, recover=True)
+            current = self._views.get(job_id)
+            if current is None or current.status in {"pending", "generating", "ready"}:
+                durable = self._load_durable(request, recover=True)
+                if durable is not None:
+                    current = durable
             if current is None:
                 return self._failed_view(request, "overlay_not_found", retryable=True)
             self._views[job_id] = current
-            if job_id in self._inflight:
+            if job_id in self._scheduled:
                 return replace(current, deduplicated=True)
             if current.status == "ready":
                 return replace(current, cache_hit=True)

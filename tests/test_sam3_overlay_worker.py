@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
-from threading import Event, Lock
+from threading import Barrier, BrokenBarrierError, Event, Lock
 import time
 
 import pytest
@@ -54,8 +55,13 @@ class RecordingRenderer:
         self.calls = 0
         self._lock = Lock()
 
-    def render_interval(self, request: object, start_frame: int, end_frame_exclusive: int, output_path: Path) -> None:
-        del request
+    def render_interval(
+        self,
+        request: object,
+        start_frame: int,
+        end_frame_exclusive: int,
+        output_path: Path,
+    ) -> dict[str, object]:
         with self._lock:
             self.calls += 1
             self.intervals.append((start_frame, end_frame_exclusive))
@@ -64,6 +70,11 @@ class RecordingRenderer:
         output_path.write_bytes(
             f"{start_frame}:{end_frame_exclusive}".encode("ascii")
         )
+        return {
+            "frame_count": end_frame_exclusive - start_frame,
+            "fps": request.fps,
+            "renderer": {"kind": "recording"},
+        }
 
 
 class BlockingRenderer(RecordingRenderer):
@@ -72,10 +83,16 @@ class BlockingRenderer(RecordingRenderer):
         self.started = Event()
         self.release = Event()
 
-    def render_interval(self, request: object, start_frame: int, end_frame_exclusive: int, output_path: Path) -> None:
+    def render_interval(
+        self,
+        request: object,
+        start_frame: int,
+        end_frame_exclusive: int,
+        output_path: Path,
+    ) -> dict[str, object]:
         self.started.set()
         assert self.release.wait(2.0)
-        super().render_interval(request, start_frame, end_frame_exclusive, output_path)
+        return super().render_interval(request, start_frame, end_frame_exclusive, output_path)
 
 
 class FailingRenderer(RecordingRenderer):
@@ -83,10 +100,16 @@ class FailingRenderer(RecordingRenderer):
         super().__init__()
         self.fail = True
 
-    def render_interval(self, request: object, start_frame: int, end_frame_exclusive: int, output_path: Path) -> None:
+    def render_interval(
+        self,
+        request: object,
+        start_frame: int,
+        end_frame_exclusive: int,
+        output_path: Path,
+    ) -> dict[str, object]:
         if self.fail:
             raise RuntimeError("/private/ffmpeg traceback command=render")
-        super().render_interval(request, start_frame, end_frame_exclusive, output_path)
+        return super().render_interval(request, start_frame, end_frame_exclusive, output_path)
 
 
 def test_merge_frame_intervals_merges_overlap_and_adjacency_but_rejects_invalid_ranges() -> None:
@@ -276,14 +299,136 @@ def test_worker_validates_a_durable_ready_manifest_before_a_fresh_cache_hit(
         assert second_renderer.calls == 0
 
         assert ready.segments[0].path is not None
-        ready.segments[0].path.write_bytes(b"tampered")
-        invalid = BoundedOverlayWorker(max_workers=1, max_pending=1)
-        try:
-            repaired = invalid.get(cached_request)
-            assert repaired.status == "failed"
-            assert repaired.code == "overlay_cache_invalid"
-            assert repaired.retryable is True
-        finally:
-            invalid.shutdown()
+        original = ready.segments[0].path.read_bytes()
+        ready.segments[0].path.write_bytes(b"x" * len(original))
+
+        # A cache entry must be rejected even if the mutation preserves its byte
+        # length.  The fresh submit is deliberately expected to regenerate it
+        # rather than returning the corrupt entry as a cache hit.
+        repaired_renderer = RecordingRenderer()
+        repaired_request = replace(request, renderer=repaired_renderer)
+        repaired = second.get(repaired_request)
+        assert repaired.status == "failed"
+        assert repaired.code == "overlay_cache_invalid"
+        regenerated = second.submit(repaired_request)
+        assert regenerated.status in {"pending", "generating"}
+        assert _wait_until_terminal(second, repaired_request).status == "ready"
+        assert repaired_renderer.calls == 2
+
+        manifest_path = request.cache_root / request.cache_key.digest / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        first_segment = manifest["segments"][0]
+        assert first_segment["sha256"] == hashlib.sha256(
+            (request.cache_root / request.cache_key.digest / first_segment["relative_path"]).read_bytes()
+        ).hexdigest()
+        assert first_segment["metadata"] == {
+            "frame_count": 62,
+            "fps": 30.0,
+            "renderer": {"kind": "recording"},
+        }
+
+        first_segment["metadata"]["fps"] = 15.0
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        invalid_metadata = second.get(repaired_request)
+        assert invalid_metadata.status == "failed"
+        assert invalid_metadata.code == "overlay_cache_invalid"
+        metadata_regenerated = second.submit(repaired_request)
+        assert metadata_regenerated.status in {"pending", "generating"}
+        assert _wait_until_terminal(second, repaired_request).status == "ready"
+        assert repaired_renderer.calls == 4
     finally:
         second.shutdown()
+
+
+def test_observer_never_recovers_a_live_cross_instance_generation(tmp_path: Path) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    renderer = BlockingRenderer()
+    request = _request(tmp_path, renderer=renderer)
+    owner = BoundedOverlayWorker(max_workers=1, max_pending=1)
+    observer = BoundedOverlayWorker(max_workers=1, max_pending=1)
+    try:
+        owner.submit(request)
+        assert renderer.started.wait(1.0)
+
+        observed = observer.get(request)
+        duplicate = observer.submit(request)
+        assert observed.status in {"pending", "generating"}
+        assert duplicate.status in {"pending", "generating"}
+        assert duplicate.deduplicated is True
+
+        manifest_path = request.cache_root / request.cache_key.digest / "manifest.json"
+        assert json.loads(manifest_path.read_text(encoding="utf-8"))["status"] in {
+            "pending",
+            "generating",
+        }
+
+        renderer.release.set()
+        assert _wait_until_terminal(owner, request).status == "ready"
+        assert _wait_until_terminal(observer, request).status == "ready"
+        assert renderer.calls == 2
+    finally:
+        renderer.release.set()
+        owner.shutdown()
+        observer.shutdown()
+
+
+def test_distinct_concurrent_jobs_publish_within_the_shared_ready_cache_limit(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    renderer_a = RecordingRenderer()
+    renderer_b = RecordingRenderer()
+    request_a = _request(
+        tmp_path,
+        intervals=((120, 169),),
+        renderer=renderer_a,
+        source_sha256="sha256:" + "d" * 64,
+    )
+    request_b = _request(
+        tmp_path,
+        intervals=((220, 269),),
+        renderer=renderer_b,
+        source_sha256="sha256:" + "e" * 64,
+    )
+    worker_a = BoundedOverlayWorker(max_workers=1, max_pending=1, max_ready_jobs=1)
+    worker_b = BoundedOverlayWorker(max_workers=1, max_pending=1, max_ready_jobs=1)
+    rendezvous = Barrier(2)
+
+    def gate_eviction(worker: object) -> None:
+        original = worker._evict_for
+
+        def coordinated(request: object, size: int) -> bool:
+            result = original(request, size)
+            try:
+                rendezvous.wait(timeout=0.25)
+            except BrokenBarrierError:
+                # With the root-wide publication lock, only one publisher enters
+                # at a time; the barrier timing out is the expected safe path.
+                pass
+            return result
+
+        worker._evict_for = coordinated
+
+    gate_eviction(worker_a)
+    gate_eviction(worker_b)
+    try:
+        worker_a.submit(request_a)
+        worker_b.submit(request_b)
+        deadline = time.monotonic() + 3.0
+        while worker_a._scheduled or worker_b._scheduled:
+            assert time.monotonic() < deadline, "concurrent jobs did not finish"
+            time.sleep(0.01)
+        assert renderer_a.calls == 1
+        assert renderer_b.calls == 1
+
+        manifests = list(request_a.cache_root.glob("*/manifest.json"))
+        ready_count = sum(
+            json.loads(path.read_text(encoding="utf-8")).get("status") == "ready"
+            for path in manifests
+        )
+        assert ready_count == 1
+    finally:
+        worker_a.shutdown()
+        worker_b.shutdown()
