@@ -10,12 +10,12 @@ import h5py
 import numpy as np
 import pytest
 
-from human_qc.contracts import BoundaryError
-from human_qc.source_adapters import (
+from semantic_calibration.contracts import BoundaryError
+from semantic_calibration.source_adapters import (
     Hdf5ScalarJsonSubtaskAdapter,
     encode_canonical_payload,
 )
-from human_qc.timeline import SharedBoundaryTimeline
+from semantic_calibration.timeline import SharedBoundaryTimeline
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "human_qc" / "subtasks_closed.json"

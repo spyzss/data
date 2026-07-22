@@ -8,7 +8,11 @@ import h5py
 import pytest
 
 import qc_common.manual_review as manual_review_module
-from human_qc.semantic_service import SemanticCalibrationService
+from semantic_calibration.application import SemanticCalibrationApplication
+from semantic_calibration.service import (
+    SemanticCalibrationService,
+    SemanticEligibilityError,
+)
 from human_qc.warn_service import WarnReviewService
 from human_qc.workbench_service import WorkbenchService
 from qc_common.config import LoadedQcConfig
@@ -294,7 +298,6 @@ def test_workbench_does_not_expose_semantic_task_before_manual_completion(
     semantic = _ForbiddenSemanticProjection(context.report_path)
     warn = _StaleWarnProjection(context.report_path, context.asset_id)
     service = WorkbenchService(
-        semantic_service=semantic,
         warn_service=warn,
         asset_contexts={context.asset_id: context},
     )
@@ -302,7 +305,7 @@ def test_workbench_does_not_expose_semantic_task_before_manual_completion(
     task = service.get_asset_task(context.asset_id)
 
     assert task["task_type"] == "warn_review"
-    assert task["semantic"] is None
+    assert "semantic" not in task
     assert semantic.calls == 0
 
 
@@ -747,8 +750,8 @@ def test_workbench_semantic_completion_keeps_cursor_for_orchestrator(
         assert domain_report["pipeline_state"]["next_module"] == "semantic_consistency"
         return registry
 
-    service = WorkbenchService(
-        semantic_service=semantic,
+    service = SemanticCalibrationApplication(
+        semantic,
         asset_contexts={asset_id: context},
         profile="acceptance",
         config=config,
@@ -756,13 +759,13 @@ def test_workbench_semantic_completion_keeps_cursor_for_orchestrator(
     )
     lease = service.acquire_lease(asset_id, "alice", 60)
 
-    completed = service.semantic_complete(
+    completed = service.complete(
         asset_id,
         expected_revision=first.report["report_revision"],
         lease_token=lease.token,
     )
 
-    assert completed["task_type"] == "completed"
+    assert completed["task_type"] == "semantic_calibration"
     assert calls == ["auto", "tail"]
     persisted = load_asset_qc_report(context.report_path)
     assert persisted is not None
@@ -833,8 +836,8 @@ def test_task_fetch_recovers_semantic_domain_completion_crash_window_once(
     assert crashed is not None
     assert crashed["semantic_calibration"]["orchestrator_resume_required"] is True
     assert crashed["pipeline_state"]["next_module"] == "semantic_consistency"
-    service = WorkbenchService(
-        semantic_service=SemanticCalibrationService(
+    service = SemanticCalibrationApplication(
+        SemanticCalibrationService(
             assets={asset_id: hdf5_path}, reports={asset_id: context.report_path}
         ),
         asset_contexts={asset_id: context},
@@ -842,27 +845,27 @@ def test_task_fetch_recovers_semantic_domain_completion_crash_window_once(
         config=config,
         registry_factory=lambda *_: registry,
     )
-    real_resume = service._resume_external
+    real_resume = service._resume
     attempts = 0
 
-    def fail_first_resume(asset: str, module: str) -> None:
+    def fail_first_resume(asset: str) -> None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("orchestrator temporarily unavailable")
-        real_resume(asset, module)
+        real_resume(asset)
 
-    service._resume_external = fail_first_resume
+    service._resume = fail_first_resume
     before_failed_retry = context.report_path.read_bytes()
     with pytest.raises(RuntimeError, match="temporarily unavailable"):
-        service.get_asset_task(asset_id)
+        service.get_task(asset_id)
     assert context.report_path.read_bytes() == before_failed_retry
 
-    recovered = service.get_asset_task(asset_id)
+    recovered = service.get_task(asset_id)
     after_first_fetch = context.report_path.read_bytes()
-    recovered_again = service.get_asset_task(asset_id)
+    recovered_again = service.get_task(asset_id)
 
-    assert recovered["task_type"] == recovered_again["task_type"] == "completed"
+    assert recovered["task_type"] == recovered_again["task_type"] == "semantic_calibration"
     assert calls == ["auto", "tail"]
     persisted = load_asset_qc_report(context.report_path)
     assert persisted is not None
@@ -1019,6 +1022,7 @@ def test_task_fetch_recovers_transition_persisted_before_successor_run_once(
 
     monkeypatch.setattr(orchestrator_module, "run_asset", crash_once_after_transition)
     monkeypatch.setattr("human_qc.workbench_service.run_asset", crash_once_after_transition)
+    monkeypatch.setattr("semantic_calibration.application.run_asset", crash_once_after_transition)
 
     with pytest.raises(RuntimeError, match="after external transition persistence"):
         resume_after_external(
@@ -1039,18 +1043,31 @@ def test_task_fetch_recovers_transition_persisted_before_successor_run_once(
     assert crashed["pipeline_state"]["next_module"] == expected_next
     assert crashed["pipeline_state"]["external_resume"]["completed_module"] == completed_module
     transition_revision = crashed["report_revision"]
-    service = WorkbenchService(
-        asset_contexts={context.asset_id: context},
-        profile="supplier_evaluation",
-        config=config,
-        registry_factory=lambda *_: registry,
-    )
+    if completed_module == "semantic_consistency":
+        service = SemanticCalibrationApplication(
+            _StaleSemanticProjection(context.report_path, context.asset_id),
+            asset_contexts={context.asset_id: context},
+            profile="supplier_evaluation",
+            config=config,
+            registry_factory=lambda *_: registry,
+        )
+        fetch = service.get_task
+        expected_task_type = "semantic_calibration"
+    else:
+        service = WorkbenchService(
+            asset_contexts={context.asset_id: context},
+            profile="supplier_evaluation",
+            config=config,
+            registry_factory=lambda *_: registry,
+        )
+        fetch = service.get_asset_task
+        expected_task_type = "completed"
 
-    recovered = service.get_asset_task(context.asset_id)
+    recovered = fetch(context.asset_id)
     after_recovery = context.report_path.read_bytes()
-    recovered_again = service.get_asset_task(context.asset_id)
+    recovered_again = fetch(context.asset_id)
 
-    assert recovered["task_type"] == recovered_again["task_type"] == "completed"
+    assert recovered["task_type"] == recovered_again["task_type"] == expected_task_type
     assert calls == (["auto"] if completed_module == "manual_review" else ["auto", "tail"])
     assert downstream_attempts == 2
     persisted = load_asset_qc_report(context.report_path)
@@ -1118,7 +1135,7 @@ def test_workbench_lists_only_profile_matching_external_assets(tmp_path: Path) -
             encoding="utf-8",
         )
     service = WorkbenchService(asset_contexts={"supplier": supplier, "stopped": stopped})
-    assert service.list_actionable_assets("supplier_evaluation") == ("supplier",)
+    assert service.list_actionable_assets("supplier_evaluation") == ()
     assert service.list_actionable_assets("acceptance") == ()
     assert service.get_asset_task("stopped")["task_type"] == "completed"
     with pytest.raises(KeyError):
@@ -1151,8 +1168,17 @@ def test_acceptance_hard_stop_exposes_no_semantic_task_or_lease(tmp_path: Path) 
 
 
 class _StaleSemanticProjection:
-    def __init__(self, report_path: Path) -> None:
-        self._reports = {"stale": report_path}
+    def __init__(self, report_path: Path, asset_id: str = "stale") -> None:
+        self._reports = {asset_id: report_path}
+
+    def asset_ids(self) -> tuple[str, ...]:
+        return tuple(self._reports)
+
+    def report_path(self, asset_id: str) -> Path:
+        return self._reports[asset_id]
+
+    def bind_lease(self, asset_id: str, token: str) -> None:
+        assert asset_id in self._reports
 
     def get_task(self, asset_id: str) -> SimpleNamespace:
         report = load_asset_qc_report(self._reports[asset_id])
@@ -1203,8 +1229,8 @@ def test_terminal_status_blocks_stale_projection_acquire_and_renew(
     }
     context.report_path.parent.mkdir(parents=True, exist_ok=True)
     context.report_path.write_text(json.dumps(report), encoding="utf-8")
-    service = WorkbenchService(
-        semantic_service=_StaleSemanticProjection(context.report_path),
+    service = SemanticCalibrationApplication(
+        _StaleSemanticProjection(context.report_path),
         asset_contexts={"stale": context},
     )
     lease = service.acquire_lease("stale", "alice", 60)
@@ -1214,11 +1240,10 @@ def test_terminal_status_blocks_stale_projection_acquire_and_renew(
     )
     context.report_path.write_text(json.dumps(report), encoding="utf-8")
 
-    expected_task_type = "error" if terminal_status == "error" else "completed"
-    assert service.get_asset_task("stale")["task_type"] == expected_task_type
-    with pytest.raises(KeyError, match="not actionable"):
+    assert service.get_task("stale")["task_type"] == "semantic_calibration"
+    with pytest.raises(SemanticEligibilityError, match="semantic_not_ready"):
         service.acquire_lease("stale", "bob", 60)
-    with pytest.raises(KeyError, match="not actionable"):
+    with pytest.raises(SemanticEligibilityError, match="semantic_not_ready"):
         service.renew_lease("stale", lease.token, 60)
 
 

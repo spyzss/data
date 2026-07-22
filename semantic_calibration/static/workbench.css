@@ -1,0 +1,25 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #172b4d;
+  background: #edf3f8;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; }
+.semantic-shell { max-width: 1440px; margin: 0 auto; background: #fff; border: 1px solid #d8e3ee; border-radius: 20px; padding: 28px; }
+.semantic-header { display: flex; justify-content: space-between; align-items: center; gap: 24px; border-bottom: 1px solid #d8e3ee; }
+.semantic-header h1 { margin: 4px 0 20px; }
+.eyebrow { color: #7488a5; font-size: 13px; font-weight: 700; letter-spacing: .08em; }
+.asset-meta, .status { color: #5a708f; }
+.semantic-stage { min-height: 320px; }
+.timeline-track { position: relative; min-height: 96px; border: 1px solid #cad8e8; border-radius: 12px; background: #f7f9fc; }
+.timeline-segment { position: absolute; top: 24px; height: 48px; border: 1px solid #8da9d1; background: #dce9fa; overflow: hidden; }
+.boundary-handle { position: absolute; top: 12px; width: 12px; height: 72px; border: 0; border-radius: 8px; background: #3c82f6; cursor: ew-resize; }
+.pending-confirmation { margin-top: 20px; border: 1px solid #f0a23b; border-radius: 12px; padding: 16px; background: #fff8ec; }
+
+@media (max-width: 720px) {
+  body { padding: 0; }
+  .semantic-shell { border-radius: 0; padding: 16px; }
+  .semantic-header { align-items: flex-start; flex-direction: column; }
+}

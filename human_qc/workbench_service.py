@@ -1,7 +1,7 @@
-"""Application facade for the human semantic/warn review workbench.
+"""Application facade for the Warn-only human review workbench.
 
-The semantic and warning services deliberately own their respective state
-machines.  This module only composes their read projections, coordinates a
+The warning service owns its state machine.  This module composes its read
+projection, coordinates a
 short-lived reviewer lease, and translates workbench actions into the typed
 service requests.  The HTTP layer can therefore stay transport-only and
 non-authoritative.
@@ -19,19 +19,13 @@ from typing import Any
 
 from qc_common.config import LoadedQcConfig
 from qc_common.module_registry import ModuleRegistry
-from qc_common.manual_review import semantic_eligibility
 from qc_common.report import load_asset_qc_report
+from qc_common.reviewer_lease import Lease, LeaseStore
 from qc_pipeline.context import AssetContext
 from qc_pipeline.default_registry import build_default_registry
 from qc_pipeline.orchestrator import resume_after_external, run_asset
 
 from .evidence import EvidenceService
-from .lease import Lease, LeaseStore
-from .semantic_service import (
-    BoundaryEditRequest,
-    SemanticCalibrationService,
-    TextEditRequest,
-)
 from .warn_service import WarnReviewService
 
 
@@ -76,17 +70,14 @@ def jsonable(value: Any) -> Any:
 
 
 class WorkbenchService:
-    """Compose semantic calibration and warning review for one asset queue.
+    """Compose warning review for one asset queue.
 
-    ``semantic_service`` and ``warn_service`` are intentionally duck-typed in
-    read paths so tests and downstream adapters can provide a compatible
-    facade.  The concrete services from this package are used by default in
-    the mutation helpers below.
+    ``warn_service`` is intentionally duck-typed in read paths so tests and
+    downstream adapters can provide a compatible facade.
     """
 
     def __init__(
         self,
-        semantic_service: SemanticCalibrationService | Any | None = None,
         warn_service: WarnReviewService | Any | None = None,
         evidence_service: EvidenceService | Any | None = None,
         *,
@@ -100,7 +91,6 @@ class WorkbenchService:
             [AssetContext, LoadedQcConfig], ModuleRegistry
         ] | None = None,
     ) -> None:
-        self.semantic_service = semantic_service
         self.warn_service = warn_service
         self.evidence_service = evidence_service
         self.lease_store = lease_store or LeaseStore()
@@ -140,7 +130,7 @@ class WorkbenchService:
     def _report(self, asset_id: str, context: AssetContext | None) -> Mapping[str, Any] | None:
         report_path: Path | None = context.report_path if context is not None else None
         if report_path is None:
-            for service in (self.warn_service, self.semantic_service):
+            for service in (self.warn_service,):
                 resolver = getattr(service, "report_path", None) if service is not None else None
                 if callable(resolver):
                     try:
@@ -165,8 +155,6 @@ class WorkbenchService:
         if pipeline.get("status") != "awaiting_external":
             return False
         next_module = pipeline.get("next_module")
-        if next_module == "semantic_consistency":
-            return semantic_eligibility(report) == "ready"
         if next_module != "manual_review":
             return False
         manual = report.get("manual_review")
@@ -252,28 +240,21 @@ class WorkbenchService:
         pipeline_status = pipeline.get("status") if isinstance(pipeline, Mapping) else None
         pipeline_next = pipeline.get("next_module") if isinstance(pipeline, Mapping) else None
         # A persisted report is authoritative over stale domain projections.
-        # Only a live external stage with editable selected work may expose a
-        # semantic/warn task; every other state is navigation-only.
+        # The formal Human service exposes only the manual-review cursor.
         report_is_noneditable = isinstance(report, Mapping) and not self._is_actionable_report(
             report
         )
         if pipeline_status in {"stopped", "completed", "error"} or report_is_noneditable:
-            semantic = None
-            warn = None
-        elif pipeline_next == "semantic_consistency":
-            semantic = self._get_task(self.semantic_service, asset_id)
             warn = None
         elif pipeline_next == "manual_review":
-            semantic = None
             warn = self._get_task(self.warn_service, asset_id)
         else:
-            semantic = None
             warn = None
-        if semantic is None and warn is None and report is None and context is None:
+        if warn is None and report is None and context is None:
             raise KeyError(f"unknown asset: {asset_id}")
 
         revisions: list[int] = []
-        for value in (semantic, warn):
+        for value in (warn,):
             if value is None:
                 continue
             raw_revision = getattr(value, "report_revision", getattr(value, "revision", None))
@@ -282,24 +263,12 @@ class WorkbenchService:
         if report is not None and isinstance(report.get("report_revision"), int):
             revisions.append(int(report["report_revision"]))
         revision = max(revisions, default=0)
-        semantic_data = jsonable(semantic) if semantic is not None else None
         warn_data = jsonable(warn) if warn is not None else None
         # Lease tokens are write credentials and should never be sent in the
         # read projection.  The browser receives one only from acquire/renew.
-        for value in (semantic_data, warn_data):
+        for value in (warn_data,):
             if isinstance(value, dict):
                 value.pop("lease_token", None)
-        if isinstance(semantic_data, dict) and context is not None:
-            raw_hdf5 = semantic_data.get("hdf5_path")
-            if isinstance(raw_hdf5, str):
-                try:
-                    semantic_data["hdf5_path"] = Path(raw_hdf5).resolve().relative_to(
-                        context.batch_root.resolve()
-                    ).as_posix()
-                except ValueError:
-                    # Keep a stable basename rather than exposing a host path
-                    # if an adapter returns an unexpected external location.
-                    semantic_data["hdf5_path"] = Path(raw_hdf5).name
         if isinstance(warn_data, dict) and report is not None:
             selected = warn_data.get("selected_issue_ids", [])
             selected_ids = set(selected) if isinstance(selected, list) else set()
@@ -319,24 +288,8 @@ class WorkbenchService:
                     if isinstance(issue, Mapping) and isinstance(issue.get("issue_id"), str)
                 }
 
-        task_type = "semantic_calibration" if semantic is not None else None
-        if semantic is not None:
-            state = (
-                semantic_data.get("report_state", semantic_data.get("state"))
-                if isinstance(semantic_data, dict)
-                else None
-            )
-            if state == "completed":
-                selected = report.get("manual_review", {}) if isinstance(report, Mapping) else {}
-                selected_ids = selected.get("selected_issue_ids", []) if isinstance(selected, Mapping) else []
-                warn_state = warn_data.get("state") if isinstance(warn_data, dict) else None
-                warn_terminal = warn_state in {"completed", "not_required", "skipped_due_to_fail"}
-                task_type = "completed" if warn_terminal or (warn is None and not selected_ids) else "warn_review"
-            elif state in {"skipped_due_to_fail", "error"}:
-                task_type = "completed"
-        elif warn is not None:
-            task_type = "warn_review"
-        elif report is not None:
+        task_type = "warn_review" if warn is not None else None
+        if warn is None and report is not None:
             task_type = "error" if pipeline_status == "error" else "completed"
 
         execution = report.get("execution") if isinstance(report, Mapping) else None
@@ -350,7 +303,6 @@ class WorkbenchService:
             "task_type": task_type,
             "pipeline_state": pipeline_status,
             "next_module": pipeline_next,
-            "semantic": semantic_data,
             "warn": warn_data,
             "evidence": self._evidence(asset_id, report, context),
         }
@@ -369,7 +321,7 @@ class WorkbenchService:
         if not isinstance(profile, str) or not profile:
             raise ValueError("profile must be a non-empty string")
         asset_ids = set(self.asset_contexts)
-        for service in (self.semantic_service, self.warn_service):
+        for service in (self.warn_service,):
             reports = getattr(service, "_reports", None) if service is not None else None
             if isinstance(reports, Mapping):
                 asset_ids.update(str(asset_id) for asset_id in reports)
@@ -432,7 +384,7 @@ class WorkbenchService:
         service-local binding.
         """
 
-        for service in (self.semantic_service, self.warn_service):
+        for service in (self.warn_service,):
             leases = getattr(service, "_leases", None) if service is not None else None
             if isinstance(leases, dict):
                 leases[asset_id] = token
@@ -451,13 +403,16 @@ class WorkbenchService:
 
         if self.config is None:
             return
+        if completed_module != "manual_review":
+            raise ValueError("Warn workbench can resume only manual_review")
         context = self._context(asset_id)
         if context is None:
             raise KeyError(f"asset context is not configured for {asset_id}")
         report = self._report(asset_id, context)
         if not isinstance(report, Mapping):
             raise FileNotFoundError(context.report_path)
-        if completed_module == "manual_review" and semantic_eligibility(report) == "skipped_due_to_fail":
+        manual = report.get("manual_review")
+        if isinstance(manual, Mapping) and manual.get("completion_mode") == "early_fail":
             return
         execution = report.get("execution")
         report_profile = (
@@ -499,7 +454,7 @@ class WorkbenchService:
                 handoff.get("transition_revision") if isinstance(handoff, Mapping) else None
             )
             next_module = pipeline.get("next_module")
-            if completed_module not in {"semantic_consistency", "manual_review"}:
+            if completed_module != "manual_review":
                 return False
             if (
                 not isinstance(transition_revision, int)
@@ -508,17 +463,11 @@ class WorkbenchService:
                 or not isinstance(next_module, str)
             ):
                 return False
-            if completed_module == "semantic_consistency":
-                domain = report.get("semantic_calibration")
-                domain_completed = (
-                    isinstance(domain, Mapping) and domain.get("state") == "completed"
-                )
-            else:
-                domain = report.get("manual_review")
-                domain_completed = isinstance(domain, Mapping) and domain.get("state") in {
-                    "completed",
-                    "not_required",
-                }
+            domain = report.get("manual_review")
+            domain_completed = isinstance(domain, Mapping) and domain.get("state") in {
+                "completed",
+                "not_required",
+            }
             modules = self.config.pipeline_modules
             if (
                 not domain_completed
@@ -550,17 +499,13 @@ class WorkbenchService:
         if pipeline.get("status") != "awaiting_external":
             return False
         completed_module = pipeline.get("next_module")
-        if completed_module == "semantic_consistency":
-            block = report.get("semantic_calibration")
-            completed = isinstance(block, Mapping) and block.get("state") == "completed"
-        elif completed_module == "manual_review":
-            block = report.get("manual_review")
-            completed = isinstance(block, Mapping) and block.get("state") in {
-                "completed",
-                "not_required",
-            }
-        else:
+        if completed_module != "manual_review":
             return False
+        block = report.get("manual_review")
+        completed = isinstance(block, Mapping) and block.get("state") in {
+            "completed",
+            "not_required",
+        }
         if not completed or not block.get("orchestrator_resume_required", False):
             return False
         try:
@@ -573,16 +518,7 @@ class WorkbenchService:
             latest_pipeline = (
                 latest.get("pipeline_state") if isinstance(latest, Mapping) else None
             )
-            if completed_module == "semantic_consistency":
-                latest_block = (
-                    latest.get("semantic_calibration")
-                    if isinstance(latest, Mapping)
-                    else None
-                )
-            else:
-                latest_block = (
-                    latest.get("manual_review") if isinstance(latest, Mapping) else None
-                )
+            latest_block = latest.get("manual_review") if isinstance(latest, Mapping) else None
             still_pending = (
                 isinstance(latest_pipeline, Mapping)
                 and latest_pipeline.get("status") == "awaiting_external"
@@ -593,96 +529,6 @@ class WorkbenchService:
             if still_pending:
                 raise
         return True
-
-    def semantic_boundary_pending(
-        self,
-        asset_id: str,
-        *,
-        boundary_index: int,
-        new_frame_exclusive: int,
-        expected_revision: int,
-        lease_token: str,
-        actor_segment_id: str | None = None,
-        reviewer: str = "human",
-        now: str | datetime | None = None,
-    ) -> dict[str, Any]:
-        self._prepare_mutation(asset_id, lease_token)
-        if self.semantic_service is None:
-            raise KeyError(f"semantic service is not configured for {asset_id}")
-        request = BoundaryEditRequest(
-            boundary_index=boundary_index,
-            new_frame_exclusive=new_frame_exclusive,
-            actor_segment_id=actor_segment_id,
-            expected_revision=expected_revision,
-            lease_token=lease_token,
-            reviewer=reviewer,
-            now=now,
-        )
-        self.semantic_service.begin_boundary_edit(asset_id, request)
-        return self._latest(asset_id)
-
-    def semantic_text_pending(
-        self,
-        asset_id: str,
-        *,
-        segment_id: str,
-        text_cn: str,
-        text_en: str,
-        expected_revision: int,
-        lease_token: str,
-        reviewer: str = "human",
-        now: str | datetime | None = None,
-    ) -> dict[str, Any]:
-        self._prepare_mutation(asset_id, lease_token)
-        if self.semantic_service is None:
-            raise KeyError(f"semantic service is not configured for {asset_id}")
-        request = TextEditRequest(
-            segment_id=segment_id,
-            text_cn=text_cn,
-            text_en=text_en,
-            expected_revision=expected_revision,
-            lease_token=lease_token,
-            reviewer=reviewer,
-            now=now,
-        )
-        self.semantic_service.begin_text_edit(asset_id, request)
-        return self._latest(asset_id)
-
-    def semantic_pending_confirm(
-        self, asset_id: str, *, expected_revision: int, lease_token: str
-    ) -> dict[str, Any]:
-        self._prepare_mutation(asset_id, lease_token)
-        if self.semantic_service is None:
-            raise KeyError(f"semantic service is not configured for {asset_id}")
-        self.semantic_service.confirm_pending(asset_id, expected_revision, lease_token)
-        return self._latest(asset_id)
-
-    def semantic_pending_cancel(
-        self, asset_id: str, *, expected_revision: int, lease_token: str
-    ) -> dict[str, Any]:
-        self._prepare_mutation(asset_id, lease_token)
-        if self.semantic_service is None:
-            raise KeyError(f"semantic service is not configured for {asset_id}")
-        self.semantic_service.cancel_pending(asset_id, expected_revision, lease_token)
-        return self._latest(asset_id)
-
-    def semantic_complete(
-        self, asset_id: str, *, expected_revision: int, lease_token: str
-    ) -> dict[str, Any]:
-        self._prepare_mutation(asset_id, lease_token)
-        if self.semantic_service is None:
-            raise KeyError(f"semantic service is not configured for {asset_id}")
-        if self.config is None:
-            self.semantic_service.complete(asset_id, expected_revision, lease_token)
-        else:
-            self.semantic_service.complete(
-                asset_id,
-                expected_revision,
-                lease_token,
-                advance_pipeline=False,
-            )
-            self._resume_external(asset_id, "semantic_consistency")
-        return self._latest(asset_id)
 
     def warn_verdict(
         self,
@@ -724,7 +570,8 @@ class WorkbenchService:
                 advance_pipeline=False,
             )
             latest = self._report(asset_id, self._context(asset_id))
-            if semantic_eligibility(latest or {}) == "ready":
+            manual = latest.get("manual_review") if isinstance(latest, Mapping) else None
+            if isinstance(manual, Mapping) and manual.get("completion_mode") == "all_reviewed":
                 self._resume_external(asset_id, "manual_review")
         return self._latest(asset_id)
 

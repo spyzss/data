@@ -94,6 +94,18 @@ class LeaseStore:
                 raise LeaseTokenError("lease token is stale or expired")
             return current
 
+    def release(self, asset_id: str, token: str) -> Lease:
+        """Release the current lease only when ``token`` still owns it."""
+
+        if not isinstance(token, str) or not token:
+            raise LeaseTokenError("lease token is required")
+        with self._lock:
+            current = self._leases.get(asset_id)
+            if current is None or current.token != token or current.expires_at_datetime <= self._now():
+                raise LeaseTokenError("lease token is stale or expired")
+            del self._leases[asset_id]
+            return current
+
 
 __all__ = [
     "Lease",

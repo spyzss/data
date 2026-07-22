@@ -8,17 +8,17 @@ from pathlib import Path
 import h5py
 import pytest
 
-from human_qc.contracts import SubtaskSegment
-from human_qc.hdf5_commit import Hdf5CommitError
-from human_qc.semantic_service import (
+from semantic_calibration.contracts import SubtaskSegment
+from semantic_calibration.hdf5_commit import Hdf5CommitError
+from semantic_calibration.service import (
     BoundaryEditRequest,
     SemanticCalibrationService,
     SemanticTaskView,
     TaskStateError,
     TextEditRequest,
 )
-from human_qc.source_adapters import Hdf5ScalarJsonSubtaskAdapter
-from human_qc.timeline import SharedBoundaryTimeline
+from semantic_calibration.source_adapters import Hdf5ScalarJsonSubtaskAdapter
+from semantic_calibration.timeline import SharedBoundaryTimeline
 from qc_common.report import load_asset_qc_report, write_asset_qc_report
 from tests.qc_report_fixtures import make_v2_report
 
@@ -240,7 +240,7 @@ def test_boundary_drag_rejects_noop_at_current_boundary(tmp_path: Path) -> None:
 def test_complete_prepare_failure_leaves_report_and_hdf5_unpublished(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service(tmp_path)
     before_hdf5 = service.get_task(ASSET_ID).hdf5_sha256
-    monkeypatch.setattr("human_qc.semantic_service.prepare_hdf5_replacement", lambda *a, **k: (_ for _ in ()).throw(Hdf5CommitError("prepare failed")))
+    monkeypatch.setattr("semantic_calibration.service.prepare_hdf5_replacement", lambda *a, **k: (_ for _ in ()).throw(Hdf5CommitError("prepare failed")))
     with pytest.raises(Hdf5CommitError):
         service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
     task = service.get_task(ASSET_ID)
@@ -521,7 +521,7 @@ def test_replace_then_report_failure_recovers_finalizing_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = _service(tmp_path)
-    real_update = __import__("human_qc.semantic_service", fromlist=["update_human_state"]).update_human_state
+    real_update = __import__("semantic_calibration.service", fromlist=["update_human_state"]).update_human_state
     calls = 0
 
     def fail_second_update(path, expected_revision, mutate):
@@ -531,7 +531,7 @@ def test_replace_then_report_failure_recovers_finalizing_transaction(
             raise RuntimeError("report commit failed after replace")
         return real_update(path, expected_revision, mutate)
 
-    monkeypatch.setattr("human_qc.semantic_service.update_human_state", fail_second_update)
+    monkeypatch.setattr("semantic_calibration.service.update_human_state", fail_second_update)
     with pytest.raises(RuntimeError, match="after replace"):
         service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
 
@@ -554,7 +554,7 @@ def test_finalizing_record_source_path_tamper_fails_closed(tmp_path: Path, monke
     def fail_replace(prepared) -> None:
         raise RuntimeError("replace interrupted")
 
-    monkeypatch.setattr("human_qc.semantic_service.commit_hdf5_replacement", fail_replace)
+    monkeypatch.setattr("semantic_calibration.service.commit_hdf5_replacement", fail_replace)
     with pytest.raises(RuntimeError, match="interrupted"):
         service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
     monkeypatch.undo()
@@ -585,7 +585,7 @@ def test_finalizing_wrong_pipeline_cursor_fails_closed_before_recovery(
     service = _service(tmp_path)
 
     monkeypatch.setattr(
-        "human_qc.semantic_service.commit_hdf5_replacement",
+        "semantic_calibration.service.commit_hdf5_replacement",
         lambda prepared: (_ for _ in ()).throw(RuntimeError("replace interrupted")),
     )
     with pytest.raises(RuntimeError, match="interrupted"):

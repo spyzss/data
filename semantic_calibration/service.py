@@ -1,9 +1,9 @@
 """Revision-safe semantic calibration transactions.
 
 The service is intentionally a small application-layer coordinator.  Timeline
-math stays in :mod:`human_qc.timeline`, report ownership and atomic JSON writes
-stay in :mod:`human_qc.report_updates`, and HDF5 replacement/recovery stays in
-:mod:`human_qc.hdf5_commit`.  A pending edit is one report transaction per
+math stays in :mod:`semantic_calibration.timeline`, report ownership and atomic
+JSON writes stay in :mod:`qc_common.human_state`, and HDF5
+replacement/recovery stays in :mod:`semantic_calibration.hdf5_commit`.  A pending edit is one report transaction per
 asset; it is never applied to the source file until :meth:`complete`.
 """
 
@@ -20,6 +20,11 @@ from typing import Any
 
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report
 from qc_common.manual_review import semantic_eligibility
+from qc_common.human_state import (
+    initialize_semantic_calibration,
+    reduce_overall_decision,
+    update_human_state,
+)
 
 from .contracts import BoundaryEdit, BoundaryError, SegmentSnapshot, SubtaskSegment
 from .hdf5_commit import (
@@ -32,11 +37,6 @@ from .hdf5_commit import (
     prepare_hdf5_replacement,
     prepared_replacement_from_record,
     recover_hdf5_replacement,
-)
-from .report_updates import (
-    initialize_semantic_calibration,
-    reduce_overall_decision,
-    update_human_state,
 )
 from .source_adapters import (
     Hdf5ScalarJsonSubtaskAdapter,
@@ -60,6 +60,10 @@ class PendingEditError(SemanticServiceError):
 
 class TaskStateError(SemanticServiceError):
     """The report is in a state that cannot accept this operation."""
+
+
+class SemanticEligibilityError(TaskStateError):
+    """Persisted manual-review state does not allow semantic access."""
 
 
 class StaleSemanticRevisionError(StaleReportRevisionError, SemanticServiceError):
@@ -593,7 +597,7 @@ def _require_semantic_pipeline_cursor(value: Mapping[str, Any]) -> dict[str, Any
             "semantic completion requires pipeline next_module=semantic_consistency"
         )
     if semantic_eligibility(value) != "ready":
-        raise TaskStateError(
+        raise SemanticEligibilityError(
             "semantic task is blocked until manual review is completed or not_required"
         )
     return pipeline
@@ -608,7 +612,7 @@ def _require_semantic_task_access(value: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(pipeline, dict):
             raise TaskStateError("pipeline_state must be an object")
         if semantic_eligibility(value) != "ready":
-            raise TaskStateError(
+            raise SemanticEligibilityError(
                 "semantic task is blocked until manual review has a legal terminal state"
             )
         return pipeline
@@ -715,6 +719,22 @@ class SemanticCalibrationService:
         if asset_id in self._assets:
             return self._assets[asset_id].parent / "quality_archive" / f"{asset_id}.json"
         raise KeyError(asset_id)
+
+    def asset_ids(self) -> tuple[str, ...]:
+        """Return the configured asset identifiers without exposing paths."""
+
+        return tuple(sorted(self._assets))
+
+    def bind_lease(self, asset_id: str, token: str) -> None:
+        """Bind the application-owned lease token through a public seam."""
+
+        self._asset_path(asset_id)
+        if not isinstance(token, str) or not token:
+            raise LeaseError("lease token is required")
+        self._leases[asset_id] = token
+        state = self._states.get(asset_id)
+        if state is not None:
+            state.lease_token = token
 
     def _asset_path(self, asset_id: str) -> Path:
         try:
@@ -1395,6 +1415,7 @@ __all__ = [
     "LeaseError",
     "PendingEditError",
     "SemanticCalibrationService",
+    "SemanticEligibilityError",
     "SemanticServiceError",
     "SemanticTaskView",
     "StaleSemanticRevisionError",

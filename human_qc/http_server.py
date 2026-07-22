@@ -19,13 +19,7 @@ from urllib.parse import unquote, urlsplit
 
 from qc_common.report import StaleReportRevisionError
 
-from .lease import LeaseConflictError, LeaseTokenError
-from .semantic_service import (
-    LeaseError as SemanticLeaseError,
-    PendingEditError as SemanticPendingEditError,
-    StaleSemanticRevisionError,
-    TaskStateError as SemanticTaskStateError,
-)
+from qc_common.reviewer_lease import LeaseConflictError, LeaseTokenError
 from .warn_service import (
     WarnLeaseError,
     WarnRevisionError,
@@ -42,15 +36,6 @@ class ApiRequestError(ValueError):
 
 
 _MUTATION_ROUTES: dict[str, str] = {
-    "semantic/boundary/pending": "semantic_boundary_pending",
-    "semantic/boundary": "semantic_boundary_pending",
-    "semantic/text/pending": "semantic_text_pending",
-    "semantic/text": "semantic_text_pending",
-    "semantic/pending/confirm": "semantic_pending_confirm",
-    "semantic/confirm": "semantic_pending_confirm",
-    "semantic/pending/cancel": "semantic_pending_cancel",
-    "semantic/cancel": "semantic_pending_cancel",
-    "semantic/complete": "semantic_complete",
     "warn/verdict": "warn_verdict",
     "warn/issue/verdict": "warn_verdict",
     "warn/complete": "warn_complete",
@@ -71,42 +56,20 @@ def _as_payload(value: Any) -> dict[str, Any]:
 
 
 def _normalize_payload(route: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """Accept the UI's short aliases while keeping service contracts typed."""
-
-    normalized = dict(payload)
-    if route in {"semantic/boundary/pending", "semantic/boundary"}:
-        normalized.setdefault("boundary_index", normalized.get("boundary", normalized.get("boundary_id")))
-        normalized.setdefault(
-            "new_frame_exclusive",
-            normalized.get(
-                "new_boundary",
-                normalized.get("new_frame", normalized.get("target_frame")),
-            ),
-        )
-        normalized.setdefault(
-            "actor_segment_id",
-            normalized.get("actor", normalized.get("segment_id")),
-        )
-    elif route in {"semantic/text/pending", "semantic/text"}:
-        normalized.setdefault("segment_id", normalized.get("segment"))
-        normalized.setdefault("text_cn", normalized.get("cn", normalized.get("text")))
-        normalized.setdefault("text_en", normalized.get("en", ""))
-    return normalized
+    return dict(payload)
 
 
 def _error_details(exc: Exception) -> tuple[int, str, str]:
     message = str(exc) or exc.__class__.__name__
     if isinstance(exc, (LeaseConflictError,)):
         return HTTPStatus.LOCKED, "lease_held", message
-    if isinstance(exc, (LeaseTokenError, SemanticLeaseError, WarnLeaseError)):
+    if isinstance(exc, (LeaseTokenError, WarnLeaseError)):
         return HTTPStatus.LOCKED, "lease_invalid", message
-    if isinstance(exc, (StaleReportRevisionError, StaleSemanticRevisionError, WarnRevisionError)):
+    if isinstance(exc, (StaleReportRevisionError, WarnRevisionError)):
         return HTTPStatus.CONFLICT, "stale_revision", message
     if isinstance(
         exc,
         (
-            SemanticPendingEditError,
-            SemanticTaskStateError,
             WarnStateError,
         ),
     ):

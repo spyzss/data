@@ -47,7 +47,7 @@ def _request(server, method: str, path: str):
     return response.status, body
 
 
-def test_static_workbench_is_served_with_boundary_only_contract() -> None:
+def test_static_workbench_is_served_as_warn_only() -> None:
     server = create_http_server("127.0.0.1", 0, _Facade())
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -55,7 +55,6 @@ def test_static_workbench_is_served_with_boundary_only_contract() -> None:
         status, body = _request(server, "GET", "/")
         assert status == 200
         text = body.decode("utf-8")
-        assert "semantic_adapter.js" in text
         assert "warn_adapter.js" in text
         assert "workbench.css" in text
         assert "data-workbench-stage" in text
@@ -65,18 +64,14 @@ def test_static_workbench_is_served_with_boundary_only_contract() -> None:
         thread.join(timeout=2)
 
 
-def test_static_modules_expose_expected_boundary_and_lock_contracts() -> None:
+def test_static_modules_expose_warn_only_contracts() -> None:
     from pathlib import Path
 
     root = Path(__file__).parents[1] / "human_qc" / "static"
-    adapter = (root / "semantic_adapter.js").read_text(encoding="utf-8")
     app = (root / "app.js").read_text(encoding="utf-8")
     warn_adapter = (root / "warn_adapter.js").read_text(encoding="utf-8")
-    assert "beginBoundaryDrag" in adapter
-    assert "pending_edit" in adapter
-    assert "pointercapture" in adapter.lower()
-    assert "mutationControlsDisabled" in app
-    assert "advanceStage" in app
+    assert "semantic_adapter" not in app
+    assert "submitBoundary" not in app
     assert "/warn/${encodeURIComponent(issueId)}/verdict" in app
     assert "data-machine-reason" in warn_adapter
     assert "data-machine-metrics" in warn_adapter
@@ -85,6 +80,3 @@ def test_static_modules_expose_expected_boundary_and_lock_contracts() -> None:
     assert "data-overlay-error" in warn_adapter
     assert "videoPlaceholder" in warn_adapter
     assert '[data-video-placeholder]' in app
-    # Blocks are layout elements, never native draggable elements.  Handles
-    # use pointer capture in the adapter instead.
-    assert 'class="timeline-segment" draggable' not in adapter

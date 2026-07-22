@@ -10,7 +10,7 @@ from jsonschema import Draft202012Validator
 from qc_common.schema import ReportValidationError, validate_asset_qc_report
 from qc_common.manual_review import select_pending_manual_review_candidates
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report, write_asset_qc_report
-from human_qc.report_updates import (
+from qc_common.human_state import (
     initialize_manual_review,
     initialize_semantic_calibration,
     reduce_overall_decision,

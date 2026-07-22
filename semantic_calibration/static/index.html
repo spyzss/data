@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>语义校准</title>
+    <link rel="stylesheet" href="./workbench.css">
+    <link rel="modulepreload" href="./semantic_adapter.js">
+  </head>
+  <body>
+    <main class="semantic-shell" data-semantic-app data-reviewer="">
+      <header class="semantic-header">
+        <div><span class="eyebrow">人工校准工作台</span><h1>语义校准</h1></div>
+        <div class="asset-meta">当前资产 <strong data-asset-id>—</strong></div>
+      </header>
+      <p class="status" data-status>正在加载</p>
+      <section class="semantic-stage" data-semantic-stage aria-live="polite"></section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

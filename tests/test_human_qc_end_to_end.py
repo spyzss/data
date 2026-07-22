@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 
 from human_qc.evidence import EvidenceService
-from human_qc.semantic_service import PendingEditError, SemanticCalibrationService
+from semantic_calibration.application import SemanticCalibrationApplication
+from semantic_calibration.service import PendingEditError, SemanticCalibrationService
 from human_qc.warn_service import (
     WarnReviewService,
     WarnStateError,
@@ -206,7 +207,9 @@ def build_file_asset(
     return FileAsset(asset_id, root, hdf5_path, report_path, video_path, context)
 
 
-def make_workbench(asset: FileAsset, *, evidence: EvidenceService | None = None) -> WorkbenchService:
+def make_workbenches(
+    asset: FileAsset, *, evidence: EvidenceService | None = None
+) -> tuple[WorkbenchService, SemanticCalibrationApplication]:
     semantic = SemanticCalibrationService(
         assets={asset.asset_id: asset.hdf5_path},
         reports={asset.asset_id: asset.report_path},
@@ -214,12 +217,14 @@ def make_workbench(asset: FileAsset, *, evidence: EvidenceService | None = None)
     warn = WarnReviewService(
         reports={asset.asset_id: asset.report_path}, reviewer="alice", clock=lambda: NOW
     )
-    return WorkbenchService(
-        semantic,
-        warn,
-        evidence,
-        asset_contexts={asset.asset_id: asset.context},
-        profile="supplier_evaluation",
+    return (
+        WorkbenchService(
+            warn_service=warn,
+            evidence_service=evidence,
+            asset_contexts={asset.asset_id: asset.context},
+            profile="supplier_evaluation",
+        ),
+        SemanticCalibrationApplication(semantic),
     )
 
 
@@ -279,7 +284,7 @@ def test_file_level_warn_then_semantic_workflow_preserves_source_fidelity(tmp_pa
     before_report = load_asset_qc_report(asset.report_path)
     assert before_report is not None
     machine_issues = copy.deepcopy(before_report["issues"])
-    workbench = make_workbench(asset)
+    workbench, semantic_app = make_workbenches(asset)
     lease = workbench.acquire_lease(asset.asset_id, "alice", 120)
 
     task = workbench.get_asset_task(asset.asset_id)
@@ -312,20 +317,23 @@ def test_file_level_warn_then_semantic_workflow_preserves_source_fidelity(tmp_pa
         expected_revision=first_review["revision"],
         lease_token=lease.token,
     )
-    semantic_task = workbench.warn_complete(
+    completed_warn = workbench.warn_complete(
         asset.asset_id,
         expected_revision=second_review["revision"],
         lease_token=lease.token,
     )
+    assert completed_warn["task_type"] == "completed"
+    semantic_task = semantic_app.get_task(asset.asset_id)
+    semantic_lease = semantic_app.acquire_lease(asset.asset_id, "alice", 120)
     assert semantic_task["task_type"] == "semantic_calibration"
     assert len(semantic_task["semantic"]["timeline"]["segments"]) == 3
 
-    left = workbench.semantic_boundary_pending(
+    left = semantic_app.begin_boundary_edit(
         asset.asset_id,
         boundary_index=1,
         new_frame_exclusive=35,
         expected_revision=semantic_task["revision"],
-        lease_token=lease.token,
+        lease_token=semantic_lease.token,
         reviewer="alice",
     )
     pending = left["semantic"]["pending_edit"]
@@ -336,51 +344,52 @@ def test_file_level_warn_then_semantic_workflow_preserves_source_fidelity(tmp_pa
         (35, 60),
     ]
     with pytest.raises(PendingEditError, match="pending"):
-        workbench.semantic_complete(
-            asset.asset_id, expected_revision=left["revision"], lease_token=lease.token
+        semantic_app.complete(
+            asset.asset_id, expected_revision=left["revision"], lease_token=semantic_lease.token
         )
-    confirmed = workbench.semantic_pending_confirm(
-        asset.asset_id, expected_revision=left["revision"], lease_token=lease.token
+    confirmed = semantic_app.confirm_pending(
+        asset.asset_id, expected_revision=left["revision"], lease_token=semantic_lease.token
     )
     assert confirmed["semantic"]["timeline_edit_count"] == 1
     assert [row["end_frame_exclusive"] for row in confirmed["semantic"]["timeline"]["segments"]] == [35, 60, 90]
 
-    right = workbench.semantic_boundary_pending(
+    right = semantic_app.begin_boundary_edit(
         asset.asset_id,
         boundary_index=2,
         new_frame_exclusive=65,
         expected_revision=confirmed["revision"],
-        lease_token=lease.token,
+        lease_token=semantic_lease.token,
         reviewer="alice",
     )
-    cancelled = workbench.semantic_pending_cancel(
-        asset.asset_id, expected_revision=right["revision"], lease_token=lease.token
+    cancelled = semantic_app.cancel_pending(
+        asset.asset_id, expected_revision=right["revision"], lease_token=semantic_lease.token
     )
     assert cancelled["semantic"]["timeline_edit_count"] == 1
     assert [row["end_frame_exclusive"] for row in cancelled["semantic"]["timeline"]["segments"]] == [35, 60, 90]
 
     segment_id = cancelled["semantic"]["timeline"]["segments"][1]["internal_id"]
-    text_pending = workbench.semantic_text_pending(
+    text_pending = semantic_app.begin_text_edit(
         asset.asset_id,
         segment_id=segment_id,
         text_cn="新的第二步",
         text_en="new second step",
         expected_revision=cancelled["revision"],
-        lease_token=lease.token,
+        lease_token=semantic_lease.token,
         reviewer="alice",
     )
-    text_confirmed = workbench.semantic_pending_confirm(
+    text_confirmed = semantic_app.confirm_pending(
         asset.asset_id,
         expected_revision=text_pending["revision"],
-        lease_token=lease.token,
+        lease_token=semantic_lease.token,
     )
     assert text_confirmed["semantic"]["subtask_text_edit_count"] == 1
-    completed = workbench.semantic_complete(
+    completed = semantic_app.complete(
         asset.asset_id,
         expected_revision=text_confirmed["revision"],
-        lease_token=lease.token,
+        lease_token=semantic_lease.token,
     )
-    assert completed["task_type"] == "completed"
+    assert completed["task_type"] == "semantic_calibration"
+    assert completed["semantic"]["report_state"] == "completed"
 
     persisted = load_asset_qc_report(asset.report_path)
     assert persisted is not None
@@ -430,7 +439,7 @@ def test_only_selected_warn_is_reviewable_and_all_pass_cannot_override_hard_fail
         hard_fail=True,
         profile="supplier_evaluation",
     )
-    workbench = make_workbench(asset)
+    workbench, semantic_app = make_workbenches(asset)
     lease = workbench.acquire_lease(asset.asset_id, "alice", 120)
     warn_task = workbench.get_asset_task(asset.asset_id)
 
@@ -451,15 +460,17 @@ def test_only_selected_warn_is_reviewable_and_all_pass_cannot_override_hard_fail
         expected_revision=warn_task["revision"],
         lease_token=lease.token,
     )
-    semantic_task = workbench.warn_complete(
+    completed_warn = workbench.warn_complete(
         asset.asset_id,
         expected_revision=reviewed["revision"],
         lease_token=lease.token,
     )
-    workbench.semantic_complete(
+    semantic_task = semantic_app.get_task(asset.asset_id)
+    semantic_lease = semantic_app.acquire_lease(asset.asset_id, "alice", 120)
+    semantic_app.complete(
         asset.asset_id,
         expected_revision=semantic_task["revision"],
-        lease_token=lease.token,
+        lease_token=semantic_lease.token,
     )
 
     report = load_asset_qc_report(asset.report_path)
@@ -483,13 +494,14 @@ def test_no_selected_warns_skip_manual_review_and_finish_pass(tmp_path: Path) ->
         hard_fail=False,
         profile="acceptance",
     )
-    workbench = make_workbench(asset)
-    lease = workbench.acquire_lease(asset.asset_id, "alice", 120)
-    task = workbench.get_asset_task(asset.asset_id)
-    completed = workbench.semantic_complete(
+    _, semantic_app = make_workbenches(asset)
+    task = semantic_app.get_task(asset.asset_id)
+    lease = semantic_app.acquire_lease(asset.asset_id, "alice", 120)
+    completed = semantic_app.complete(
         asset.asset_id, expected_revision=task["revision"], lease_token=lease.token
     )
-    assert completed["task_type"] == "completed"
+    assert completed["task_type"] == "semantic_calibration"
+    assert completed["semantic"]["report_state"] == "completed"
     report = load_asset_qc_report(asset.report_path)
     assert report is not None
     assert report["issues"] == []
