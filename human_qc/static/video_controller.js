@@ -15,9 +15,15 @@ const clamp = (value, minimum, maximum) => Math.min(Math.max(value, minimum), ma
 
 const isEventTarget = (value) => Boolean(value && typeof value.addEventListener === "function");
 
-const supportedRate = (value) => {
-  const numeric = Number(value);
-  return PLAYBACK_RATES.includes(numeric) ? numeric : null;
+const supportedRate = (value) => (
+  typeof value === "number" && Number.isFinite(value) && PLAYBACK_RATES.includes(value)
+    ? value
+    : null
+);
+
+const storedRate = (value) => {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  return supportedRate(Number(value));
 };
 
 const safeLocalStorage = () => {
@@ -31,7 +37,7 @@ const safeLocalStorage = () => {
 const readStoredRate = (storage) => {
   if (!storage || typeof storage.getItem !== "function") return DEFAULT_PLAYBACK_RATE;
   try {
-    return supportedRate(storage.getItem(PLAYBACK_RATE_STORAGE_KEY)) ?? DEFAULT_PLAYBACK_RATE;
+    return storedRate(storage.getItem(PLAYBACK_RATE_STORAGE_KEY)) ?? DEFAULT_PLAYBACK_RATE;
   } catch {
     return DEFAULT_PLAYBACK_RATE;
   }
@@ -94,6 +100,8 @@ export class VideoController {
     this.currentFrame = 0;
     this.playbackRate = readStoredRate(this.storage);
     this.media = null;
+    this._metadataReady = false;
+    this._pendingFrame = null;
     this._rootOwnsFocus = false;
     this._listeners = [];
 
@@ -109,7 +117,9 @@ export class VideoController {
     this.fps = normalized.fps;
     this.totalFrames = normalized.totalFrames;
     this.currentFrame = 0;
+    this._pendingFrame = null;
     this.video.src = normalized.url;
+    this._metadataReady = this._metadataIsAvailable();
     this.video.currentTime = 0;
     this._applyPlaybackRate();
     this._emitFrameChange(true);
@@ -121,21 +131,27 @@ export class VideoController {
   seekToFrame(frame) {
     const target = clampFrame(frame, this.totalFrames);
     this.currentFrame = target;
-    if (this.fps > 0) this.video.currentTime = target / this.fps;
+    this._pendingFrame = target;
+    if (this._metadataReady && this.fps > 0) this.video.currentTime = target / this.fps;
     this._emitFrameChange();
     return target;
   }
 
   /** Advance or rewind by whole source frames. */
   stepFrame(delta) {
-    if (!Number.isFinite(Number(delta))) return this.currentFrame;
-    return this.seekToFrame(this.currentFrame + Math.trunc(Number(delta)));
+    if (!Number.isInteger(delta) || delta === 0) {
+      throw new RangeError("frame step delta must be a non-zero integer");
+    }
+    this.video.pause?.();
+    return this.seekToFrame((this._pendingFrame ?? this.currentFrame) + delta);
   }
 
   /** Set one of the discrete supported rates; unsupported values leave state unchanged. */
   setRate(rate) {
     const nextRate = supportedRate(rate);
-    if (nextRate === null) return this.playbackRate;
+    if (nextRate === null) {
+      throw new RangeError("playback rate must be one of 0.25, 0.5, 1, 1.5, 2, 3");
+    }
     this.playbackRate = nextRate;
     this._applyPlaybackRate();
     this._persistRate();
@@ -195,8 +211,9 @@ export class VideoController {
   }
 
   _bindEvents() {
-    this._listen(this.video, "timeupdate", () => this._syncFrameFromVideo());
-    this._listen(this.video, "seeked", () => this._syncFrameFromVideo());
+    this._listen(this.video, "timeupdate", () => this._syncFrameFromVideo(false));
+    this._listen(this.video, "seeked", () => this._syncFrameFromVideo(true));
+    this._listen(this.video, "loadedmetadata", () => this._reapplyRateAfterMetadata());
     this._listen(this.video, "play", () => this._emitPlaybackState());
     this._listen(this.video, "pause", () => this._emitPlaybackState());
     this._listen(this.video, "ended", () => this._emitPlaybackState());
@@ -230,11 +247,15 @@ export class VideoController {
     return this._rootOwnsFocus;
   }
 
-  _syncFrameFromVideo() {
+  _syncFrameFromVideo(isSettledSeek) {
     if (!this.fps || !this.totalFrames) return this.currentFrame;
     const seconds = Number(this.video.currentTime);
     const sourceFrame = Number.isFinite(seconds) ? Math.round(seconds * this.fps) : 0;
     const nextFrame = clampFrame(sourceFrame, this.totalFrames);
+    if (this._pendingFrame !== null) {
+      if (!isSettledSeek || nextFrame !== this._pendingFrame) return this.currentFrame;
+      this._pendingFrame = null;
+    }
     if (nextFrame === this.currentFrame) return this.currentFrame;
     this.currentFrame = nextFrame;
     this._emitFrameChange();
@@ -248,6 +269,20 @@ export class VideoController {
       this._persistRate();
     }
     this._emitPlaybackState();
+  }
+
+  _reapplyRateAfterMetadata() {
+    this._metadataReady = true;
+    this.video.playbackRate = this.playbackRate;
+    this.video.defaultPlaybackRate = this.playbackRate;
+    if (this._pendingFrame !== null && this.fps > 0) {
+      this.video.currentTime = this._pendingFrame / this.fps;
+    }
+    this._emitPlaybackState();
+  }
+
+  _metadataIsAvailable() {
+    return typeof this.video.readyState !== "number" || this.video.readyState >= 1;
   }
 
   _applyPlaybackRate() {

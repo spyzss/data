@@ -67,7 +67,15 @@ class FakeVideo extends FakeEventTarget {
     super();
     this.currentTime = 0;
     this.playbackRate = 1;
+    this.defaultPlaybackRate = 1;
     this.src = "";
+    this.paused = true;
+    this.pauseCalls = 0;
+    this.readyState = 1;
+  }
+
+  pause() {
+    this.pauseCalls += 1;
     this.paused = true;
   }
 }
@@ -286,4 +294,122 @@ test("releases all DOM listeners when destroyed", () => {
   assert.equal(video.listenerCount("timeupdate"), 0);
   assert.equal(video.listenerCount("seeked"), 0);
   assert.equal(video.listenerCount("play"), 0);
+});
+
+
+test("pauses native playback before stepping exactly one source frame", () => {
+  const { controller, video } = createController();
+  controller.setMedia(canonicalVideo({ total_frames: 200 }));
+  controller.seekToFrame(120);
+  video.paused = false;
+
+  assert.equal(controller.stepFrame(1), 121);
+  assert.equal(video.pauseCalls, 1);
+  assert.equal(video.paused, true);
+  assert.equal(video.currentTime, 121 / 30);
+});
+
+
+test("rejects zero, fractional, and non-numeric frame-step deltas without pausing or seeking", () => {
+  const { controller, video } = createController();
+  controller.setMedia(canonicalVideo({ total_frames: 200 }));
+  controller.seekToFrame(120);
+  const initialTime = video.currentTime;
+
+  for (const invalidDelta of [0, 0.5, -0.25, Number.NaN, "1"]) {
+    assert.throws(() => controller.stepFrame(invalidDelta), RangeError);
+  }
+
+  assert.equal(controller.currentFrame, 120);
+  assert.equal(video.currentTime, initialTime);
+  assert.equal(video.pauseCalls, 0);
+});
+
+
+test("rejects non-numeric and unsupported rates before mutating controller, video, or storage", () => {
+  const storage = new FakeStorage();
+  const states = [];
+  const { controller, video } = createController({
+    storage,
+    onPlaybackStateChange: (state) => states.push(state),
+  });
+  controller.setMedia(canonicalVideo());
+  controller.setRate(1.5);
+  const stateCount = states.length;
+
+  for (const invalidRate of ["1.5", Number.NaN, 0.75]) {
+    assert.throws(() => controller.setRate(invalidRate), RangeError);
+  }
+
+  assert.equal(controller.playbackRate, 1.5);
+  assert.equal(video.playbackRate, 1.5);
+  assert.equal(video.defaultPlaybackRate, 1);
+  assert.equal(storage.getItem(PLAYBACK_RATE_STORAGE_KEY), "1.5");
+  assert.equal(states.length, stateCount);
+});
+
+
+test("reapplies the saved legal rate to both native rate fields after metadata resets a source", () => {
+  const states = [];
+  const { controller, video } = createController({
+    onPlaybackStateChange: (state) => states.push(state),
+  });
+  controller.setMedia(canonicalVideo());
+  controller.setRate(2);
+
+  video.playbackRate = 1;
+  video.defaultPlaybackRate = 1;
+  video.dispatch("loadedmetadata");
+
+  assert.equal(video.playbackRate, 2);
+  assert.equal(video.defaultPlaybackRate, 2);
+  assert.equal(states.at(-1).playbackRate, 2);
+});
+
+
+test("keeps the newest pending seek visible while older timeupdate and seeked events arrive", () => {
+  const frames = [];
+  const { controller, video } = createController({ onFrameChange: (frame) => frames.push(frame) });
+  controller.setMedia(canonicalVideo({ total_frames: 300 }));
+
+  controller.seekToFrame(120);
+  controller.seekToFrame(142);
+  assert.equal(controller.currentFrame, 142);
+
+  video.currentTime = 120 / 30;
+  video.dispatch("timeupdate");
+  video.dispatch("seeked");
+  assert.equal(controller.currentFrame, 142);
+  assert.equal(frames.at(-1), 142);
+
+  video.currentTime = 142 / 30;
+  video.dispatch("seeked");
+  assert.equal(controller.currentFrame, 142);
+
+  video.currentTime = 143 / 30;
+  video.dispatch("timeupdate");
+  assert.equal(controller.currentFrame, 143);
+});
+
+
+test("queues the newest source-frame seek until metadata is available", () => {
+  const frames = [];
+  const { controller, video } = createController({ onFrameChange: (frame) => frames.push(frame) });
+  video.readyState = 0;
+  controller.setMedia(canonicalVideo({ total_frames: 300 }));
+
+  controller.seekToFrame(120);
+  controller.seekToFrame(142);
+  assert.equal(video.currentTime, 0);
+  assert.equal(controller.currentFrame, 142);
+  assert.deepEqual(frames, [0, 120, 142]);
+
+  video.readyState = 1;
+  video.dispatch("loadedmetadata");
+  assert.equal(video.currentTime, 142 / 30);
+  assert.equal(controller.currentFrame, 142);
+
+  video.dispatch("seeked");
+  assert.equal(controller.currentFrame, 142);
+  assert.deepEqual(frames, [0, 120, 142]);
 });
