@@ -1,82 +1,381 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
-from http.client import HTTPConnection
-from threading import Thread
+from pathlib import Path
 
-from human_qc.http_server import create_http_server
+import pytest
+
+from human_qc.warn_service import WarnStateError
+from qc_common.reviewer_lease import LeaseStore
+from qc_pipeline.context import AssetContext
+from tests.qc_report_fixtures import make_manual_block, make_v2_report
 
 
-class _Facade:
+class Clock:
     def __init__(self) -> None:
-        self.task = {
-            "asset_id": "asset-1",
-            "revision": 1,
-            "task_type": "semantic_calibration",
-            "semantic": {
-                "report_revision": 1,
-                "report_state": "in_progress",
-                "timeline": {
-                    "frame_count": 90,
-                    "fps": 30,
-                    "segments": [
-                        {"internal_id": "s1", "start_frame": 0, "end_frame_exclusive": 30},
-                        {"internal_id": "s2", "start_frame": 30, "end_frame_exclusive": 60},
-                        {"internal_id": "s3", "start_frame": 60, "end_frame_exclusive": 90},
-                    ],
-                },
-                "pending_edit": None,
-            },
-        }
+        self.value = datetime(2026, 7, 22, tzinfo=timezone.utc)
 
-    def get_asset_task(self, asset_id: str):
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, seconds: int) -> None:
+        self.value += timedelta(seconds=seconds)
+
+
+def _report(asset_id: str = "asset-1") -> dict:
+    report = make_v2_report(status="awaiting_external")
+    report.update(
+        {
+            "asset_id": asset_id,
+            "report_revision": 3,
+            "source_path": "/private/batch/secret.mp4",
+            "task_type": "shared-workbench",
+            "profile": "internal",
+            "semantic": {"secret": True},
+            "issues": [
+                {
+                    "issue_id": "warn-1",
+                    "code": "blur",
+                    "display_name": "画面模糊",
+                    "severity": "warn",
+                    "module": "video_quality",
+                    "operator": "<",
+                    "boundary_value": 0.5,
+                    "observed_value": 0.2,
+                    "default_reason": "清晰度低于阈值",
+                    "source_path": "/private/batch/secret.mp4",
+                    "command": "ffmpeg --secret",
+                    "traceback": "private traceback",
+                    "context": {
+                        "start_frame": 120,
+                        "end_frame": 168,
+                        "debug_path": "/private/context",
+                    },
+                    "evidence_ids": ["internal-evidence-id"],
+                },
+                {
+                    "issue_id": "warn-2",
+                    "code": "hand_occlusion",
+                    "severity": "warn",
+                    "module": "sam3_containment",
+                    "message": "/private/batch/renderer command=ffmpeg",
+                    "start_frame": -10,
+                    "end_frame": 20,
+                },
+                {
+                    "issue_id": "not-selected",
+                    "code": "internal-candidate",
+                    "severity": "warn",
+                    "context": {"start_frame": 1, "end_frame": 2},
+                },
+            ],
+        }
+    )
+    report["pipeline_state"].update(
+        {"status": "awaiting_external", "next_module": "manual_review"}
+    )
+    report["manual_review"] = make_manual_block(
+        state="in_progress",
+        candidate_issue_ids=["warn-1", "warn-2", "not-selected"],
+        selected_issue_ids=["warn-2", "warn-1"],
+        issue_reviews={
+            "warn-1": {
+                "verdict": "fail",
+                "effective_verdict": "fail",
+                "machine_verdict": "warn",
+                "reason": "occlusion",
+                "reviewer": "alice",
+                "reviewed_at": "2026-07-22T00:00:00+00:00",
+                "debug": "/private/review",
+            }
+        },
+    )
+    report["manual_review"]["failure_reason"] = {
+        "mode": "manual",
+        "reason_codes": ["occlusion"],
+        "other_text": None,
+        "internal": "/private/failure",
+    }
+    return report
+
+
+def _context(tmp_path: Path, report: dict) -> AssetContext:
+    asset_id = report["asset_id"]
+    video = tmp_path / "videos" / f"{asset_id}.mp4"
+    video.parent.mkdir(parents=True, exist_ok=True)
+    video.write_bytes(bytes(range(250)) * 8)
+    report_path = tmp_path / "quality_archive" / f"{asset_id}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report["source_files"] = {
+        "video": {
+            "path": video.relative_to(tmp_path).as_posix(),
+            "sha256": "sha256:" + "a" * 64,
+        }
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    return AssetContext(
+        asset_id=asset_id,
+        batch_root=tmp_path,
+        report_path=report_path,
+        source_files=report["source_files"],
+    )
+
+
+def _service(tmp_path: Path, *, clock: Clock | None = None):
+    from human_qc.media import MediaCatalog
+    from human_qc.warn_workbench_service import WarnWorkbenchService
+
+    report = _report()
+    context = _context(tmp_path, report)
+    probe_calls: list[Path] = []
+
+    def probe(path: Path):
+        probe_calls.append(path)
+        return {"fps": 30.0, "total_frames": 1800}
+
+    lease_store = LeaseStore(clock=clock) if clock is not None else LeaseStore()
+    media = MediaCatalog({context.asset_id: context}, probe=probe)
+    service = WarnWorkbenchService(
+        reviewer="alice",
+        asset_contexts={context.asset_id: context},
+        lease_store=lease_store,
+        media_catalog=media,
+        lease_ttl_seconds=60,
+    )
+    return service, lease_store, probe_calls, context
+
+
+def test_warn_task_is_an_explicit_safe_projection_in_selected_order(tmp_path: Path) -> None:
+    service, _, probe_calls, _ = _service(tmp_path)
+
+    task = service.get_asset_task("asset-1")
+    token = task["lease"]["token"]
+    reloaded = service.get_asset_task("asset-1", lease_token=token)
+
+    assert set(task) == {
+        "asset_id",
+        "report_revision",
+        "manual_review_state",
+        "completion_mode",
+        "failure_reason",
+        "video",
+        "issues",
+        "reason_options",
+        "lease",
+    }
+    assert task["video"] == {
+        "url": "/media/assets/asset-1/source",
+        "fps": 30.0,
+        "total_frames": 1800,
+    }
+    assert [issue["id"] for issue in task["issues"]] == ["warn-2", "warn-1"]
+    assert task["issues"][0]["frame_range"] == {
+        "start_frame": 0,
+        "end_frame_exclusive": 20,
+    }
+    assert task["issues"][1]["frame_range"] == {
+        "start_frame": 120,
+        "end_frame_exclusive": 169,
+    }
+    assert set(task["issues"][1]) == {
+        "id",
+        "display_name",
+        "frame_range",
+        "default_reason",
+        "threshold",
+        "evidence_type",
+        "review",
+        "overlay",
+    }
+    assert task["issues"][1]["threshold"] == {"operator": "<", "value": 0.5}
+    assert task["issues"][0]["overlay"] == {
+        "status": "pending",
+        "frame_range": {"start_frame": 0, "end_frame_exclusive": 20},
+        "url": None,
+        "code": None,
+    }
+    assert task["failure_reason"] == {
+        "mode": "manual",
+        "reason_codes": ["occlusion"],
+        "other_text": None,
+    }
+    assert task["reason_options"] == [
+        {"code": "occlusion", "display_name": "遮挡", "requires_text": False},
+        {
+            "code": "action_unrecognizable",
+            "display_name": "动作不可辨",
+            "requires_text": False,
+        },
+        {
+            "code": "inaccurate_interval",
+            "display_name": "标注区间不准确",
+            "requires_text": False,
+        },
+        {"code": "other", "display_name": "其他", "requires_text": True},
+    ]
+    serialized = json.dumps(task, ensure_ascii=False)
+    for forbidden in (
+        "source_path",
+        "/private/",
+        "observed_value",
+        "command",
+        "traceback",
+        "evidence_ids",
+        "semantic",
+        "task_type",
+        "profile",
+        "next_module",
+        "not-selected",
+    ):
+        assert forbidden not in serialized
+    assert reloaded["lease"]["token"] == token
+    assert len(probe_calls) == 1
+
+
+def test_task_load_lease_collision_is_safe_read_only(tmp_path: Path) -> None:
+    service, lease_store, _, _ = _service(tmp_path)
+    held = lease_store.acquire("asset-1", "bob", 60)
+
+    task = service.get_asset_task("asset-1")
+
+    assert task["lease"] == {
+        "read_only": True,
+        "token": None,
+        "expires_at": None,
+        "code": "lease_held",
+    }
+    assert held.token not in json.dumps(task)
+    assert "bob" not in json.dumps(task)
+    assert task["video"]["url"] == "/media/assets/asset-1/source"
+
+
+def test_task_reload_renews_current_header_token(tmp_path: Path) -> None:
+    clock = Clock()
+    service, _, _, _ = _service(tmp_path, clock=clock)
+    first = service.get_asset_task("asset-1")
+    token = first["lease"]["token"]
+    first_expiry = first["lease"]["expires_at"]
+    clock.advance(20)
+
+    renewed = service.get_asset_task("asset-1", lease_token=token)
+
+    assert renewed["lease"]["token"] == token
+    assert renewed["lease"]["expires_at"] > first_expiry
+
+
+def test_invalid_clamped_issue_range_is_rejected(tmp_path: Path) -> None:
+    from human_qc.media import MediaCatalog
+    from human_qc.warn_workbench_service import InvalidIssueRangeError, WarnWorkbenchService
+
+    report = _report()
+    report["manual_review"]["selected_issue_ids"] = ["warn-1"]
+    report["issues"][0]["context"] = {"start_frame": 2000, "end_frame": 2100}
+    context = _context(tmp_path, report)
+    service = WarnWorkbenchService(
+        reviewer="alice",
+        asset_contexts={"asset-1": context},
+        media_catalog=MediaCatalog(
+            {"asset-1": context},
+            probe=lambda _path: {"fps": 30.0, "total_frames": 1800},
+        ),
+    )
+
+    with pytest.raises(InvalidIssueRangeError, match="invalid_issue_range"):
+        service.get_asset_task("asset-1")
+
+
+class RecordingWarnService:
+    def __init__(self, report_path: Path) -> None:
+        self._report_path = report_path
+        self.calls: list[tuple[str, tuple, dict]] = []
+
+    def report_path(self, asset_id: str) -> Path:
         if asset_id != "asset-1":
             raise KeyError(asset_id)
-        return self.task
+        return self._report_path
 
-    def current_revision(self, asset_id: str):
-        return self.task["revision"] if asset_id == "asset-1" else None
+    def submit_verdict(self, *args, **kwargs):
+        self.calls.append(("submit_verdict", args, kwargs))
 
-
-def _request(server, method: str, path: str):
-    connection = HTTPConnection("127.0.0.1", server.server_port)
-    connection.request(method, path)
-    response = connection.getresponse()
-    body = response.read()
-    connection.close()
-    return response.status, body
+    def complete(self, *args, **kwargs):
+        self.calls.append(("complete", args, kwargs))
 
 
-def test_static_workbench_is_served_as_warn_only() -> None:
-    server = create_http_server("127.0.0.1", 0, _Facade())
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        status, body = _request(server, "GET", "/")
-        assert status == 200
-        text = body.decode("utf-8")
-        assert "warn_adapter.js" in text
-        assert "workbench.css" in text
-        assert "data-workbench-stage" in text
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+def test_mutations_forward_atomic_warn_payload_and_session_reviewer(tmp_path: Path) -> None:
+    from human_qc.media import MediaCatalog
+    from human_qc.warn_workbench_service import WarnWorkbenchService
+
+    report = _report()
+    context = _context(tmp_path, report)
+    warn = RecordingWarnService(context.report_path)
+    service = WarnWorkbenchService(
+        reviewer="alice",
+        warn_service=warn,
+        asset_contexts={"asset-1": context},
+        media_catalog=MediaCatalog(
+            {"asset-1": context},
+            probe=lambda _path: {"fps": 30.0, "total_frames": 1800},
+        ),
+    )
+    task = service.get_asset_task("asset-1")
+    token = task["lease"]["token"]
+    failure_reason = {"reason_codes": ["other"], "other_text": "遮挡严重"}
+
+    service.warn_verdict(
+        "asset-1",
+        issue_id="warn-1",
+        verdict="fail",
+        reason="occlusion",
+        failure_reason=failure_reason,
+        expected_revision=3,
+        lease_token=token,
+    )
+    service.warn_complete(
+        "asset-1",
+        completion_mode="early_fail",
+        failure_reason=failure_reason,
+        expected_revision=3,
+        lease_token=token,
+    )
+
+    verdict = warn.calls[0]
+    assert verdict[0] == "submit_verdict"
+    assert verdict[1] == ("asset-1", "warn-1", "fail", "occlusion", 3, token)
+    assert verdict[2] == {"reviewer": "alice", "failure_reason": failure_reason}
+    complete = warn.calls[1]
+    assert complete[0] == "complete"
+    assert complete[1] == ("asset-1", 3, token)
+    assert complete[2] == {
+        "completion_mode": "early_fail",
+        "failure_reason": failure_reason,
+    }
 
 
-def test_static_modules_expose_warn_only_contracts() -> None:
-    from pathlib import Path
+def test_selected_issue_missing_from_report_fails_closed(tmp_path: Path) -> None:
+    from human_qc.media import MediaCatalog
+    from human_qc.warn_workbench_service import WarnWorkbenchService
 
-    root = Path(__file__).parents[1] / "human_qc" / "static"
-    app = (root / "app.js").read_text(encoding="utf-8")
-    warn_adapter = (root / "warn_adapter.js").read_text(encoding="utf-8")
-    assert "semantic_adapter" not in app
-    assert "submitBoundary" not in app
-    assert "/warn/${encodeURIComponent(issueId)}/verdict" in app
-    assert "data-machine-reason" in warn_adapter
-    assert "data-machine-metrics" in warn_adapter
-    assert "data-machine-threshold" in warn_adapter
-    assert "data-evidence-window" in warn_adapter
-    assert "data-overlay-error" in warn_adapter
-    assert "videoPlaceholder" in warn_adapter
-    assert '[data-video-placeholder]' in app
+    report = _report()
+    report["manual_review"]["selected_issue_ids"] = ["missing"]
+    context = _context(tmp_path, report)
+    service = WarnWorkbenchService(
+        reviewer="alice",
+        asset_contexts={"asset-1": context},
+        media_catalog=MediaCatalog(
+            {"asset-1": context},
+            probe=lambda _path: {"fps": 30.0, "total_frames": 1800},
+        ),
+    )
+
+    with pytest.raises(WarnStateError, match="missing from report"):
+        service.get_asset_task("asset-1")
+
+
+def test_public_package_exports_only_the_warn_facade() -> None:
+    import human_qc
+
+    assert human_qc.WarnWorkbenchService is not None
+    assert "WarnWorkbenchService" in human_qc.__all__
+    assert "WorkbenchService" not in human_qc.__all__
+    assert "jsonable" not in human_qc.__all__

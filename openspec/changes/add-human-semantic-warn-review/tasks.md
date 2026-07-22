@@ -55,7 +55,7 @@
 
 ## 9. 整段视频与 Warning 时间轴
 
-- [ ] 9.1 提供安全原视频 URL、FPS、总帧数、规范化半开区间、阈值提示和原因选项 DTO，并支持 HTTP Range
+- [x] 9.1 提供安全原视频 URL、FPS、总帧数、规范化半开区间、阈值提示和原因选项 DTO，并支持 HTTP Range
 - [ ] 9.2 以 ES modules 拆分 `WarnReviewApp`、`VideoController`、`WarningTimeline` 和 `ReviewPanel`
 - [ ] 9.3 实现真实帧宽度、重叠合并、窄色块、可进入弹层、色块跳起始帧和可拖动蓝色时间针
 - [ ] 9.4 实现视频聚焦后的左右键逐帧、六档倍速持久化、唯一当前帧和视频/判定状态分离

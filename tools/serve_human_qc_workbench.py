@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,12 +14,10 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from human_qc.evidence import EvidenceService  # noqa: E402
 from human_qc.http_server import create_http_server  # noqa: E402
 from qc_common.reviewer_lease import LeaseStore  # noqa: E402
 from human_qc.warn_service import WarnReviewService  # noqa: E402
-from human_qc.workbench_service import WorkbenchService  # noqa: E402
-from qc_common.config import load_qc_acceptance_config  # noqa: E402
+from human_qc.warn_workbench_service import WarnWorkbenchService  # noqa: E402
 from qc_pipeline.context import AssetContext  # noqa: E402
 
 
@@ -33,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", default=8897, type=int)
     parser.add_argument("--profile", default="acceptance")
     parser.add_argument("--lease-ttl-seconds", default=900, type=int)
+    parser.add_argument("--reviewer", required=True)
     return parser
 
 
@@ -50,9 +50,14 @@ def _inside(root: Path, value: str | Path, *, field: str) -> tuple[str, Path]:
     return relative.as_posix(), absolute
 
 
-def _source_files(report: dict[str, Any], batch_root: Path, asset_id: str) -> dict[str, dict[str, str]]:
+_SHA256 = re.compile(r"sha256:[0-9a-fA-F]{64}").fullmatch
+
+
+def _source_files(
+    report: dict[str, Any], batch_root: Path, asset_id: str
+) -> dict[str, dict[str, Any]]:
     raw = report.get("source_files", {})
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, dict[str, Any]] = {}
     if isinstance(raw, dict):
         for name, value in raw.items():
             if not isinstance(value, dict):
@@ -61,7 +66,18 @@ def _source_files(report: dict[str, Any], batch_root: Path, asset_id: str) -> di
             if not isinstance(path_value, str) or not path_value:
                 continue
             relative, _ = _inside(batch_root, path_value, field=f"source_files.{name}.path")
-            result[str(name)] = {"path": relative}
+            source: dict[str, Any] = {"path": relative}
+            sha256 = value.get("sha256")
+            if isinstance(sha256, str) and _SHA256(sha256) is not None:
+                source["sha256"] = sha256.lower()
+            size_bytes = value.get("size_bytes")
+            if (
+                isinstance(size_bytes, int)
+                and not isinstance(size_bytes, bool)
+                and size_bytes >= 0
+            ):
+                source["size_bytes"] = size_bytes
+            result[str(name)] = source
     # Reports produced by older runners sometimes only carry an HDF5 path at
     # the top level.  Keep this fallback source-faithful and containment-safe.
     if "hdf5" not in result:
@@ -137,22 +153,20 @@ def build_workbench_service(
     *,
     batch_root: Path,
     quality_archive: Path,
+    reviewer: str,
     profile: str = "acceptance",
     lease_ttl_seconds: int = 900,
-) -> WorkbenchService:
+) -> WarnWorkbenchService:
     contexts = load_contexts(batch_root, quality_archive)
     reports = {context.asset_id: context.report_path for context in contexts}
     warn = WarnReviewService(reports=reports)
-    evidence = EvidenceService(batch_root / ".human_qc_evidence")
-    config = load_qc_acceptance_config()
-    service = WorkbenchService(
+    service = WarnWorkbenchService(
+        reviewer=reviewer,
         warn_service=warn,
-        evidence_service=evidence,
         lease_store=LeaseStore(),
         asset_contexts={context.asset_id: context for context in contexts},
         lease_ttl_seconds=lease_ttl_seconds,
         profile=profile,
-        config=config,
     )
     # Force report loading at process start so malformed review state fails
     # before the first browser request.
@@ -167,10 +181,11 @@ def main(argv: list[str] | None = None) -> int:
     service = build_workbench_service(
         batch_root=args.batch_root,
         quality_archive=args.quality_archive,
+        reviewer=args.reviewer,
         profile=args.profile,
         lease_ttl_seconds=args.lease_ttl_seconds,
     )
-    server = create_http_server(args.host, args.port, service, evidence_root=args.batch_root)
+    server = create_http_server(args.host, args.port, service)
     LOGGER.info("Serving human QC workbench at http://%s:%s", args.host, server.server_port)
     try:
         server.serve_forever()

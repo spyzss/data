@@ -9,6 +9,12 @@ from qc_common.reviewer_lease import (
 )
 
 from .evidence import EvidenceError, EvidenceService, EvidenceView
+from .media import (
+    MediaCatalog,
+    MediaNotFoundError,
+    MediaUnavailableError,
+    RangeNotSatisfiable,
+)
 from .warn_service import (
     WarnLeaseError,
     WarnRevisionError,
@@ -19,7 +25,16 @@ from .warn_service import (
     effective_issue_verdict,
     reduce_overall_decision,
 )
-from .workbench_service import WorkbenchService, jsonable
+from .warn_workbench_service import (
+    FrameRangeDto,
+    InvalidIssueRangeError,
+    OverlayDto,
+    OverlayHandle,
+    VideoDto,
+    WarnIssueDto,
+    WarnTaskDto,
+    WarnWorkbenchService,
+)
 
 __all__ = [
     "EvidenceError",
@@ -29,15 +44,25 @@ __all__ = [
     "LeaseConflictError",
     "LeaseStore",
     "LeaseTokenError",
+    "MediaCatalog",
+    "MediaNotFoundError",
+    "MediaUnavailableError",
+    "RangeNotSatisfiable",
     "ReviewerLeaseError",
+    "FrameRangeDto",
+    "InvalidIssueRangeError",
+    "OverlayDto",
+    "OverlayHandle",
     "WarnLeaseError",
     "WarnRevisionError",
     "WarnReviewService",
     "WarnServiceError",
     "WarnStateError",
     "WarnTaskView",
-    "WorkbenchService",
+    "VideoDto",
+    "WarnIssueDto",
+    "WarnTaskDto",
+    "WarnWorkbenchService",
     "effective_issue_verdict",
-    "jsonable",
     "reduce_overall_decision",
 ]

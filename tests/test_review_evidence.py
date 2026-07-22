@@ -306,3 +306,37 @@ def test_workbench_joins_canonical_issue_evidence_and_converts_inclusive_context
             "generation_error": None,
         }
     ]
+
+
+def test_warn_dto_uses_opaque_overlay_handle_without_legacy_evidence_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from human_qc.warn_workbench_service import OverlayHandle
+    from tests.test_human_qc_workbench import _service
+
+    service, _, _, _ = _service(tmp_path)
+    overlay = tmp_path / "overlays" / "continuous.mp4"
+    overlay.parent.mkdir()
+    overlay.write_bytes(b"continuous-overlay")
+    service.overlay_provider = lambda asset_id, issue_id, frame_range: OverlayHandle(
+        status="ready",
+        overlay_id="opaque-continuous-1",
+        path=overlay,
+    ) if issue_id == "warn-2" else None
+    monkeypatch.setattr(
+        EvidenceService,
+        "resolve",
+        lambda *_args, **_kwargs: pytest.fail("legacy evidence must not run on task GET"),
+    )
+
+    task = service.get_asset_task("asset-1")
+
+    ready = task["issues"][0]["overlay"]
+    assert ready == {
+        "status": "ready",
+        "frame_range": {"start_frame": 0, "end_frame_exclusive": 20},
+        "url": "/media/assets/asset-1/overlays/opaque-continuous-1",
+        "code": None,
+    }
+    assert str(overlay) not in json.dumps(task)
+    assert service.overlay_media("asset-1", "opaque-continuous-1").path == overlay

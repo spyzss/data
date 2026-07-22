@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
+from pathlib import Path
 from threading import Thread
 
 import pytest
 
 from human_qc.http_server import create_http_server
-from qc_common.reviewer_lease import LeaseConflictError, LeaseStore, LeaseTokenError
-from human_qc.workbench_service import WorkbenchService
+from human_qc.warn_service import WarnRevisionError
+from qc_common.reviewer_lease import Lease, LeaseConflictError, LeaseStore, LeaseTokenError
 
 
 class Clock:
@@ -23,7 +24,7 @@ class Clock:
         self.value += timedelta(seconds=seconds)
 
 
-def test_lease_expiry_and_renewal() -> None:
+def test_lease_expiry_renewal_and_release() -> None:
     clock = Clock()
     store = LeaseStore(clock=clock)
     first = store.acquire("asset-1", "alice", ttl_seconds=10)
@@ -31,138 +32,374 @@ def test_lease_expiry_and_renewal() -> None:
         store.acquire("asset-1", "bob", ttl_seconds=10)
     renewed = store.renew("asset-1", first.token, ttl_seconds=20)
     assert renewed.token == first.token
-    clock.advance(21)
+    released = store.release("asset-1", first.token)
+    assert released.token == first.token
     with pytest.raises(LeaseTokenError):
-        store.renew("asset-1", first.token, ttl_seconds=10)
-    second = store.acquire("asset-1", "bob", ttl_seconds=10)
-    assert second.reviewer == "bob"
+        store.validate("asset-1", first.token)
 
 
 class FakeFacade:
     def __init__(self) -> None:
-        self.calls = []
-        self.task = {"asset_id": "asset-1", "revision": 3, "state": "ready"}
+        self.calls: list[tuple] = []
+        self.task = {
+            "asset_id": "asset-1",
+            "report_revision": 3,
+            "manual_review_state": "queued",
+            "completion_mode": None,
+            "failure_reason": None,
+            "video": {
+                "url": "/media/assets/asset-1/source",
+                "fps": 30.0,
+                "total_frames": 1800,
+            },
+            "issues": [],
+            "reason_options": [],
+            "lease": {
+                "read_only": False,
+                "token": "lease-1",
+                "expires_at": "2026-07-22T01:00:00+00:00",
+                "code": None,
+            },
+        }
+        self.raise_conflict = False
+        self.raise_stale = False
 
-    def get_asset_task(self, asset_id: str):
+    def list_assets(self):
+        return ("asset-1",)
+
+    def get_asset_task(self, asset_id: str, *, lease_token: str | None = None):
+        self.calls.append(("get_asset_task", asset_id, lease_token))
         if asset_id != "asset-1":
-            raise KeyError(asset_id)
+            raise KeyError("/private/batch/missing.json")
         return self.task
 
     def current_revision(self, asset_id: str):
-        return self.task["revision"] if asset_id == "asset-1" else None
+        self.calls.append(("current_revision", asset_id))
+        return 3 if asset_id == "asset-1" else None
 
-    def acquire_lease(self, asset_id: str, reviewer: str, ttl_seconds: int):
-        return self.lease_store.acquire(asset_id, reviewer, ttl_seconds)
+    def acquire_lease(self, asset_id: str, ttl_seconds: int | None = None):
+        self.calls.append(("acquire_lease", asset_id, ttl_seconds))
+        if self.raise_conflict:
+            raise LeaseConflictError("asset held by reviewer=bob token=secret")
+        return Lease(asset_id, "alice", "lease-1", "2026-07-22T01:00:00+00:00")
 
-    def renew_lease(self, asset_id: str, token: str, ttl_seconds: int):
-        return self.lease_store.renew(asset_id, token, ttl_seconds)
+    def renew_lease(self, asset_id: str, token: str, ttl_seconds: int | None = None):
+        self.calls.append(("renew_lease", asset_id, token, ttl_seconds))
+        return Lease(asset_id, "alice", token, "2026-07-22T01:00:00+00:00")
 
-    def mutate(self, name: str, asset_id: str, payload: dict):
-        self.calls.append((name, asset_id, payload))
-        return {**self.task, "revision": self.task["revision"] + 1, "operation": name}
+    def release_lease(self, asset_id: str, token: str):
+        self.calls.append(("release_lease", asset_id, token))
+        return Lease(asset_id, "alice", token, "2026-07-22T01:00:00+00:00")
+
+    def validate_lease(self, asset_id: str, token: str):
+        self.calls.append(("validate_lease", asset_id, token))
+        if token != "lease-1":
+            raise LeaseTokenError("invalid token secret-token")
+        return Lease(asset_id, "alice", token, "2026-07-22T01:00:00+00:00")
+
+    def warn_verdict(self, asset_id: str, **payload):
+        self.calls.append(("warn_verdict", asset_id, payload))
+        if self.raise_stale:
+            raise WarnRevisionError(
+                "expected revision from /private/batch; command=cat secret; traceback"
+            )
+        return self.task
+
+    def warn_complete(self, asset_id: str, **payload):
+        self.calls.append(("warn_complete", asset_id, payload))
+        return self.task
 
 
-def _server(facade: FakeFacade):
-    facade.lease_store = LeaseStore()
-    return create_http_server("127.0.0.1", 0, facade)
-
-
-def _request(server, method: str, path: str, body: dict | None = None):
+def _request_raw(
+    server,
+    method: str,
+    path: str,
+    body: dict | None = None,
+    *,
+    headers: dict[str, str] | None = None,
+):
     connection = HTTPConnection("127.0.0.1", server.server_port)
     payload = None if body is None else json.dumps(body).encode("utf-8")
-    connection.request(
-        method,
-        path,
-        body=payload,
-        headers={"Content-Type": "application/json"} if payload is not None else {},
-    )
+    request_headers = dict(headers or {})
+    if payload is not None:
+        request_headers["Content-Type"] = "application/json"
+    connection.request(method, path, body=payload, headers=request_headers)
     response = connection.getresponse()
-    value = json.loads(response.read().decode("utf-8"))
+    value = response.read()
+    result_headers = {name: value for name, value in response.getheaders()}
+    status = response.status
     connection.close()
-    return response.status, value
+    return status, result_headers, value
 
 
-def test_http_success_and_bad_payload_statuses() -> None:
-    facade = FakeFacade()
-    server = _server(facade)
+def _request_json(server, method: str, path: str, body: dict | None = None, **kwargs):
+    status, headers, raw = _request_raw(server, method, path, body, **kwargs)
+    return status, headers, json.loads(raw.decode("utf-8"))
+
+
+def _running_server(facade):
+    server = create_http_server("127.0.0.1", 0, facade)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    try:
-        status, value = _request(server, "GET", "/api/assets/asset-1/task")
-        assert status == 200 and value["task"]["revision"] == 3
-        status, value = _request(server, "POST", "/api/assets/asset-1/semantic/complete", {})
-        assert status == 404 and value["error"]["code"] == "not_found"
-        status, value = _request(server, "GET", "/api/assets/missing/task")
-        assert status == 404 and value["error"]["code"] == "not_found"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+    return server, thread
 
 
-def test_http_serves_sampled_sam3_overlay_evidence(tmp_path) -> None:
-    overlay = tmp_path / "sam3" / "combined_overlays" / "frame-10.png"
-    overlay.parent.mkdir(parents=True)
-    overlay.write_bytes(b"sampled-sam3-overlay")
+def _stop(server, thread: Thread) -> None:
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+
+
+def test_warn_routes_are_canonical_and_task_header_auto_renews() -> None:
     facade = FakeFacade()
-    facade.lease_store = LeaseStore()
-    server = create_http_server(
-        "127.0.0.1",
-        0,
-        facade,
-        evidence_root=tmp_path,
-    )
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    server, thread = _running_server(facade)
     try:
-        connection = HTTPConnection("127.0.0.1", server.server_port)
-        connection.request("GET", "/evidence/sam3/combined_overlays/frame-10.png")
-        response = connection.getresponse()
-        body = response.read()
-        connection.close()
-        assert response.status == 200
-        assert response.getheader("Content-Type") == "image/png"
-        assert body == b"sampled-sam3-overlay"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        status, _, assets = _request_json(server, "GET", "/api/warn/assets")
+        assert status == 200 and assets == {"assets": ["asset-1"]}
 
-
-def test_http_lease_and_mutation_delegate() -> None:
-    facade = FakeFacade()
-    server = _server(facade)
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        status, lease = _request(
+        status, _, value = _request_json(
             server,
-            "POST",
-            "/api/assets/asset-1/lease/acquire",
-            {"reviewer": "alice", "ttl_seconds": 60},
+            "GET",
+            "/api/warn/assets/asset-1/task",
+            headers={"X-Reviewer-Lease": "lease-1"},
         )
-        assert status == 200 and lease["lease"]["token"]
-        token = lease["lease"]["token"]
-        status, renewed = _request(
+        assert status == 200
+        assert value["task"]["video"]["fps"] == 30.0
+        assert ("get_asset_task", "asset-1", "lease-1") in facade.calls
+
+        for old_path in (
+            "/api/assets/asset-1/task",
+            "/api/semantic/assets/asset-1/task",
+            "/evidence/sam3/frame.png",
+            "/api/warn/assets/asset-1/overlays/warn-1/status",
+        ):
+            status, _, value = _request_json(server, "GET", old_path)
+            assert status == 404
+            assert value["error"]["code"] == "not_found"
+    finally:
+        _stop(server, thread)
+
+
+def test_warn_mutation_routes_forward_complete_payload_and_release() -> None:
+    facade = FakeFacade()
+    server, thread = _running_server(facade)
+    try:
+        status, _, lease = _request_json(
             server,
             "POST",
-            "/api/assets/asset-1/lease/renew",
-            {"expected_revision": 3, "lease_token": token, "ttl_seconds": 60},
+            "/api/warn/assets/asset-1/lease/acquire",
+            {"ttl_seconds": 60, "reviewer": "mallory"},
         )
-        assert status == 200 and renewed["lease"]["token"] == token
-        status, value = _request(
+        assert status == 200 and lease["lease"]["token"] == "lease-1"
+        assert ("acquire_lease", "asset-1", 60) in facade.calls
+
+        status, _, renewed = _request_json(
             server,
             "POST",
-            "/api/assets/asset-1/warn/warn-1/verdict",
+            "/api/warn/assets/asset-1/lease/renew",
+            {"expected_revision": 3, "lease_token": "lease-1", "ttl_seconds": 60},
+        )
+        assert status == 200 and renewed["lease"]["token"] == "lease-1"
+
+        failure_reason = {"reason_codes": ["other"], "other_text": "动作不可辨"}
+        status, _, value = _request_json(
+            server,
+            "POST",
+            "/api/warn/assets/asset-1/issues/warn-1/verdict",
             {
                 "expected_revision": 3,
-                "lease_token": token,
+                "lease_token": "lease-1",
+                "verdict": "fail",
+                "reason": "occlusion",
+                "failure_reason": failure_reason,
+            },
+        )
+        assert status == 200 and value["task"]["asset_id"] == "asset-1"
+        verdict = [call for call in facade.calls if call[0] == "warn_verdict"][-1]
+        assert verdict[2] == {
+            "expected_revision": 3,
+            "lease_token": "lease-1",
+            "issue_id": "warn-1",
+            "verdict": "fail",
+            "reason": "occlusion",
+            "failure_reason": failure_reason,
+        }
+
+        status, _, _ = _request_json(
+            server,
+            "POST",
+            "/api/warn/assets/asset-1/complete",
+            {
+                "expected_revision": 3,
+                "lease_token": "lease-1",
+                "completion_mode": "early_fail",
+                "failure_reason": failure_reason,
+            },
+        )
+        assert status == 200
+        complete = [call for call in facade.calls if call[0] == "warn_complete"][-1]
+        assert complete[2]["completion_mode"] == "early_fail"
+        assert complete[2]["failure_reason"] == failure_reason
+
+        status, _, released = _request_json(
+            server,
+            "POST",
+            "/api/warn/assets/asset-1/lease/release",
+            {"expected_revision": 3, "lease_token": "lease-1"},
+        )
+        assert status == 200
+        assert released == {"released": True}
+        assert ("release_lease", "asset-1", "lease-1") in facade.calls
+    finally:
+        _stop(server, thread)
+
+
+def test_issue_id_mismatch_is_rejected_before_mutation() -> None:
+    facade = FakeFacade()
+    server, thread = _running_server(facade)
+    try:
+        status, _, value = _request_json(
+            server,
+            "POST",
+            "/api/warn/assets/asset-1/issues/warn-1/verdict",
+            {
+                "issue_id": "warn-2",
+                "expected_revision": 3,
+                "lease_token": "lease-1",
                 "verdict": "pass",
             },
         )
-        assert status == 200 and value["task"]["operation"] == "warn_verdict"
-        assert facade.calls[-1][2]["issue_id"] == "warn-1"
+        assert status == 400 and value["error"]["code"] == "bad_request"
+        assert not any(call[0] == "warn_verdict" for call in facade.calls)
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        _stop(server, thread)
+
+
+def test_stale_and_lease_errors_are_stable_and_sanitized() -> None:
+    facade = FakeFacade()
+    server, thread = _running_server(facade)
+    try:
+        facade.raise_stale = True
+        status, _, value = _request_json(
+            server,
+            "POST",
+            "/api/warn/assets/asset-1/issues/warn-1/verdict",
+            {
+                "expected_revision": 3,
+                "lease_token": "lease-1",
+                "verdict": "pass",
+            },
+        )
+        assert status == 409
+        assert value["error"] == {
+            "code": "stale_revision",
+            "message": "the report revision is stale",
+            "current_revision": 3,
+        }
+        serialized = json.dumps(value)
+        assert "/private/" not in serialized
+        assert "command" not in serialized
+        assert "traceback" not in serialized
+
+        facade.raise_conflict = True
+        status, _, value = _request_json(
+            server,
+            "POST",
+            "/api/warn/assets/asset-1/lease/acquire",
+            {},
+        )
+        assert status == 423
+        assert value["error"]["code"] == "lease_held"
+        assert "bob" not in json.dumps(value)
+        assert "secret" not in json.dumps(value)
+
+        status, _, value = _request_json(
+            server,
+            "POST",
+            "/api/warn/assets/asset-1/complete",
+            {"expected_revision": 3, "lease_token": "wrong"},
+        )
+        assert status == 423
+        assert value["error"]["code"] == "lease_invalid"
+        assert "wrong" not in json.dumps(value)
+    finally:
+        _stop(server, thread)
+
+
+def test_source_media_supports_full_and_strict_single_ranges(tmp_path: Path) -> None:
+    from tests.test_human_qc_workbench import _service
+
+    service, _, _, context = _service(tmp_path)
+    source = context.batch_root / context.source_files["video"]["path"]
+    expected = source.read_bytes()
+    server, thread = _running_server(service)
+    try:
+        status, headers, body = _request_raw(
+            server, "GET", "/media/assets/asset-1/source"
+        )
+        assert status == 200
+        assert body == expected
+        assert headers["Content-Length"] == str(len(expected))
+        assert headers["Accept-Ranges"] == "bytes"
+
+        status, headers, body = _request_raw(
+            server,
+            "GET",
+            "/media/assets/asset-1/source",
+            headers={"Range": "bytes=0-99"},
+        )
+        assert status == 206
+        assert body == expected[:100]
+        assert headers["Content-Range"] == f"bytes 0-99/{len(expected)}"
+        assert headers["Content-Length"] == "100"
+
+        status, headers, body = _request_raw(
+            server,
+            "GET",
+            "/media/assets/asset-1/source",
+            headers={"Range": "bytes=-10"},
+        )
+        assert status == 206 and body == expected[-10:]
+
+        status, headers, body = _request_raw(
+            server,
+            "GET",
+            "/media/assets/asset-1/source",
+            headers={"Range": "bytes=0-1,4-5"},
+        )
+        assert status == 416
+        assert headers["Content-Range"] == f"bytes */{len(expected)}"
+        assert json.loads(body)["error"]["code"] == "range_not_satisfiable"
+    finally:
+        _stop(server, thread)
+
+
+def test_overlay_media_is_allowlisted_per_asset(tmp_path: Path) -> None:
+    from tests.test_human_qc_workbench import _service
+
+    service, _, _, _ = _service(tmp_path)
+    overlay = tmp_path / "overlays" / "ready.mp4"
+    overlay.parent.mkdir()
+    overlay.write_bytes(b"ready-overlay")
+    unlisted = overlay.parent / "unlisted.mp4"
+    unlisted.write_bytes(b"secret-overlay")
+    service.media_catalog.allow_overlay("asset-1", "overlay-opaque-1", overlay)
+    server, thread = _running_server(service)
+    try:
+        status, _, body = _request_raw(
+            server,
+            "GET",
+            "/media/assets/asset-1/overlays/overlay-opaque-1",
+        )
+        assert status == 200 and body == b"ready-overlay"
+        for path in (
+            "/media/assets/asset-1/overlays/unlisted.mp4",
+            "/media/assets/other-asset/overlays/overlay-opaque-1",
+            "/media/assets/asset-1/overlays/..%2Funlisted.mp4",
+        ):
+            status, _, value = _request_json(server, "GET", path)
+            assert status == 404
+            assert value["error"]["code"] == "not_found"
+            assert "secret-overlay" not in json.dumps(value)
+    finally:
+        _stop(server, thread)
