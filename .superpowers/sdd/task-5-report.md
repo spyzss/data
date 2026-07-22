@@ -245,3 +245,54 @@ git diff --check -- \
 ### 7.4 Concerns
 
 无阻断项。source 成功响应现在会在发送 headers 前完整读取并写入临时快照，以磁盘 I/O 和临时空间换取强一致性及有界内存；超大视频或高并发部署应预留相应临时存储容量并监控首字节延迟。
+
+## 8. Review round 3 修复：service exception 脱敏（2026-07-22）
+
+业务与测试提交：`d8bc05956fdf734246e2fb3e05b7812008f4aebd`（`fix(human-qc): sanitize raw warn state errors`）。
+
+### 8.1 Root cause 与 RED
+
+`WarnWorkbenchService.warn_verdict()` 会将安全公开 issue ID 反查为原始持久化 ID，以保持既有 domain 写回语义。若该 issue 缺少机器 verdict，底层 `WarnReviewService.submit_verdict()` 会抛出含 raw ID 的 `WarnStateError`；HTTP 边界虽会脱敏，但直接 service 调用仍泄漏该值。
+
+新增最小回归后先执行：
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_workbench.py::test_opaque_selected_issue_without_machine_verdict_has_sanitized_service_error
+```
+
+结果：`1 failed in 0.29s`。实际异常为 `issue /private/traceback-command=ffmpeg has no machine verdict`，证明泄漏来自 domain-to-workbench exception 边界，而非 DTO 或 HTTP 序列化。
+
+### 8.2 修复与 GREEN
+
+仅在 `WarnWorkbenchService.warn_verdict()` 的 domain 调用处处理这一条精确的 expected state error：当且仅当错误文本是当前已反查 raw issue 的“缺少机器 verdict”状态时，使用 `from None` 转换为稳定的 `selected issue has no machine verdict`。其余 `WarnStateError` 原样抛出；未修改 domain service、公开到 raw 的写回映射、revision/lease/CAS、HTTP 脱敏或媒体行为。
+
+定点兼容回归：
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_workbench.py::test_opaque_selected_issue_without_machine_verdict_has_sanitized_service_error \
+  tests/test_human_qc_workbench.py::test_opaque_selected_issue_id_preserves_internal_write_semantics \
+  tests/test_human_qc_workbench.py::test_untrusted_selected_issue_id_is_opaque_in_task_and_audit
+```
+
+结果：`6 passed in 0.14s`。
+
+Task 5 聚焦套件：
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_http_server.py \
+  tests/test_human_qc_workbench.py \
+  tests/test_review_evidence.py \
+  tests/test_human_qc_media.py \
+  tests/test_human_qc_launcher.py
+```
+
+结果：`60 passed in 5.85s`。
+
+`git diff --check` 退出码 0，无输出。
+
+### 8.3 Concerns
+
+无阻断项。该转换有意只匹配此 domain service 的既有、精确错误文本；若未来 domain error contract 改动，需要同步更新这个 facade 回归测试，而不能扩展为对所有 `WarnStateError` 的吞没或重写。

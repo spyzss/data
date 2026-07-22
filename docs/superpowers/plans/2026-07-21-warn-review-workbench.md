@@ -381,7 +381,7 @@ git commit -m "feat(reporting): count early-fail unreviewed warns"
 - Exposes: `/api/warn/assets`, `/api/warn/assets/{id}/task`, lease, verdict, complete and overlay-status routes.
 - Exposes: Range-capable `/media/assets/{id}/source` and allowlisted overlay URLs.
 
-- [ ] **Step 1: Write failing API tests**
+- [x] **Step 1: Write failing API tests**
 
 Assert:
 
@@ -396,7 +396,7 @@ assert acquire_called_automatically_on_task_load is True
 
 Also assert 409 is sanitized and 423 returns a stable read-only code.
 
-- [ ] **Step 2: Run tests and verify Red**
+- [x] **Step 2: Run tests and verify Red**
 
 ```bash
 pytest -q tests/test_human_qc_http_server.py tests/test_human_qc_workbench.py tests/test_review_evidence.py
@@ -404,7 +404,7 @@ pytest -q tests/test_human_qc_http_server.py tests/test_human_qc_workbench.py te
 
 Expected: FAIL because the current facade is shared, returns issue clips, and lacks Range media DTOs.
 
-- [ ] **Step 3: Implement the Warn DTO and route boundary**
+- [x] **Step 3: Implement the Warn DTO and route boundary**
 
 Define immutable DTO types and explicit normalization:
 
@@ -423,11 +423,11 @@ class VideoDto:
 
 Probe media once per source hash, clamp issue ranges to `[0, total_frames)`, and reject empty ranges. Implement byte Range parsing for a single range and stream only the requested bytes. Task load acquires or renews the current reviewer lease in the facade; lease collision returns a task with `read_only=true` rather than exposing an edit-lock button.
 
-- [ ] **Step 4: Run focused tests and verify Green**
+- [x] **Step 4: Run focused tests and verify Green**
 
 Run the Step 2 command. Expected: PASS.
 
-- [ ] **Step 5: Commit Task 5**
+- [x] **Step 5: Commit Task 5**
 
 ```bash
 git add human_qc/warn_workbench_service.py human_qc/http_server.py tools/serve_human_qc_workbench.py tests/test_human_qc_http_server.py tests/test_human_qc_workbench.py tests/test_review_evidence.py openspec/changes/add-human-semantic-warn-review/tasks.md
