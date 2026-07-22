@@ -1,16 +1,25 @@
 # Comet Subagent Progress
 
-- Change: `add-human-semantic-warn-review`
-- Plan task: `Task 1: 扩展人工复核报告合同和批次统计`
+## Completed
+
+- Task 1: report schema, migration compatibility, write boundary, and count projection complete in `57f8ab1..b01bcf1`; progress commit `133701c`.
+- OpenSpec checked off: 7.4. OpenSpec 7.1 and 7.3 remain pending for audit and aggregator integration.
+
+## Current Task
+
+- Plan task: `Task 2: 实现 Warn verdict、原因和完成状态机`
 - OpenSpec mapping:
   - `7.1 扩展 QC JSON Schema，加入 completion_mode、资产级 failure_reason、未查看 selected issue 兼容和审计约束`
-  - `7.3 更新批次投影，仅统计实际 issue review，并单独统计 early-fail 后未查看 Warn`
-  - `7.4 为旧报告添加兼容读取与显式迁移测试，已完成历史报告保持只读`
+  - `7.2 以测试驱动改造 Warn service，支持 all_reviewed、early_fail、完成前修改 verdict、人工原因覆盖和 Other 必填`
 - Stage: `done`
 - Review mode: `thorough`
-- Review/fix round: `extra 3/2 (explicitly authorized by user on 2026-07-22)`
-- Implementer commits: `3a52716bda630f5e2740dba80b19aaafba8f8654`, `fe3651a51c8150b9e77cc88d52d4c3e827a529ad`, `23549ea4380c3d3c43893ec8e59c2206c0690692`, `b01bcf1bc3a5c3f92cb98be8e5dc2994338bfde1`
-- Changed files: `qc_common/schema.py`, `qc_common/report_migration.py`, `qc_common/projection.py`, and three focused test files
-- RED evidence: import failure for missing projection, then `2 failed, 46 passed`, then focused migration failure
-- GREEN evidence: extra bypass regressions `2 passed`; schema/migration focus `51 passed`; write-path regression `21 passed`
-- Review result: Task 1 accepted after controller adjudication. The user-authorized schema bypass fix is verified. Publisher `reviews[]` legality remains owned and enforced by `lerobot_v3_publisher.prerequisites._validate_manual_review()` before publication; Warn service canonical completion writes are Task 2. Aggregator wiring remains pending under OpenSpec 7.3, so only 7.4 is checked off now.
+- Review/fix round: `1/2`
+- Implementer commits: `d62a443`, `192625e`
+- Changed files: `human_qc/warn_service.py`, `tests/test_warn_review_service.py`, `tests/test_human_qc_end_to_end.py`
+- RED evidence: main focus `10 failed, 24 passed`; reason-audit focus `1 failed`
+- GREEN evidence: main focus `35 passed`; schema regression `47 passed`; compileall and diff-check pass
+- Review result: approved after round 1 fixes; fresh reviewer found no Critical, Important, or Minor blockers. Focused + schema review run: 85 passed.
+- Binding downstream decisions:
+  - The service must now emit canonical completion fields required by the Task 1 writer boundary.
+  - The server derives actual Fail reviews and rejects any requested completion mode that does not match; it must not synthesize reviews for unreviewed issue IDs.
+  - Publisher `reviews[]` validation remains outside `human_qc`.

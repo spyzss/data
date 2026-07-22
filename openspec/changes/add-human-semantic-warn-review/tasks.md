@@ -41,8 +41,8 @@
 
 ## 7. Warn 完成与原因合同重构
 
-- [ ] 7.1 扩展 QC JSON Schema，加入 `completion_mode`、资产级 `failure_reason`、未查看 selected issue 兼容和审计约束
-- [ ] 7.2 以测试驱动改造 Warn service，支持 `all_reviewed`、`early_fail`、完成前修改 verdict、人工原因覆盖和 Other 必填
+- [x] 7.1 扩展 QC JSON Schema，加入 `completion_mode`、资产级 `failure_reason`、未查看 selected issue 兼容和审计约束
+- [x] 7.2 以测试驱动改造 Warn service，支持 `all_reviewed`、`early_fail`、完成前修改 verdict、人工原因覆盖和 Other 必填
 - [ ] 7.3 更新批次投影，仅统计实际 issue review，并单独统计 early-fail 后未查看 Warn
 - [x] 7.4 为旧报告添加兼容读取与显式迁移测试，已完成历史报告保持只读
 

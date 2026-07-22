@@ -117,7 +117,7 @@ git commit -m "feat(human-qc): add early-fail report contract"
 - Change: `WarnReviewService.complete(..., completion_mode: Literal["all_reviewed", "early_fail"], failure_reason: Mapping[str, object] | None = None)`
 - Produces: completion transition to semantic for all-reviewed Pass, or stopped/skipped semantic for early Fail.
 
-- [ ] **Step 1: Write failing service tests**
+- [x] **Step 1: Write failing service tests**
 
 Add tests named:
 
@@ -131,7 +131,7 @@ def test_completed_asset_rejects_verdict_changes(...): ...
 
 The first test must assert that unreviewed issue IDs are absent from `issue_reviews`, `semantic_calibration.state == "skipped_due_to_fail"`, pipeline status is `stopped`, and `overall_decision == "fail"`.
 
-- [ ] **Step 2: Run tests and verify Red**
+- [x] **Step 2: Run tests and verify Red**
 
 ```bash
 pytest -q tests/test_warn_review_service.py tests/test_human_qc_end_to_end.py
@@ -139,7 +139,7 @@ pytest -q tests/test_warn_review_service.py tests/test_human_qc_end_to_end.py
 
 Expected: FAIL because `complete()` still requires every selected issue and advances directly to a completed pipeline.
 
-- [ ] **Step 3: Implement verdict and completion invariants**
+- [x] **Step 3: Implement verdict and completion invariants**
 
 Introduce normalization with stable types:
 
@@ -158,11 +158,11 @@ def normalize_failure_reason(value: Mapping[str, object] | None) -> FailureReaso
 
 `submit_verdict()` must audit replacements and atomically persist the current reason version with a Fail. `complete()` must re-read the current report under expected revision, derive actual Fail reviews, validate the requested mode, and write exactly one of the two pipeline transitions described in the design. It must never synthesize reviews for unreviewed IDs.
 
-- [ ] **Step 4: Run focused tests and verify Green**
+- [x] **Step 4: Run focused tests and verify Green**
 
 Run the Step 2 command. Expected: PASS.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```bash
 git add human_qc/warn_service.py human_qc/report_updates.py tests/test_warn_review_service.py tests/test_human_qc_end_to_end.py openspec/changes/add-human-semantic-warn-review/tasks.md
