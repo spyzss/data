@@ -227,8 +227,10 @@ field inventory + 本最终报告 + optional Canonical revision artifact。
 `--revision-artifact` 读取 `canonical_revision_artifact.v1`；缺失、CAS/fingerprint/
 revision/edit-count 不匹配均 fail closed，不得回写 Raw。
 
-发布 Gate 只读取本 PRD 第 8.3 节的正式 `manual_review.reviews[]`；不得另造
-`issue_reviews` 的 pass/fail 字典。每个 candidate issue 必须恰好有一条 review，且
+Publisher audit 只读取发布合同中的 `manual_review.reviews[]`；它是 Publisher 的独立
+审计列表，不是 Warn 服务的结果映射。Warn 人工复核只写
+`manual_review.issue_reviews[issue_id]`，不得把两种结构互相推导或替换。早期 Fail 的
+未查看 Warn 只保留原状；Publisher 仅在其自身 Gate 已满足时解释 `reviews[]`。
 最终 `asset_action` 只能是 `accept` 或 `accept_with_risk`。`reject` 和
 `return_for_rework` 均不可发布。
 
@@ -325,9 +327,11 @@ module.thresholds
 
 ## 6. 人工串行阶段
 
-正式顺序是自动 QC → `semantic_calibration` → `manual_review`。两个人工阶段
-复用同一份 QC JSON、同一 `report_revision` 与单资产 lease；CSV、progress JSON
-和浏览器 localStorage 都不是正式事实源。
+正式顺序是自动/SAM3 → Warn 人工复核 → 语义：Warn 的 `all_reviewed` 或
+`not_required` 才可进入 `semantic_consistency`。`early_fail` 直接终止，不进入语义；
+未查看的 Warn 保持原状。两个独立服务都通过同一份 QC JSON 和 `report_revision`
+协作，但 Warn 使用独立 lease/8897 服务，语义使用独立 lease/8898 服务；CSV、progress
+JSON 和浏览器 localStorage 都不是正式事实源。
 
 ### 6.1 `semantic_calibration`
 
@@ -385,7 +389,9 @@ module.thresholds
 - `required=false`：无候选或按抽样策略无需人工。
 - `required=true`：进入 `queued` / `in_progress` / `completed`；候选为空时必须是
   `state=not_required`，不做正常 Pass 样本抽检。
-- 语义 `semantic_consistency` 是 `execution_kind=external`，完成后才进入上述路由。
+- Warn `completion_mode=all_reviewed` 表示所有 selected issue 已 Pass；
+  `completion_mode=early_fail` 表示有 Fail，未查看项不新增 verdict。
+- 语义 `semantic_consistency` 是 `execution_kind=external`，只在上述 Warn Gate 后进入。
 - 自动 QC 已 hard fail：`required=false`、`state=skipped_due_to_fail`，问题直接供
   批次统计和返工使用。
 
@@ -396,9 +402,34 @@ module.thresholds
 - 人工 Fail：确认该 Warn 为 fail，effective verdict 为 fail；
 - 自动 hard fail：始终保持 fail，人工 Pass 不能覆盖。
 
-每个 selected issue 都有 Pass/Fail 后才能完成样本。刷新页面从服务端 QC JSON
-恢复状态；写入必须带 lease token 和 expected revision。lease 无效返回 423；
-revision 过期返回 409，复核员应刷新后重新确认，禁止覆盖新 revision。
+Pass 总是保存时间轴当前命中的最早待复核 Warn；已判定的项允许返回修改。Fail 原因可
+预选、多选和取消，Other 必填，人工原因覆盖默认原因；选择原因本身不改变 verdict。
+Fail 只在“完成复核”时以 `early_fail` 提交。刷新页面从服务端 QC JSON 恢复状态；
+写入必须带 lease token 和 expected revision。lease 无效返回 423；revision 过期返回
+409，复核员应刷新后重新确认，禁止覆盖新 revision。
+
+Warn 映射的每项可含以下面向操作员的安全投影：
+
+```json
+{
+  "issue_reviews": {
+    "sam3_containment:hand:001": {
+      "verdict": "pass",
+      "failure_reason": null
+    }
+  },
+  "completion_mode": "all_reviewed"
+}
+```
+
+Warn 帧范围一律为 `[start_frame, end_frame_exclusive)`，页面显示结束帧
+`end_frame_exclusive - 1`。这是 Warn UI 坐标约定，不得改写 legacy freeze 语义。
+问题卡片正文仅显示问题帧区间；同一区间的多个 Warn 逐条同时列出。Warn 名称后的“？”
+悬停时展示对应阈值，正文不显示检测分数或阈值字段。工作台使用整条视频和时间轴色块；
+重叠色块在 popover 选择，点击跳转到起始帧，可拖动的播放针允许任意 seek。空间不足的
+色块仅显示颜色，不堆叠；重叠选择仍进入 popover。SAM3 仅在问题帧区间实时 overlay，
+pending/failed 只锁定对应 Warn 并可轮询/重试。视频聚焦后左右键逐帧；速率为
+0.25×、0.5×、1×、1.5×、2×、3× 且保存上次设置。
 
 完成后不新增 `human_qc_pass`。消费者应联合读取
 `manual_review.state/completed_at/issue_reviews` 与顶层 `overall_decision`。

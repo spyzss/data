@@ -30,16 +30,19 @@ the legacy annotation outputs above. It is driven by
 automatic QC Gate
   acceptance: hard fail -> stopped/fail; skip semantic/manual
   supplier_evaluation: hard fail -> record and continue
--> semantic_consistency (external)
 -> no candidate_issue_ids -> manual_review=not_required
--> candidate_issue_ids -> manual_review=queued/in_progress/completed
+-> candidate_issue_ids -> Warn manual_review=queued/in_progress/completed
+-> manual_review=all_reviewed or not_required -> semantic_consistency (external)
+-> manual_review=early_fail -> stopped; unviewed Warn stays unchanged
 -> overall_decision=pass|fail
 -> batch projections read quality_archive/*.json only
 ```
 
-`semantic_consistency` is before manual warn review and is currently an external
-human calibration stage; a future model may implement the same external
-interface. Runtime errors, evidence failures, config drift and CAS conflicts set
+Warn 人工复核 is before `semantic_consistency`; the latter is an independent external
+human calibration stage that a future model may implement through the same
+interface. `not_required` and `all_reviewed` may enter semantic; `early_fail`
+stops the asset and preserves unviewed Warn state. Runtime errors, evidence
+failures, config drift and CAS conflicts set
 `pipeline_state.status=error`, append `runtime_errors`, and leave
 `overall_decision=null`; they are not quality fails. The only final decision
 values are `pass`, `fail`, and `null` while incomplete.
@@ -47,6 +50,11 @@ values are `pass`, `fail`, and `null` while incomplete.
 `quality_archive/*.json` is the sole master source. Sidecars, overlays, CSV,
 XLSX, Markdown, events and cache are derived evidence/reconciliation only
 （sidecar 只作证据）; they cannot replace or overwrite a report verdict.
+
+The operator endpoints are separate: Warn review is the automatic-lease service
+on 8897 (`tools/serve_human_qc_workbench.py`, required `--batch-root`,
+`--quality-archive`, `--reviewer`, optional `--sam3-model`); semantic calibration
+is the independent 8898 service. Lease acquisition is automatic.
 
 ### 1.2 Canonical Data ingest and curated publish
 

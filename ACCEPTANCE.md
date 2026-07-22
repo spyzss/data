@@ -46,8 +46,9 @@ python tools/run_canonical_qc.py \
   --batch-metadata /data/batch/batch_manifest.json
 ```
 
-自动 QC 可以安全 resume，并在当前人工语义边界返回 `awaiting_external`。最终人工
-状态和 `canonical_binding` 完成后执行：
+自动 QC 可以安全 resume，并在 Warn 人工复核边界返回 `awaiting_external`；Warn
+`all_reviewed` 或 `not_required` 后才进入语义。最终人工状态和 `canonical_binding`
+完成后执行：
 
 显式 identity 来自批次 manifest；Source Gate 的确定性失败也会原子写入该资产的
 QC JSON，保证后续批次统计不依赖 CLI 日志。存在非零语义编辑时，Publisher 要求
@@ -276,24 +277,32 @@ Video flow rules:
 The profile-aware flow is:
 
 ```text
-自动 QC Gate
+自动/SAM3 Gate
   acceptance: hard fail -> stopped/fail；不进入语义和人工质检
   supplier_evaluation: hard fail -> 记录并继续
--> semantic_consistency external
 -> candidate_issue_ids 为空：manual_review=not_required
--> candidate_issue_ids 非空：manual_review=queued
+-> candidate_issue_ids 非空：Warn 人工复核=queued
+-> manual_review=all_reviewed 才进入 semantic_consistency external
+-> manual_review=early_fail：终止，未查看 Warn 保持原状
 -> 最终 overall_decision=pass|fail
 -> 批次输出只投影 quality_archive/*.json
 ```
 
-`semantic_consistency` is an external stage before manual warn review. It is
-currently human-operated and may later be replaced by a model adapter without
-changing the report contract. Only accumulated warn candidates enter manual
+Warn 人工复核在 `semantic_consistency` 之前；语义仍是独立 external stage，未来可由
+模型 adapter 替换而不改变 report contract。Only accumulated warn candidates enter manual
 review（仅累计 warn 进入人工质检）. An empty candidate list sets
 `manual_review.required=false`, `state=not_required`; it does not create a
 normal Pass-sample review task. Non-empty candidates use `queued`, then
-`in_progress`, and finally `completed`. An acceptance hard fail uses
-`skipped_due_to_fail` and never creates a semantic/manual task.
+`in_progress`, and finally `completed` with `all_reviewed` or `early_fail`.
+Early fail does not manufacture verdicts for unviewed warnings and never enters
+semantic. An acceptance hard fail uses `skipped_due_to_fail` and never creates a
+semantic/manual task.
+
+Operator services are independent: `tools/serve_human_qc_workbench.py` serves
+Warn on 8897 and requires `--batch-root --quality-archive --reviewer`; its
+`--sam3-model` is optional. `tools/serve_semantic_calibration.py` serves
+semantic calibration on 8898. Warn acquires its lease automatically; there is
+no manual lock-acquisition action.
 
 Machine issues remain immutable observations. Human review records verdict,
 reviewer, timestamp and evidence references alongside them; human-confirmed

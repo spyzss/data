@@ -2,16 +2,17 @@
 
 ## 1. 目标与事实源
 
-系统为每个资产维护唯一的 `quality_archive/<asset_id>.json`，把机器检测、语义
-校准、Warn 人工复核和最终二元结论串成可恢复流程。CSV、XLSX、Markdown、
+系统为每个资产维护唯一的 `quality_archive/<asset_id>.json`，把机器检测、SAM3、
+Warn 人工复核、语义校准和最终二元结论串成可恢复流程。CSV、XLSX、Markdown、
 Parquet、review queue、overlay 和浏览器缓存都是从 QC JSON 派生的视图或证据，
 不能成为最终事实源。
 
 ## 2. 串行流程
 
-1. 自动模块生成不可变机器 issue，severity 为 warn 或 fail。
-2. 适用时进入 `semantic_calibration`，只校准 subtask 共享边界和中英文文字。
-3. 语义完成后进入 `manual_review`，逐条判定 selected machine warn。
+1. 自动/SAM3 生成不可变机器 issue，severity 为 warn 或 fail。
+2. 自动/SAM3 → Warn 人工复核 → 语义：适用的 `manual_review` 必须先于
+   `semantic_consistency`；Warn 全部通过或 `not_required` 后才可进入语义。
+3. `early_fail` 结束资产，不再进入语义；未查看的 Warn 保持原状，不得伪造 verdict。
 4. 全部适用阶段完成后，`overall_decision` 只能是 pass 或 fail；运行中、等待人工
    或错误状态必须为 null。
 
@@ -20,10 +21,10 @@ revision 加一；过期 revision 返回 409，lease 冲突或过期返回 423�
 
 ## 3. Profile 规则
 
-| Profile | 自动 hard fail | 语义校准 | Warn 复核 | 最终结论 |
+| Profile | 自动 hard fail | Warn 复核 | 语义校准 | 最终结论 |
 |---|---|---|---|---|
 | `acceptance` | 立即停止 | 不创建 | 不创建 | fail |
-| `supplier_evaluation` | 保留机器 fail 并继续 | 按配置执行 | 复核适用 warn | 仍为 fail，人工 Pass 不得覆盖机器 fail |
+| `supplier_evaluation` | 保留机器 fail 并继续 | 先复核适用 warn | Warn `all_reviewed` 后按配置执行 | 仍为 fail，人工 Pass 不得覆盖机器 fail |
 
 没有 machine warn 候选时，Warn 阶段标记 `not_required` 并完成为 pass。
 
@@ -45,9 +46,24 @@ revision 加一；过期 revision 返回 409，lease 冲突或过期返回 423�
   `selection_policy=all_candidates`；已有非空 selection 不覆盖。
 - policy seam 后续可换成抽样、风险或预算选择，但不得删改候选池。
 - 工作台只消费当前 QC JSON 的 `manual_review.selected_issue_ids`。
-- 人工 Pass 表示消解 warn；人工 Fail 表示确认 fail。
+- 人工 Pass 表示消解 warn：当同一时刻多个 Warn 命中时，Pass 必须先保存最早的待复核
+  Warn；已判定 Warn 可以返回修改。
+- 人工 Fail 只在操作员点击“完成复核”时提交 `early_fail`；未查看的 Warn 保持原状。
 - 人工记录写入 `manual_review.issue_reviews[issue_id]`，不得改写顶层机器 issue。
-- 所有 selected issue 必须有 verdict 才能完成；自动 hard fail 优先于人工结论。
+- `completion_mode=all_reviewed` 要求全部 selected issue 有 Pass；
+  `completion_mode=early_fail` 要求已有 Fail。`not_required` 不创建正常 Pass 抽检。
+- `manual_review.issue_reviews` 是 Warn 服务的逐 issue 映射；Publisher audit 使用独立的
+  `manual_review.reviews[]`，不得互相推导或复用。
+- Warn 帧区间用半开 `[start_frame, end_frame_exclusive)`；操作员显示结束帧
+  `end_frame_exclusive - 1`。该约定只适用于 Warn，不得改写 legacy freeze 语义。
+- Warn 卡片正文只显示问题帧区间；同一区间有多个 Warn 时逐条同时列出。每个 Warn 名称
+  后的“？”悬停时才展示该 Warn 阈值，正文不显示检测分数或阈值字段。
+- Warn 工作台播放整条视频：时间轴色块按真实帧宽度绘制，重叠色块在 popover 中可选，
+  点击色块跳转到起始帧，且可拖动的播放针始终可用。显示空间不足时色块仅显示颜色；
+  不堆叠色块，重叠 Warn 仍由 popover 选择。
+- SAM3 仅在问题帧区间实时 overlay；pending/failed 只锁定对应 Warn，可轮询和重试。
+- 视频聚焦后左右键逐帧；速率为 0.25×、0.5×、1×、1.5×、2×、3× 并记住上次选择。
+- Fail 原因可预选、多选和取消，Other 为必填且覆盖默认原因；只选原因不改变 verdict。
 
 ## 6. 正式批次指标
 

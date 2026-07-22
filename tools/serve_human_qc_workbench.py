@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the revision-aware Warn human-review workbench locally."""
+"""Serve the independent Warn 人工复核 workbench on port 8897 by default."""
 
 from __future__ import annotations
 
@@ -37,15 +37,27 @@ LOGGER = logging.getLogger("serve_human_qc_workbench")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--batch-root", required=True, type=Path)
-    parser.add_argument("--quality-archive", required=True, type=Path)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", default=8897, type=int)
-    parser.add_argument("--profile", default="acceptance")
-    parser.add_argument("--lease-ttl-seconds", default=900, type=int)
-    parser.add_argument("--reviewer", required=True)
-    parser.add_argument("--sam3-model", type=Path, default=None)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--batch-root", required=True, type=Path,
+        help="batch 根目录；质量报告和媒体路径不得逃出该目录",
+    )
+    parser.add_argument(
+        "--quality-archive", required=True, type=Path,
+        help="batch 内的 quality_archive 目录（每资产一个 QC JSON）",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址")
+    parser.add_argument("--port", default=8897, type=int, help="Warn 服务端口")
+    parser.add_argument("--profile", default="acceptance", help="QC execution profile")
+    parser.add_argument("--lease-ttl-seconds", default=900, type=int, help="reviewer lease 时长")
+    parser.add_argument("--reviewer", required=True, help="当前操作员标识（必填）")
+    parser.add_argument(
+        "--sam3-model", type=Path, default=None,
+        help="可选：SAM3 模型路径；未提供时仅该 SAM3 Warn 显示不可用 overlay 状态",
+    )
     parser.add_argument(
         "--overlay-cache-dir",
         type=Path,
