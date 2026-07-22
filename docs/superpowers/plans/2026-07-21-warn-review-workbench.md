@@ -42,7 +42,7 @@ base-ref: 2a63925d8f11be9685347f8539afe9e9f18f1be6
 - Produces: aggregation field `unreviewed_selected_warn_count`
 - Preserves: missing new fields remain readable for historical reports; any new write emits the new canonical shape.
 
-- [ ] **Step 1: Write failing schema and aggregation tests**
+- [x] **Step 1: Write failing schema and aggregation tests**
 
 Add tests that construct a completed early-fail report with three selected issues and only one Fail review, then assert:
 
@@ -61,7 +61,7 @@ assert projected["unreviewed_selected_warn_count"] == 2
 
 Also assert that `other` with blank `other_text`, `early_fail` without an actual Fail, and `all_reviewed` with a missing review raise `ReportValidationError`.
 
-- [ ] **Step 2: Run tests and verify Red**
+- [x] **Step 2: Run tests and verify Red**
 
 Run:
 
@@ -71,7 +71,7 @@ pytest -q tests/test_human_qc_report_schema.py tests/test_human_qc_aggregation.p
 
 Expected: FAIL because the current schema requires every selected issue review and has no completion/failure-reason validation or unreviewed aggregate.
 
-- [ ] **Step 3: Implement the canonical validators and projection**
+- [x] **Step 3: Implement the canonical validators and projection**
 
 In `qc_common/schema.py`, validate the new blocks with explicit helpers:
 
@@ -93,11 +93,11 @@ def _validate_failure_reason(value: object) -> None:
 
 For completed blocks, derive Pass/Fail counts from `issue_reviews`; enforce `all_reviewed` and `early_fail` invariants. Update the v1/v2 compatibility migration to add `completion_mode="all_reviewed"` only when a historical completed report has all selected reviews, otherwise retain the legacy block as read-only. Count unreviewed IDs as `selected_issue_ids - issue_reviews.keys()` in `qc_common/projection.py`.
 
-- [ ] **Step 4: Run focused tests and verify Green**
+- [x] **Step 4: Run focused tests and verify Green**
 
 Run the Step 2 command. Expected: PASS.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add qc_common/schema.py qc_common/report_migration.py qc_common/projection.py tests/test_human_qc_report_schema.py tests/test_human_qc_aggregation.py tests/test_qc_migration_reconciliation.py openspec/changes/add-human-semantic-warn-review/tasks.md
