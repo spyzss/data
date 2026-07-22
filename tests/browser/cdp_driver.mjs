@@ -7,13 +7,83 @@
  */
 
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 
-const [baseUrl, chromeBin, profileDir] = process.argv.slice(2);
-if (!baseUrl || !chromeBin || !profileDir) {
-  throw new Error("usage: cdp_driver.mjs <base-url> <chrome-bin> <profile-dir>");
-}
+export const DEFAULT_CDP_TIMEOUT_MS = 8_000;
+export const MIN_CDP_TIMEOUT_MS = 5_000;
+export const MAX_CDP_TIMEOUT_MS = 10_000;
+export const TERM_GRACE_MS = 1_000;
+export const KILL_GRACE_MS = 1_000;
+
+export const cdpTimeoutFromEnvironment = (environment = process.env) => {
+  const raw = environment.HUMAN_QC_CDP_TIMEOUT_MS;
+  if (raw === undefined || raw === "") return DEFAULT_CDP_TIMEOUT_MS;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < MIN_CDP_TIMEOUT_MS || value > MAX_CDP_TIMEOUT_MS) {
+    throw new Error(
+      `HUMAN_QC_CDP_TIMEOUT_MS must be an integer between ${MIN_CDP_TIMEOUT_MS} and ${MAX_CDP_TIMEOUT_MS}`,
+    );
+  }
+  return value;
+};
+
+export const resolveChromeBin = ({
+  environment = process.env,
+  explicit = null,
+  exists = existsSync,
+  findOnPath = (name) => {
+    const result = spawnSync("which", [name], { encoding: "utf8" });
+    return result.status === 0 ? result.stdout.trim() : null;
+  },
+} = {}) => {
+  const override = environment.CHROME_BIN;
+  if (typeof override === "string" && override.trim()) {
+    const candidate = override.trim();
+    if (exists(candidate)) return candidate;
+    throw new Error(`CHROME_BIN does not point to an executable browser: ${candidate}`);
+  }
+  if (typeof explicit === "string" && explicit.trim() && exists(explicit.trim())) return explicit.trim();
+  const macCandidates = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  ];
+  for (const candidate of macCandidates) if (exists(candidate)) return candidate;
+  for (const command of ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]) {
+    const candidate = findOnPath(command);
+    if (candidate && exists(candidate)) return candidate;
+  }
+  throw new Error(
+    "Chrome/Chromium was not found. Set CHROME_BIN to an executable browser path; "
+      + "checked macOS Google Chrome/Chromium and google-chrome, google-chrome-stable, chromium, chromium-browser on PATH.",
+  );
+};
+
+export const parseDriverArguments = (argumentsList = process.argv.slice(2)) => {
+  const [baseUrl, first, second] = argumentsList;
+  if (!baseUrl || !first || (second && argumentsList.length !== 3) || (!second && argumentsList.length !== 2)) {
+    throw new Error("usage: cdp_driver.mjs <base-url> <profile-dir> (legacy: <base-url> <chrome-bin> <profile-dir>)");
+  }
+  return second
+    ? { baseUrl, profileDir: second, explicitChromeBin: first }
+    : { baseUrl, profileDir: first, explicitChromeBin: null };
+};
+
+export const withTimeout = async (promise, { timeoutMs, label } = {}) => {
+  const timeout = Number.isInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_CDP_TIMEOUT_MS;
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${timeout}ms waiting for ${label ?? "operation"}`)), timeout);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
 
 const timeoutAt = (milliseconds) => Date.now() + milliseconds;
 
@@ -32,9 +102,10 @@ const until = async (predicate, { timeout = 8000, label = "condition" } = {}) =>
   throw new Error(`timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ""}`);
 };
 
-class Cdp {
-  constructor(url) {
+export class Cdp {
+  constructor(url, { requestTimeoutMs = cdpTimeoutFromEnvironment() } = {}) {
     this.url = url;
+    this.requestTimeoutMs = requestTimeoutMs;
     this.socket = null;
     this.sequence = 0;
     this.pending = new Map();
@@ -42,7 +113,7 @@ class Cdp {
   }
 
   async connect() {
-    await new Promise((resolve, reject) => {
+    await withTimeout(new Promise((resolve, reject) => {
       const socket = new WebSocket(this.url);
       this.socket = socket;
       socket.addEventListener("open", resolve, { once: true });
@@ -54,7 +125,7 @@ class Cdp {
         }
         this.pending.clear();
       });
-    });
+    }), { timeoutMs: this.requestTimeoutMs, label: "CDP WebSocket connection" });
     return this;
   }
 
@@ -80,10 +151,19 @@ class Cdp {
 
   send(method, params = {}) {
     const id = ++this.sequence;
-    return new Promise((resolve, reject) => {
+    const pending = new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.socket.send(JSON.stringify({ id, method, params }));
+      try {
+        this.socket.send(JSON.stringify({ id, method, params }));
+      } catch (error) {
+        this.pending.delete(id);
+        reject(error);
+      }
     });
+    return withTimeout(pending, {
+      timeoutMs: this.requestTimeoutMs,
+      label: `CDP ${method}`,
+    }).finally(() => this.pending.delete(id));
   }
 
   async evaluate(expression, { awaitPromise = false } = {}) {
@@ -100,11 +180,127 @@ class Cdp {
   }
 
   async close() {
-    try { this.socket?.close(); } catch { /* process cleanup owns the fallback */ }
+    const socket = this.socket;
+    if (!socket) return;
+    try {
+      if (socket.readyState === WebSocket.CLOSED) return;
+      await withTimeout(new Promise((resolve) => {
+        socket.addEventListener("close", resolve, { once: true });
+        socket.close();
+      }), { timeoutMs: this.requestTimeoutMs, label: "CDP WebSocket close" });
+    } catch { /* process cleanup owns the fallback */ }
   }
 }
 
-const chrome = spawn(chromeBin, [
+export const waitForChildExit = (child, timeoutMs) => {
+  if (!child || child.exitCode != null || child.signalCode != null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      if (timer) clearTimeout(timer);
+      child.removeListener?.("exit", finish);
+      child.removeListener?.("close", finish);
+      resolve(true);
+    };
+    child.once?.("exit", finish);
+    child.once?.("close", finish);
+    timer = setTimeout(() => {
+      child.removeListener?.("exit", finish);
+      child.removeListener?.("close", finish);
+      resolve(false);
+    }, timeoutMs);
+  });
+};
+
+export const stopChild = async (
+  child,
+  { termGraceMs = TERM_GRACE_MS, killGraceMs = KILL_GRACE_MS } = {},
+) => {
+  if (!child || child.exitCode != null || child.signalCode != null) return "already_exited";
+  child.kill?.("SIGTERM");
+  if (await waitForChildExit(child, termGraceMs)) return "sigterm";
+  child.kill?.("SIGKILL");
+  if (await waitForChildExit(child, killGraceMs)) return "sigkill";
+  throw new Error("Chrome process did not exit after SIGTERM and SIGKILL");
+};
+
+export const shutdownResources = async ({ cdp = null, children = [], stopOptions = {} } = {}) => {
+  await cdp?.close?.();
+  return Promise.all(children.filter(Boolean).map((child) => stopChild(child, stopOptions)));
+};
+
+export const installShutdownSignalHandlers = ({
+  processRef = process,
+  shutdown,
+  exit = (code) => process.exit(code),
+} = {}) => {
+  let handled = false;
+  const handler = (signal) => {
+    if (handled) return;
+    handled = true;
+    void Promise.resolve(shutdown?.()).catch(() => undefined).finally(() => {
+      exit(signal === "SIGINT" ? 130 : 143);
+    });
+  };
+  processRef.once("SIGTERM", handler);
+  processRef.once("SIGINT", handler);
+  return () => {
+    processRef.removeListener?.("SIGTERM", handler);
+    processRef.removeListener?.("SIGINT", handler);
+  };
+};
+
+export class NetworkHealth {
+  constructor(baseUrl) {
+    this.baseUrl = baseUrl;
+    this.urls = new Map();
+    this.failed = [];
+    this.canceled = [];
+  }
+
+  _relevant(url) {
+    return typeof url === "string" && url.startsWith(this.baseUrl);
+  }
+
+  request({ requestId, request }) {
+    if (requestId && typeof request?.url === "string") this.urls.set(requestId, request.url);
+    return request?.url;
+  }
+
+  response({ requestId, response }) {
+    const url = response?.url ?? this.urls.get(requestId);
+    if (requestId && typeof url === "string") this.urls.set(requestId, url);
+    if (this._relevant(url) && Number(response?.status) >= 400) this.failed.push({ status: Number(response.status), url });
+  }
+
+  finished({ requestId }) {
+    if (requestId) this.urls.delete(requestId);
+  }
+
+  loadingFailed({ requestId, errorText, blockedReason, canceled = false }) {
+    const url = this.urls.get(requestId);
+    if (requestId) this.urls.delete(requestId);
+    if (!this._relevant(url)) return;
+    const record = {
+      url,
+      error_text: typeof errorText === "string" && errorText ? errorText : null,
+      blocked_reason: typeof blockedReason === "string" && blockedReason ? blockedReason : null,
+    };
+    if (canceled) {
+      this.canceled.push(record);
+      return;
+    }
+    this.failed.push(record);
+  }
+}
+
+let baseUrl = null;
+let profileDir = null;
+let chrome = null;
+let cdp = null;
+let shutdownPromise = null;
+
+const launchChrome = (chromeBin) => spawn(chromeBin, [
   "--headless=new",
   "--remote-debugging-port=0",
   `--user-data-dir=${profileDir}`,
@@ -114,20 +310,13 @@ const chrome = spawn(chromeBin, [
   "--window-size=1280,1100",
 ], { stdio: "ignore" });
 
-let cdp = null;
 const uncaught = [];
 const consoleErrors = [];
-const failedNetwork = [];
 const mutationRequests = [];
 
 const shutdown = async () => {
-  await cdp?.close();
-  if (!chrome.killed) chrome.kill("SIGTERM");
-  await Promise.race([
-    new Promise((resolve) => chrome.once("exit", resolve)),
-    delay(2000),
-  ]);
-  if (!chrome.killed) chrome.kill("SIGKILL");
+  shutdownPromise ??= shutdownResources({ cdp, children: [chrome] });
+  return shutdownPromise;
 };
 
 const devtoolsPort = async () => {
@@ -208,7 +397,21 @@ const dragToFrame = async (frame) => {
   }
 };
 
-try {
+export const runDriver = async ({
+  argumentsList = process.argv.slice(2),
+  environment = process.env,
+} = {}) => {
+  const parsed = parseDriverArguments(argumentsList);
+  baseUrl = parsed.baseUrl;
+  profileDir = parsed.profileDir;
+  const requestTimeoutMs = cdpTimeoutFromEnvironment(environment);
+  const chromeBin = resolveChromeBin({
+    environment,
+    explicit: parsed.explicitChromeBin,
+  });
+  chrome = launchChrome(chromeBin);
+  const removeSignalHandlers = installShutdownSignalHandlers({ shutdown });
+  try {
   mkdirSync(profileDir, { recursive: true });
   const port = await devtoolsPort();
   const pages = await until(async () => {
@@ -216,7 +419,8 @@ try {
     const values = await response.json();
     return values.find((item) => item.type === "page" && item.webSocketDebuggerUrl) ?? null;
   }, { label: "Chrome page target" });
-  cdp = await new Cdp(pages.webSocketDebuggerUrl).connect();
+  cdp = await new Cdp(pages.webSocketDebuggerUrl, { requestTimeoutMs }).connect();
+  const networkHealth = new NetworkHealth(baseUrl);
   cdp.on("Runtime.exceptionThrown", ({ exceptionDetails }) => {
     uncaught.push(exceptionDetails?.exception?.description ?? exceptionDetails?.text ?? "runtime exception");
   });
@@ -226,16 +430,18 @@ try {
   cdp.on("Log.entryAdded", ({ entry }) => {
     if (entry?.level === "error") consoleErrors.push(entry.text ?? "log error");
   });
-  cdp.on("Network.responseReceived", ({ response }) => {
-    if (typeof response?.url === "string" && response.url.startsWith(baseUrl) && Number(response.status) >= 400) {
-      failedNetwork.push({ status: Number(response.status), url: response.url });
-    }
+  cdp.on("Network.responseReceived", (params) => {
+    networkHealth.response(params);
   });
-  cdp.on("Network.requestWillBeSent", ({ request }) => {
+  cdp.on("Network.requestWillBeSent", (params) => {
+    networkHealth.request(params);
+    const { request } = params;
     if (request?.method === "POST" && typeof request.url === "string" && request.url.startsWith(baseUrl)) {
       mutationRequests.push(request.url);
     }
   });
+  cdp.on("Network.loadingFinished", (params) => networkHealth.finished(params));
+  cdp.on("Network.loadingFailed", (params) => networkHealth.loadingFailed(params));
   await cdp.send("Runtime.enable");
   await cdp.send("Log.enable");
   await cdp.send("Network.enable");
@@ -368,8 +574,20 @@ try {
     overlay_sync: overlaySync,
     uncaught,
     console_errors: consoleErrors,
-    failed_network: failedNetwork,
+    failed_network: networkHealth.failed,
+    canceled_network: networkHealth.canceled,
   })}\n`);
 } finally {
+  removeSignalHandlers();
   await shutdown();
+}
+};
+
+const invokedDirectly = process.argv[1]
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  runDriver().catch((error) => {
+    process.stderr.write(`${error?.stack ?? error}\n`);
+    process.exitCode = 1;
+  });
 }

@@ -9,6 +9,7 @@ the report/service state real and does not mutate client state directly.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -209,14 +210,14 @@ def browser_workbench(tmp_path: Path):
 
 
 def _run_browser_scenario(base_url: str, tmp_path: Path) -> dict[str, object]:
-    assert CHROME_BIN.is_file(), f"Chrome is required at {CHROME_BIN}"
     driver = Path(__file__).with_name("browser") / "cdp_driver.mjs"
     completed = subprocess.run(
-        ["node", str(driver), base_url, str(CHROME_BIN), str(tmp_path / "chrome")],
+        ["node", str(driver), base_url, str(tmp_path / "chrome")],
         check=False,
         capture_output=True,
         text=True,
         timeout=40,
+        env=os.environ.copy(),
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
     return json.loads(completed.stdout)

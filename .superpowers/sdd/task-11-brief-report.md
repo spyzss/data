@@ -67,3 +67,29 @@ node --test human_qc/static/*.test.mjs
 git diff --check
 # clean
 ```
+
+## Final review hardening
+
+The browser driver now gives every CDP command a configurable 5--10 second
+deadline (`HUMAN_QC_CDP_TIMEOUT_MS`, default 8 seconds), awaits WebSocket
+close, and supervises Chrome through SIGTERM grace followed by SIGKILL when it
+has not actually exited.  SIGTERM/SIGINT invoke the same idempotent cleanup
+before the Node process exits.  `CHROME_BIN` is preferred; absent that, the
+driver diagnoses the macOS and common Linux Chrome/Chromium locations it
+checked.  Network health also records `Network.loadingFailed` through a
+request-id-to-URL map: canceled media/navigation are reported separately while
+actual transport or blocked failures fail the browser health assertion.
+
+New `tests/browser/cdp_driver.test.mjs` exercises deadline cleanup with
+controlled Chrome/server children, TERM-to-KILL escalation, environment
+override/discovery, and failure/cancellation classification.  It also starts
+the real driver with a controlled executable browser and sends a POSIX SIGTERM
+from its parent; the driver exits only after the launched browser PID is gone.
+
+```text
+Chrome browser contract, run 1: 1 passed in 2.29s
+Chrome browser contract, run 2: 1 passed in 1.77s
+Focused Python suite: 64 passed in 3.55s
+Node static + driver suite: 67 passed
+git diff --check: clean
+```
