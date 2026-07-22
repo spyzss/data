@@ -499,7 +499,7 @@ git commit -m "feat(human-qc): add frame-accurate warning timeline"
 - Produces: `VideoController.seekToFrame(frame)`, `stepFrame(delta)`, `setRate(rate)`, `increaseRate()`, `decreaseRate()`
 - Emits: `onFrameChange(frame)` and `onPlaybackStateChange(state)`.
 
-- [ ] **Step 1: Write failing controller tests**
+- [x] **Step 1: Write failing controller tests**
 
 Assert frame clamping, exact rate sequence, preference restore, and focus gating:
 
@@ -512,7 +512,7 @@ assert.deepEqual(stepRates(1, +1, 5), [1.5, 2, 3, 3, 3]);
 assert.equal(handleArrow({key: "ArrowRight", target: reasonInput}, false), false);
 ```
 
-- [ ] **Step 2: Run tests and verify Red**
+- [x] **Step 2: Run tests and verify Red**
 
 ```bash
 node --test human_qc/static/video_controller.test.mjs
@@ -520,15 +520,15 @@ node --test human_qc/static/video_controller.test.mjs
 
 Expected: FAIL because the module does not exist.
 
-- [ ] **Step 3: Implement frame/rate synchronization**
+- [x] **Step 3: Implement frame/rate synchronization**
 
 Use `frame / fps` for seek, clamp to `0..totalFrames-1`, update current frame from `Math.round(video.currentTime * fps)` after `timeupdate/seeked`, and only register arrow stepping while the video container owns focus. Persist only the numeric rate under `human-qc.playback-rate.v1`.
 
-- [ ] **Step 4: Run tests and verify Green**
+- [x] **Step 4: Run tests and verify Green**
 
 Run the Step 2 command. Expected: PASS.
 
-- [ ] **Step 5: Commit Task 7**
+- [x] **Step 5: Commit Task 7**
 
 ```bash
 git add human_qc/static/video_controller.js human_qc/static/video_controller.test.mjs openspec/changes/add-human-semantic-warn-review/tasks.md
