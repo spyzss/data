@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from qc_reporting.aggregate import aggregate_projection
 from qc_common.projection import project_manual_review_counts
 from qc_reporting.projection import (
@@ -110,6 +112,8 @@ def test_human_projection_reads_only_canonical_human_blocks() -> None:
             "report_revision": 7,
             "semantic_state": "completed",
             "manual_review_state": "completed",
+            "selected_issue_ids": ("warn-0", "warn-1"),
+            "completion_mode": None,
             "timeline_edit_count": 1,
             "subtask_text_edit_count": 2,
             "issue_reviews": {
@@ -131,6 +135,111 @@ def test_manual_review_projection_counts_unreviewed_early_fail_warns() -> None:
     assert projected["human_reviewed_warn_count"] == 1
     assert projected["human_confirmed_fail_count"] == 1
     assert projected["unreviewed_selected_warn_count"] == 2
+
+
+def _early_fail_report(
+    asset_id: str,
+    *,
+    revision: int,
+    status: str = "stopped",
+) -> dict[str, Any]:
+    report = _report(
+        asset_id,
+        revision=revision,
+        status=status,
+        decision="fail" if status in {"completed", "stopped"} else None,
+        warn_verdicts=("fail", "pass", "pass"),
+        timeline_edits=0,
+    )
+    report["manual_review"]["issue_reviews"] = {"warn-0": _review("fail")}
+    report["manual_review"]["completion_mode"] = "early_fail"
+    return report
+
+
+def test_formal_projection_and_aggregate_count_terminal_early_fail_unreviewed_warns() -> None:
+    report = _early_fail_report("asset-early-fail", revision=4)
+
+    projection = project_quality_archive_from_reports((report,))
+    row = projection.human_review_rows[0]
+    stats = aggregate_projection(projection)["overall"]
+
+    assert row["selected_issue_ids"] == ("warn-0", "warn-1", "warn-2")
+    assert row["completion_mode"] == "early_fail"
+    assert set(row["issue_reviews"]) == {"warn-0"}
+    assert stats["human_checked_warn_issues"] == 1
+    assert stats["human_resolved_warn_issues"] == 0
+    assert stats["human_confirmed_fail_issues"] == 1
+    assert stats["unreviewed_selected_warn_issues"] == 2
+
+
+def test_formal_aggregate_does_not_count_in_progress_selected_warns() -> None:
+    report = _early_fail_report("asset-in-progress", revision=4, status="running")
+    report["manual_review"]["state"] = "in_progress"
+    report["manual_review"]["completion_mode"] = None
+
+    stats = aggregate_projection(project_quality_archive_from_reports((report,)))["overall"]
+
+    assert stats["unreviewed_selected_warn_issues"] == 0
+
+
+def test_formal_aggregate_uses_only_latest_early_fail_revision() -> None:
+    stale = _early_fail_report("asset-revision", revision=1)
+    current = _early_fail_report("asset-revision", revision=2)
+    current["manual_review"]["selected_issue_ids"] = ["warn-0", "warn-1"]
+    current["manual_review"]["issue_reviews"] = {
+        "warn-0": _review("fail"),
+        "warn-1": _review("pass"),
+    }
+    current["manual_review"]["completion_mode"] = "all_reviewed"
+
+    stats = aggregate_projection(project_quality_archive_from_reports((stale, current)))[
+        "overall"
+    ]
+
+    assert stats["unreviewed_selected_warn_issues"] == 0
+
+
+def test_formal_projection_rejects_unselected_or_non_warn_review_relations() -> None:
+    report = _early_fail_report("asset-invalid", revision=4)
+    report["manual_review"]["issue_reviews"] = {
+        "not-selected": _review("fail"),
+    }
+
+    with pytest.raises(ValueError, match="selected_issue_ids"):
+        project_human_review_rows(report)
+
+
+def project_quality_archive_from_reports(
+    reports: tuple[dict[str, Any], ...],
+) -> BatchProjection:
+    return BatchProjection(
+        asset_rows=tuple(
+            {
+                "asset_id": report["asset_id"],
+                "profile": report["execution"]["profile"],
+                "status": report["pipeline_state"]["status"],
+                "decision": report["overall_decision"],
+                "report_revision": report["report_revision"],
+            }
+            for report in reports
+        ),
+        issue_rows=tuple(
+            {
+                "asset_id": report["asset_id"],
+                "profile": report["execution"]["profile"],
+                "issue_id": issue["issue_id"],
+                "machine_severity": issue["severity"],
+                "report_revision": report["report_revision"],
+            }
+            for report in reports
+            for issue in report["issues"]
+        ),
+        execution_rows=(),
+        human_review_rows=tuple(
+            row for report in reports for row in project_human_review_rows(report)
+        ),
+        source_manifest=(),
+    )
 
 
 def test_quality_archive_projection_preserves_machine_warn_and_human_rows(

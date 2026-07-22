@@ -165,6 +165,13 @@ def project_human_review_rows(
     manual = report.get("manual_review")
     manual_map = manual if isinstance(manual, Mapping) else {}
 
+    selected_issue_ids = _normalized_selected_warn_issue_ids(report, manual_map)
+    completion_mode = manual_map.get("completion_mode")
+    if completion_mode not in {None, "all_reviewed", "early_fail"}:
+        raise ValueError(
+            "manual_review.completion_mode must be null, all_reviewed, or early_fail"
+        )
+
     reviews = manual_map.get("issue_reviews", {})
     if not isinstance(reviews, Mapping):
         raise ValueError("manual_review.issue_reviews must be an object")
@@ -188,6 +195,11 @@ def project_human_review_rows(
             "human_verdict": str(human),
             "effective_verdict": str(effective),
         }
+    unselected_review_ids = set(normalized_reviews).difference(selected_issue_ids)
+    if unselected_review_ids:
+        raise ValueError(
+            "manual_review.issue_reviews may only contain selected_issue_ids"
+        )
 
     return (
         {
@@ -201,6 +213,8 @@ def project_human_review_rows(
             ),
             "semantic_state": str(semantic_map.get("state") or "not_evaluated"),
             "manual_review_state": str(manual_map.get("state") or "not_evaluated"),
+            "selected_issue_ids": selected_issue_ids,
+            "completion_mode": completion_mode,
             "timeline_edit_count": _nonnegative_int(
                 semantic_map.get("timeline_edit_count", 0),
                 "semantic_calibration.timeline_edit_count",
@@ -212,6 +226,37 @@ def project_human_review_rows(
             "issue_reviews": normalized_reviews,
         },
     )
+
+
+def _normalized_selected_warn_issue_ids(
+    report: Mapping[str, Any], manual_review: Mapping[str, Any]
+) -> tuple[str, ...]:
+    selected = manual_review.get("selected_issue_ids", ())
+    if not isinstance(selected, Sequence) or isinstance(selected, (str, bytes)):
+        raise ValueError("manual_review.selected_issue_ids must be an array")
+
+    selected_ids: list[str] = []
+    for issue_id in selected:
+        if not isinstance(issue_id, str) or not issue_id:
+            raise ValueError(
+                "manual_review.selected_issue_ids must contain non-empty strings"
+            )
+        selected_ids.append(issue_id)
+    if len(set(selected_ids)) != len(selected_ids):
+        raise ValueError("manual_review.selected_issue_ids must contain unique issue IDs")
+
+    issue_by_id = {str(issue.get("issue_id")): issue for issue in _issues(report)}
+    for issue_id in selected_ids:
+        issue = issue_by_id.get(issue_id)
+        if issue is None:
+            raise ValueError(
+                f"manual_review.selected_issue_ids references missing issue: {issue_id}"
+            )
+        if str(issue.get("severity") or "").lower() != "warn":
+            raise ValueError(
+                f"manual_review.selected_issue_ids issue {issue_id} severity must be warn"
+            )
+    return tuple(selected_ids)
 
 
 def _nonnegative_int(value: Any, field: str) -> int:

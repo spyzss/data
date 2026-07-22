@@ -184,6 +184,11 @@ def _aggregate_group(
     human_confirmed_fail = {
         issue_key for issue_key, verdict in reviewed_verdicts.items() if verdict == "fail"
     }
+    unreviewed_selected_warn = _unreviewed_selected_warn_count(
+        human_reviews,
+        warn_keys,
+        {_asset_key(row) for row in terminal},
+    )
 
     human_counter_rows = human_reviews if human_reviews else assets
     timeline_edit_count = sum(
@@ -234,6 +239,7 @@ def _aggregate_group(
         "human_checked_warn_issue_count": len(human_checked),
         "human_resolved_warn_issue_count": len(human_resolved),
         "human_confirmed_fail_issue_count": len(human_confirmed_fail),
+        "unreviewed_selected_warn_issue_count": unreviewed_selected_warn,
         "timeline_edit_count": timeline_edit_count,
         "subtask_text_edit_count": subtask_text_edit_count,
         "final_pass_asset_count": len(final_pass),
@@ -254,11 +260,52 @@ def _aggregate_group(
             "human_checked_warn_issues": len(human_checked),
             "human_resolved_warn_issues": len(human_resolved),
             "human_confirmed_fail_issues": len(human_confirmed_fail),
+            "unreviewed_selected_warn_issues": unreviewed_selected_warn,
             "final_pass_assets": len(final_pass),
             "final_fail_assets": len(final_fail),
         }
     )
     return result
+
+
+def _unreviewed_selected_warn_count(
+    human_rows: Iterable[Mapping[str, Any]],
+    warn_keys: set[tuple[str, str, str]],
+    terminal_asset_keys: set[tuple[str, str]],
+) -> int:
+    count = 0
+    for row in human_rows:
+        if (
+            _asset_key(row) not in terminal_asset_keys
+            or row.get("manual_review_state") != "completed"
+            or row.get("completion_mode") != "early_fail"
+        ):
+            continue
+
+        selected = row.get("selected_issue_ids", ())
+        if not isinstance(selected, (list, tuple)):
+            raise TypeError("human_review_rows.selected_issue_ids must be a sequence")
+        if any(not isinstance(issue_id, str) or not issue_id for issue_id in selected):
+            raise ValueError(
+                "human_review_rows.selected_issue_ids must contain non-empty strings"
+            )
+        if len(set(selected)) != len(selected):
+            raise ValueError("human_review_rows.selected_issue_ids must contain unique issue IDs")
+
+        selected_keys = {(*_asset_key(row), issue_id) for issue_id in selected}
+        if not selected_keys.issubset(warn_keys):
+            raise ValueError(
+                "human_review_rows.selected_issue_ids must reference current machine Warn issues"
+            )
+        reviews = row.get("issue_reviews", {})
+        if not isinstance(reviews, Mapping):
+            raise TypeError("human_review_rows.issue_reviews must be a mapping")
+        if not set(reviews).issubset(selected):
+            raise ValueError(
+                "human_review_rows.issue_reviews may only contain selected_issue_ids"
+            )
+        count += len(selected_keys.difference({(*_asset_key(row), str(issue_id)) for issue_id in reviews}))
+    return count
 
 
 def _at_current_revision(

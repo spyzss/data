@@ -22,6 +22,7 @@ FORMAL_AGGREGATE_METRICS = (
     "human_checked_warn_issues",
     "human_resolved_warn_issues",
     "human_confirmed_fail_issues",
+    "unreviewed_selected_warn_issues",
     "timeline_edit_count",
     "subtask_text_edit_count",
     "final_pass_assets",
