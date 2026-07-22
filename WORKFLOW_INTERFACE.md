@@ -56,6 +56,16 @@ on 8897 (`tools/serve_human_qc_workbench.py`, required `--batch-root`,
 `--quality-archive`, `--reviewer`, optional `--sam3-model`); semantic calibration
 is the independent 8898 service. Lease acquisition is automatic.
 
+Warn Gate 状态合同：
+
+- `not_required`：`manual_review.state=not_required`，不写 `completion_mode`；Warn Gate 已满足，语义为 ready。
+- `all_reviewed`：`manual_review.state=completed` 且 `completion_mode=all_reviewed`；Warn Gate 已满足，语义为 ready。
+- `early_fail`：`manual_review.state=completed` 且 `completion_mode=early_fail`；资产 `pipeline_state.status=stopped`，`semantic_calibration.state=skipped_due_to_fail`。
+
+点击 Fail 立即写入当前 issue 的 `manual_review.issue_reviews[issue_id].verdict=fail`。
+人工原因预选、多选、取消或填写 Other 只更新本地草稿，不改变 issue verdict 或资产状态。
+点击“完成复核”才写资产级 `completion_mode=early_fail`，停止资产并自动跳转下一条。
+
 ### 1.2 Canonical Data ingest and curated publish
 
 标准 HDF5 与 LeRobot 使用同一显式入口：

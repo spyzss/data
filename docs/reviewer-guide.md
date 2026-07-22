@@ -47,7 +47,7 @@ Warn 页面只展示 QC JSON 已选择的机器问题、问题区间、原因和
 策略替换为抽样、风险或预算选择，但不得因此删改候选池。
 
 问题卡片正文只显示问题帧区间；同一区间的多个 Warn 必须同时逐条列出。每个 Warn 名称后
-的“？”悬停时才显示该 Warn 阈值，正文不显示检测分数或阈值字段。
+的“？”悬停时才显示该 Warn 阈值，正文不显示机器指标或阈值字段。
 
 ### 3.1 视频、时间轴和 overlay
 
@@ -68,12 +68,12 @@ SAM3 只在问题帧区间实时 overlay，离开区间即隐藏。`pending/fail
 
 - Pass：认定机器 Warn 可消解。多个 Warn 同时点亮时，Pass 保存最早的待复核 Warn；
   已通过或已 Fail 的项可从状态条返回修改。
-- Fail：先可选择人工原因，但只选择原因不改变状态。Fail 不立即终止或提交完成；
-  Fail 只在“完成复核”时提交，并以 `early_fail` 写回。
+- Fail：点击 Fail 立即保存当前 Warn 的 Fail verdict，但不立即结束资产；操作员仍可返回
+  修改已判定项。
 - 人工原因可预选、多选和取消；选中 Other 后必须填写非空文字。任何人工补充原因
   覆盖默认原因。
 - “完成复核”有两种终态：全部 selected Warn 已 Pass 时提交 `all_reviewed`；已有
-  Fail 时提交 `early_fail`。early fail 后未查看的 Warn 保持原状。
+  Fail 时提交 `early_fail`。early fail 后未查看的 Warn 保持原状，并自动进入下一条资产。
 - 自动 hard fail：不能通过人工 Pass 改为通过。
 
 Warn 逐 issue 结果写入 `manual_review.issue_reviews[issue_id]`，一个问题重复提交时以
@@ -81,6 +81,16 @@ Warn 逐 issue 结果写入 `manual_review.issue_reviews[issue_id]`，一个问�
 `manual_review.reviews[]`，不能把该列表当作 Warn 映射。完成状态以 JSON 的
 `manual_review.state=completed`、`completion_mode`、`completed_at`、`issue_reviews` 和
 顶层 `overall_decision` 为准；系统不新增 `human_qc_pass` 标志位。
+
+Warn Gate 状态合同：
+
+- `not_required`：`manual_review.state=not_required`，不写 `completion_mode`；Warn Gate 已满足，语义为 ready。
+- `all_reviewed`：`manual_review.state=completed` 且 `completion_mode=all_reviewed`；Warn Gate 已满足，语义为 ready。
+- `early_fail`：`manual_review.state=completed` 且 `completion_mode=early_fail`；资产 `pipeline_state.status=stopped`，`semantic_calibration.state=skipped_due_to_fail`。
+
+点击 Fail 立即写入当前 issue 的 `manual_review.issue_reviews[issue_id].verdict=fail`。
+人工原因预选、多选、取消或填写 Other 只更新本地草稿，不改变 issue verdict 或资产状态。
+点击“完成复核”才写资产级 `completion_mode=early_fail`，停止资产并自动跳转下一条。
 
 ### 3.3 启动独立服务
 

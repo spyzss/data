@@ -280,9 +280,9 @@ The profile-aware flow is:
 自动/SAM3 Gate
   acceptance: hard fail -> stopped/fail；不进入语义和人工质检
   supplier_evaluation: hard fail -> 记录并继续
--> candidate_issue_ids 为空：manual_review=not_required
+-> candidate_issue_ids 为空：manual_review=not_required，Warn Gate 已满足、语义 ready
 -> candidate_issue_ids 非空：Warn 人工复核=queued
--> manual_review=all_reviewed 才进入 semantic_consistency external
+-> manual_review=all_reviewed or not_required -> semantic_consistency external
 -> manual_review=early_fail：终止，未查看 Warn 保持原状
 -> 最终 overall_decision=pass|fail
 -> 批次输出只投影 quality_archive/*.json
@@ -303,6 +303,16 @@ Warn on 8897 and requires `--batch-root --quality-archive --reviewer`; its
 `--sam3-model` is optional. `tools/serve_semantic_calibration.py` serves
 semantic calibration on 8898. Warn acquires its lease automatically; there is
 no manual lock-acquisition action.
+
+Warn Gate 状态合同：
+
+- `not_required`：`manual_review.state=not_required`，不写 `completion_mode`；Warn Gate 已满足，语义为 ready。
+- `all_reviewed`：`manual_review.state=completed` 且 `completion_mode=all_reviewed`；Warn Gate 已满足，语义为 ready。
+- `early_fail`：`manual_review.state=completed` 且 `completion_mode=early_fail`；资产 `pipeline_state.status=stopped`，`semantic_calibration.state=skipped_due_to_fail`。
+
+点击 Fail 立即写入当前 issue 的 `manual_review.issue_reviews[issue_id].verdict=fail`。
+人工原因预选、多选、取消或填写 Other 只更新本地草稿，不改变 issue verdict 或资产状态。
+点击“完成复核”才写资产级 `completion_mode=early_fail`，停止资产并自动跳转下一条。
 
 Machine issues remain immutable observations. Human review records verdict,
 reviewer, timestamp and evidence references alongside them; human-confirmed

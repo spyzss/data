@@ -24,8 +24,9 @@ schemas/asset_qc_report.v2.schema.json
 `metadata.supplier`，两者都缺失时写入 `"unknown"`。旧报告没有该字段时仍可读取，
 review queue 会再从报告 `metadata` fallback，最终使用 `"unknown"`。
 
-当前代码已实现 `video_quality` 的写入合同；其余模块按
-`docs/PRD-qc-gated-json.md` 接入。
+当前仓库已覆盖 `video_quality`、`sam3_containment`、Warn `manual_review`、
+`semantic_calibration` 及其 overlay 证据合同；所有模块仍按
+`docs/PRD-qc-gated-json.md` 的共同 report 约束写入。
 
 ## 2. 顶层结构
 
@@ -402,11 +403,21 @@ JSON 和浏览器 localStorage 都不是正式事实源。
 - 人工 Fail：确认该 Warn 为 fail，effective verdict 为 fail；
 - 自动 hard fail：始终保持 fail，人工 Pass 不能覆盖。
 
-Pass 总是保存时间轴当前命中的最早待复核 Warn；已判定的项允许返回修改。Fail 原因可
-预选、多选和取消，Other 必填，人工原因覆盖默认原因；选择原因本身不改变 verdict。
-Fail 只在“完成复核”时以 `early_fail` 提交。刷新页面从服务端 QC JSON 恢复状态；
+Pass 总是保存时间轴当前命中的最早待复核 Warn；已判定的项允许返回修改。点击 Fail
+立即写入当前 issue 的 Fail verdict。Fail 原因可预选、多选和取消，Other 必填，人工原因
+覆盖默认原因；选择原因本身不改变 verdict。刷新页面从服务端 QC JSON 恢复状态；
 写入必须带 lease token 和 expected revision。lease 无效返回 423；revision 过期返回
 409，复核员应刷新后重新确认，禁止覆盖新 revision。
+
+Warn Gate 状态合同：
+
+- `not_required`：`manual_review.state=not_required`，不写 `completion_mode`；Warn Gate 已满足，语义为 ready。
+- `all_reviewed`：`manual_review.state=completed` 且 `completion_mode=all_reviewed`；Warn Gate 已满足，语义为 ready。
+- `early_fail`：`manual_review.state=completed` 且 `completion_mode=early_fail`；资产 `pipeline_state.status=stopped`，`semantic_calibration.state=skipped_due_to_fail`。
+
+点击 Fail 立即写入当前 issue 的 `manual_review.issue_reviews[issue_id].verdict=fail`。
+人工原因预选、多选、取消或填写 Other 只更新本地草稿，不改变 issue verdict 或资产状态。
+点击“完成复核”才写资产级 `completion_mode=early_fail`，停止资产并自动跳转下一条。
 
 Warn 映射的每项可含以下面向操作员的安全投影：
 
@@ -425,7 +436,7 @@ Warn 映射的每项可含以下面向操作员的安全投影：
 Warn 帧范围一律为 `[start_frame, end_frame_exclusive)`，页面显示结束帧
 `end_frame_exclusive - 1`。这是 Warn UI 坐标约定，不得改写 legacy freeze 语义。
 问题卡片正文仅显示问题帧区间；同一区间的多个 Warn 逐条同时列出。Warn 名称后的“？”
-悬停时展示对应阈值，正文不显示检测分数或阈值字段。工作台使用整条视频和时间轴色块；
+悬停时展示对应阈值，正文不显示机器指标或阈值字段。工作台使用整条视频和时间轴色块；
 重叠色块在 popover 选择，点击跳转到起始帧，可拖动的播放针允许任意 seek。空间不足的
 色块仅显示颜色，不堆叠；重叠选择仍进入 popover。SAM3 仅在问题帧区间实时 overlay，
 pending/failed 只锁定对应 Warn 并可轮询/重试。视频聚焦后左右键逐帧；速率为

@@ -74,18 +74,19 @@ profile 的流转差异：
 ## 4. v2 正式流转
 
 ```text
-自动 QC Gate
+自动/SAM3 Gate
   acceptance: hard fail -> stopped/fail；不进入语义和人工质检
   supplier_evaluation: hard fail -> 记录并继续
--> semantic_consistency external
--> candidate_issue_ids 为空：manual_review=not_required
+-> candidate_issue_ids 为空：manual_review=not_required，Warn Gate 已满足、语义 ready
 -> candidate_issue_ids 非空：当前 all_candidates 策略全量写入 selected_issue_ids，manual_review=queued
+-> manual_review=all_reviewed or not_required -> semantic_consistency external
+-> manual_review=early_fail -> stopped，semantic_calibration=skipped_due_to_fail
 -> 最终 overall_decision=pass|fail
 -> 批次输出只投影 quality_archive/*.json
 ```
 
-语义校准是人工质检之前的 external 阶段，当前由人工工作台实现，后续可替换为模型
-adapter。人工 queue 状态为 `not_evaluated`、`not_required`、`required`、`queued`、
+Warn 人工复核在语义校准之前；语义仍是独立 external 阶段，后续可替换为模型 adapter。
+人工 queue 状态为 `not_evaluated`、`not_required`、`required`、`queued`、
 `in_progress`、`completed` 或 `skipped_due_to_fail`。只有累计 warn 候选进入人工队列；
 空候选不做正常 Pass 样本抽检。机器 issue 只追加人工 review 记录，不被人工 verdict
 覆盖；人工确认 fail 由聚合器单独统计。
