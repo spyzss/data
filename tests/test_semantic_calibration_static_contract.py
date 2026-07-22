@@ -20,6 +20,21 @@ def test_semantic_static_bundle_contains_no_warn_or_evidence_domain() -> None:
     assert "semantic_adapter.js" in _read("index.html")
 
 
+def test_semantic_page_contains_reviewer_video_timeline_and_text_calibration_ui() -> None:
+    html = _read("index.html")
+    adapter = _read("semantic_adapter.js")
+    app = _read("app.js")
+    assert "data-reviewer-input" in html
+    assert "data-action=\"start-calibration\"" in html
+    assert "<video" in html and "data-semantic-video" in html
+    assert "data-current-frame" in html
+    assert "timeline-track" in adapter
+    assert "semantic-text-slot" in adapter
+    assert "lease/acquire" in app
+    assert "lease/renew" in app
+    assert "lease/release" in app
+
+
 def test_semantic_node_contracts_pass() -> None:
     result = subprocess.run(
         ["node", "--test", *sorted(str(path) for path in STATIC.glob("*.test.mjs"))],

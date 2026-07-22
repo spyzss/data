@@ -109,3 +109,147 @@ test("application uses the explicit issue-id verdict endpoint", async () => {
   assert.equal(calls[0][1].expected_revision, 7);
   assert.equal(app.task.revision, 8);
 });
+
+
+test("409 conflict never overwrites the current task", async () => {
+  const app = new WorkbenchApp({
+    fetcher: async () => ({
+      ok: false,
+      status: 409,
+      json: async () => ({ error: { code: "stale_revision", message: "refresh" } }),
+    }),
+  });
+  app.applyServerTask(task);
+  app.renderStatus = () => {};
+  await assert.rejects(() => app.requestTask("asset-1"), /refresh/);
+  assert.equal(app.task.revision, 7);
+  assert.equal(app.lastError.code, "stale_revision");
+});
+
+
+test("switching assets clears the old lease", async () => {
+  const app = new WorkbenchApp({ fetcher: null });
+  app.task = task;
+  app.assetId = "asset-1";
+  app.lease = { token: "old-token" };
+  app.leaseTimer = setInterval(() => {}, 60_000);
+  app.leaseTimer.unref?.();
+  app.requestTask = async (assetId) => {
+    assert.equal(assetId, "asset-2");
+    assert.equal(app.lease, null);
+    assert.equal(app.leaseTimer, null);
+    return { asset_id: assetId };
+  };
+  await app.loadAsset("asset-2");
+});
+
+
+test("evidence degradation uses stable safe operator copy", () => {
+  const degraded = structuredClone(task);
+  degraded.evidence = [{ issue_id: "warn-1", generation_error: "clip_unavailable" }];
+  const markup = renderWarnMarkup(degraded, "warn-1");
+  assert.match(markup, /问题片段暂不可用/);
+  assert.doesNotMatch(markup, /ffmpeg|Command|\/private\//i);
+});
+
+
+test("one overlay sample failure is isolated from video and healthy samples", () => {
+  let failedImageError = null;
+  const failedSample = { hidden: false };
+  const failedImage = {
+    hidden: false,
+    closest: () => failedSample,
+    addEventListener(type, handler) { if (type === "error") failedImageError = handler; },
+  };
+  const healthySample = { hidden: false };
+  const healthyImage = { hidden: false, closest: () => healthySample, addEventListener() {} };
+  const degradation = { hidden: true, textContent: "" };
+  const root = {
+    innerHTML: "",
+    querySelectorAll(selector) {
+      if (selector === '[data-action="select-issue"]') return [];
+      if (selector === "[data-warn-overlay-sample]") return [failedImage, healthyImage];
+      return [];
+    },
+    querySelector(selector) {
+      if (selector === "[data-overlay-sample-error]") return degradation;
+      return null;
+    },
+  };
+  const sampled = structuredClone(task);
+  sampled.warn.issue_reviews = {};
+  sampled.evidence[0].overlay_images = [
+    { frame: 120, url: "/evidence/frame-120.png" },
+    { frame: 144, url: "/evidence/frame-144.png" },
+  ];
+  const video = { src: "", currentTime: -1, dataset: {}, addEventListener() {}, removeEventListener() {} };
+  const adapter = new WarnReviewAdapter({ video });
+  adapter.render(sampled, root);
+  failedImageError();
+  assert.equal(failedImage.hidden, true);
+  assert.equal(healthyImage.hidden, false);
+  assert.equal(video.src, sampled.evidence[0].clip_url);
+  assert.match(degradation.textContent, /部分骨架抽样图加载失败/);
+});
+
+
+test("missing clip clears stale video and reveals the placeholder", () => {
+  const video = {
+    src: "/old.mp4",
+    currentTime: 9,
+    dataset: {},
+    pause() {},
+    load() {},
+    removeAttribute(name) { if (name === "src") this.src = ""; },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const placeholder = { hidden: true };
+  const adapter = new WarnReviewAdapter({ video, videoPlaceholder: placeholder });
+  const noClip = structuredClone(task);
+  noClip.evidence = [];
+  adapter.task = noClip;
+  adapter.configureVideo(buildWarnIssueModel(noClip, "warn-1"));
+  assert.equal(video.src, "");
+  assert.equal(video.currentTime, 0);
+  assert.equal(placeholder.hidden, false);
+});
+
+
+test("queued candidates and empty candidates render distinct stable states", () => {
+  const queued = { task_type: "warn_review", warn: { candidate_issue_ids: ["w1"], selected_issue_ids: [] } };
+  const empty = { task_type: "warn_review", warn: { candidate_issue_ids: [], selected_issue_ids: [] } };
+  assert.match(renderWarnMarkup(queued), /data-warn-queued/);
+  assert.match(renderWarnMarkup(empty), /data-warn-empty/);
+});
+
+
+test("completion remains gated until every selected warning has a verdict", async () => {
+  const adapter = new WarnReviewAdapter({ onComplete: async () => "done" });
+  adapter.task = task;
+  await assert.rejects(() => adapter.complete(), /all selected issues/);
+  const completed = structuredClone(task);
+  completed.warn.issue_reviews["warn-2"] = { verdict: "pass" };
+  adapter.task = completed;
+  assert.equal(await adapter.complete(), "done");
+});
+
+
+test("Pass and Fail save errors remain visible to the operator", async () => {
+  const errorBox = { textContent: "" };
+  const root = {
+    querySelector(selector) {
+      if (selector === "[data-review-reason]") return { value: "reason" };
+      if (selector === ".warn-error") return errorBox;
+      return null;
+    },
+  };
+  const adapter = new WarnReviewAdapter({ onVerdict: async () => { throw new Error("save failed"); } });
+  adapter.task = task;
+  adapter.root = root;
+  adapter.selectedIssueId = "warn-2";
+  assert.equal(await adapter.submitCurrentVerdict("pass"), null);
+  assert.match(errorBox.textContent, /save failed/);
+  assert.equal(await adapter.submitCurrentVerdict("fail"), null);
+  assert.match(errorBox.textContent, /save failed/);
+});

@@ -18,6 +18,8 @@ def test_human_static_bundle_is_warn_only() -> None:
     assert "SemanticCalibration" not in source
     assert "completeSemantic" not in source
     assert "语义" not in source
+    assert "共享边界" not in source
+    assert "相邻任务之间的" not in source
     assert 'data-action="verdict-pass"' in _read("warn_adapter.js")
     assert 'data-action="verdict-fail"' in _read("warn_adapter.js")
 

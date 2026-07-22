@@ -29,6 +29,7 @@ MAX_REQUEST_BYTES = 10 * 1024 * 1024
 SEMANTIC_ROUTES = {
     "GET /api/semantic/assets",
     "GET /api/semantic/assets/{asset_id}/task",
+    "GET /api/semantic/assets/{asset_id}/video",
     "POST /api/semantic/assets/{asset_id}/lease/acquire",
     "POST /api/semantic/assets/{asset_id}/lease/renew",
     "POST /api/semantic/assets/{asset_id}/lease/release",
@@ -50,6 +51,10 @@ _MUTATIONS = {
 
 class ApiRequestError(ValueError):
     """Malformed public request."""
+
+
+class UnsupportedMediaTypeError(ApiRequestError):
+    """A state-changing route was not sent as JSON."""
 
 
 def _parts(path: str) -> tuple[str | None, str]:
@@ -77,6 +82,8 @@ def _error(exc: Exception) -> tuple[int, str, str]:
         return HTTPStatus.CONFLICT, "state_conflict", "semantic task state conflicts with this operation"
     if isinstance(exc, (KeyError, FileNotFoundError)):
         return HTTPStatus.NOT_FOUND, "not_found", "semantic asset was not found"
+    if isinstance(exc, UnsupportedMediaTypeError):
+        return HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", "Content-Type must be application/json"
     if isinstance(exc, ApiRequestError):
         return HTTPStatus.BAD_REQUEST, "bad_request", str(exc)
     if isinstance(exc, (ValueError, TypeError, json.JSONDecodeError)):
@@ -96,6 +103,9 @@ class SemanticCalibrationRequestHandler(BaseHTTPRequestHandler):
                 return
             if asset_id is not None and route == "task":
                 self._send_json({"task": self.server.application.get_task(asset_id)})
+                return
+            if asset_id is not None and route == "video":
+                self._serve_video(asset_id)
                 return
             if not urlsplit(self.path).path.startswith("/api/") and not urlsplit(self.path).path.startswith("/evidence/"):
                 if self._serve_static():
@@ -118,20 +128,21 @@ class SemanticCalibrationRequestHandler(BaseHTTPRequestHandler):
                 lease = self.server.application.acquire_lease(asset_id, reviewer, payload.get("ttl_seconds"))
                 self._send_json({"lease": jsonable(lease)})
                 return
-            if route in {"lease/renew", "lease/release"}:
+            if route == "lease/release":
+                self._require_lease_token(payload)
+                self._send_json(
+                    self.server.application.release_lease(asset_id, payload["lease_token"])
+                )
+                return
+            if route == "lease/renew":
                 self._require_write_fields(payload)
                 self._validate_revision(asset_id, payload["expected_revision"])
-                if route == "lease/renew":
-                    lease = self.server.application.renew_lease(
-                        asset_id,
-                        payload["lease_token"],
-                        payload.get("ttl_seconds"),
-                    )
-                    self._send_json({"lease": jsonable(lease)})
-                else:
-                    self._send_json(
-                        self.server.application.release_lease(asset_id, payload["lease_token"])
-                    )
+                lease = self.server.application.renew_lease(
+                    asset_id,
+                    payload["lease_token"],
+                    payload.get("ttl_seconds"),
+                )
+                self._send_json({"lease": jsonable(lease)})
                 return
             operation = _MUTATIONS.get(route)
             if operation is None:
@@ -148,6 +159,10 @@ class SemanticCalibrationRequestHandler(BaseHTTPRequestHandler):
             self._handle(exc, asset_id)
 
     def _read_json(self) -> dict[str, Any]:
+        content_type = self.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            raise UnsupportedMediaTypeError("Content-Type must be application/json")
         raw_length = self.headers.get("Content-Length")
         try:
             length = int(raw_length or "0")
@@ -165,6 +180,12 @@ class SemanticCalibrationRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(value, Mapping):
             raise ApiRequestError("payload must be a JSON object")
         return dict(value)
+
+    @staticmethod
+    def _require_lease_token(payload: Mapping[str, Any]) -> None:
+        token = payload.get("lease_token")
+        if not isinstance(token, str) or not token:
+            raise ApiRequestError("lease_token must be a non-empty string")
 
     @staticmethod
     def _require_write_fields(payload: Mapping[str, Any]) -> None:
@@ -208,6 +229,70 @@ class SemanticCalibrationRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
         return True
+
+    def _serve_video(self, asset_id: str) -> None:
+        resolver = getattr(self.server.application, "semantic_video_path", None)
+        if not callable(resolver):
+            raise KeyError(asset_id)
+        path = Path(resolver(asset_id))
+        size = path.stat().st_size
+        start = 0
+        end = max(0, size - 1)
+        partial = False
+        header = self.headers.get("Range")
+        if header:
+            if not header.startswith("bytes=") or "," in header:
+                self._send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, "invalid_range", "video range is invalid", asset_id)
+                return
+            raw_start, separator, raw_end = header[6:].partition("-")
+            try:
+                if raw_start:
+                    start = int(raw_start)
+                    end = int(raw_end) if raw_end else end
+                elif separator and raw_end:
+                    length = int(raw_end)
+                    start = max(0, size - length)
+                else:
+                    raise ValueError
+            except ValueError:
+                self._send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, "invalid_range", "video range is invalid", asset_id)
+                return
+            if start < 0 or end < start or start >= size:
+                self._send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, "invalid_range", "video range is invalid", asset_id)
+                return
+            end = min(end, size - 1)
+            partial = True
+        length = 0 if size == 0 else end - start + 1
+        with path.open("rb") as handle:
+            handle.seek(start)
+            body = handle.read(length)
+        self.send_response(HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK)
+        self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _method_not_allowed(self) -> None:
+        asset_id, _ = _parts(self.path)
+        self._send_error(
+            HTTPStatus.METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "method is not allowed for this endpoint",
+            asset_id,
+        )
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._method_not_allowed()
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._method_not_allowed()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._method_not_allowed()
 
     def _handle(self, exc: Exception, asset_id: str | None) -> None:
         status, code, message = _error(exc)

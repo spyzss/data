@@ -11,10 +11,26 @@
     <main class="semantic-shell" data-semantic-app data-reviewer="">
       <header class="semantic-header">
         <div><span class="eyebrow">人工校准工作台</span><h1>语义校准</h1></div>
-        <div class="asset-meta">当前资产 <strong data-asset-id>—</strong></div>
+        <div class="asset-meta">操作员 <strong data-reviewer-current>—</strong> · 当前资产 <strong data-asset-id>—</strong></div>
       </header>
+      <section class="reviewer-gate" data-reviewer-gate>
+        <label for="semantic-reviewer">操作员身份</label>
+        <div class="reviewer-row">
+          <input id="semantic-reviewer" data-reviewer-input autocomplete="name" placeholder="请输入姓名或工号">
+          <button type="button" data-action="start-calibration">开始校准</button>
+        </div>
+      </section>
       <p class="status" data-status>正在加载</p>
-      <section class="semantic-stage" data-semantic-stage aria-live="polite"></section>
+      <section data-workbench hidden>
+        <label class="asset-selector">语义任务
+          <select data-asset-select aria-label="选择语义任务"></select>
+        </label>
+        <section class="video-panel" aria-label="语义校准视频">
+          <video data-semantic-video controls preload="metadata"></video>
+          <div class="video-readout">当前帧 <strong data-current-frame>0</strong></div>
+        </section>
+        <section class="semantic-stage" data-semantic-stage aria-live="polite"></section>
+      </section>
     </main>
     <script type="module" src="./app.js"></script>
   </body>

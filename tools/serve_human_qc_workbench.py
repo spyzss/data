@@ -109,11 +109,9 @@ def load_contexts(batch_root: Path, quality_archive: Path) -> list[AssetContext]
             raise ValueError(f"duplicate asset_id in quality archive: {asset_id}")
         seen.add(asset_id)
         source_files = _source_files(report, root, asset_id)
-        hdf5_source = source_files.get("hdf5")
-        if isinstance(hdf5_source, dict) and isinstance(hdf5_source.get("path"), str):
-            hdf5_path = root / hdf5_source["path"]
-            if not hdf5_path.is_file():
-                raise FileNotFoundError(f"HDF5 source does not exist: {hdf5_path}")
+        # Warn review is report/evidence driven.  Preserve an opaque HDF5
+        # context path for later pipeline stages, but do not make an unrelated
+        # semantic source file a launcher precondition.
         source_range: tuple[int, int] | None = None
         raw_range = report.get("source_range")
         if isinstance(raw_range, (list, tuple)) and len(raw_range) == 2:

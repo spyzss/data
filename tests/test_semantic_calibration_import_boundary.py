@@ -92,3 +92,24 @@ def test_semantic_launcher_imports_only_semantic_and_neutral_packages() -> None:
         for module in imports
     )
     assert not any(module == "human_qc" or module.startswith("human_qc.") for module in imports)
+
+
+def test_neutral_human_state_contains_only_revision_safe_mutation_primitives() -> None:
+    human_state = (ROOT / "qc_common" / "human_state.py").read_text(encoding="utf-8")
+    tree = ast.parse(human_state)
+    public_functions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    }
+    assert public_functions == {"update_human_state"}
+
+    semantic_state = (ROOT / "semantic_calibration" / "report_state.py").read_text(
+        encoding="utf-8"
+    )
+    manual_state = (ROOT / "qc_common" / "manual_review.py").read_text(encoding="utf-8")
+    reduction = (ROOT / "qc_common" / "reduction.py").read_text(encoding="utf-8")
+    assert "def initialize_semantic_calibration" in semantic_state
+    assert "def initialize_manual_review" in manual_state
+    assert "def reduce_overall_decision" in reduction

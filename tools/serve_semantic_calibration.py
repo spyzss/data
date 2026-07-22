@@ -64,6 +64,20 @@ def _hdf5_path(report: dict[str, Any], batch_root: Path) -> Path:
     raise ValueError("semantic report does not declare an HDF5 source")
 
 
+def _video_path(report: dict[str, Any], batch_root: Path) -> Path | None:
+    sources = report.get("source_files")
+    if isinstance(sources, dict):
+        video = sources.get("video")
+        path = video.get("path") if isinstance(video, dict) else None
+        if isinstance(path, str) and path:
+            return _inside(batch_root, path, field="source_files.video.path")
+    for field in ("video_path", "primary_video_path"):
+        value = report.get(field)
+        if isinstance(value, str) and value:
+            return _inside(batch_root, value, field=field)
+    return None
+
+
 def load_semantic_assets(
     batch_root: Path,
     quality_archive: Path,
@@ -85,13 +99,17 @@ def load_semantic_assets(
         if asset_id in assets:
             raise ValueError(f"duplicate asset_id: {asset_id}")
         source = _hdf5_path(value, root)
+        video = _video_path(value, root)
+        source_files = {"hdf5": {"path": source.relative_to(root).as_posix()}}
+        if video is not None and video.is_file():
+            source_files["video"] = {"path": video.relative_to(root).as_posix()}
         assets[asset_id] = source
         reports[asset_id] = report_path.resolve()
         contexts[asset_id] = AssetContext(
             asset_id,
             root,
             report_path.resolve(),
-            {"hdf5": {"path": source.relative_to(root).as_posix()}},
+            source_files,
         )
     return assets, reports, contexts
 
