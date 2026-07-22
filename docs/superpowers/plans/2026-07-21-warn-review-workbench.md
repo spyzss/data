@@ -339,11 +339,11 @@ git commit -m "refactor(semantic): split calibration into independent service"
 - Count `unreviewed_selected_warn_issues` only for terminal, completed `early_fail` reports, after current-revision de-duplication and intersecting with current machine-Warn issues.
 - Add the metric to all formal aggregate formats; do not introduce Feishu/Lark scope.
 
-- [ ] **Step 1: Write failing early-fail aggregation and export tests**
+- [x] **Step 1: Write failing early-fail aggregation and export tests**
 
 Cover a three-selected/one-Fail early-fail report, an in-progress report that must not count as terminal unviewed, latest-revision de-duplication, invalid selected/review relations, and formal CSV/Parquet/XLSX/Markdown parity.
 
-- [ ] **Step 2: Run aggregation tests and verify Red**
+- [x] **Step 2: Run aggregation tests and verify Red**
 
 ```bash
 pytest -q tests/test_human_qc_aggregation.py tests/test_human_qc_reporting_outputs.py tests/test_qc_reporting_projection.py tests/test_qc_reporting_aggregate.py
@@ -351,15 +351,15 @@ pytest -q tests/test_human_qc_aggregation.py tests/test_human_qc_reporting_outpu
 
 Expected: FAIL because the formal projection drops selected IDs/completion mode and the aggregate/export do not publish the metric.
 
-- [ ] **Step 3: Implement formal early-fail projection and aggregate contract**
+- [x] **Step 3: Implement formal early-fail projection and aggregate contract**
 
 Keep the source-of-truth fields in the human-review row, calculate the derived count only after terminal/latest-revision gating, emit both the descriptive internal key and formal `unreviewed_selected_warn_issues` alias, and make every formal exporter require the new metric.
 
-- [ ] **Step 4: Run focused aggregation/export tests and verify Green**
+- [x] **Step 4: Run focused aggregation/export tests and verify Green**
 
 Run the Step 2 command plus any CLI entrypoint coverage added by RED. Expected: all PASS.
 
-- [ ] **Step 5: Commit Task 4A**
+- [x] **Step 5: Commit Task 4A**
 
 ```bash
 git add qc_reporting/projection.py qc_reporting/aggregate.py qc_reporting/export.py tests/test_human_qc_aggregation.py tests/test_human_qc_reporting_outputs.py tests/test_qc_reporting_entrypoints.py openspec/changes/add-human-semantic-warn-review/tasks.md
