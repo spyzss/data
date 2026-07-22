@@ -130,6 +130,22 @@ def test_launcher_accepts_explicit_model_and_bounded_overlay_inputs(
     assert args.overlay_max_ready_jobs == 8
 
 
+def test_launcher_has_a_non_none_safe_default_batch_cache_limit(tmp_path: Path) -> None:
+    args = parse_args(
+        [
+            "--batch-root",
+            str(tmp_path),
+            "--quality-archive",
+            "quality_archive",
+            "--reviewer",
+            "alice",
+        ]
+    )
+
+    assert isinstance(args.overlay_max_cache_bytes, int)
+    assert args.overlay_max_cache_bytes > 0
+
+
 def test_production_launcher_builds_one_shared_runtime_worker_and_injects_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -295,3 +311,74 @@ def test_main_closes_overlay_worker_in_finally(
 
     assert launcher.main([]) == 0
     assert events == ["server_close", "worker_shutdown"]
+
+
+def test_compatibility_service_retains_and_exposes_its_shutdown_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdown_calls: list[str] = []
+    runtime = SimpleNamespace(
+        service=SimpleNamespace(),
+        shutdown=lambda: shutdown_calls.append("shutdown"),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "build_workbench_runtime",
+        lambda **_kwargs: runtime,
+    )
+
+    service = launcher.build_workbench_service(
+        batch_root=tmp_path,
+        quality_archive=tmp_path / "quality_archive",
+        reviewer="alice",
+        sam3_model=tmp_path / "model",
+    )
+
+    assert service._workbench_runtime_owner is runtime
+    service.shutdown()
+    assert shutdown_calls == ["shutdown"]
+
+
+def test_runtime_preload_failure_shuts_down_overlay_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = SimpleNamespace(
+        asset_id="asset-1",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-1.json",
+    )
+    shutdown_calls: list[str] = []
+    overlay_runtime = SimpleNamespace(
+        provider=object(),
+        shutdown=lambda: shutdown_calls.append("shutdown"),
+    )
+    monkeypatch.setattr(launcher, "load_contexts", lambda *_args: [context])
+    monkeypatch.setattr(
+        launcher,
+        "build_production_overlay_runtime",
+        lambda **_kwargs: overlay_runtime,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "WarnReviewService",
+        lambda **_kwargs: SimpleNamespace(
+            get_task=lambda _asset_id: (_ for _ in ()).throw(RuntimeError("preload"))
+        ),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "WarnWorkbenchService",
+        lambda **_kwargs: SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="preload"):
+        launcher.build_workbench_runtime(
+            batch_root=tmp_path,
+            quality_archive=tmp_path / "quality_archive",
+            reviewer="alice",
+            sam3_model=tmp_path / "model",
+        )
+
+    assert shutdown_calls == ["shutdown"]

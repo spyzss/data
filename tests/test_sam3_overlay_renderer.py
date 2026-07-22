@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import importlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -124,6 +125,14 @@ def _renderer(
         queries=("hand", "left hand", "right hand"),
         encoder_factory=encoder_factory,
         frame_composer=lambda sample, masks: sample.frame_rgb,
+        media_probe=lambda _path: SimpleNamespace(
+            frame_count=len(observed["encoder"].frames),
+            width_px=6,
+            height_px=4,
+            fps_num=30,
+            fps_den=1,
+            codec="mpeg4",
+        ),
     )
     return renderer, frame_provider, runtime, concrete_segmenter, observed
 
@@ -181,6 +190,9 @@ def test_renderer_consumes_every_explicit_source_frame_once_and_uses_shared_runt
     assert metadata == {
         "frame_count": 62,
         "fps": 30.0,
+        "width_px": 6,
+        "height_px": 4,
+        "codec": "mpeg4",
         "first_source_frame": 120,
         "end_source_frame_exclusive": 182,
         "mapping": "explicit",
@@ -310,6 +322,320 @@ def test_request_factory_rejects_unproved_mapping_instead_of_guessing_direct_fra
         )
 
 
+@pytest.mark.parametrize("failure", ["seek_false", "wrong_position", "out_of_bounds"])
+def test_explicit_recipe_provider_rejects_untrusted_video_seek_or_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    import cv2
+
+    module = _renderer_module()
+
+    class Capture:
+        position = 0.0
+
+        @staticmethod
+        def isOpened() -> bool:
+            return True
+
+        @staticmethod
+        def release() -> None:
+            return None
+
+        def set(self, prop: int, value: float) -> bool:
+            assert prop == cv2.CAP_PROP_POS_FRAMES
+            if failure == "seek_false":
+                return False
+            self.position = float(value)
+            return True
+
+        def get(self, prop: int) -> float:
+            if prop == cv2.CAP_PROP_FRAME_COUNT:
+                return 5.0
+            if prop == cv2.CAP_PROP_POS_FRAMES:
+                if failure == "wrong_position":
+                    return self.position + 2.0
+                return self.position
+            return 0.0
+
+        def read(self):
+            self.position += 1.0
+            return True, np.zeros((4, 6, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _path: Capture())
+    video_frame = 5 if failure == "out_of_bounds" else 2
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    from qc_pipeline.artifacts import file_sha256
+
+    provider = module.ExplicitRecipeFrameProvider(
+        video_path=video_path,
+        recipe={
+            "schema_version": "sam3_overlay_input.v1",
+            "video_identity": file_sha256(video_path),
+            "source_to_video": {"10": video_frame},
+            "keypoints_2d": {"10": {"left": [[1.0, 2.0]]}},
+        },
+    )
+
+    with pytest.raises(module.OverlaySetupError, match="overlay_decode_failed"):
+        provider.read_frame(10)
+
+
+def test_runtime_rebuilds_frame_provider_when_same_asset_source_identity_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_pipeline.context import AssetContext
+    from human_qc.warn_workbench_service import FrameRangeDto, OverlayIssueInput
+
+    module = _renderer_module()
+    context = AssetContext(
+        asset_id="asset-a",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-a.json",
+        source_files={},
+        source_range=(0, 1),
+        metadata={},
+    )
+    identity = ["sha256:" + "a" * 64]
+
+    class Catalog:
+        @staticmethod
+        def source(_asset_id: str):
+            return SimpleNamespace(etag=identity[0], fps=10.0, total_frames=1)
+
+    factory_calls: list[str] = []
+
+    def frame_provider_factory(_context: object, source: object):
+        factory_calls.append(source.etag)
+        return FakeFrameProvider(mapping_identity=source.etag)
+
+    class Renderer:
+        renderer_version = "source-revalidation-test-v1"
+
+        def __init__(self, *, frame_provider: object, **_kwargs: object) -> None:
+            self.frame_provider = frame_provider
+
+        @staticmethod
+        def render_interval(
+            _request: object,
+            _start: int,
+            _end: int,
+            output_path: Path,
+        ) -> dict[str, object]:
+            output_path.write_bytes(b"mp4")
+            return {"frame_count": 1, "fps": 10.0}
+
+    monkeypatch.setattr(module, "Sam3OverlayRenderer", Renderer)
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    runtime = module.build_production_overlay_runtime(
+        contexts={"asset-a": context},
+        media_catalog=Catalog(),
+        model_path=model,
+        max_cache_bytes=1024 * 1024,
+        frame_provider_factory=frame_provider_factory,
+    )
+    selected = (OverlayIssueInput("issue", FrameRangeDto(0, 1)),)
+
+    def wait_ready() -> None:
+        import time
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            view = runtime.provider.get_asset_overlays("asset-a", selected)["issue"]
+            if view.status == "ready":
+                return
+            if view.status == "failed":
+                pytest.fail(f"unexpected failed overlay: {view.code}")
+            time.sleep(0.01)
+        pytest.fail("overlay did not become ready")
+
+    try:
+        wait_ready()
+        identity[0] = "sha256:" + "b" * 64
+        wait_ready()
+    finally:
+        runtime.shutdown()
+
+    assert factory_calls == ["sha256:" + "a" * 64, "sha256:" + "b" * 64]
+
+
+def test_explicit_recipe_provider_rejects_source_file_substitution_before_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cv2
+    from qc_pipeline.artifacts import file_sha256
+
+    module = _renderer_module()
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"original")
+    provider = module.ExplicitRecipeFrameProvider(
+        video_path=video,
+        recipe={
+            "schema_version": "sam3_overlay_input.v1",
+            "video_identity": file_sha256(video),
+            "source_to_video": {"0": 0},
+            "keypoints_2d": {"0": {"left": [[1.0, 2.0]]}},
+        },
+    )
+    video.write_bytes(b"replaced")
+    monkeypatch.setattr(
+        cv2,
+        "VideoCapture",
+        lambda _path: pytest.fail("substituted source must fail before decoder open"),
+    )
+
+    with pytest.raises(module.OverlaySetupError, match="overlay_source_unavailable"):
+        provider.read_frame(0)
+
+
+def test_model_hash_covers_all_directory_content_even_when_size_and_mtime_are_preserved(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    module = _renderer_module()
+    model = tmp_path / "model"
+    shard_dir = model / "weights"
+    shard_dir.mkdir(parents=True)
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    shard = shard_dir / "model-00001-of-00002.safetensors"
+    shard.write_bytes(b"AAAA")
+    before_stat = shard.stat()
+    before_hash = module._model_hash(model)
+
+    shard.write_bytes(b"BBBB")
+    os.utime(shard, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
+    after_stat = shard.stat()
+    after_hash = module._model_hash(model)
+
+    assert after_stat.st_size == before_stat.st_size
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+    assert after_hash != before_hash
+
+
+def test_default_encoder_output_is_probed_as_exact_decodable_mp4(tmp_path: Path) -> None:
+    from canonical_qc.video_probe import probe_video
+
+    module = _renderer_module()
+    provider = FakeFrameProvider()
+    segmenter = RecordingSegmenter()
+    renderer = module.Sam3OverlayRenderer(
+        frame_provider=provider,
+        runtime_provider=RecordingRuntimeProvider(segmenter),
+        model_path=tmp_path / "model",
+        runtime_config={"confidence_threshold": 0.5},
+        queries=("hand",),
+    )
+    request = _request(tmp_path, renderer, interval=(0, 3))
+    output = tmp_path / "real-overlay.mp4"
+
+    metadata = renderer.render_interval(request, 0, 3, output)
+    probed = probe_video(output)
+
+    assert probed.frame_count == 3
+    assert (probed.width_px, probed.height_px) == (6, 4)
+    assert probed.fps_num / probed.fps_den == pytest.approx(30.0)
+    assert probed.codec == "mpeg4"
+    assert metadata["frame_count"] == 3
+    assert metadata["width_px"] == 6
+    assert metadata["height_px"] == 4
+    assert metadata["codec"] == "mpeg4"
+
+
+def test_renderer_rejects_bad_mp4_product_after_encoder_close(tmp_path: Path) -> None:
+    module = _renderer_module()
+
+    class JunkEncoder:
+        def __init__(self, output_path: Path) -> None:
+            self.output_path = output_path
+
+        @staticmethod
+        def write(_frame: np.ndarray) -> None:
+            return None
+
+        def close(self) -> None:
+            self.output_path.write_bytes(b"not-an-mp4")
+
+    renderer = module.Sam3OverlayRenderer(
+        frame_provider=FakeFrameProvider(),
+        runtime_provider=RecordingRuntimeProvider(RecordingSegmenter()),
+        model_path=tmp_path / "model",
+        runtime_config={},
+        queries=("hand",),
+        encoder_factory=lambda path, _fps, _size: JunkEncoder(path),
+    )
+    output = tmp_path / "bad-overlay.mp4"
+
+    with pytest.raises(module.OverlayRenderError, match="overlay_encoder_failed"):
+        renderer.render_interval(
+            _request(tmp_path, renderer, interval=(0, 2)),
+            0,
+            2,
+            output,
+        )
+
+    assert not output.exists()
+
+
+def test_malformed_frame_array_maps_to_stable_decode_failure(tmp_path: Path) -> None:
+    module = _renderer_module()
+
+    class MalformedFrameProvider(FakeFrameProvider):
+        def read_frame(self, source_frame: int):
+            return module.OverlayFrame(
+                source_frame=source_frame,
+                video_frame=source_frame,
+                frame_rgb=[[[1, 2, 3]], [[4, 5]]],
+                keypoints={"left": np.asarray([[1.0, 2.0]], dtype=np.float32)},
+            )
+
+    renderer, *_ = _renderer(tmp_path, provider=MalformedFrameProvider())
+
+    with pytest.raises(module.OverlayRenderError, match="overlay_decode_failed"):
+        renderer.render_interval(
+            _request(tmp_path, renderer, interval=(0, 1)),
+            0,
+            1,
+            tmp_path / "malformed.mp4",
+        )
+
+
+def test_inline_recipe_rehydrates_from_frozen_report_context(tmp_path: Path) -> None:
+    from qc_pipeline.artifacts import file_sha256
+    from qc_pipeline.context import AssetContext
+
+    module = _renderer_module()
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    recipe = {
+        "schema_version": "sam3_overlay_input.v1",
+        "video_source": "video",
+        "video_identity": file_sha256(video),
+        "source_to_video": {"0": 0},
+        "keypoints_2d": {"0": {"left": [[1.0, 2.0]]}},
+    }
+    context = AssetContext(
+        asset_id="asset-a",
+        batch_root=tmp_path,
+        report_path=tmp_path / "quality_archive" / "asset-a.json",
+        source_files={"video": {"path": "video.mp4"}},
+        source_range=(0, 1),
+        metadata={"sam3_overlay_recipe": recipe},
+    )
+    source = SimpleNamespace(path=video, etag=file_sha256(video))
+
+    provider = module.frame_provider_from_context(context, source)
+
+    assert provider.input_identity["video"] == file_sha256(video)
+    assert provider.input_identity["keypoints"].startswith("sha256:")
+
+
 def test_production_provider_never_exposes_ready_segments_from_a_failed_multi_interval_job(
     tmp_path: Path,
 ) -> None:
@@ -353,3 +679,96 @@ def test_production_provider_never_exposes_ready_segments_from_a_failed_multi_in
         or all(segment.path is None for segment in value.segments)
         for value in values.values()
     )
+
+
+def test_production_cache_quota_is_shared_across_assets_and_keeps_asset_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_pipeline.context import AssetContext
+    from human_qc.warn_workbench_service import FrameRangeDto, OverlayIssueInput
+
+    module = _renderer_module()
+    contexts = {
+        asset_id: AssetContext(
+            asset_id=asset_id,
+            batch_root=tmp_path,
+            report_path=tmp_path / "quality_archive" / f"{asset_id}.json",
+            source_files={},
+            source_range=(0, 1),
+            metadata={},
+        )
+        for asset_id in ("asset-a", "asset-b")
+    }
+
+    class Catalog:
+        @staticmethod
+        def source(_asset_id: str):
+            return SimpleNamespace(
+                etag="sha256:" + "a" * 64,
+                fps=10.0,
+                total_frames=1,
+            )
+
+    rendered: list[tuple[str, Path]] = []
+
+    class LargeRenderer:
+        renderer_version = "shared-quota-test-v1"
+
+        def __init__(self, *, frame_provider: object, **_kwargs: object) -> None:
+            self.frame_provider = frame_provider
+
+        def render_interval(
+            self,
+            request: object,
+            _start: int,
+            _end: int,
+            output_path: Path,
+        ) -> dict[str, object]:
+            rendered.append((request.asset_id, request.cache_root))
+            output_path.write_bytes(b"x" * (1024 * 1024))
+            return {"frame_count": 1, "fps": 10.0}
+
+    monkeypatch.setattr(module, "Sam3OverlayRenderer", LargeRenderer)
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    runtime = module.build_production_overlay_runtime(
+        contexts=contexts,
+        media_catalog=Catalog(),
+        model_path=model,
+        max_cache_bytes=1024 * 1024 + 64 * 1024,
+        frame_provider_factory=lambda _context, _source: FakeFrameProvider(),
+    )
+    selected = (OverlayIssueInput("issue", FrameRangeDto(0, 1)),)
+
+    def wait_ready(asset_id: str) -> None:
+        import time
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            view = runtime.provider.get_asset_overlays(asset_id, selected)["issue"]
+            if view.status == "ready":
+                return
+            if view.status == "failed":
+                pytest.fail(f"unexpected failed overlay: {view.code}")
+            time.sleep(0.01)
+        pytest.fail("overlay did not become ready")
+
+    try:
+        wait_ready("asset-a")
+        wait_ready("asset-b")
+    finally:
+        runtime.shutdown()
+
+    shared_root = tmp_path / ".human_qc" / "overlay-cache"
+    assert rendered == [
+        ("asset-a", shared_root.resolve()),
+        ("asset-b", shared_root.resolve()),
+    ]
+    ready_manifests = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in shared_root.glob("*/manifest.json")
+        if json.loads(path.read_text(encoding="utf-8")).get("status") == "ready"
+    ]
+    assert len(ready_manifests) == 1

@@ -554,6 +554,12 @@ def test_shifted_canonical_sam3_reads_physical_frame_and_reports_logical_frame(
     assert {row["frame_idx"] for row in rows} == {0}
     assert {row["source_frame_idx"] for row in rows} == {0}
     assert result.module == "sam3_containment"
+    recipe = result.runtime["overlay_input_recipe"]
+    assert recipe["schema_version"] == "sam3_overlay_input.v1"
+    assert recipe["video_source"] == "video"
+    assert recipe["video_identity"] == f"sha256:{digest}"
+    assert recipe["source_to_video"] == {"0": 3}
+    assert set(recipe["keypoints_2d"]["0"]) == {"left", "right"}
 
 
 def test_canonical_sam3_fails_if_source_mutates_during_producer(

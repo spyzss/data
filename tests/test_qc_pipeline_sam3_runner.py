@@ -106,6 +106,40 @@ def _model_context(tmp_path: Path) -> tuple[AssetContext, Path]:
     )
 
 
+def _real_jdt_context(tmp_path: Path) -> AssetContext:
+    import pandas as pd
+
+    context = _context(tmp_path)
+    video = tmp_path / "source" / "video.mp4"
+    parquet = tmp_path / "source" / "episode.parquet"
+    write_test_video(
+        video,
+        [solid_frame(40 + index, width=48, height=32) for index in range(3)],
+        fps=10.0,
+    )
+    points = [
+        np.tile(np.asarray([[20.0 + index, 12.0]], dtype=np.float32), (21, 1))
+        for index in range(3)
+    ]
+    pd.DataFrame(
+        {
+            "leftcam_left_kp2d": [value.reshape(-1) for value in points],
+            "leftcam_right_kp2d": [value.reshape(-1) for value in points],
+        }
+    ).to_parquet(parquet, index=False)
+    manifest = dict(context.metadata["manifest_row"])
+    manifest["end_frame"] = 2
+    return replace(
+        context,
+        source_range=(0, 3),
+        metadata={
+            **dict(context.metadata),
+            "manifest_row": manifest,
+            "reuse_artifacts": False,
+        },
+    )
+
+
 def _dr_context(
     tmp_path: Path,
     *,
@@ -702,6 +736,121 @@ def test_jdt_runner_gets_segmenter_from_injected_runtime_provider(
     assert captured["segmenter"] is segmenter
 
 
+def test_jdt_runner_persists_versioned_rehydratable_overlay_recipe(
+    tmp_path: Path,
+) -> None:
+    from qc_pipeline.artifacts import file_sha256
+
+    context = _real_jdt_context(tmp_path)
+    _write_candidates(tmp_path, [_candidate(0, 2)])
+    _write_current_run_config(context, valid_frame_count=3)
+
+    result = runner(lambda: _FullMaskSegmenter())(
+        context,
+        load_qc_acceptance_config(),
+    )
+
+    recipe = result.runtime["overlay_input_recipe"]
+    assert recipe["schema_version"] == "sam3_overlay_input.v1"
+    assert recipe["video_source"] == "video"
+    assert recipe["video_identity"] == file_sha256(
+        tmp_path / "source" / "video.mp4"
+    )
+    assert recipe["source_to_video"] == {"0": 0, "1": 1, "2": 2}
+    reference = recipe["keypoints_2d_reference"]
+    assert reference == {
+        "schema_version": "parquet_columns.v1",
+        "source": "parquet",
+        "sha256": file_sha256(tmp_path / "source" / "episode.parquet"),
+        "row_mapping": "source_frame_index",
+        "fields": {
+            "left": "leftcam_left_kp2d",
+            "right": "leftcam_right_kp2d",
+        },
+    }
+    reused_context = replace(
+        context,
+        metadata={**dict(context.metadata), "reuse_artifacts": True},
+    )
+    reused = runner(lambda: pytest.fail("matching artifact must be reused"))(
+        reused_context,
+        load_qc_acceptance_config(),
+    )
+    assert reused.runtime["artifact_state"] == "reused"
+    assert reused.runtime["overlay_input_recipe"] == recipe
+
+
+def test_runner_report_rehydrates_through_launcher_and_production_worker_reaches_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from human_qc.media import MediaCatalog
+    from human_qc.warn_workbench_service import FrameRangeDto, OverlayIssueInput
+    from human_qc import sam3_overlay_renderer as overlay_module
+    from tools.serve_human_qc_workbench import load_contexts
+
+    context = _real_jdt_context(tmp_path)
+    _write_candidates(tmp_path, [_candidate(0, 2)])
+    _write_current_run_config(context, valid_frame_count=3)
+    result = runner(lambda: _FullMaskSegmenter())(
+        context,
+        load_qc_acceptance_config(),
+    )
+    context.report_path.parent.mkdir(parents=True, exist_ok=True)
+    context.report_path.write_text(
+        json.dumps(
+            {
+                "asset_id": context.asset_id,
+                "profile": "acceptance",
+                "source_files": {
+                    name: dict(value)
+                    for name, value in context.source_files.items()
+                },
+                "source_range": list(context.source_range or ()),
+                "manifest_metadata": dict(context.metadata["manifest_row"]),
+                "sam3_containment": {"runtime": dict(result.runtime)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = tmp_path / "sam3-model"
+    model.mkdir()
+    (model / "config.json").write_text("{}\n", encoding="utf-8")
+    segmenter = _FullMaskSegmenter()
+
+    class RuntimeProvider:
+        def get_segmenter(self, _path: Path, _config: dict[str, object]):
+            return segmenter
+
+    monkeypatch.setattr(overlay_module, "Sam3RuntimeProvider", RuntimeProvider)
+    loaded = load_contexts(tmp_path, context.report_path.parent)
+    by_id = {item.asset_id: item for item in loaded}
+    runtime = overlay_module.build_production_overlay_runtime(
+        contexts=by_id,
+        media_catalog=MediaCatalog(by_id),
+        model_path=model,
+        max_cache_bytes=16 * 1024 * 1024,
+    )
+    selected = (
+        OverlayIssueInput("issue-1", FrameRangeDto(0, 3)),
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            values = runtime.provider.get_asset_overlays("asset-a", selected)
+            if values["issue-1"].status in {"ready", "failed"}:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("production overlay did not become terminal")
+    finally:
+        runtime.shutdown()
+
+    assert values["issue-1"].status == "ready"
+    assert values["issue-1"].code is None
+    assert segmenter.calls == 3
+
+
 def test_full_pipeline_uses_current_precheck_artifact_not_legacy_manifest_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -935,6 +1084,87 @@ def test_validated_dr_candidates_use_hdf5_calibration_without_jdt_parquet(
     assert {row["camera_id"] for row in frame_rows} == {"main"}
     assert all("parquet_path" not in row for row in frame_rows)
     assert all(row["hdf5_path"].endswith("source/task.h5") for row in frame_rows)
+    recipe = result.runtime["overlay_input_recipe"]
+    assert recipe["schema_version"] == "sam3_overlay_input.v1"
+    assert recipe["video_source"] == "video"
+    assert recipe["source_to_video"] == {"0": 0, "1": 1, "2": 2}
+    assert set(recipe["keypoints_2d"]) == {"0", "1", "2"}
+    assert all(recipe["keypoints_2d"][str(frame)]["left"] for frame in range(3))
+
+
+def test_qy_runner_persists_only_proven_continuous_overlay_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_pipeline.runners import sam3_containment as module
+
+    base = _context(tmp_path, supplier="qy")
+    observations = tmp_path / "source" / "observations.json"
+    timebase = tmp_path / "source" / "timebase.json"
+    observations.write_text("{}", encoding="utf-8")
+    timebase.write_text("{}", encoding="utf-8")
+    context = replace(
+        base,
+        source_range=(0, 3),
+        source_files={
+            "video": {"path": "source/video.mp4"},
+            "observations_2d": {"path": "source/observations.json"},
+            "timebase": {"path": "source/timebase.json"},
+        },
+        metadata={
+            "supplier": "qy",
+            "primary_camera": "head",
+            "frame_mapping_status": "verified",
+            "reuse_artifacts": False,
+        },
+    )
+    points = np.tile(np.asarray([[10.0, 11.0]], dtype=np.float32), (21, 1))
+    inputs = module._QyContainmentInputs(
+        video_path=tmp_path / "source" / "video.mp4",
+        observations_path=observations,
+        timebase_path=timebase,
+        primary_camera="head",
+        timebase={"source_frame_count": 3, "frames": 3},
+        direct_2d={
+            (frame, side): {"video_frame": frame, "keypoints_2d": points.copy()}
+            for frame in range(3)
+            for side in ("left", "right")
+        },
+        sampled_frames={0: (0, 1, 2)},
+    )
+    monkeypatch.setattr(module, "_qy_containment_inputs", lambda *_args: inputs)
+    monkeypatch.setattr(
+        module,
+        "_run_qy_containment",
+        lambda **_kwargs: (
+            [],
+            [
+                {
+                    "asset_id": "asset-a",
+                    "window_start_frame": 0,
+                    "window_end_frame": 2,
+                    "hand_side": "left",
+                    "window_containment_verdict": "pass",
+                }
+            ],
+            [],
+            [],
+            {},
+        ),
+    )
+    _write_candidates(tmp_path, [_candidate(0, 2)])
+    _write_current_run_config(context, valid_frame_count=3)
+
+    result = module.runner(lambda: _FullMaskSegmenter())(
+        context,
+        load_qc_acceptance_config(),
+    )
+
+    recipe = result.runtime["overlay_input_recipe"]
+    assert recipe["schema_version"] == "sam3_overlay_input.v1"
+    assert recipe["video_source"] == "video"
+    assert recipe["source_to_video"] == {"0": 0, "1": 1, "2": 2}
+    assert set(recipe["keypoints_2d"]) == {"0", "1", "2"}
 
 
 @pytest.mark.parametrize(
