@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>人工复核工作台</title>
     <link rel="stylesheet" href="./workbench.css">
-    <link rel="modulepreload" href="./semantic_adapter.js">
     <link rel="modulepreload" href="./warn_adapter.js">
   </head>
   <body>
@@ -13,7 +12,7 @@
       <header class="topbar">
         <div class="brand-lockup">
           <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-          <div><span class="eyebrow">人工复核工作台</span><h1>语义与 Warn 复核</h1></div>
+          <div><span class="eyebrow">人工复核工作台</span><h1>Warn 复核</h1></div>
         </div>
         <div class="topbar-actions">
           <span class="status-dot" aria-hidden="true"></span><span data-reviewer>reviewer —</span>
@@ -50,11 +49,9 @@
         </section>
 
         <aside class="inspector-panel" aria-label="复核信息">
-          <div class="panel-heading"><span>任务信息</span><span class="task-kind" data-task-kind>Semantic</span></div>
+          <div class="panel-heading"><span>任务信息</span><span class="task-kind" data-task-kind>Warn</span></div>
           <dl class="inspector-list">
             <div><dt>编辑锁</dt><dd data-lease-status>未获取</dd></div>
-            <div><dt>时间轴修改</dt><dd data-timeline-count>0 次</dd></div>
-            <div><dt>文字修改</dt><dd data-text-count>0 次</dd></div>
           </dl>
           <div class="inspector-note" data-inspector-note>只允许拖动相邻任务之间的共享边界。每次修改先进入待确认状态。</div>
         </aside>

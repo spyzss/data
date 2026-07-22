@@ -25,7 +25,7 @@ from typing import Any
 from qc_common.manual_review import mark_semantic_skipped_due_to_fail
 from qc_common.report import load_asset_qc_report
 
-from .report_updates import reduce_overall_decision, update_human_state
+from qc_common.human_state import reduce_overall_decision, update_human_state
 from .warn_service import effective_issue_verdict
 
 

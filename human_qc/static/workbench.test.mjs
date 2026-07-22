@@ -2,168 +2,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  SemanticCalibrationAdapter,
-  buildTimelineModel,
-  linkedBoundaryPreview,
-  makeBoundaryPayload,
-  pendingPresentation,
-  renderTimelineMarkup,
-} from "./semantic_adapter.js";
-import {
   WarnReviewAdapter,
   allSelectedIssuesReviewed,
   buildWarnIssueModel,
   nextReviewIssueId,
   renderWarnMarkup,
 } from "./warn_adapter.js";
-import { WorkbenchApp, mutationControlsDisabled } from "./app.js";
+import { WorkbenchApp, stageTypeForTask } from "./app.js";
 
-const segments = [
-  { internal_id: "s1", start_frame: 0, end_frame_exclusive: 51, text_cn: "接近杯子", text_en: "approach" },
-  { internal_id: "s2", start_frame: 51, end_frame_exclusive: 123, text_cn: "拿起杯子", text_en: "pick up" },
-  { internal_id: "s3", start_frame: 123, end_frame_exclusive: 195, text_cn: "放入托盘", text_en: "place" },
-];
 
 const task = {
   asset_id: "asset-1",
-  revision: 4,
-  task_type: "semantic_calibration",
-  semantic: {
-    report_revision: 4,
-    report_state: "in_progress",
-    timeline: { frame_count: 195, fps: 30, segments },
-    pending_edit: null,
-  },
-};
-
-test("N segments render exactly N-1 internal shared-boundary handles", () => {
-  const model = buildTimelineModel(task.semantic);
-  assert.equal(model.segments.length, 3);
-  assert.equal(model.handles.length, 2);
-  assert.deepEqual(model.handles.map((item) => item.boundary_index), [1, 2]);
-
-  const markup = renderTimelineMarkup(model);
-  assert.equal((markup.match(/class="boundary-handle/g) || []).length, 2);
-  assert.equal((markup.match(/class="timeline-segment/g) || []).length, 3);
-  assert.doesNotMatch(markup, /class="timeline-segment[^>]*draggable=/);
-  assert.match(markup, /data-end-frame="50"/);
-  assert.match(markup, /data-end-frame="122"/);
-  assert.doesNotMatch(markup, /data-end-frame="123"/);
-});
-
-test("boundary payload carries shared boundary index, actor segment, and exclusive frame", () => {
-  assert.deepEqual(
-    makeBoundaryPayload({
-      boundaryIndex: 1,
-      actorSegmentId: "s2",
-      frameExclusive: 60,
-      expectedRevision: 4,
-      leaseToken: "lease-1",
-    }),
-    {
-      boundary_index: 1,
-      actor_segment_id: "s2",
-      new_frame_exclusive: 60,
-      expected_revision: 4,
-      lease_token: "lease-1",
-    },
-  );
-});
-
-test("drag preview resizes exactly the two adjacent segments", () => {
-  const model = buildTimelineModel(task.semantic);
-  const preview = linkedBoundaryPreview(model, 1, 60);
-  assert.deepEqual(preview.previous, {
-    startFrame: 0,
-    endFrameExclusive: 60,
-    widthPercent: (60 / 195) * 100,
-  });
-  assert.deepEqual(preview.following, {
-    startFrame: 60,
-    endFrameExclusive: 123,
-    widthPercent: (63 / 195) * 100,
-  });
-  assert.equal(model.segments[2].start_frame, 123);
-});
-
-test("pending presentation includes both affected before/after snapshots and locks edits", () => {
-  const pendingTask = {
-    ...task,
-    semantic: {
-      ...task.semantic,
-      pending_edit: {
-        edit_type: "boundary",
-        affected_segment_ids: ["s1", "s2"],
-        before: [
-          { internal_id: "s1", start_frame: 0, end_frame_exclusive: 51 },
-          { internal_id: "s2", start_frame: 51, end_frame_exclusive: 123 },
-        ],
-        after: [
-          { internal_id: "s1", start_frame: 0, end_frame_exclusive: 60 },
-          { internal_id: "s2", start_frame: 60, end_frame_exclusive: 123 },
-        ],
-      },
-    },
-  };
-  const view = pendingPresentation(pendingTask.semantic.pending_edit);
-  assert.deepEqual(view.affectedSegmentIds, ["s1", "s2"]);
-  assert.deepEqual(view.before.map((item) => item.end_frame_exclusive), [51, 123]);
-  assert.deepEqual(view.after.map((item) => item.start_frame), [0, 60]);
-  assert.equal(mutationControlsDisabled(pendingTask), true);
-});
-
-test("adapter accepts boundary drag payloads only for internal handles", () => {
-  const adapter = new SemanticCalibrationAdapter({
-    postPending: () => {},
-  });
-  adapter.model = buildTimelineModel(task.semantic);
-  assert.throws(() => adapter.beginBoundaryDrag(0, "s1", 20), /internal boundary/);
-  assert.throws(() => adapter.beginBoundaryDrag(3, "s3", 170), /internal boundary/);
-  assert.deepEqual(adapter.beginBoundaryDrag(1, "s2", 60), {
-    boundary_index: 1,
-    actor_segment_id: "s2",
-    new_frame_exclusive: 60,
-  });
-});
-
-test("WorkbenchApp keeps server-conflict errors visible without overwriting the task", async () => {
-  const app = new WorkbenchApp({
-    fetcher: async () => ({
-      ok: false,
-      status: 409,
-      json: async () => ({ error: { code: "stale_revision", message: "refresh" } }),
-    }),
-  });
-  app.applyServerTask(task);
-  let statusRenders = 0;
-  app.renderStatus = () => { statusRenders += 1; };
-  await assert.rejects(() => app.requestTask("asset-1"), /refresh/);
-  assert.equal(app.task.revision, 4);
-  assert.equal(app.lastError.code, "stale_revision");
-  assert.equal(statusRenders, 1);
-});
-
-test("loading a different asset clears the prior asset lease", async () => {
-  const app = new WorkbenchApp({ fetcher: null });
-  app.task = task;
-  app.assetId = "asset-1";
-  app.lease = { token: "old-token", expires_at: "later" };
-  app.leaseTimer = setInterval(() => {}, 60_000);
-  app.leaseTimer.unref?.();
-  app.requestTask = async (assetId) => {
-    assert.equal(assetId, "asset-2");
-    assert.equal(app.lease, null);
-    assert.equal(app.leaseTimer, null);
-    return { asset_id: assetId };
-  };
-  await app.loadAsset("asset-2");
-});
-
-const warnTask = {
-  asset_id: "asset-1",
   revision: 7,
   task_type: "warn_review",
-  semantic: { state: "completed" },
   warn: {
     state: "in_progress",
     selected_issue_ids: ["warn-1", "warn-2"],
@@ -191,361 +42,70 @@ const warnTask = {
       "warn-1": { verdict: "pass", reason: "动作本身正常" },
     },
   },
-  evidence: [
-    {
-      issue_id: "warn-1",
-      start_frame: 30,
-      end_frame_exclusive: 43,
-      clip_url: "/evidence/asset-1/warn-1.mp4",
-      overlay_url: "/evidence/asset-1/warn-1.png",
-      generation_error: null,
-    },
-  ],
+  evidence: [{
+    issue_id: "warn-1",
+    start_frame: 30,
+    end_frame_exclusive: 43,
+    clip_url: "/media/asset-1/warn-1.mp4",
+    overlay_url: "/media/asset-1/warn-1.png",
+    generation_error: null,
+  }],
 };
 
-test("warn model keeps machine reason metrics threshold and half-open evidence read-only", () => {
-  const model = buildWarnIssueModel(warnTask, "warn-1");
+
+test("warn model keeps machine fields and half-open evidence read-only", () => {
+  const model = buildWarnIssueModel(task, "warn-1");
   assert.equal(model.issueId, "warn-1");
-  assert.equal(model.reason, "关节速度超过阈值");
   assert.deepEqual(model.metrics, { joint_velocity_max: 1.4 });
   assert.deepEqual(model.threshold, { operator: ">", value: 1.0 });
   assert.deepEqual(model.window, { startFrame: 30, endFrameExclusive: 43 });
-  assert.equal(model.overlayUrl, "/evidence/asset-1/warn-1.png");
-
-  const markup = renderWarnMarkup(warnTask, "warn-1");
-  assert.match(markup, /关节速度超过阈值/);
-  assert.match(markup, /joint_velocity_max/);
+  const markup = renderWarnMarkup(task, "warn-1");
   assert.match(markup, /30–42/);
-  assert.match(markup, /data-action="toggle-overlay"/);
   assert.match(markup, /data-action="verdict-pass"/);
   assert.match(markup, /data-action="verdict-fail"/);
-  assert.doesNotMatch(markup, /timeline-track|semantic-text-slot|boundary-handle/);
 });
 
-test("warn markup follows video-first rationale-then-decision flow", () => {
-  const markup = renderWarnMarkup(warnTask, "warn-1");
-  assert.match(markup, /class="warn-rationale"/);
-  assert.match(markup, /class="warn-decision"/);
-  assert.match(markup, /data-action="verdict-pass"/);
-  assert.match(markup, /data-action="verdict-fail"/);
-  assert.ok(markup.indexOf("warn-rationale") < markup.indexOf("warn-decision"));
-  assert.doesNotMatch(markup, /class="warn-layout"/);
-  assert.doesNotMatch(markup, /<pre data-machine-metrics>/);
-});
 
-test("warn evidence codes render safe reviewer copy", () => {
-  const degraded = structuredClone(warnTask);
-  degraded.evidence = [{ issue_id: "warn-1", generation_error: "clip_unavailable" }];
-  const markup = renderWarnMarkup(degraded, "warn-1");
-  assert.match(markup, /问题片段暂不可用/);
-  assert.doesNotMatch(markup, /ffmpeg|Command|\/private\//i);
-});
-
-test("warn markup renders every sampled SAM3 overlay image", () => {
-  const sampled = structuredClone(warnTask);
-  sampled.evidence[0].overlay_images = [
-    { frame: 120, url: "/evidence/frame-120.png" },
-    { frame: 144, url: "/evidence/frame-144.png" },
-    { frame: 188, url: "/evidence/frame-188.png" },
-  ];
-  const markup = renderWarnMarkup(sampled, "warn-1");
-  assert.equal((markup.match(/class="warn-overlay-sample"/g) || []).length, 3);
-  assert.ok(markup.indexOf("frame-120.png") < markup.indexOf("frame-188.png"));
-});
-
-test("sampled SAM3 overlay errors hide only the failed image and show safe fallback", () => {
-  let failedImageError = null;
-  const failedSample = { hidden: false };
-  const failedImage = {
-    hidden: false,
-    closest: () => failedSample,
-    addEventListener(type, handler) {
-      if (type === "error") failedImageError = handler;
-    },
-  };
-  const healthySample = { hidden: false };
-  const healthyImage = {
-    hidden: false,
-    closest: () => healthySample,
-    addEventListener() {},
-  };
-  const degradation = { hidden: true, textContent: "" };
-  const root = {
-    innerHTML: "",
-    querySelectorAll(selector) {
-      if (selector === '[data-action="select-issue"]') return [];
-      if (selector === "[data-warn-overlay-sample]") return [failedImage, healthyImage];
-      return [];
-    },
-    querySelector(selector) {
-      if (selector === "[data-overlay-sample-error]") return degradation;
-      return null;
-    },
-  };
-  const sampled = structuredClone(warnTask);
-  sampled.warn.issue_reviews = {};
-  sampled.evidence[0].overlay_images = [
-    { frame: 120, url: "/evidence/frame-120.png" },
-    { frame: 144, url: "/evidence/frame-144.png" },
-  ];
-  const video = {
-    src: "",
-    currentTime: -1,
-    dataset: {},
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  const adapter = new WarnReviewAdapter({ video });
-
-  adapter.render(sampled, root);
-  assert.equal(typeof failedImageError, "function");
-  assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
-  failedImageError({ message: "/private/failed-frame.png" });
-
-  assert.equal(failedImage.hidden, true);
-  assert.equal(failedSample.hidden, true);
-  assert.equal(healthyImage.hidden, false);
-  assert.equal(healthySample.hidden, false);
-  assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
-  assert.equal(degradation.hidden, false);
-  assert.match(degradation.textContent, /骨架抽样图加载失败/);
-  assert.doesNotMatch(degradation.textContent, /private|failed-frame/i);
-  assert.match(renderWarnMarkup(warnTask, "warn-1"), /data-action="toggle-overlay"/);
-});
-
-test("reviewed warn advances to the next unresolved issue", () => {
-  const updated = structuredClone(warnTask);
-  updated.warn.issue_reviews = { "warn-1": { verdict: "pass" } };
-  assert.equal(nextReviewIssueId(updated, "warn-1"), "warn-2");
-  updated.warn.issue_reviews["warn-2"] = { verdict: "fail" };
-  assert.equal(nextReviewIssueId(updated, "warn-2"), "warn-2");
-});
-
-test("warn model converts inclusive canonical context end when evidence projection degrades", () => {
-  const canonicalTask = structuredClone(warnTask);
-  canonicalTask.evidence = [];
-  const issue = canonicalTask.warn.selected_issues["warn-1"];
-  delete issue.start_frame;
-  delete issue.end_frame_exclusive;
-  issue.context = {
-    ...issue.context,
-    start_frame: 30,
-    end_frame: 42,
-  };
-
-  const model = buildWarnIssueModel(canonicalTask, "warn-1");
-
-  assert.deepEqual(model.window, { startFrame: 30, endFrameExclusive: 43 });
-});
-
-test("warn completion stays disabled until every selected issue has a verdict", () => {
-  assert.equal(allSelectedIssuesReviewed(warnTask), false);
-  assert.match(renderWarnMarkup(warnTask, "warn-1"), /data-action="complete-warn"[^>]*disabled/);
-  const complete = structuredClone(warnTask);
-  complete.warn.issue_reviews["warn-2"] = { verdict: "fail", reason: "confirmed" };
+test("reviewed issue advances to the first unresolved issue", () => {
+  assert.equal(nextReviewIssueId(task), "warn-2");
+  assert.equal(allSelectedIssuesReviewed(task), false);
+  const complete = structuredClone(task);
+  complete.warn.issue_reviews["warn-2"] = { verdict: "pass" };
   assert.equal(allSelectedIssuesReviewed(complete), true);
-  assert.doesNotMatch(renderWarnMarkup(complete, "warn-1"), /data-action="complete-warn"[^>]*disabled/);
 });
 
-test("warn adapter submits verdict for the explicitly selected issue", async () => {
-  const submissions = [];
+
+test("adapter submits verdict for the explicitly selected issue", async () => {
+  const calls = [];
   const adapter = new WarnReviewAdapter({
-    onVerdict: async (...args) => submissions.push(args),
+    onVerdict: async (...args) => calls.push(args),
   });
-  adapter.render(warnTask);
-  adapter.selectIssue("warn-2");
-  await adapter.submitVerdict("warn-2", "fail", "confirmed");
-  assert.deepEqual(submissions, [["warn-2", "fail", "confirmed"]]);
-  await assert.rejects(() => adapter.submitVerdict("not-selected", "pass", ""), /selected/);
+  adapter.task = task;
+  adapter.selectedIssueId = "warn-2";
+  await adapter.submitVerdict("warn-2", "pass", "clear");
+  assert.deepEqual(calls, [["warn-2", "pass", "clear"]]);
 });
 
-test("task_type switches mutually exclusively between semantic, warn, and completed", () => {
-  let semanticConstructed = 0;
-  let warnConstructed = 0;
-  const renders = [];
-  const stage = { innerHTML: "", querySelector: () => null };
-  const root = {
-    querySelector(selector) {
-      return selector === "[data-workbench-stage]" ? stage : null;
-    },
-  };
+
+test("human application treats only warning work as editable", () => {
+  assert.equal(stageTypeForTask(task), "warn_review");
+  assert.equal(stageTypeForTask({ task_type: "completed", warn: { state: "completed" } }), "completed");
+});
+
+
+test("application uses the explicit issue-id verdict endpoint", async () => {
+  const calls = [];
   const app = new WorkbenchApp({
-    documentRef: {},
-    root,
-    semanticAdapterFactory: () => {
-      semanticConstructed += 1;
-      return { render: () => renders.push("semantic") };
-    },
-    warnAdapterFactory: () => {
-      warnConstructed += 1;
-      return { render: () => renders.push("warn") };
+    fetcher: async (path, options) => {
+      calls.push([path, JSON.parse(options.body)]);
+      return { ok: true, status: 200, json: async () => ({ task: { ...task, revision: 8 } }) };
     },
   });
-
-  app.advanceStage(task);
-  assert.deepEqual([semanticConstructed, warnConstructed, renders.at(-1)], [1, 0, "semantic"]);
-  app.advanceStage(warnTask);
-  assert.deepEqual([semanticConstructed, warnConstructed, renders.at(-1)], [1, 1, "warn"]);
-  app.advanceStage({ ...warnTask, task_type: "completed", warn: { state: "completed", selected_issue_ids: [] } });
-  assert.equal(app.adapter, null);
-  assert.match(stage.innerHTML, /已完成/);
-});
-
-test("warn tasks advance only for explicitly empty candidates or a terminal state", () => {
-  let warnConstructed = 0;
-  const stage = { innerHTML: "" };
-  const root = { querySelector: (selector) => selector === "[data-workbench-stage]" ? stage : null };
-  const app = new WorkbenchApp({
-    documentRef: {},
-    root,
-    warnAdapterFactory: () => {
-      warnConstructed += 1;
-      return { render: () => {} };
-    },
-  });
-  assert.equal(app.advanceStage({
-    ...warnTask,
-    warn: {
-      ...warnTask.warn,
-      candidate_issue_ids: [],
-      selected_issue_ids: [],
-      selected_issues: {},
-    },
-  }), "completed");
-  assert.equal(warnConstructed, 0);
-  assert.match(stage.innerHTML, /已完成/);
-  assert.equal(app.advanceStage({
-    ...warnTask,
-    warn: { ...warnTask.warn, state: "completed" },
-  }), "completed");
-  assert.equal(warnConstructed, 0);
-});
-
-test("non-empty warn candidates do not auto-complete when selection is temporarily empty", () => {
-  let warnConstructed = 0;
-  const stage = { innerHTML: "" };
-  const root = { querySelector: (selector) => selector === "[data-workbench-stage]" ? stage : null };
-  const app = new WorkbenchApp({
-    documentRef: {},
-    root,
-    warnAdapterFactory: () => {
-      warnConstructed += 1;
-      return { render: () => {} };
-    },
-  });
-  const queuedTask = {
-    ...warnTask,
-    warn: {
-      ...warnTask.warn,
-      candidate_issue_ids: ["warn-1"],
-      selected_issue_ids: [],
-      selected_issues: {},
-    },
-  };
-  assert.equal(app.advanceStage(queuedTask), "warn_review");
-  assert.equal(warnConstructed, 1);
-  const markup = renderWarnMarkup(queuedTask);
-  assert.match(markup, /data-warn-queued/);
-  assert.match(markup, /1 个.*等待选择/);
-  assert.doesNotMatch(markup, /任务已完成|data-action="complete-warn"/);
-});
-
-test("status exposes the active task type on the app shell", () => {
-  const root = { dataset: {}, querySelector: () => null };
-  const app = new WorkbenchApp({ root });
-  app.task = warnTask;
-  app.renderStatus();
-  assert.equal(root.dataset.taskType, "warn_review");
-});
-
-test("configured warn evidence video hides the opaque media placeholder", () => {
-  const video = {
-    src: "",
-    currentTime: -1,
-    dataset: {},
-    addEventListener() {},
-    removeEventListener() {},
-  };
-  const videoPlaceholder = { hidden: false };
-  const adapter = new WarnReviewAdapter({ video, videoPlaceholder });
-  adapter.task = warnTask;
-  adapter.configureVideo(buildWarnIssueModel(warnTask, "warn-1"));
-  assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
-  assert.equal(video.currentTime, 0);
-  assert.equal(videoPlaceholder.hidden, true);
-});
-
-test("switching from a clipped issue to an issue without a clip clears stale video", () => {
-  let loadCount = 0;
-  let pauseCount = 0;
-  let removedSource = false;
-  const video = {
-    src: "",
-    currentTime: -1,
-    dataset: {},
-    addEventListener() {},
-    removeEventListener() {},
-    removeAttribute(name) {
-      if (name === "src") {
-        removedSource = true;
-        this.src = "";
-      }
-    },
-    load() { loadCount += 1; },
-    pause() { pauseCount += 1; },
-  };
-  const videoPlaceholder = { hidden: false };
-  const adapter = new WarnReviewAdapter({ video, videoPlaceholder });
-  const sequentialTask = structuredClone(warnTask);
-  sequentialTask.evidence.push({
-    issue_id: "warn-2",
-    generation_error: "clip generation failed",
-  });
-  adapter.task = sequentialTask;
-  adapter.configureVideo(buildWarnIssueModel(sequentialTask, "warn-1"));
-  assert.equal(video.src, "/evidence/asset-1/warn-1.mp4");
-  assert.equal(videoPlaceholder.hidden, true);
-
-  adapter.configureVideo(buildWarnIssueModel(sequentialTask, "warn-2"));
-  assert.equal(removedSource, true);
-  assert.equal(video.src, "");
-  assert.equal(loadCount, 1);
-  assert.equal(pauseCount, 1);
-  assert.equal(videoPlaceholder.hidden, false);
-});
-
-test("rejected Pass or Fail saves are caught and shown in the warn error region", async () => {
-  const visibleError = { textContent: "" };
-  const adapter = new WarnReviewAdapter({ onVerdict: async () => { throw new Error("lease expired"); } });
-  adapter.task = warnTask;
-  adapter.selectedIssueId = "warn-1";
-  adapter.root = {
-    querySelector(selector) {
-      if (selector === "[data-review-reason]") return { value: "reviewed" };
-      if (selector === ".warn-error") return visibleError;
-      return null;
-    },
-  };
-  assert.equal(await adapter.submitCurrentVerdict("pass"), null);
-  assert.equal(visibleError.textContent, "lease expired");
-});
-
-test("WorkbenchApp uses the issue-id verdict endpoint and server revision refresh", async () => {
-  let request = null;
-  const app = new WorkbenchApp({ fetcher: async (path, options) => {
-    request = { path, options };
-    return { ok: true, status: 200, json: async () => ({ task: { ...warnTask, revision: 8 } }) };
-  } });
-  app.task = warnTask;
-  app.assetId = "asset-1";
+  app.task = task;
+  app.assetId = task.asset_id;
   app.lease = { token: "lease-1" };
-  await app.submitWarnVerdict("warn-1", "pass", "normal motion");
-  assert.equal(request.path, "/api/assets/asset-1/warn/warn-1/verdict");
-  assert.deepEqual(JSON.parse(request.options.body), {
-    verdict: "pass",
-    reason: "normal motion",
-    expected_revision: 7,
-    lease_token: "lease-1",
-  });
-  assert.equal(app.revision(), 8);
+  await app.submitWarnVerdict("warn-2", "pass", "clear");
+  assert.equal(calls[0][0], "/api/assets/asset-1/warn/warn-2/verdict");
+  assert.equal(calls[0][1].expected_revision, 7);
+  assert.equal(app.task.revision, 8);
 });

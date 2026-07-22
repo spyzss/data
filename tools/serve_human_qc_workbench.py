@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the revision-aware human semantic/warn QC workbench locally."""
+"""Serve the revision-aware Warn human-review workbench locally."""
 
 from __future__ import annotations
 
@@ -15,8 +15,7 @@ if __package__ in {None, ""}:
 
 from human_qc.evidence import EvidenceService  # noqa: E402
 from human_qc.http_server import create_http_server  # noqa: E402
-from human_qc.lease import LeaseStore  # noqa: E402
-from human_qc.semantic_service import SemanticCalibrationService  # noqa: E402
+from qc_common.reviewer_lease import LeaseStore  # noqa: E402
 from human_qc.warn_service import WarnReviewService  # noqa: E402
 from human_qc.workbench_service import WorkbenchService  # noqa: E402
 from qc_common.config import load_qc_acceptance_config  # noqa: E402
@@ -145,31 +144,21 @@ def build_workbench_service(
 ) -> WorkbenchService:
     contexts = load_contexts(batch_root, quality_archive)
     reports = {context.asset_id: context.report_path for context in contexts}
-    assets = {
-        context.asset_id: context.batch_root / source["path"]
-        for context in contexts
-        if isinstance((source := context.source_files.get("hdf5")), dict)
-        and isinstance(source.get("path"), str)
-    }
-    semantic = SemanticCalibrationService(assets=assets, reports=reports)
     warn = WarnReviewService(reports=reports)
     evidence = EvidenceService(batch_root / ".human_qc_evidence")
     config = load_qc_acceptance_config()
     service = WorkbenchService(
-        semantic,
-        warn,
-        evidence,
+        warn_service=warn,
+        evidence_service=evidence,
         lease_store=LeaseStore(),
         asset_contexts={context.asset_id: context for context in contexts},
         lease_ttl_seconds=lease_ttl_seconds,
         profile=profile,
         config=config,
     )
-    # Force report/HDF5 loading at process start so a durable ``finalizing``
-    # semantic transaction is recovered before the first browser request.
+    # Force report loading at process start so malformed review state fails
+    # before the first browser request.
     for context in contexts:
-        if context.asset_id in assets:
-            semantic.get_task(context.asset_id)
         warn.get_task(context.asset_id)
     return service
 

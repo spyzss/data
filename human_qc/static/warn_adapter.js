@@ -286,7 +286,7 @@ export class WarnReviewAdapter {
     const video = this.video;
     if (!video || !model) return;
     if (this.boundTimeUpdate) video.removeEventListener?.("timeupdate", this.boundTimeUpdate);
-    const fps = Number(this.task?.warn?.fps ?? this.task?.semantic?.timeline?.fps ?? this.task?.fps ?? 0);
+    const fps = Number(this.task?.warn?.fps ?? this.task?.fps ?? 0);
     const startFrame = model.window.startFrame;
     const endFrame = model.window.endFrameExclusive;
     if (model.clipUrl) {

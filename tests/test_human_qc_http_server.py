@@ -8,7 +8,7 @@ from threading import Thread
 import pytest
 
 from human_qc.http_server import create_http_server
-from human_qc.lease import LeaseConflictError, LeaseStore, LeaseTokenError
+from qc_common.reviewer_lease import LeaseConflictError, LeaseStore, LeaseTokenError
 from human_qc.workbench_service import WorkbenchService
 
 
@@ -91,7 +91,7 @@ def test_http_success_and_bad_payload_statuses() -> None:
         status, value = _request(server, "GET", "/api/assets/asset-1/task")
         assert status == 200 and value["task"]["revision"] == 3
         status, value = _request(server, "POST", "/api/assets/asset-1/semantic/complete", {})
-        assert status == 400 and value["error"]["code"] == "bad_request"
+        assert status == 404 and value["error"]["code"] == "not_found"
         status, value = _request(server, "GET", "/api/assets/missing/task")
         assert status == 404 and value["error"]["code"] == "not_found"
     finally:
@@ -150,14 +150,6 @@ def test_http_lease_and_mutation_delegate() -> None:
             {"expected_revision": 3, "lease_token": token, "ttl_seconds": 60},
         )
         assert status == 200 and renewed["lease"]["token"] == token
-        status, value = _request(
-            server,
-            "POST",
-            "/api/assets/asset-1/semantic/complete",
-            {"expected_revision": 3, "lease_token": token},
-        )
-        assert status == 200 and value["task"]["operation"] == "semantic_complete"
-        assert facade.calls[-1][0] == "semantic_complete"
         status, value = _request(
             server,
             "POST",

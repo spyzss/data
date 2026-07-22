@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from human_qc.contracts import BoundaryError, SubtaskSegment
-from human_qc.timeline import (
+from semantic_calibration.contracts import BoundaryError, SubtaskSegment
+from semantic_calibration.timeline import (
     SharedBoundaryTimeline,
     closed_to_half_open,
     half_open_to_closed,

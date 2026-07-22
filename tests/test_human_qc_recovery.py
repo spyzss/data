@@ -9,10 +9,11 @@ from threading import Thread
 import pytest
 
 from human_qc.evidence import EvidenceService
-from human_qc.hdf5_commit import Hdf5CommitError
-from human_qc.http_server import create_http_server
-from human_qc.lease import LeaseStore, LeaseTokenError
-from human_qc.semantic_service import (
+from semantic_calibration.application import SemanticCalibrationApplication
+from semantic_calibration.hdf5_commit import Hdf5CommitError
+from semantic_calibration.http_server import create_http_server as create_semantic_http_server
+from qc_common.reviewer_lease import LeaseStore, LeaseTokenError
+from semantic_calibration.service import (
     BoundaryEditRequest,
     SemanticCalibrationService,
     StaleSemanticRevisionError,
@@ -55,9 +56,9 @@ def _boundary_request(
     return BoundaryEditRequest(1, frame, None, revision, lease, reviewer)
 
 
-def _http_task(server, asset_id: str) -> dict:
+def _semantic_http_task(server, asset_id: str) -> dict:
     connection = HTTPConnection("127.0.0.1", server.server_port)
-    connection.request("GET", f"/api/assets/{asset_id}/task")
+    connection.request("GET", f"/api/semantic/assets/{asset_id}/task")
     response = connection.getresponse()
     body = json.loads(response.read().decode("utf-8"))
     connection.close()
@@ -79,16 +80,15 @@ def test_browser_refresh_recovers_pending_edit_from_server_report(tmp_path: Path
     first = _semantic(asset)
     pending = first.begin_boundary_edit(asset.asset_id, _boundary_request(1))
     restarted_semantic = _semantic(asset)
-    restarted = WorkbenchService(
+    restarted = SemanticCalibrationApplication(
         restarted_semantic,
-        WarnReviewService(reports={asset.asset_id: asset.report_path}),
         asset_contexts={asset.asset_id: asset.context},
     )
-    server = create_http_server("127.0.0.1", 0, restarted)
+    server = create_semantic_http_server("127.0.0.1", 0, restarted)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        browser_task = _http_task(server, asset.asset_id)
+        browser_task = _semantic_http_task(server, asset.asset_id)
     finally:
         server.shutdown()
         server.server_close()
@@ -129,19 +129,18 @@ def test_expired_workbench_lease_blocks_mutation_without_report_write(tmp_path: 
         assets={asset.asset_id: asset.hdf5_path}, reports={asset.asset_id: asset.report_path}
     )
     warn = WarnReviewService(reports={asset.asset_id: asset.report_path}, clock=lambda: NOW)
-    workbench = WorkbenchService(
+    application = SemanticCalibrationApplication(
         semantic,
-        warn,
         lease_store=LeaseStore(clock=clock),
         asset_contexts={asset.asset_id: asset.context},
     )
-    task = workbench.get_asset_task(asset.asset_id)
-    lease = workbench.acquire_lease(asset.asset_id, "alice", 1)
+    task = application.get_task(asset.asset_id)
+    lease = application.acquire_lease(asset.asset_id, "alice", 1)
     clock.advance(2)
     before = asset.report_path.read_bytes()
 
     with pytest.raises(LeaseTokenError, match="expired"):
-        workbench.semantic_boundary_pending(
+        application.begin_boundary_edit(
             asset.asset_id,
             boundary_index=1,
             new_frame_exclusive=35,
@@ -153,8 +152,6 @@ def test_expired_workbench_lease_blocks_mutation_without_report_write(tmp_path: 
 
 def test_overlay_failure_degrades_in_integrated_task_but_keeps_clip(tmp_path: Path) -> None:
     asset = build_file_asset(tmp_path, asset_id="asset-overlay", hard_fail=False)
-    semantic = _semantic(asset)
-
     def generate_clip(command, output: Path) -> None:
         output.write_bytes(b"clip")
 
@@ -167,9 +164,10 @@ def test_overlay_failure_degrades_in_integrated_task_but_keeps_clip(tmp_path: Pa
         overlay_renderer=fail_overlay,
     )
     workbench = WorkbenchService(
-        semantic,
-        WarnReviewService(reports={asset.asset_id: asset.report_path}, leases={asset.asset_id: LEASE}),
-        evidence,
+        warn_service=WarnReviewService(
+            reports={asset.asset_id: asset.report_path}, leases={asset.asset_id: LEASE}
+        ),
+        evidence_service=evidence,
         asset_contexts={asset.asset_id: asset.context},
     )
     task = workbench.get_asset_task(asset.asset_id)
@@ -183,15 +181,14 @@ def test_overlay_failure_degrades_in_integrated_task_but_keeps_clip(tmp_path: Pa
 
 def test_clip_failure_exposes_stable_code_without_internal_exception(tmp_path: Path) -> None:
     asset = build_file_asset(tmp_path, asset_id="asset-clip-error", hard_fail=False)
-    semantic = _semantic(asset)
-
     def fail_clip(*_args: object) -> None:
         raise RuntimeError(f"ffmpeg failed for {asset.video_path}")
 
     workbench = WorkbenchService(
-        semantic,
-        WarnReviewService(reports={asset.asset_id: asset.report_path}, leases={asset.asset_id: LEASE}),
-        EvidenceService(asset.root / "cache", ffmpeg_runner=fail_clip),
+        warn_service=WarnReviewService(
+            reports={asset.asset_id: asset.report_path}, leases={asset.asset_id: LEASE}
+        ),
+        evidence_service=EvidenceService(asset.root / "cache", ffmpeg_runner=fail_clip),
         asset_contexts={asset.asset_id: asset.context},
     )
     task = workbench.get_asset_task(asset.asset_id)
@@ -211,7 +208,7 @@ def test_prepare_phase_failure_leaves_original_byte_identical(
     def fail_prepare(*args, **kwargs):
         raise Hdf5CommitError("prepare failed")
 
-    monkeypatch.setattr("human_qc.semantic_service.prepare_hdf5_replacement", fail_prepare)
+    monkeypatch.setattr("semantic_calibration.service.prepare_hdf5_replacement", fail_prepare)
     with pytest.raises(Hdf5CommitError, match="prepare"):
         service.complete(asset.asset_id, expected_revision=1, lease_token=LEASE)
 
@@ -228,7 +225,7 @@ def test_replace_failure_keeps_old_bytes_then_restart_completes_and_cleans(
     before_hdf5 = asset.hdf5_path.read_bytes()
 
     monkeypatch.setattr(
-        "human_qc.semantic_service.commit_hdf5_replacement",
+        "semantic_calibration.service.commit_hdf5_replacement",
         lambda prepared: (_ for _ in ()).throw(RuntimeError("replace failed")),
     )
     with pytest.raises(RuntimeError, match="replace failed"):
@@ -252,7 +249,7 @@ def test_replace_success_report_failure_recovers_after_restart_without_artifacts
         tmp_path, asset_id="asset-report-recovery", selected_warn_ids=()
     )
     service = _semantic(asset)
-    module = __import__("human_qc.semantic_service", fromlist=["update_human_state"])
+    module = __import__("semantic_calibration.service", fromlist=["update_human_state"])
     real_update = module.update_human_state
     calls = 0
 
@@ -263,7 +260,7 @@ def test_replace_success_report_failure_recovers_after_restart_without_artifacts
             raise RuntimeError("report completion failed")
         return real_update(path, expected_revision, mutate)
 
-    monkeypatch.setattr("human_qc.semantic_service.update_human_state", fail_second_update)
+    monkeypatch.setattr("semantic_calibration.service.update_human_state", fail_second_update)
     with pytest.raises(RuntimeError, match="report completion failed"):
         service.complete(asset.asset_id, expected_revision=1, lease_token=LEASE)
     report = load_asset_qc_report(asset.report_path)
@@ -281,7 +278,7 @@ def test_unknown_current_hash_refuses_recovery_overwrite(tmp_path: Path, monkeyp
     )
     service = _semantic(asset)
     monkeypatch.setattr(
-        "human_qc.semantic_service.commit_hdf5_replacement",
+        "semantic_calibration.service.commit_hdf5_replacement",
         lambda prepared: (_ for _ in ()).throw(RuntimeError("pause before replace")),
     )
     with pytest.raises(RuntimeError, match="pause before replace"):

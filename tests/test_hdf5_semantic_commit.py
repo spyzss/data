@@ -9,7 +9,7 @@ import h5py
 import numpy as np
 import pytest
 
-from human_qc.hdf5_commit import (
+from semantic_calibration.hdf5_commit import (
     FinalizingRecord,
     Hdf5CommitError,
     PreparedReplacement,
@@ -21,7 +21,7 @@ from human_qc.hdf5_commit import (
     prepared_replacement_from_record,
     recover_hdf5_replacement,
 )
-from human_qc.source_adapters import Hdf5ScalarJsonSubtaskAdapter, encode_canonical_payload
+from semantic_calibration.source_adapters import Hdf5ScalarJsonSubtaskAdapter, encode_canonical_payload
 
 
 DATASET_PATH = "/label/subtask_label"
@@ -698,7 +698,7 @@ def test_commit_parent_directory_fsync_failure_keeps_published_new_bytes(
     source = write_complex_hdf5(tmp_path / "asset.hdf5")
     prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-dir-fsync")
     expected_new = prepared.staged_path.read_bytes()
-    import human_qc.hdf5_commit as module
+    import semantic_calibration.hdf5_commit as module
 
     monkeypatch.setattr(
         module,
@@ -735,14 +735,14 @@ def test_prepare_failure_injection_cleans_staged_and_preserves_source(
     before = source.read_bytes()
 
     if failure_point == "copy":
-        import human_qc.hdf5_commit as module
+        import semantic_calibration.hdf5_commit as module
 
         def fail_copy(*args: object, **kwargs: object) -> None:
             raise OSError("copy injected")
 
         monkeypatch.setattr(module.shutil, "copy2", fail_copy)
     elif failure_point == "write":
-        import human_qc.hdf5_commit as module
+        import semantic_calibration.hdf5_commit as module
 
         original_dump = module.json.dumps
 
@@ -753,7 +753,7 @@ def test_prepare_failure_injection_cleans_staged_and_preserves_source(
 
         monkeypatch.setattr(module.json, "dumps", fail_dump)
     elif failure_point == "h5py_write":
-        import human_qc.hdf5_commit as module
+        import semantic_calibration.hdf5_commit as module
 
         monkeypatch.setattr(
             module,
@@ -763,7 +763,7 @@ def test_prepare_failure_injection_cleans_staged_and_preserves_source(
             ),
         )
     elif failure_point == "reopen":
-        import human_qc.hdf5_commit as module
+        import semantic_calibration.hdf5_commit as module
 
         original_load = module.Hdf5ScalarJsonSubtaskAdapter.load
         calls = 0
@@ -777,7 +777,7 @@ def test_prepare_failure_injection_cleans_staged_and_preserves_source(
 
         monkeypatch.setattr(module.Hdf5ScalarJsonSubtaskAdapter, "load", fail_reopen)
     elif failure_point == "diff":
-        import human_qc.hdf5_commit as module
+        import semantic_calibration.hdf5_commit as module
 
         monkeypatch.setattr(
             module,
@@ -785,7 +785,7 @@ def test_prepare_failure_injection_cleans_staged_and_preserves_source(
             lambda *args, **kwargs: (_ for _ in ()).throw(OSError("diff injected")),
         )
     else:
-        import human_qc.hdf5_commit as module
+        import semantic_calibration.hdf5_commit as module
 
         monkeypatch.setattr(module.os, "fsync", lambda *_: (_ for _ in ()).throw(OSError("fsync injected")))
 
@@ -802,7 +802,7 @@ def test_commit_replace_failure_leaves_original_and_cleans_staged(
     source = write_complex_hdf5(tmp_path / "asset.hdf5")
     before = source.read_bytes()
     prepared = prepare_hdf5_replacement(source, DATASET_PATH, UPDATED, "tx-replace-fail")
-    import human_qc.hdf5_commit as module
+    import semantic_calibration.hdf5_commit as module
 
     monkeypatch.setattr(module.os, "replace", lambda *_: (_ for _ in ()).throw(OSError("replace injected")))
 

@@ -18,7 +18,7 @@ from typing import Any, Literal
 from qc_common.report import StaleReportRevisionError, load_asset_qc_report
 from qc_common.manual_review import mark_semantic_skipped_due_to_fail
 
-from .report_updates import reduce_overall_decision, update_human_state
+from qc_common.human_state import reduce_overall_decision, update_human_state
 
 
 class WarnServiceError(RuntimeError):

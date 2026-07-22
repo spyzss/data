@@ -2,7 +2,7 @@
 
 Supplier files use an inclusive ``start_frame``/``end_frame`` pair while the
 human-review workbench uses the shared half-open timeline from
-``human_qc.timeline``.  This module is the boundary between those formats:
+``semantic_calibration.timeline``.  This module is the boundary between those formats:
 source payloads are validated and copied on load, and review-only fields are
 never written back by the canonical encoder.
 """

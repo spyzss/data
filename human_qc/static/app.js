@@ -7,12 +7,10 @@
  * previous task is deliberately left untouched until the reviewer refreshes.
  */
 
-import { SemanticCalibrationAdapter } from "./semantic_adapter.js";
 import { WarnReviewAdapter } from "./warn_adapter.js";
 
 export function mutationControlsDisabled(task) {
-  const semantic = task?.semantic ?? task;
-  return Boolean(semantic?.pending_edit ?? task?.pending_edit);
+  return false;
 }
 
 export function stageTypeForTask(task) {
@@ -42,7 +40,6 @@ export class WorkbenchApp {
     root = null,
     reviewer = "",
     adapterFactory = null,
-    semanticAdapterFactory = null,
     warnAdapterFactory = null,
     leaseRenewIntervalMs = 240000,
     onNavigate = null,
@@ -52,10 +49,7 @@ export class WorkbenchApp {
     this.document = documentRef;
     this.root = root;
     this.reviewer = reviewer;
-    this.semanticAdapterFactory = semanticAdapterFactory
-      ?? adapterFactory
-      ?? ((options) => new SemanticCalibrationAdapter(options));
-    this.warnAdapterFactory = warnAdapterFactory ?? ((options) => new WarnReviewAdapter(options));
+    this.warnAdapterFactory = warnAdapterFactory ?? adapterFactory ?? ((options) => new WarnReviewAdapter(options));
     this.leaseRenewIntervalMs = Number(leaseRenewIntervalMs) || 0;
     this.onNavigate = onNavigate;
     this.task = null;
@@ -208,26 +202,6 @@ export class WorkbenchApp {
     return task;
   }
 
-  async submitBoundary(payload) {
-    return this.mutate(`/api/assets/${encodeURIComponent(this.assetId)}/semantic/boundary/pending`, payload);
-  }
-
-  async submitText(payload) {
-    return this.mutate(`/api/assets/${encodeURIComponent(this.assetId)}/semantic/text/pending`, payload);
-  }
-
-  async confirmPending() {
-    return this.mutate(`/api/assets/${encodeURIComponent(this.assetId)}/semantic/pending/confirm`);
-  }
-
-  async cancelPending() {
-    return this.mutate(`/api/assets/${encodeURIComponent(this.assetId)}/semantic/pending/cancel`);
-  }
-
-  async completeSemantic() {
-    return this.mutate(`/api/assets/${encodeURIComponent(this.assetId)}/semantic/complete`);
-  }
-
   async submitWarnVerdict(issueId, verdict, reason = "") {
     return this.mutate(
       `/api/assets/${encodeURIComponent(this.assetId)}/warn/${encodeURIComponent(issueId)}/verdict`,
@@ -253,17 +227,7 @@ export class WorkbenchApp {
     const stage = this.root.querySelector?.("[data-workbench-stage]");
     if (!stage) return;
     const taskType = this.adapterType ?? stageTypeForTask(task);
-    if (taskType === "semantic_calibration") {
-      this.adapter ??= this.semanticAdapterFactory({
-        postPending: (payload) => this.submitBoundary(payload),
-        onTextPending: (payload) => this.submitText(payload),
-        onConfirm: () => this.confirmPending(),
-        onCancel: () => this.cancelPending(),
-        onComplete: () => this.completeSemantic(),
-        onLockChange: (locked) => this.setMutationLock(locked),
-      });
-      this.adapter.render(task, stage);
-    } else if (taskType === "warn_review") {
+    if (taskType === "warn_review") {
       this.adapter ??= this.warnAdapterFactory({
         onVerdict: (issueId, verdict, reason) => this.submitWarnVerdict(issueId, verdict, reason),
         onComplete: () => this.completeWarn(),
@@ -293,28 +257,20 @@ export class WorkbenchApp {
     set("[data-revision]", this.task ? `revision ${this.revision()}` : "revision —");
     set("[data-reviewer]", this.reviewer || "reviewer —");
     set("[data-lease-status]", this.lease?.expires_at ? "已获取" : "未获取");
-    const timelineCount = this.task?.semantic?.timeline_edit_count;
-    const textCount = this.task?.semantic?.subtask_text_edit_count;
-    set("[data-timeline-count]", Number.isInteger(timelineCount) ? `${timelineCount} 次` : "—");
-    set("[data-text-count]", Number.isInteger(textCount) ? `${textCount} 次` : "—");
     const progress = this.root.querySelector?.("[data-progress]");
     if (progress && this.task) progress.textContent = this.task.task_type || "—";
     const taskLabels = {
-      semantic_calibration: "Semantic",
       warn_review: "Warn Review",
       completed: "Completed",
       error: "Error",
     };
     set("[data-task-kind]", taskLabels[currentTaskType] || "—");
     set("[data-stage-title]", {
-      semantic_calibration: "语义时间轴校准",
       warn_review: "Warn 复核",
       completed: "人工复核已完成",
       error: "任务处理失败",
     }[currentTaskType] || "人工复核");
-    set("[data-inspector-note]", currentTaskType === "warn_review"
-      ? "观看问题片段后选择 Pass 或 Fail；机器信息仅供参考。"
-      : "只允许拖动相邻任务之间的共享边界。每次修改先进入待确认状态。");
+    set("[data-inspector-note]", "观看问题片段后选择 Pass 或 Fail；机器信息仅供参考。");
     const error = this.root.querySelector?.("[data-save-error]");
     if (error) {
       error.textContent = this.lastError?.message || "";
