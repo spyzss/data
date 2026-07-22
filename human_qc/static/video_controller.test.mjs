@@ -193,6 +193,24 @@ test("steps one frame at a time only for a focused video root and never consumes
 });
 
 
+test("a direct video click grants frame-step focus without stealing a reason-input click", () => {
+  const { controller, root, video } = createController();
+  controller.setMedia(canonicalVideo({ total_frames: 200 }));
+
+  root.dispatch("pointerdown", { target: video });
+  const afterVideoClick = root.dispatch("keydown", { key: "ArrowRight", target: root });
+  assert.equal(afterVideoClick.defaultPrevented, true);
+  assert.equal(controller.currentFrame, 1);
+
+  root.blur();
+  const reasonInput = { tagName: "INPUT" };
+  root.dispatch("pointerdown", { target: reasonInput });
+  const afterReasonClick = root.dispatch("keydown", { key: "ArrowRight", target: root });
+  assert.equal(afterReasonClick.defaultPrevented, false);
+  assert.equal(controller.currentFrame, 1);
+});
+
+
 test("uses the exact fixed rate ladder, persists only the selected numeric rate, and keeps it across assets", () => {
   const storage = new FakeStorage();
   const { controller, video } = createController({ storage });

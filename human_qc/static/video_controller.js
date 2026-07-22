@@ -207,6 +207,11 @@ export class VideoController {
     this._listen(this.root, "blur", (event) => {
       if (event.target === this.root) this._rootOwnsFocus = false;
     });
+    this._listen(this.root, "pointerdown", (event) => {
+      // A direct click on the video region enables the intentional frame-step
+      // shortcut.  Descendant form controls keep their native focus behavior.
+      if (event.target === this.root || event.target === this.video) this.focus();
+    });
     this._listen(this.root, "keydown", (event) => this.handleKeydown(event));
   }
 
