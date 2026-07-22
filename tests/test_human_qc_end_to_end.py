@@ -12,7 +12,11 @@ import pytest
 
 from human_qc.evidence import EvidenceService
 from human_qc.semantic_service import PendingEditError, SemanticCalibrationService
-from human_qc.warn_service import WarnReviewService, WarnStateError
+from human_qc.warn_service import (
+    WarnReviewService,
+    WarnStateError,
+    reduce_overall_decision,
+)
 from human_qc.workbench_service import WorkbenchService
 from qc_common.report import load_asset_qc_report, write_asset_qc_report
 from qc_pipeline.context import AssetContext
@@ -467,6 +471,7 @@ def test_only_selected_warn_is_reviewable_and_all_pass_cannot_override_hard_fail
     assert report["pipeline_state"]["status"] == "awaiting_external"
     assert report["pipeline_state"]["next_module"] == "semantic_consistency"
     assert report["overall_decision"] is None
+    assert reduce_overall_decision(report) == "fail"
 
 
 def test_no_selected_warns_skip_manual_review_and_finish_pass(tmp_path: Path) -> None:

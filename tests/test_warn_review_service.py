@@ -351,7 +351,19 @@ def test_completed_asset_rejects_verdict_changes(tmp_path: Path) -> None:
 def test_all_reviewed_completion_writes_canonical_fields_and_semantic_handoff(
     tmp_path: Path,
 ) -> None:
-    service = _service(tmp_path)
+    report_path = _report(tmp_path)
+    report = load_asset_qc_report(report_path)
+    assert report is not None
+    report["pipeline_state"]["last_completed_module"] = "video_quality"
+    report["semantic_calibration"]["state"] = "not_started"
+    report["semantic_calibration"]["final_hdf5_sha256"] = None
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    service = WarnReviewService(
+        reports={ASSET_ID: report_path},
+        leases={ASSET_ID: LEASE},
+        reviewer="alice",
+        clock=lambda: NOW,
+    )
     reviewed = service.submit_verdict(
         ASSET_ID, "warn-1", "pass", None, expected_revision=1, lease_token=LEASE
     )
@@ -368,6 +380,8 @@ def test_all_reviewed_completion_writes_canonical_fields_and_semantic_handoff(
     assert report["manual_review"]["failure_reason"] is None
     assert report["pipeline_state"]["status"] == "awaiting_external"
     assert report["pipeline_state"]["next_module"] == "semantic_consistency"
+    assert report["pipeline_state"]["last_completed_module"] == "manual_review"
+    assert report["semantic_calibration"]["state"] == "not_started"
 
 
 def test_resubmission_audits_previous_review_and_increments_once(tmp_path: Path) -> None:
@@ -423,6 +437,107 @@ def test_resubmission_audits_previous_asset_failure_reason(tmp_path: Path) -> No
     }
 
 
+def test_new_issue_fail_audits_replaced_asset_failure_reason(tmp_path: Path) -> None:
+    service = _service(
+        tmp_path,
+        candidates=["warn-1", "warn-2"],
+        selected=["warn-1", "warn-2"],
+        issues=[_issue("warn-1"), _issue("warn-2")],
+    )
+    first_reason = {"reason_codes": ["occlusion"], "other_text": None}
+    second_reason = {"reason_codes": ["other"], "other_text": "camera blocked"}
+    first = service.submit_verdict(
+        ASSET_ID,
+        "warn-1",
+        "fail",
+        None,
+        expected_revision=1,
+        lease_token=LEASE,
+        failure_reason=first_reason,
+    )
+    service.submit_verdict(
+        ASSET_ID,
+        "warn-2",
+        "fail",
+        None,
+        expected_revision=first.report_revision,
+        lease_token=LEASE,
+        failure_reason=second_reason,
+    )
+
+    report = load_asset_qc_report(service.report_path(ASSET_ID))
+    assert report is not None
+    reason_changes = [
+        entry
+        for entry in report["manual_review"]["review_audit"]
+        if entry["action"] == "failure_reason_changed"
+    ]
+    assert reason_changes == [
+        {
+            "action": "failure_reason_changed",
+            "issue_id": "warn-2",
+            "previous_failure_reason": {
+                "mode": "manual",
+                "reason_codes": ["occlusion"],
+                "other_text": None,
+            },
+            "failure_reason": {
+                "mode": "manual",
+                "reason_codes": ["other"],
+                "other_text": "camera blocked",
+            },
+            "reviewed_at": NOW,
+        }
+    ]
+
+
+def test_complete_audits_replaced_asset_failure_reason(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    first_reason = {"reason_codes": ["occlusion"], "other_text": None}
+    final_reason = {"reason_codes": ["other"], "other_text": "final obstruction"}
+    reviewed = service.submit_verdict(
+        ASSET_ID,
+        "warn-1",
+        "fail",
+        None,
+        expected_revision=1,
+        lease_token=LEASE,
+        failure_reason=first_reason,
+    )
+    service.complete(
+        ASSET_ID,
+        expected_revision=reviewed.report_revision,
+        lease_token=LEASE,
+        completion_mode="early_fail",
+        failure_reason=final_reason,
+    )
+
+    report = load_asset_qc_report(service.report_path(ASSET_ID))
+    assert report is not None
+    reason_changes = [
+        entry
+        for entry in report["manual_review"]["review_audit"]
+        if entry["action"] == "failure_reason_changed"
+    ]
+    assert reason_changes == [
+        {
+            "action": "failure_reason_changed",
+            "issue_id": None,
+            "previous_failure_reason": {
+                "mode": "manual",
+                "reason_codes": ["occlusion"],
+                "other_text": None,
+            },
+            "failure_reason": {
+                "mode": "manual",
+                "reason_codes": ["other"],
+                "other_text": "final obstruction",
+            },
+            "reviewed_at": NOW,
+        }
+    ]
+
+
 @pytest.mark.parametrize("issue_id", ["unknown", "candidate-not-selected"])
 def test_unknown_or_unselected_issue_is_rejected_without_write(
     tmp_path: Path, issue_id: str
@@ -448,6 +563,23 @@ def test_no_selected_candidates_are_not_required(tmp_path: Path) -> None:
     assert completed.state == "not_required"
     assert completed.pipeline_state == "completed"
     assert completed.overall_decision == "pass"
+
+
+def test_no_selected_candidates_reject_explicit_completion_mode(tmp_path: Path) -> None:
+    service = _service(tmp_path, candidates=["warn-1"], selected=[])
+
+    with pytest.raises(WarnStateError, match="not_required|completion_mode"):
+        service.complete(
+            ASSET_ID,
+            expected_revision=1,
+            lease_token=LEASE,
+            completion_mode="all_reviewed",
+        )
+
+    report = load_asset_qc_report(service.report_path(ASSET_ID))
+    assert report is not None
+    assert report["report_revision"] == 1
+    assert report["manual_review"]["state"] == "not_evaluated"
 
 
 def test_terminal_warn_completion_is_rejected(tmp_path: Path) -> None:

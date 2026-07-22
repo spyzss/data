@@ -287,12 +287,36 @@ class WarnReviewService:
         )
 
     @staticmethod
-    def _assert_semantic_ready(report: Mapping[str, Any]) -> None:
+    def _assert_semantic_handoff_available(report: Mapping[str, Any]) -> None:
         semantic = report.get("semantic_calibration")
-        if not isinstance(semantic, Mapping) or semantic.get("state") != "completed":
-            raise WarnStateError("semantic calibration must be completed before warn review")
+        if not isinstance(semantic, Mapping):
+            raise WarnStateError("semantic_calibration block is missing")
         if semantic.get("pending_edit") is not None:
             raise WarnStateError("semantic calibration has a pending edit")
+
+    @staticmethod
+    def _audit_failure_reason_change(
+        block: dict[str, Any],
+        failure_reason: FailureReason | None,
+        *,
+        issue_id: str | None,
+        reviewed_at: str,
+    ) -> None:
+        previous = block.get("failure_reason")
+        if previous is None or previous == failure_reason:
+            return
+        audit = block.setdefault("review_audit", [])
+        if not isinstance(audit, list):
+            raise WarnStateError("manual_review.review_audit must be a list")
+        audit.append(
+            {
+                "action": "failure_reason_changed",
+                "issue_id": issue_id,
+                "previous_failure_reason": deepcopy(previous),
+                "failure_reason": deepcopy(failure_reason),
+                "reviewed_at": reviewed_at,
+            }
+        )
 
     @classmethod
     def _assert_manual_cursor(cls, report: Mapping[str, Any]) -> None:
@@ -331,7 +355,7 @@ class WarnReviewService:
         manual, candidates, selected = self._ids(report)
         if manual.get("state") in {"completed", "not_required", "skipped_due_to_fail"}:
             raise WarnStateError("warn review is in a terminal state")
-        self._assert_semantic_ready(report)
+        self._assert_semantic_handoff_available(report)
         self._assert_manual_cursor(report)
         issue_id = _non_empty(issue_id, "issue_id")
         if issue_id not in candidates:
@@ -393,6 +417,12 @@ class WarnReviewService:
                 )
             reviews[issue_id] = deepcopy(review)
             if verdict == "fail":
+                self._audit_failure_reason_change(
+                    block,
+                    normalized_failure_reason,
+                    issue_id=issue_id,
+                    reviewed_at=reviewed_at,
+                )
                 block["failure_reason"] = deepcopy(normalized_failure_reason)
             elif not any(
                 isinstance(item, Mapping) and item.get("verdict") == "fail"
@@ -424,7 +454,7 @@ class WarnReviewService:
         state = str(manual.get("state", "not_evaluated"))
         if state in {"completed", "not_required", "skipped_due_to_fail"}:
             raise WarnStateError("warn review is already completed")
-        self._assert_semantic_ready(report)
+        self._assert_semantic_handoff_available(report)
         self._assert_manual_cursor(report)
         reviews = manual.get("issue_reviews", {})
         if not isinstance(reviews, Mapping):
@@ -478,12 +508,23 @@ class WarnReviewService:
                 block["state"] = "completed"
                 block["completed_at"] = completed_at
                 block["completion_mode"] = actual_mode
-                block["failure_reason"] = (
+                final_failure_reason = (
                     deepcopy(normalized_failure_reason)
                     if actual_mode == "early_fail"
                     else None
                 )
+                self._audit_failure_reason_change(
+                    block,
+                    final_failure_reason,
+                    issue_id=None,
+                    reviewed_at=completed_at,
+                )
+                block["failure_reason"] = final_failure_reason
             else:
+                if completion_mode is not None:
+                    raise WarnStateError(
+                        "completion_mode is invalid when manual review is not_required"
+                    )
                 actual_mode = None
                 block["state"] = "not_required"
                 block["required"] = False
