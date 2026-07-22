@@ -105,8 +105,7 @@ python tools/serve_human_qc_workbench.py \
   --sam3-model /path/to/sam3-model
 ```
 
-不需要 SAM3 overlay 时省略 `--sam3-model`。语义校准服务独立运行在 8898 端口；Warn
-完成为 `all_reviewed` 后才可进入语义，不通过 Warn 页面启动或代替语义校准。
+不需要 SAM3 overlay 时省略 `--sam3-model`。语义校准服务独立运行在 8898 端口；Warn `all_reviewed` 或 `not_required` 后才可进入语义，不通过 Warn 页面启动或代替语义校准。
 
 ## 4. 冲突与恢复
 

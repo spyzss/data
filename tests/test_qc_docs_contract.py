@@ -46,6 +46,8 @@ def test_prd_publishes_precise_warn_gate_and_fail_contract() -> None:
     text = _text(PRD)
     _assert_warn_gate_contract(text)
     assert "自动/SAM3 → Warn 人工复核 → 语义" in text
+    assert "Warn `all_reviewed` 或 `not_required` 后按配置执行" in text
+    assert "Warn `all_reviewed` 后按配置执行" not in text
     assert "manual_review.reviews[]" in text
     assert "正文不显示机器指标或阈值字段" in text
 
@@ -53,6 +55,8 @@ def test_prd_publishes_precise_warn_gate_and_fail_contract() -> None:
 def test_reviewer_guide_publishes_precise_warn_gate_and_fail_contract() -> None:
     text = _text(REVIEWER_GUIDE)
     _assert_warn_gate_contract(text)
+    assert "Warn `all_reviewed` 或 `not_required` 后才可进入语义" in text
+    assert "Warn\n完成为 `all_reviewed` 后才可进入语义" not in text
     assert "整条视频" in text
     assert "popover" in text
     assert "短片" not in text

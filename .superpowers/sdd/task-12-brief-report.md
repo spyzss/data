@@ -56,7 +56,7 @@ node --test human_qc/static/*.test.mjs semantic_calibration/static/*.test.mjs
 # 79 passed
 
 .venv/bin/python -m pytest -q
-# 1903 passed, 1 skipped in 123.02s
+# 1903 passed, 1 skipped in 122.53s
 
 if rg -n "获取编辑锁|语义与 Warn 复核|[+-]1 帧|machine score" \
   human_qc/static docs/reviewer-guide.md; then exit 1; fi
@@ -79,3 +79,10 @@ git diff --check
 预检的 `/evidence/` 文字扫描在 `human_qc/http_server.py:261` 命中的是未知请求的静态
 文件 fallback 排除条件，并非暴露的旧 evidence route；经路由分支核验后按 false positive
 记录，不改动产品源码。
+
+## 最终窄修复
+
+最终复审发现两处“仅 `all_reviewed`”的遗漏：PRD 的 `supplier_evaluation` profile 表和
+操作员指南的 8898 启动说明。先为两份文档加入精确正向/负向断言并观察 2 项 RED；随后
+两处统一为 `all_reviewed` **或** `not_required` 后进入语义。该修改不触及产品逻辑、CLI
+帮助或协调器的 OpenSpec 计划文件。

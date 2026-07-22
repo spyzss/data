@@ -24,7 +24,7 @@ revision 加一；过期 revision 返回 409，lease 冲突或过期返回 423�
 | Profile | 自动 hard fail | Warn 复核 | 语义校准 | 最终结论 |
 |---|---|---|---|---|
 | `acceptance` | 立即停止 | 不创建 | 不创建 | fail |
-| `supplier_evaluation` | 保留机器 fail 并继续 | 先复核适用 warn | Warn `all_reviewed` 后按配置执行 | 仍为 fail，人工 Pass 不得覆盖机器 fail |
+| `supplier_evaluation` | 保留机器 fail 并继续 | 先复核适用 warn | Warn `all_reviewed` 或 `not_required` 后按配置执行 | 仍为 fail，人工 Pass 不得覆盖机器 fail |
 
 没有 machine warn 候选时，Warn 阶段不创建逐 issue 判定；它以 `not_required` 满足
 Warn Gate，语义阶段随即可执行。
