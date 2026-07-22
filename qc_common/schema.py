@@ -193,8 +193,8 @@ def _validate_semantic_calibration(block: Mapping[str, Any]) -> None:
 def _validate_manual_review(block: Mapping[str, Any]) -> None:
     state = block.get("state")
     # Reports produced by the automatic pipeline before a human task is
-    # created retain the legacy not_evaluated shape.  Once a human state or any
-    # of the new fields appears, the complete review sub-contract applies.
+    # created retain the legacy not_evaluated shape. Once a completed state or
+    # any of the new fields appears, the complete review sub-contract applies.
     human_fields = {
         "selected_issue_ids",
         "selected_issue_id",
@@ -206,7 +206,7 @@ def _validate_manual_review(block: Mapping[str, Any]) -> None:
         # publisher validates its stronger record semantics separately.
         return
     legacy_completed = state == "completed" and "completion_mode" not in block
-    is_human_block = bool(human_fields.intersection(block))
+    is_human_block = state == "completed" or bool(human_fields.intersection(block))
     if not is_human_block:
         return
 
