@@ -25,17 +25,17 @@
 批次 manifest 的显式 identity
   -> Source Gate（配置、路径、Adapter、Canonical 合同）
   -> 自动 QC pipeline
-  -> semantic_consistency（external）
-  -> semantic_calibration（external）
-  -> warn manual review（仅有 warn 时）
+  -> warn manual review（仅有 warn 时；无候选为 not_required）
+  -> semantic_consistency / 独立 semantic_calibration（external）
   -> final asset_qc_report.v2
   -> LeRobotV3Publisher 前置校验
   -> staging 写入和独立回读
   -> 原子 release commit / CURRENT.json
 ```
 
-自动 QC 确定性 fail 不进入语义校准；自动阶段全部 pass 且没有 warn 时，在人工语义
-阶段完成后不进入 warn 人工质检。供应商测评 profile 继续运行已启用模块，但不改变
+自动 QC 确定性 fail 不进入人工或语义阶段；没有 warn 时人工阶段为 `not_required`
+并直接进入语义校准。人工任一 Fail 终止资产，不进入语义。供应商测评 profile
+继续运行已启用模块，但不改变
 Source Gate、报告 schema 或 Publisher 的 fail-closed 合同。
 
 ## 3. 合同对账

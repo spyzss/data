@@ -18,23 +18,24 @@
 - [x] 3.3 实现所有候选完成检查、全 Pass 跳过人工质检和最终二元结论
 - [x] 3.4 验证 supplier_evaluation 中自动 hard fail 不被人工 warn Pass 覆盖
 
-## 4. 共用工作台
+## 4. 独立工作台边界
 
-- [x] 4.1 建立共用资产导航、视频播放器、reviewer、revision 和保存错误外壳
-- [x] 4.2 实现只显示视频/字幕/共享边界手柄/subtask 编辑器的 SemanticCalibrationAdapter，禁止整段平移并同时展示两段联动差异
-- [x] 4.3 实现只显示问题片段/overlay、warn 原因和 Pass/Fail 的 WarnReviewAdapter
-- [x] 4.4 在共享边界或文字 pending edit 存在时锁定其他边界、文字、模式切换、完成样本和下一资产操作
-- [x] 4.5 实现问题窗口短片播放与 21 点骨骼 overlay 按需生成/缓存
+- [x] 4.1 建立独立 `semantic_calibration` package、application facade、HTTP server、静态页面和启动入口
+- [x] 4.2 语义 server 只暴露 `/api/semantic/...`，根地址自动加载首条待办并支持 asset 深链
+- [x] 4.3 移除 human_qc 对语义 service/adapter/路由的托管，两个领域包只共享 QC JSON 合同
+- [x] 4.4 实现只显示视频/字幕/共享边界手柄/subtask 编辑器的语义页面，禁止整段平移并同时展示两段联动差异
+- [x] 4.5 在共享边界或文字 pending edit 存在时锁定其他边界、文字、资产切换和完成操作
 
 ## 5. Profile 路由与迁移
 
-- [x] 5.1 接入 acceptance profile，使自动 hard fail 数据不创建语义或人工任务
-- [x] 5.2 接入 supplier_evaluation profile，使自动 fail 数据继续语义和适用的 warn 人工质检
+- [x] 5.1 接入 acceptance profile，使自动 hard fail 数据不创建人工或语义任务
+- [x] 5.2 接入 supplier_evaluation profile，使机器自动 fail 数据继续适用的 warn 人工质检，并在人工 Pass/not_required 后继续语义
 - [x] 5.3 提供遗留 manual CSV/progress JSON 的一次性导入，但禁止其成为最终事实源
+- [x] 5.4 人工全 Pass/not_required 原子推进语义，人工 early-fail 终止并阻止语义读取/写入
 
 ## 6. 文档与端到端验证
 
-- [x] 6.1 同步 PRD、JSON 格式文档和人工操作说明中的串行流程及逐次确认规则
+- [x] 6.1 同步 README、独立语义操作指南、PRD、JSON 格式、迁移、人工操作和 OpenSpec
 - [x] 6.2 测试全 Pass 跳过人工质检、warn 人工 Pass、warn 人工 Fail 和多 warn 未完成四类流程
 - [x] 6.3 测试浏览器刷新、并发 reviewer stale revision、overlay 生成失败和 HDF5 原子写入失败
 - [x] 6.4 运行全量测试并验证每份最终 QC JSON 可独立生成资产质量报告

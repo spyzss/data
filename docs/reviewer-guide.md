@@ -1,13 +1,18 @@
-# 人工 QC 工作台操作指南
+# 人工质检与独立语义校准操作指南
 
 ## 1. 工作顺序
 
-每个资产按服务端状态串行处理：自动 QC → 语义校准 → Warn 复核。页面只显示
-当前可执行阶段；任务状态、编辑计数和最终结论都以
+每个资产按服务端状态串行处理：自动 QC → Warn 人工质检 → 独立语义校准。
+人工质检和语义校准不再共用工作台、HTTP server 或前端资源；当前应用只显示
+自己的可执行阶段。任务状态、编辑计数和最终结论都以
 `quality_archive/<asset_id>.json` 为准。
 
-开始工作前填写 reviewer 并获取资产 lease。lease 期间其他 reviewer 不能修改
-同一资产。页面刷新不会丢失已确认或 pending 的服务端状态。
+人工质检全部 Pass 后才进入语义校准；任一人工 Fail 使用 `early_fail` 终止资产，
+不得进入语义校准。没有 Warn 候选时 `manual_review=not_required`，可直接进入语义。
+
+语义工作台启动和 API 见 `docs/semantic-calibration-workbench.md`。开始语义工作前
+填写 reviewer 并取得资产 lease。lease 期间其他 reviewer 不能修改同一资产。
+页面刷新不会丢失已确认或 pending 的服务端状态。
 
 ## 2. 语义校准
 
@@ -23,7 +28,7 @@
 HDF5 的闭区间结束帧显示为 `end - 1`。例如内部 `[241, 429)` 显示为帧
 241–428。
 
-一次只能存在一个 pending edit。pending 期间其他边界、文字输入、模式切换、
+一次只能存在一个 pending edit。pending 期间其他边界、文字输入、资产切换、
 完成样本和下一资产全部锁定：
 
 - “确认并原子写入”会一次性确认两段联动，只增加一次时间轴修改计数；

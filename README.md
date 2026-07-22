@@ -18,6 +18,7 @@ annotation outputs -> annotation_verify
 - `precheck/`：数据可信度、HDF5 文本字段、`quality_hand`、骨骼点 existence/morphology/temporal 与 candidate-window 生成；不加载视觉模型。
 - `annotation/`：视觉标注，包含 discovery、SAM3 segmentation、DA3 depth、storage、annotation QC。
 - `annotation_verify/`：语义一致性验证契约，目前 VLM 仍是 stub。
+- `semantic_calibration/`：独立的人工语义校准前后端，只处理 subtask 共享边界和文字修订。
 - `qc_common/`：共享契约、schema、keypoint topology、registry 和纯工具。
 
 主接口文档见 [WORKFLOW_INTERFACE.md](WORKFLOW_INTERFACE.md)。
@@ -90,7 +91,21 @@ DR 与 Potentia 的 `supplier_evaluation` 通过独立 `supplier_data_audit` pro
 
 云端小样本构建、pipeline、projection overlay 和状态审计命令见 `docs/dr_potentia_supplier_evaluation_cloud_smoke_zh.md`。
 
-### 4. Annotation
+### 4. 独立语义校准工作台
+
+人工质检完成或被标记为 `not_required` 后，使用独立语义服务：
+
+```bash
+.venv/bin/python tools/serve_semantic_calibration.py \
+  --batch-root /path/to/qc_run \
+  --quality-archive quality_archive \
+  --port 8898
+```
+
+浏览器打开 `http://127.0.0.1:8898/`。完整门禁、API 和操作说明见
+[`docs/semantic-calibration-workbench.md`](docs/semantic-calibration-workbench.md)。
+
+### 5. Annotation
 
 ```bash
 python run_annotate.py configs/anygrasp_full.yaml
@@ -107,7 +122,7 @@ sampling_manifest.parquet
 qc/*.png
 ```
 
-### 5. Annotation verification
+### 6. Annotation verification
 
 ```bash
 python run_annotation_verify.py configs/annotation_verify_example.yaml

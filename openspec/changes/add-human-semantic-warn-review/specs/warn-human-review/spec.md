@@ -1,12 +1,12 @@
 ## ADDED Requirements
 
 ### Requirement: 人工质检只处理累计 Warn
-warn 人工质检 SHALL 只为自动模块写入且被路由选中的 warn issue 创建任务。自动检查全部 Pass 且语义校准完成、候选集合为空时，系统 MUST 跳过人工质检并继续形成最终 Pass；本次不得抽取正常样本额外送审。
+warn 人工质检 SHALL 只为自动模块写入且被路由选中的 warn issue 创建任务。自动检查候选集合为空时，系统 MUST 将人工质检标记为 `not_required` 并推进到语义校准；本次不得抽取正常样本额外送审。
 
 #### Scenario: 全部自动检查 Pass
-- **WHEN** 资产没有自动 hard fail且 warn 候选集合为空，语义校准已完成
+- **WHEN** 资产没有自动 hard fail且 warn 候选集合为空
 - **THEN** manual review 标记为 not_required
-- **THEN** 资产无需人工 Pass/Fail 即可进入最终完成流程
+- **THEN** 资产无需人工 Pass/Fail 即可进入语义校准
 
 ### Requirement: 当前默认全量选择机器候选
 系统 SHALL 保留 `candidate_issue_ids` 作为完整机器候选池，并将
@@ -16,7 +16,7 @@ selection MUST NOT 被覆盖。未来抽样、风险或预算策略 MAY 替换�
 MUST NOT 删除或改写候选池。
 
 #### Scenario: 非空候选进入人工复核
-- **WHEN** 语义阶段完成且有两个 machine warn candidates，当前 selection 为空
+- **WHEN** 自动阶段完成且有两个 machine warn candidates，当前 selection 为空
 - **THEN** 两个 candidate ID 都写入 `selected_issue_ids`
 - **THEN** `selection_policy` 为 `all_candidates`
 - **THEN** `candidate_issue_ids` 保持不变

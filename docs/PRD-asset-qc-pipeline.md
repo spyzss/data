@@ -10,8 +10,10 @@ Parquet、review queue、overlay 和浏览器缓存都是从 QC JSON 派生的�
 ## 2. 串行流程
 
 1. 自动模块生成不可变机器 issue，severity 为 warn 或 fail。
-2. 适用时进入 `semantic_calibration`，只校准 subtask 共享边界和中英文文字。
-3. 语义完成后进入 `manual_review`，逐条判定 selected machine warn。
+2. 进入 `manual_review`：有候选时逐条判定 selected machine warn；无候选时标记
+   `not_required`。
+3. 人工全部 Pass 或 `not_required` 后进入独立 `semantic_calibration`，只校准
+   subtask 共享边界和中英文文字；任一人工 Fail 直接终止资产。
 4. 全部适用阶段完成后，`overall_decision` 只能是 pass 或 fail；运行中、等待人工
    或错误状态必须为 null。
 
@@ -20,12 +22,12 @@ revision 加一；过期 revision 返回 409，lease 冲突或过期返回 423�
 
 ## 3. Profile 规则
 
-| Profile | 自动 hard fail | 语义校准 | Warn 复核 | 最终结论 |
+| Profile | 自动 hard fail | Warn 复核 | 语义校准 | 最终结论 |
 |---|---|---|---|---|
 | `acceptance` | 立即停止 | 不创建 | 不创建 | fail |
-| `supplier_evaluation` | 保留机器 fail 并继续 | 按配置执行 | 复核适用 warn | 仍为 fail，人工 Pass 不得覆盖机器 fail |
+| `supplier_evaluation` | 保留机器 fail 并继续 | 复核适用 warn | 人工 Pass/not_required 后执行 | 仍为 fail，人工 Pass 不得覆盖机器 fail |
 
-没有 machine warn 候选时，Warn 阶段标记 `not_required` 并完成为 pass。
+没有 machine warn 候选时，Warn 阶段标记 `not_required` 并继续语义校准。
 
 ## 4. 语义校准合同
 

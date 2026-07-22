@@ -209,7 +209,8 @@ profile/policy，禁止删字段后重试。跨批次检索索引与人工 revis
 ## 6. 故障处理
 
 - input/timebase fail：修正供应商字段或显式 episode selector，不降低 tolerance 猜测。
-- `awaiting_external`：在人工工作台完成语义校准/Warn review，再从同一 report resume。
+- `awaiting_external`：先在人工质检服务完成 Warn review，再在独立语义工作台完成
+  semantic calibration；每阶段都从同一 report resume。
 - runtime：保留 report/runtime_errors，修复依赖后 `--resume`。
 - `source_integrity_error`：按 JSON 的 `retryable` 区分；临时 I/O 可重试，确定性的
   缺失、格式损坏、size/hash 漂移必须修复输入，禁止无限重试。

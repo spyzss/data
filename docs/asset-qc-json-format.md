@@ -325,11 +325,19 @@ module.thresholds
 
 ## 6. 人工串行阶段
 
-正式顺序是自动 QC → `semantic_calibration` → `manual_review`。两个人工阶段
-复用同一份 QC JSON、同一 `report_revision` 与单资产 lease；CSV、progress JSON
-和浏览器 localStorage 都不是正式事实源。
+正式顺序是自动 QC → `manual_review` → `semantic_calibration`。两个阶段只共享
+QC JSON 和 `report_revision` 状态合同，不共用工作台、HTTP server、前端组件或
+lease 实例；CSV、progress JSON 和浏览器 localStorage 都不是正式事实源。
 
-### 6.1 `semantic_calibration`
+### 6.1 `manual_review`
+
+自动模块先累计 `candidate_issue_ids`。候选为空时写 `state=not_required` 并推进
+语义；候选非空时当前 `all_candidates` 策略全量快照到 `selected_issue_ids`。
+所有 selected issue 均 Pass 时使用 `completion_mode=all_reviewed` 推进语义；任一
+Fail 使用 `completion_mode=early_fail`，流水线停止并将语义标记为
+`skipped_due_to_fail`。
+
+### 6.2 `semantic_calibration`
 
 语义时间轴内部采用共享边界 `b_0...b_n` 和半开区间
 `[start_frame, end_frame_exclusive)`。供应商 HDF5 使用闭区间，因此界面显示的
@@ -359,7 +367,7 @@ module.thresholds
 只有 `/label/subtask_label` 的 canonical 内容变化并 `fsync`，随后原子替换；不
 生成持久 `.bak`。
 
-### 6.2 `manual_review`
+### 6.3 `manual_review` 字段合同
 
 自动模块只负责累计候选：
 
@@ -385,7 +393,8 @@ module.thresholds
 - `required=false`：无候选或按抽样策略无需人工。
 - `required=true`：进入 `queued` / `in_progress` / `completed`；候选为空时必须是
   `state=not_required`，不做正常 Pass 样本抽检。
-- 语义 `semantic_consistency` 是 `execution_kind=external`，完成后才进入上述路由。
+- `manual_review` 和 `semantic_consistency` 都是 `execution_kind=external`；人工阶段
+  合法完成或 `not_required` 后，才把 cursor 推进到语义阶段。
 - 自动 QC 已 hard fail：`required=false`、`state=skipped_due_to_fail`，问题直接供
   批次统计和返工使用。
 

@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
-### Requirement: 语义校准的进入条件由执行 profile 决定
-准入模式下，只有未产生自动 hard fail 的资产 SHALL 进入语义校准；供应商测评模式下，只要自动阶段没有运行错误，包含自动 fail 的资产也 SHALL 进入语义校准。
+### Requirement: 语义校准同时受 profile 与人工质检门禁控制
+准入模式下，只有未产生自动 hard fail 且人工质检全 Pass 或 `not_required` 的资产 SHALL 进入语义校准。供应商测评模式下，机器自动 fail 可继续，但仍 MUST 先满足相同人工门禁。人工 Fail 的资产 MUST 终止且不得进入语义。
 
 #### Scenario: 准入模式自动 fail
 - **WHEN** 资产在 acceptance profile 的自动阶段产生 hard fail
@@ -10,7 +10,20 @@
 
 #### Scenario: 供应商测评模式自动 fail
 - **WHEN** 同一资产在 supplier_evaluation profile 产生 hard fail但自动阶段正常结束
-- **THEN** 系统仍创建语义校准任务
+- **THEN** 系统仍先进入适用的人工质检
+- **THEN** 人工 Pass/not_required 后创建语义校准任务
+
+#### Scenario: 直接请求未完成人工质检资产
+- **WHEN** 客户端通过深链或 API 请求 manual review 仍为 queued/in_progress 的资产
+- **THEN** 服务端拒绝返回语义 task DTO 或执行写操作
+
+### Requirement: 语义校准使用独立服务边界
+语义校准 SHALL 由独立 `semantic_calibration` package、application facade、HTTP server、静态页面和启动入口提供。服务 MUST 只暴露 `/api/semantic/...`，MUST NOT 暴露 Warn evidence 或人工 Pass/Fail 路由，也 MUST NOT 导入 `human_qc` 领域服务。
+
+#### Scenario: 直接打开语义根地址
+- **WHEN** URL 未指定 asset_id 且存在符合门禁的语义待办
+- **THEN** 页面自动加载第一条待办而不是停留在未加载空壳
+- **THEN** 页面只显示语义校准组件
 
 ### Requirement: 每次语义修改必须独立确认
 时间轴共享边界拖动或一条 subtask 文字修改 MUST 立即进入 pending confirmation。存在 pending confirmation 时，工作台 MUST 禁止修改其他段落、切换任务或完成样本，直到操作者确认或取消本次修改。

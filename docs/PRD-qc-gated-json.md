@@ -293,9 +293,10 @@ flowchart TD
 `execution_kind: external`。orchestrator 到达任一阶段时只写
 `pipeline_state.status=awaiting_external`、`next_module` 和对应
 `execution.module_states.<module>.state=awaiting_external`，不会伪造模型结论。
-语义校准先由人工工作台完成；后续可替换为模型 adapter，报告接口不变。
+Warn 人工质检先完成；全 Pass 或 `not_required` 后，独立语义工作台才能读取任务。
+语义实现后续可替换为模型 adapter，报告接口不变。
 
-语义阶段完成后按累计 warn 候选路由：
+自动阶段完成后按累计 warn 候选路由：
 
 - `manual_review.candidate_issue_ids=[]`：写 `required=false`、`state=not_required`，
   不做正常 Pass 样本抽检；
@@ -303,6 +304,10 @@ flowchart TD
   `selection_policy=all_candidates`、`required=true`、`state=queued`；
 - 复核过程中使用 `in_progress`，全部写回后使用 `completed`；
 - acceptance hard fail 已停止时使用 `skipped_due_to_fail`，不创建人工任务。
+
+人工全部 Pass 时把 pipeline cursor 推进到 `semantic_consistency`；任一人工 Fail 使用
+`completion_mode=early_fail` 终止资产并标记语义 `skipped_due_to_fail`。没有候选的
+`not_required` 资产直接推进语义。
 
 人工 verdict 只能补充 issue review 和统计，不得删除/改写机器 issue；人工确认 fail
 会进入 `human_confirmed_fail_issue_count` 和最终 fail 统计。
@@ -321,7 +326,7 @@ manual_review.candidate_issue_ids
 issues
 source_files
 各 issue 的 context/evidence path
-统一 config 的 manual_review 策略和 semantic_consistency 写回状态
+统一 config 的 manual_review 策略；语义模块不读取人工工作台内部状态
 ```
 
 路由结果建议写：

@@ -2,6 +2,10 @@
 
 日期：2026-07-20
 
+实现状态（2026-07-22）：已落地独立 `semantic_calibration` 包、独立 HTTP server、
+`/api/semantic/...`、独立静态页面和 `tools/serve_semantic_calibration.py`；正式操作
+说明见 `docs/semantic-calibration-workbench.md`。
+
 ## 目标
 
 将人工语义校准从现有 `human_qc` 共用工作台中完整拆出，形成独立前端、独立后端、独立启动入口和独立 API 命名空间。现有语义校准能力必须原样保留；人工质检前后端不再承载、导入或渲染语义校准代码。
