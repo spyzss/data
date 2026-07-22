@@ -32,6 +32,7 @@ _STABLE_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}").fullmatch
 _DIGEST = re.compile(r"[0-9a-f]{64}").fullmatch
 _MANIFEST_NAME = "manifest.json"
 _OWNER_NAME = ".generation.owner.json"
+_RENDER_FENCE_NAME = ".render.fence"
 _PUBLISH_LOCK_NAME = ".overlay-publish.lock"
 _PIN_ROOT_NAME = ".overlay-pins"
 _SCHEMA_VERSION = 1
@@ -342,6 +343,9 @@ class BoundedOverlayWorker:
 
     def _owner_path(self, request: OverlayRequest) -> Path:
         return self._job_dir(request) / _OWNER_NAME
+
+    def _render_fence_path(self, request: OverlayRequest) -> Path:
+        return self._job_dir(request) / _RENDER_FENCE_NAME
 
     @staticmethod
     def _overlay_id(key: OverlayCacheKey, index: int) -> str:
@@ -847,11 +851,17 @@ class BoundedOverlayWorker:
                 return latest or view
             if self._owner_is_live_locked(request):
                 return latest
-            try:
-                self._owner_path(request).unlink(missing_ok=True)
-            except OSError:
-                return self._failed_view(request, "overlay_cache_invalid", retryable=True)
-            return self._recover_interrupted_locked(request, latest)
+            # A delayed heartbeat can expire while a separate process is still
+            # CPU-bound in the renderer.  Only recover an expired marker after
+            # the OS-owned renderer fence is free; process death releases it.
+            with self._render_fence(request, blocking=False) as fence_acquired:
+                if not fence_acquired:
+                    return latest
+                try:
+                    self._owner_path(request).unlink(missing_ok=True)
+                except OSError:
+                    return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+                return self._recover_interrupted_locked(request, latest)
 
     def _load_durable(self, request: OverlayRequest, *, recover: bool) -> OverlayJobView | None:
         view = self._parse_manifest(request)
@@ -867,6 +877,43 @@ class BoundedOverlayWorker:
         job_dir.mkdir(parents=True, exist_ok=True)
         lock_path = job_dir / ".generation.lock"
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        acquired = True
+        try:
+            try:
+                import fcntl
+
+                flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(descriptor, flags)
+                except BlockingIOError:
+                    acquired = False
+            except ImportError:  # pragma: no cover - Unix worker deployment uses fcntl.
+                pass
+            yield acquired
+        finally:
+            try:
+                try:
+                    import fcntl
+
+                    if acquired:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except ImportError:  # pragma: no cover
+                    pass
+            finally:
+                os.close(descriptor)
+
+    @contextmanager
+    def _render_fence(self, request: OverlayRequest, *, blocking: bool = True):
+        """Fence one key's renderer for its complete CPU-bound lifetime.
+
+        Unlike ``_key_lock``, this file lock remains held while rendering and
+        is released by the OS when an owning process dies.  It never guards a
+        root-wide publication or another key.
+        """
+
+        job_dir = self._job_dir(request)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self._render_fence_path(request), os.O_CREAT | os.O_RDWR, 0o600)
         acquired = True
         try:
             try:
@@ -1018,12 +1065,17 @@ class BoundedOverlayWorker:
             expires_at = payload.get("expires_at") if isinstance(payload, Mapping) else None
             valid = (
                 isinstance(payload, Mapping)
+                and payload.get("schema_version") == _SCHEMA_VERSION
                 and payload.get("key_digest") == digest
+                and isinstance(payload.get("process_incarnation"), str)
+                and bool(payload.get("process_incarnation"))
                 and isinstance(payload.get("token"), str)
+                and bool(payload.get("token"))
                 and isinstance(expires_at, (int, float))
                 and not isinstance(expires_at, bool)
                 and math.isfinite(float(expires_at))
                 and float(expires_at) > now
+                and float(expires_at) <= now + _MAX_PIN_LEASE_SECONDS
             )
             if valid:
                 live = True
@@ -1291,7 +1343,15 @@ class BoundedOverlayWorker:
                         final = generating
             if generating is not None:
                 self._publish_view(request, generating)
-                rendered = self._render(request, generating)
+                with self._render_fence(request) as fence_acquired:
+                    if not fence_acquired:
+                        rendered = self._failed_view(
+                            request,
+                            "overlay_interrupted",
+                            retryable=True,
+                        )
+                    else:
+                        rendered = self._render(request, generating)
                 final = self._publish_rendered(request, rendered, owner_token)
         except BaseException:
             final = self._failed_view(request, "overlay_render_failed", retryable=True)

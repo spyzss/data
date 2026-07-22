@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import multiprocessing
+import os
 from pathlib import Path
 from threading import Barrier, BrokenBarrierError, Event, Lock
 import time
@@ -45,6 +47,29 @@ def _wait_until_terminal(worker: object, request: object, *, timeout: float = 3.
             return view
         time.sleep(0.01)
     pytest.fail("overlay job did not become terminal")
+
+
+def _hold_render_fence_while_cpu_bound(
+    fence_path: str,
+    started: object,
+    release: object,
+) -> None:
+    """Separate-process stand-in for a CPU-bound renderer holding its fence."""
+
+    import fcntl
+
+    descriptor = os.open(fence_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        started.set()
+        accumulator = 0
+        deadline = time.monotonic() + 3.0
+        while not release.is_set() and time.monotonic() < deadline:
+            accumulator = (accumulator + 1) % 104729
+        assert accumulator >= 0
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 class RecordingRenderer:
@@ -492,6 +517,71 @@ def test_owner_marker_with_an_unbounded_future_lease_is_not_live(tmp_path: Path)
         worker.shutdown()
 
 
+def test_expired_owner_marker_is_not_recovered_while_a_separate_process_holds_the_render_fence(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(tmp_path, renderer=RecordingRenderer())
+    job_dir = request.cache_root / request.cache_key.digest
+    job_dir.mkdir(parents=True)
+    (job_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "key_digest": request.cache_key.digest,
+                "status": "generating",
+                "segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = time.time()
+    (job_dir / ".generation.owner.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "process_incarnation": "cpu-bound-owner",
+                "token": "expired-heartbeat",
+                "pid": 99999,
+                "host": "unreachable-remote-host",
+                "heartbeat_at": now - 10.0,
+                "lease_expires_at": now - 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    process_context = multiprocessing.get_context("spawn")
+    started = process_context.Event()
+    release = process_context.Event()
+    process = process_context.Process(
+        target=_hold_render_fence_while_cpu_bound,
+        args=(str(job_dir / ".render.fence"), started, release),
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=1)
+    process.start()
+    try:
+        assert started.wait(3.0)
+        observed = worker.get(request)
+        assert observed.status in {"pending", "generating"}
+        assert json.loads((job_dir / "manifest.json").read_text(encoding="utf-8"))["status"] == "generating"
+
+        release.set()
+        process.join(timeout=3.0)
+        assert process.exitcode == 0
+
+        recovered = worker.get(request)
+        assert recovered.status == "failed"
+        assert recovered.code == "overlay_interrupted"
+    finally:
+        release.set()
+        process.join(timeout=3.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=3.0)
+        worker.shutdown()
+
+
 def test_owner_cleanup_error_still_releases_capacity_and_returns_safe_failure(
     tmp_path: Path,
 ) -> None:
@@ -565,6 +655,62 @@ def test_durable_pin_blocks_other_worker_eviction_until_the_lease_expires(
         assert _wait_until_terminal(worker_b, request_b).status == "ready"
         assert not (request_a.cache_root / request_a.cache_key.digest).exists()
         assert not (request_a.cache_root / ".overlay-pins" / request_a.cache_key.digest).exists()
+    finally:
+        worker_a.shutdown()
+        worker_b.shutdown()
+
+
+def test_corrupt_durable_pins_do_not_block_cross_worker_eviction(tmp_path: Path) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request_a = _request(
+        tmp_path,
+        intervals=((120, 169),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "3" * 64,
+    )
+    request_b = _request(
+        tmp_path,
+        intervals=((220, 269),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "4" * 64,
+    )
+    worker_a = BoundedOverlayWorker(max_workers=1, max_pending=1, max_ready_jobs=1)
+    worker_b = BoundedOverlayWorker(max_workers=1, max_pending=1, max_ready_jobs=1)
+    try:
+        worker_a.submit(request_a)
+        assert _wait_until_terminal(worker_a, request_a).status == "ready"
+        pin_directory = request_a.cache_root / ".overlay-pins" / request_a.cache_key.digest
+        pin_directory.mkdir(parents=True)
+        now = time.time()
+        (pin_directory / "far-future.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "key_digest": request_a.cache_key.digest,
+                    "process_incarnation": "otherwise-valid-owner",
+                    "token": "far-future-token",
+                    "expires_at": now + 365 * 24 * 60 * 60,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (pin_directory / "missing-owner.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "key_digest": request_a.cache_key.digest,
+                    "token": "missing-owner-token",
+                    "expires_at": now + 60.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        worker_b.submit(request_b)
+        assert _wait_until_terminal(worker_b, request_b).status == "ready"
+        assert not (request_a.cache_root / request_a.cache_key.digest).exists()
+        assert not pin_directory.exists()
     finally:
         worker_a.shutdown()
         worker_b.shutdown()
