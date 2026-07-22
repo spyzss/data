@@ -809,3 +809,56 @@ def test_asset_overlay_provider_accepts_only_explicit_continuous_sam3_contract(
     assert task["issues"][0]["overlay"]["status"] == "pending"
     assert task["issues"][1]["overlay"] is None
     assert task["issues"][2]["overlay"] is None
+
+
+def test_asset_ready_handle_without_segments_fails_closed_but_legacy_handle_remains_valid(
+    tmp_path: Path,
+) -> None:
+    from human_qc.media import MediaNotFoundError
+    from human_qc.warn_workbench_service import OverlayHandle
+    from tests.test_human_qc_workbench import _service
+
+    asset_overlay = tmp_path / "overlays" / "asset-ready.mp4"
+    legacy_overlay = tmp_path / "overlays" / "legacy-ready.mp4"
+    asset_overlay.parent.mkdir()
+    asset_overlay.write_bytes(b"asset-ready")
+    legacy_overlay.write_bytes(b"legacy-ready")
+
+    class AssetProvider:
+        def get_asset_overlays(self, _asset_id, selected):
+            return {
+                selected[0].issue_id: OverlayHandle(
+                    status="ready",
+                    overlay_id="asset-ready-without-segments",
+                    path=asset_overlay,
+                )
+            }
+
+    service, _, _, _ = _service(tmp_path)
+    service.overlay_provider = AssetProvider()
+
+    asset_task = service.get_asset_task("asset-1")
+    asset_projection = asset_task["issues"][0]["overlay"]
+
+    assert asset_projection["status"] == "failed"
+    assert asset_projection["code"] == "overlay_incomplete"
+    assert asset_projection["url"] is None
+    with pytest.raises(MediaNotFoundError, match="media_not_found"):
+        service.overlay_media("asset-1", "asset-ready-without-segments")
+
+    class LegacyProvider:
+        def get_overlay(self, _asset_id, _issue_id, _frame_range):
+            return OverlayHandle(
+                status="ready",
+                overlay_id="legacy-ready-without-segments",
+                path=legacy_overlay,
+            )
+
+    service.overlay_provider = LegacyProvider()
+
+    legacy_task = service.get_asset_task("asset-1")
+
+    assert legacy_task["issues"][0]["overlay"]["status"] == "ready"
+    assert legacy_task["issues"][0]["overlay"]["url"].endswith(
+        "/legacy-ready-without-segments"
+    )

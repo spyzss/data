@@ -944,6 +944,8 @@ class WarnWorkbenchService:
         asset_id: str,
         frame_range: FrameRangeDto,
         value: object,
+        *,
+        require_segment_coverage: bool = False,
     ) -> OverlayDto:
         if isinstance(value, OverlayHandle):
             status = self._overlay_status(value.status)
@@ -1012,6 +1014,18 @@ class WarnWorkbenchService:
                     or any(segment.retryable for segment in relevant)
                     or not fully_covered
                 ),
+            )
+
+        if require_segment_coverage and status == "ready":
+            # Asset-level jobs are continuous media manifests.  A legacy
+            # single-file handle has no source-frame range and must not bypass
+            # the interval coverage gate reserved for those manifests.
+            return OverlayDto(
+                "failed",
+                frame_range,
+                None,
+                "overlay_incomplete",
+                retryable=True,
             )
 
         url: str | None = None
@@ -1123,7 +1137,12 @@ class WarnWorkbenchService:
             if asset_overlay_values is not None and _is_sam3_issue(issue):
                 overlay_value = asset_overlay_values.get(issue_id)
                 overlay = (
-                    self._overlay_from_value(asset_id, frame_range, overlay_value)
+                    self._overlay_from_value(
+                        asset_id,
+                        frame_range,
+                        overlay_value,
+                        require_segment_coverage=True,
+                    )
                     if overlay_value is not None
                     else OverlayDto("pending", frame_range, None, None)
                 )
