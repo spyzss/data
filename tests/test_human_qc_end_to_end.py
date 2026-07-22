@@ -383,13 +383,18 @@ def test_file_level_semantic_then_warn_workflow_preserves_source_fidelity(tmp_pa
     assert persisted["issues"] == machine_issues
     assert persisted["manual_review"]["issue_reviews"]["warn-left"]["effective_verdict"] == "pass"
     assert persisted["manual_review"]["issue_reviews"]["warn-right"]["effective_verdict"] == "fail"
+    assert persisted["manual_review"]["completion_mode"] == "early_fail"
+    assert persisted["manual_review"]["failure_reason"] is None
     assert persisted["overall_decision"] == "fail"
+    assert persisted["pipeline_state"]["status"] == "stopped"
+    assert persisted["pipeline_state"]["next_module"] is None
+    assert persisted["semantic_calibration"]["state"] == "skipped_due_to_fail"
     assert persisted["semantic_calibration"]["timeline_edit_count"] == 1
     assert persisted["semantic_calibration"]["subtask_text_edit_count"] == 1
 
     projection = project_quality_archive(asset.report_path.parent)
     asset_row = next(row for row in projection.asset_rows if row["asset_id"] == asset.asset_id)
-    assert asset_row["status"] == "completed"
+    assert asset_row["status"] == "stopped"
     assert asset_row["decision"] == "fail"
     batch = aggregate_projection(projection)
     assert batch["overall"]["final_fail_assets"] == 1
@@ -457,7 +462,11 @@ def test_only_selected_warn_is_reviewable_and_all_pass_cannot_override_hard_fail
     assert report is not None
     assert report["manual_review"]["issue_reviews"]["warn-left"]["effective_verdict"] == "pass"
     assert "warn-right" not in report["manual_review"]["issue_reviews"]
-    assert report["overall_decision"] == "fail"
+    assert report["manual_review"]["completion_mode"] == "all_reviewed"
+    assert report["manual_review"]["failure_reason"] is None
+    assert report["pipeline_state"]["status"] == "awaiting_external"
+    assert report["pipeline_state"]["next_module"] == "semantic_consistency"
+    assert report["overall_decision"] is None
 
 
 def test_no_selected_warns_skip_manual_review_and_finish_pass(tmp_path: Path) -> None:

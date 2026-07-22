@@ -42,6 +42,36 @@ StaleRevisionError = WarnRevisionError
 PendingEditError = WarnStateError
 
 
+FailureReason = dict[str, object]
+
+
+def normalize_failure_reason(
+    value: Mapping[str, object] | None,
+) -> FailureReason | None:
+    """Normalize one asset-level manual failure reason without reordering it."""
+
+    if value is None or not value.get("reason_codes"):
+        return None
+    raw_codes = value["reason_codes"]
+    if isinstance(raw_codes, (str, bytes, bytearray)) or not isinstance(
+        raw_codes, Sequence
+    ):
+        raise WarnStateError("failure_reason.reason_codes must be a sequence")
+    codes = list(
+        dict.fromkeys(str(code).strip() for code in raw_codes if str(code).strip())
+    )
+    if not codes:
+        return None
+    other_text = str(value.get("other_text") or "").strip() or None
+    if "other" in codes and other_text is None:
+        raise WarnStateError("other_text is required when other is selected")
+    return {
+        "mode": "manual",
+        "reason_codes": codes,
+        "other_text": other_text,
+    }
+
+
 @dataclass(frozen=True)
 class WarnTaskView:
     """Immutable projection of one selected warning-review task."""
@@ -292,16 +322,17 @@ class WarnReviewService:
         lease_token: str,
         *,
         reviewer: str | None = None,
+        failure_reason: Mapping[str, object] | None = None,
     ) -> WarnTaskView:
         report = self._load(_non_empty(asset_id, "asset_id"))
         if report is None:
             raise FileNotFoundError(self.report_path(asset_id))
         self._require_revision_lease(asset_id, report, expected_revision, lease_token)
-        self._assert_semantic_ready(report)
-        self._assert_manual_cursor(report)
         manual, candidates, selected = self._ids(report)
         if manual.get("state") in {"completed", "not_required", "skipped_due_to_fail"}:
             raise WarnStateError("warn review is in a terminal state")
+        self._assert_semantic_ready(report)
+        self._assert_manual_cursor(report)
         issue_id = _non_empty(issue_id, "issue_id")
         if issue_id not in candidates:
             raise WarnStateError(f"issue {issue_id} is not a candidate")
@@ -313,6 +344,9 @@ class WarnReviewService:
             raise TypeError("reason must be a string or None")
         normalized_reason = reason.strip() if isinstance(reason, str) else None
         normalized_reason = normalized_reason or None
+        normalized_failure_reason = (
+            normalize_failure_reason(failure_reason) if verdict == "fail" else None
+        )
         review_author = (
             self._reviewer if reviewer is None else _non_empty(reviewer, "reviewer")
         )
@@ -351,10 +385,20 @@ class WarnReviewService:
                         "action": "resubmitted",
                         "issue_id": issue_id,
                         "previous": deepcopy(prior),
+                        "previous_failure_reason": deepcopy(
+                            block.get("failure_reason")
+                        ),
                         "reviewed_at": reviewed_at,
                     }
                 )
             reviews[issue_id] = deepcopy(review)
+            if verdict == "fail":
+                block["failure_reason"] = deepcopy(normalized_failure_reason)
+            elif not any(
+                isinstance(item, Mapping) and item.get("verdict") == "fail"
+                for item in reviews.values()
+            ):
+                block["failure_reason"] = None
             block["state"] = "in_progress"
             block["completed_at"] = None
 
@@ -367,6 +411,8 @@ class WarnReviewService:
         expected_revision: int,
         lease_token: str,
         *,
+        completion_mode: Literal["all_reviewed", "early_fail"] | None = None,
+        failure_reason: Mapping[str, object] | None = None,
         advance_pipeline: bool = True,
     ) -> WarnTaskView:
         asset_id = _non_empty(asset_id, "asset_id")
@@ -374,17 +420,11 @@ class WarnReviewService:
         if report is None:
             raise FileNotFoundError(self.report_path(asset_id))
         self._require_revision_lease(asset_id, report, expected_revision, lease_token)
-        self._assert_semantic_ready(report)
-        manual, candidates, selected = self._ids(report)
+        manual, _, selected = self._ids(report)
         state = str(manual.get("state", "not_evaluated"))
-        pipeline = report.get("pipeline_state")
-        if (
-            isinstance(pipeline, Mapping)
-            and pipeline.get("status") == "completed"
-            and pipeline.get("next_module") is None
-            and state in {"completed", "not_required"}
-        ):
+        if state in {"completed", "not_required", "skipped_due_to_fail"}:
             raise WarnStateError("warn review is already completed")
+        self._assert_semantic_ready(report)
         self._assert_manual_cursor(report)
         reviews = manual.get("issue_reviews", {})
         if not isinstance(reviews, Mapping):
@@ -396,12 +436,9 @@ class WarnReviewService:
                 "selected issue IDs are missing from report issues: "
                 + ", ".join(missing_issues)
             )
-        if selected and not set(selected).issubset(reviews):
-            raise WarnStateError("every selected issue requires a verdict before completion")
-        for issue_id in selected:
-            review = reviews.get(issue_id)
-            if not isinstance(review, Mapping) or review.get("verdict") not in {"pass", "fail"}:
-                raise WarnStateError("every selected issue requires a verdict before completion")
+        if completion_mode not in {None, "all_reviewed", "early_fail"}:
+            raise WarnStateError("completion_mode must be all_reviewed or early_fail")
+        normalized_failure_reason = normalize_failure_reason(failure_reason)
         completed_at = _now(self._clock())
 
         def mutate(candidate: dict[str, Any]) -> None:
@@ -413,29 +450,79 @@ class WarnReviewService:
             if not isinstance(reviews_now, dict):
                 raise WarnStateError("manual_review.issue_reviews must be an object")
             if selected_now:
+                fail_ids = [
+                    issue_id
+                    for issue_id in selected_now
+                    if isinstance(reviews_now.get(issue_id), Mapping)
+                    and reviews_now[issue_id].get("verdict") == "fail"
+                ]
+                all_pass = all(
+                    isinstance(reviews_now.get(issue_id), Mapping)
+                    and reviews_now[issue_id].get("verdict") == "pass"
+                    for issue_id in selected_now
+                )
+                if fail_ids:
+                    actual_mode = "early_fail"
+                elif all_pass:
+                    actual_mode = "all_reviewed"
+                else:
+                    raise WarnStateError(
+                        "every selected issue requires a Pass verdict unless at least "
+                        "one Fail enables early_fail completion"
+                    )
+                if completion_mode is not None and completion_mode != actual_mode:
+                    raise WarnStateError(
+                        f"completion_mode {completion_mode} does not match derived "
+                        f"mode {actual_mode}"
+                    )
                 block["state"] = "completed"
                 block["completed_at"] = completed_at
+                block["completion_mode"] = actual_mode
+                block["failure_reason"] = (
+                    deepcopy(normalized_failure_reason)
+                    if actual_mode == "early_fail"
+                    else None
+                )
             else:
+                actual_mode = None
                 block["state"] = "not_required"
                 block["required"] = False
                 block["selected_issue_id"] = None
                 block["completed_at"] = None
-            if advance_pipeline:
+                block.pop("completion_mode", None)
+                block.pop("failure_reason", None)
+            if advance_pipeline or actual_mode == "early_fail":
                 block.pop("orchestrator_resume_required", None)
             else:
                 block["orchestrator_resume_required"] = True
-            if advance_pipeline:
+            if advance_pipeline or actual_mode == "early_fail":
                 pipeline_now = candidate.get("pipeline_state")
                 if not isinstance(pipeline_now, dict):
                     raise WarnStateError("pipeline_state block is missing")
-                pipeline_now["status"] = "completed"
                 pipeline_now["last_completed_module"] = "manual_review"
-                pipeline_now["next_module"] = None
-                pipeline_now["stop_reason"] = None
+                if actual_mode == "early_fail":
+                    pipeline_now["status"] = "stopped"
+                    pipeline_now["next_module"] = None
+                    pipeline_now["stop_reason"] = "manual_review_failed"
+                    semantic = candidate.get("semantic_calibration")
+                    if not isinstance(semantic, dict):
+                        raise WarnStateError("semantic_calibration block is missing")
+                    semantic["state"] = "skipped_due_to_fail"
+                    semantic["pending_edit"] = None
+                    candidate["overall_decision"] = "fail"
+                elif actual_mode == "all_reviewed":
+                    pipeline_now["status"] = "awaiting_external"
+                    pipeline_now["next_module"] = "semantic_consistency"
+                    pipeline_now["stop_reason"] = None
+                    candidate["overall_decision"] = None
+                else:
+                    pipeline_now["status"] = "completed"
+                    pipeline_now["next_module"] = None
+                    pipeline_now["stop_reason"] = None
+                    candidate["overall_decision"] = (
+                        reduce_overall_decision(candidate) or "pass"
+                    )
                 candidate["pipeline_state"] = pipeline_now
-                candidate["overall_decision"] = (
-                    reduce_overall_decision(candidate) or "pass"
-                )
 
         updated = update_human_state(self.report_path(asset_id), expected_revision, mutate)
         return self._view(asset_id, updated)
@@ -452,5 +539,6 @@ __all__ = [
     "WarnStateError",
     "WarnTaskView",
     "effective_issue_verdict",
+    "normalize_failure_reason",
     "reduce_overall_decision",
 ]
