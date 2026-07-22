@@ -32,6 +32,7 @@
         <div class="panel-heading"><span>视频预览</span><span>全视频原始画面</span></div>
         <div class="video-stage" data-video-root tabindex="0" aria-label="视频区域。点击后可用左右方向键逐帧移动">
           <video data-video controls preload="metadata"></video>
+          <video data-overlay-video muted playsinline hidden aria-hidden="true"></video>
           <div class="video-placeholder" data-video-placeholder>
             <span class="play-glyph" aria-hidden="true">▶</span>
             <span>正在加载原始视频</span>

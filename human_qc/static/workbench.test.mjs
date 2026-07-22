@@ -68,13 +68,33 @@ function canonicalTask(overrides = {}) {
 }
 
 
+function fakePanelRoot() {
+  const listeners = new Map();
+  return {
+    innerHTML: "",
+    addEventListener(type, listener) {
+      const values = listeners.get(type) ?? [];
+      values.push(listener);
+      listeners.set(type, values);
+    },
+    removeEventListener(type, listener) {
+      const values = listeners.get(type) ?? [];
+      listeners.set(type, values.filter((candidate) => candidate !== listener));
+    },
+    listenerCount(type) {
+      return (listeners.get(type) ?? []).length;
+    },
+  };
+}
+
+
 test("the earliest pending active warning wins even when active ids arrive in another order", () => {
   const task = canonicalTask();
   assert.equal(nextDecisionTarget(task, ["shake", "exposure"], null), "exposure");
 
   const afterFirstPass = applySavedReview(task, "exposure", "pass");
   assert.equal(nextDecisionTarget(afterFirstPass, ["exposure", "shake"], null), "shake");
-  assert.equal(nextDecisionTarget(afterFirstPass, ["shake"], "exposure"), "exposure");
+  assert.equal(nextDecisionTarget(afterFirstPass, ["shake"], "exposure"), "shake");
 });
 
 
@@ -239,6 +259,222 @@ test("timeline seeking never sets an explicit decision target, while status-row 
   assert.equal(app.defaultDecisionTarget(), "shake");
   assert.equal(app.selectIssueFromStatus("exposure"), "exposure");
   assert.equal(app.defaultDecisionTarget(), "exposure");
+});
+
+
+test("an explicit status-row target is ignored outside its active frame and becomes active after its start is seeked", () => {
+  const reviewed = applySavedReview(canonicalTask(), "exposure", "pass");
+  assert.equal(nextDecisionTarget(reviewed, ["late"], "exposure"), "late");
+
+  const app = new WarnReviewApp();
+  app.applyServerTask(reviewed);
+  app.setCurrentFrame(390);
+  let explicitIssueIdDuringSeek = "not-called";
+  app.videoController = {
+    seekToFrame() { explicitIssueIdDuringSeek = app.explicitIssueId; },
+  };
+  assert.equal(app.selectIssueFromStatus("exposure"), "exposure");
+  assert.equal(explicitIssueIdDuringSeek, null);
+  assert.equal(app.currentFrame, 120);
+  assert.equal(app.defaultDecisionTarget(), "exposure");
+});
+
+
+test("an in-flight verdict is single-flight and blocks direct asset navigation", async () => {
+  const calls = [];
+  let resolveVerdict;
+  const pendingVerdict = new Promise((resolve) => { resolveVerdict = resolve; });
+  const saved = applySavedReview(canonicalTask({ report_revision: 8 }), "exposure", "pass");
+  const app = new WarnReviewApp({
+    fetcher: async (path) => {
+      calls.push(path);
+      if (path === "/api/warn/assets/asset-1/task") {
+        return { ok: true, status: 200, json: async () => ({ task: canonicalTask() }) };
+      }
+      if (path.includes("/verdict")) return pendingVerdict;
+      if (path === "/api/warn/assets") {
+        return { ok: true, status: 200, json: async () => ({ assets: ["asset-1", "asset-2"] }) };
+      }
+      if (path === "/api/warn/assets/asset-2/task") {
+        return { ok: true, status: 200, json: async () => ({ task: canonicalTask({ asset_id: "asset-2" }) }) };
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+
+  await app.loadAsset("asset-1");
+  app.setCurrentFrame(120);
+  const first = app.submitDefaultVerdict("pass");
+  const second = app.submitDefaultVerdict("pass");
+
+  assert.equal(app.isBusy, true);
+  assert.equal(calls.filter((path) => path.includes("/verdict")).length, 1);
+  assert.equal(await app.loadNextAsset(), null);
+  assert.equal(calls.filter((path) => path === "/api/warn/assets").length, 0);
+
+  resolveVerdict({ ok: true, status: 200, json: async () => ({ task: saved }) });
+  await Promise.all([first, second]);
+  assert.equal(app.isBusy, false);
+  assert.equal(app.assetId, "asset-1");
+});
+
+
+test("a Pass preserves a selected reason draft for the next active Fail", async () => {
+  const submitted = [];
+  const afterPass = applySavedReview(canonicalTask({ report_revision: 8 }), "exposure", "pass");
+  const afterFail = applySavedReview(
+    canonicalTask({
+      report_revision: 9,
+      failure_reason: { mode: "manual", reason_codes: ["occlusion"], other_text: null },
+    }),
+    "shake",
+    "fail",
+  );
+  const app = new WarnReviewApp({
+    fetcher: async (path, options = {}) => {
+      if (path.endsWith("/task")) return { ok: true, status: 200, json: async () => ({ task: canonicalTask() }) };
+      if (path.includes("/verdict")) {
+        submitted.push(JSON.parse(options.body));
+        const task = path.includes("/exposure/") ? afterPass : afterFail;
+        return { ok: true, status: 200, json: async () => ({ task }) };
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+
+  await app.loadAsset("asset-1");
+  app.setCurrentFrame(120);
+  app.panel.toggleReason("occlusion");
+  await app.submitDefaultVerdict("pass");
+  assert.deepEqual(app.panel.reasonDraft().reasonCodes, ["occlusion"]);
+
+  await app.submitDefaultVerdict("fail");
+  assert.deepEqual(submitted[1].failure_reason, {
+    mode: "manual",
+    reason_codes: ["occlusion"],
+    other_text: null,
+  });
+  assert.deepEqual(app.panel.reasonDraft().reasonCodes, ["occlusion"]);
+});
+
+
+test("early-fail completion restores and submits the current normalized manual reason draft", async () => {
+  const failed = applySavedReview(
+    canonicalTask({
+      report_revision: 8,
+      failure_reason: { mode: "manual", reason_codes: ["occlusion"], other_text: null },
+    }),
+    "exposure",
+    "fail",
+  );
+  let completionBody = null;
+  const app = new WarnReviewApp({
+    fetcher: async (path, options = {}) => {
+      if (path.endsWith("/task")) return { ok: true, status: 200, json: async () => ({ task: failed }) };
+      if (path.endsWith("/complete")) {
+        completionBody = JSON.parse(options.body);
+        return { ok: true, status: 200, json: async () => ({ task: failed }) };
+      }
+      if (path === "/api/warn/assets") return { ok: true, status: 200, json: async () => ({ assets: ["asset-1"] }) };
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+
+  await app.loadAsset("asset-1");
+  assert.deepEqual(app.panel.reasonDraft().reasonCodes, ["occlusion"]);
+  app.panel.toggleReason("occlusion");
+  app.panel.toggleReason("other");
+  app.panel.setOtherText("  补充文字  ");
+
+  await app.completeReview();
+  assert.deepEqual(completionBody.failure_reason, {
+    mode: "manual",
+    reason_codes: ["other"],
+    other_text: "补充文字",
+  });
+});
+
+
+test("early-fail completion rejects blank Other text without issuing a request", async () => {
+  const failed = applySavedReview(canonicalTask({ report_revision: 8 }), "exposure", "fail");
+  let requests = 0;
+  const app = new WarnReviewApp({
+    fetcher: async () => {
+      requests += 1;
+      throw new Error("completion must not request with blank Other text");
+    },
+  });
+  app.applyServerTask(failed);
+  app.setCurrentFrame(120);
+  app.panel.toggleReason("other");
+
+  await assert.rejects(() => app.completeReview(), /其他原因/);
+  assert.equal(requests, 0);
+  assert.deepEqual(app.panel.reasonDraft().reasonCodes, ["other"]);
+});
+
+
+test("the active warning card exposes saved verdicts and accessible reason and threshold controls", () => {
+  const root = fakePanelRoot();
+  const panel = new ReviewPanel();
+  const task = applySavedReview(
+    applySavedReview(canonicalTask(), "exposure", "pass"),
+    "shake",
+    "fail",
+  );
+  panel.mount(root);
+  panel.setTask(task);
+  panel.setCurrentFrame(142);
+
+  assert.match(root.innerHTML, /data-review-status="pass"[\s\S]*✓ 已通过/);
+  assert.match(root.innerHTML, /data-review-status="fail"[\s\S]*已失败/);
+  assert.match(root.innerHTML, /aria-pressed="false"/);
+  assert.match(root.innerHTML, /aria-describedby="threshold-/);
+  assert.match(root.innerHTML, /role="tooltip"/);
+  assert.doesNotMatch(root.innerHTML, /data-reason-code="occlusion"[^>]*disabled/);
+});
+
+
+test("review panel destroy unbinds its delegated DOM listeners", () => {
+  const root = fakePanelRoot();
+  const panel = new ReviewPanel();
+  panel.mount(root);
+  assert.equal(root.listenerCount("click"), 1);
+  assert.equal(root.listenerCount("input"), 1);
+
+  panel.destroy();
+  assert.equal(root.listenerCount("click"), 0);
+  assert.equal(root.listenerCount("input"), 0);
+  assert.equal(panel.root, null);
+});
+
+
+test("app destroy releases chrome, panel, timeline, and video controller listeners", () => {
+  const chrome = fakePanelRoot();
+  let panelDestroyed = 0;
+  let timelineDestroyed = 0;
+  let videoDestroyed = 0;
+  const app = new WarnReviewApp({
+    panelFactory: () => ({
+      destroy() { panelDestroyed += 1; },
+      setBusy() {},
+    }),
+  });
+  const listener = () => {};
+  chrome.addEventListener("click", listener);
+  app._chromeListeners = [[chrome, "click", listener]];
+  app._chromeBound = true;
+  app.root = chrome;
+  app.timeline = { destroy() { timelineDestroyed += 1; } };
+  app.videoController = { destroy() { videoDestroyed += 1; } };
+
+  app.destroy();
+  assert.equal(chrome.listenerCount("click"), 0);
+  assert.equal(panelDestroyed, 1);
+  assert.equal(timelineDestroyed, 1);
+  assert.equal(videoDestroyed, 1);
+  assert.equal(app.root, null);
+  assert.equal(app._chromeBound, false);
 });
 
 

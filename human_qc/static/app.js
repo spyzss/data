@@ -78,6 +78,7 @@ export class WarnReviewApp {
     panelFactory = (options) => new ReviewPanel(options),
     timelineFactory = (options) => new WarningTimeline(options),
     videoControllerFactory = (options) => new VideoController(options),
+    canSubmitIssue = () => true,
   } = {}) {
     this.baseUrl = String(baseUrl).replace(/\/$/, "");
     this.fetcher = fetcher;
@@ -86,6 +87,7 @@ export class WarnReviewApp {
     this.panelFactory = panelFactory;
     this.timelineFactory = timelineFactory;
     this.videoControllerFactory = videoControllerFactory;
+    this.canSubmitIssue = typeof canSubmitIssue === "function" ? canSubmitIssue : () => true;
     this.task = null;
     this.assetId = null;
     this.assets = [];
@@ -99,9 +101,16 @@ export class WarnReviewApp {
       onVerdict: (issueId, verdict, payload) => this.submitVerdict(issueId, verdict, payload),
       onComplete: () => this.completeReview(),
       onSelectIssue: (issueId) => this._acceptStatusSelection(issueId),
+      canSubmitIssue: (issue) => this.canSubmitIssue(issue),
     });
     this._mediaKey = null;
     this._chromeBound = false;
+    this._chromeListeners = [];
+    this._mutation = null;
+  }
+
+  get isBusy() {
+    return this._mutation !== null;
   }
 
   endpoint(path) {
@@ -139,7 +148,8 @@ export class WarnReviewApp {
     return value;
   }
 
-  async listAssets() {
+  async listAssets({ allowWhileBusy = false } = {}) {
+    if (this.isBusy && !allowWhileBusy) return this.assets;
     const value = await this.requestJson("/api/warn/assets");
     const assets = Array.isArray(value?.assets)
       ? value.assets.filter((assetId) => typeof assetId === "string" && assetId)
@@ -149,7 +159,8 @@ export class WarnReviewApp {
     return this.assets;
   }
 
-  async requestTask(assetId) {
+  async requestTask(assetId, { allowWhileBusy = false } = {}) {
+    if (this.isBusy && !allowWhileBusy) return null;
     const value = await this.requestJson(`/api/warn/assets/${encodeURIComponent(assetId)}/task`);
     const task = taskFromEnvelope(value);
     this.applyServerTask(task);
@@ -157,10 +168,11 @@ export class WarnReviewApp {
   }
 
   /** Direct asset switching intentionally discards only local unsaved drafts. */
-  async loadAsset(assetId) {
+  async loadAsset(assetId, { discardDraft = true, allowWhileBusy = false } = {}) {
     if (typeof assetId !== "string" || !assetId) throw new Error("assetId is required");
-    this.resetDraft();
-    return this.requestTask(assetId);
+    if (this.isBusy && !allowWhileBusy) return null;
+    if (discardDraft) this.resetDraft();
+    return this.requestTask(assetId, { allowWhileBusy });
   }
 
   async start() {
@@ -169,7 +181,7 @@ export class WarnReviewApp {
     return this.task;
   }
 
-  applyServerTask(task) {
+  applyServerTask(task, { restoreDraft = true } = {}) {
     if (!canonicalTask(task)) throw new TypeError("server task must be a canonical Warn task DTO");
     this.task = task;
     this.assetId = task.asset_id;
@@ -180,6 +192,7 @@ export class WarnReviewApp {
     this._configureMedia(task);
     this._configureTimeline(task);
     this.panel.setTask(task);
+    if (restoreDraft) this.panel.setDraftFromFailureReason(task.failure_reason);
     this.panel.setExplicitIssueId(this.explicitIssueId);
     this.panel.setCurrentFrame(this.currentFrame);
     this.render();
@@ -202,7 +215,10 @@ export class WarnReviewApp {
   }
 
   _acceptStatusSelection(issueId) {
-    this.explicitIssueId = this.task?.issues?.some((issue) => issue.id === issueId) ? issueId : null;
+    const issue = this.task?.issues?.find((candidate) => candidate.id === issueId) ?? null;
+    const range = issueRange(issue);
+    if (range) this.setCurrentFrame(range.start);
+    this.explicitIssueId = issue ? issueId : null;
     this.panel.setExplicitIssueId(this.explicitIssueId);
     return this.explicitIssueId;
   }
@@ -235,6 +251,28 @@ export class WarnReviewApp {
     };
   }
 
+  _runMutation(kind, operation) {
+    if (this._mutation) return this._mutation.promise;
+    const record = { kind, promise: null };
+    this._mutation = record;
+    this.panel.setBusy?.(true);
+    this.render();
+    let result;
+    try {
+      result = operation();
+    } catch (error) {
+      result = Promise.reject(error);
+    }
+    const promise = Promise.resolve(result).finally(() => {
+      if (this._mutation !== record) return;
+      this._mutation = null;
+      this.panel.setBusy?.(false);
+      this.render();
+    });
+    record.promise = promise;
+    return promise;
+  }
+
   async submitDefaultVerdict(verdict) {
     const issueId = this.defaultDecisionTarget();
     if (!issueId) throw new Error("当前帧没有待复核的 Warn");
@@ -242,72 +280,73 @@ export class WarnReviewApp {
   }
 
   async submitVerdict(issueId, verdict, suppliedPayload = null) {
+    if (this._mutation) return this._mutation.promise;
     if (!this.task || !this.assetId) throw new Error("尚未加载 Warn 任务");
     const target = this.task.issues.find((issue) => issue.id === issueId);
     if (!target) throw new Error("当前 Warn 不存在");
     const payload = suppliedPayload ?? this.panel.payloadForVerdict(issueId, verdict);
-    const value = await this.requestJson(
-      `/api/warn/assets/${encodeURIComponent(this.assetId)}/issues/${encodeURIComponent(issueId)}/verdict`,
-      { method: "POST", body: this.mutationBody(payload) },
-    );
-    if (verdict === "pass") this.explicitIssueId = null;
-    this.applyServerTask(taskFromEnvelope(value));
-    // Pass should expose the next pending active warning after the returned
-    // snapshot is consumed.  Moving the source cursor—not an explicit status
-    // selection—to that warning's start preserves the timeline's seek-only
-    // semantics.  Fail remains inspectable until the operator explicitly
-    // presses 完成复核.
-    if (verdict === "pass") {
-      const next = earliestPendingIssue(this.task);
-      const range = issueRange(next);
-      if (range) this.setCurrentFrame(range.start);
-    }
-    this.panel.setExplicitIssueId(this.explicitIssueId);
-    this.panel.resetDraft();
-    this.render();
-    return this.task;
+    return this._runMutation("verdict", async () => {
+      const value = await this.requestJson(
+        `/api/warn/assets/${encodeURIComponent(this.assetId)}/issues/${encodeURIComponent(issueId)}/verdict`,
+        { method: "POST", body: this.mutationBody(payload) },
+      );
+      if (verdict === "pass") this.explicitIssueId = null;
+      this.applyServerTask(taskFromEnvelope(value), { restoreDraft: verdict === "fail" });
+      // Pass should expose the next pending active warning after the returned
+      // snapshot is consumed.  Moving the source cursor—not an explicit status
+      // selection—to that warning's start preserves the timeline's seek-only
+      // semantics.  Fail remains inspectable until the operator explicitly
+      // presses 完成复核.
+      if (verdict === "pass") {
+        const next = earliestPendingIssue(this.task);
+        const range = issueRange(next);
+        if (range) this.setCurrentFrame(range.start);
+      }
+      this.panel.setExplicitIssueId(this.explicitIssueId);
+      this.render();
+      return this.task;
+    });
   }
 
   async completeReview() {
+    if (this._mutation) return this._mutation.promise;
     if (!this.task || !this.assetId) throw new Error("尚未加载 Warn 任务");
     const gate = completionGate(this.task);
     if (!gate.enabled || !gate.mode) throw new Error("请先完成当前 Warn 判定");
     const payload = { completion_mode: gate.mode };
-    const failureReason = this.task.failure_reason;
-    if (gate.mode === "early_fail" && isObject(failureReason) && Array.isArray(failureReason.reason_codes)) {
-      payload.failure_reason = {
-        reason_codes: failureReason.reason_codes,
-        other_text: typeof failureReason.other_text === "string" ? failureReason.other_text : null,
-      };
-    }
-    const value = await this.requestJson(
-      `/api/warn/assets/${encodeURIComponent(this.assetId)}/complete`,
-      { method: "POST", body: this.mutationBody(payload) },
-    );
-    this.applyServerTask(taskFromEnvelope(value));
-    this.resetDraft();
-    await this.loadNextAsset();
-    return this.task;
+    if (gate.mode === "early_fail") Object.assign(payload, this.panel.completionPayload());
+    return this._runMutation("complete", async () => {
+      const value = await this.requestJson(
+        `/api/warn/assets/${encodeURIComponent(this.assetId)}/complete`,
+        { method: "POST", body: this.mutationBody(payload) },
+      );
+      this.applyServerTask(taskFromEnvelope(value));
+      this.resetDraft();
+      await this.loadNextAsset({ allowWhileBusy: true });
+      return this.task;
+    });
   }
 
-  async loadNextAsset() {
+  async loadNextAsset({ allowWhileBusy = false } = {}) {
     // Navigation never carries an unsaved local reason draft across assets,
     // including while the lightweight asset-list request is in flight.
+    if (this.isBusy && !allowWhileBusy) return null;
     this.resetDraft();
-    const assets = await this.listAssets();
+    const assets = await this.listAssets({ allowWhileBusy });
     const currentIndex = assets.indexOf(this.assetId);
     const next = currentIndex >= 0 ? assets[currentIndex + 1] : assets[0];
     if (!next) return null;
-    return this.loadAsset(next);
+    return this.loadAsset(next, { allowWhileBusy });
   }
 
-  async loadPreviousAsset() {
+  async loadPreviousAsset({ allowWhileBusy = false } = {}) {
+    if (this.isBusy && !allowWhileBusy) return null;
     this.resetDraft();
-    const assets = await this.listAssets();
+    const assets = await this.listAssets({ allowWhileBusy });
     const currentIndex = assets.indexOf(this.assetId);
     const previous = currentIndex > 0 ? assets[currentIndex - 1] : null;
     if (!previous) return null;
-    return this.loadAsset(previous);
+    return this.loadAsset(previous, { allowWhileBusy });
   }
 
   resetDraft() {
@@ -339,6 +378,20 @@ export class WarnReviewApp {
     return this;
   }
 
+  destroy() {
+    for (const [target, type, listener] of this._chromeListeners.splice(0)) {
+      target.removeEventListener?.(type, listener);
+    }
+    this._chromeBound = false;
+    this.panel.destroy?.();
+    this.timeline?.destroy?.();
+    this.videoController?.destroy?.();
+    this.timeline = null;
+    this.videoController = null;
+    this._mediaKey = null;
+    this.root = null;
+  }
+
   render() {
     if (!this.root) return;
     const setText = (selector, text) => {
@@ -355,8 +408,8 @@ export class WarnReviewApp {
     const previous = this.root.querySelector?.('[data-action="previous-asset"]');
     const next = this.root.querySelector?.('[data-action="next-asset"]');
     const currentIndex = this.assets.indexOf(this.assetId);
-    if (previous) previous.disabled = currentIndex <= 0;
-    if (next) next.disabled = currentIndex < 0 || currentIndex >= this.assets.length - 1;
+    if (previous) previous.disabled = this.isBusy || currentIndex <= 0;
+    if (next) next.disabled = this.isBusy || currentIndex < 0 || currentIndex >= this.assets.length - 1;
     this._renderVideoState();
   }
 
@@ -409,9 +462,15 @@ export class WarnReviewApp {
   _bindChrome() {
     if (this._chromeBound || !this.root) return;
     this._chromeBound = true;
-    const bind = (selector, handler) => this.root.querySelector?.(selector)?.addEventListener("click", () => {
-      Promise.resolve(handler()).catch((error) => this._setError(error?.code ?? "request_failed", String(error?.message ?? error), error?.status ?? 0));
-    });
+    const bind = (selector, handler) => {
+      const element = this.root.querySelector?.(selector);
+      if (!element) return;
+      const listener = () => {
+        Promise.resolve(handler()).catch((error) => this._setError(error?.code ?? "request_failed", String(error?.message ?? error), error?.status ?? 0));
+      };
+      element.addEventListener("click", listener);
+      this._chromeListeners.push([element, "click", listener]);
+    };
     bind('[data-action="refresh"]', () => this.assetId ? this.requestTask(this.assetId) : this.start());
     bind('[data-action="rate-decrease"]', () => this.videoController?.decreaseRate());
     bind('[data-action="rate-increase"]', () => this.videoController?.increaseRate());

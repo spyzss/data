@@ -65,9 +65,13 @@ const selectedOptionMap = (options) => new Map(
 export function nextDecisionTarget(task, activeIssueIds, explicitIssueId = null) {
   const issues = asIssues(task);
   const byId = new Map(issues.map((issue) => [issue?.id, issue]));
-  if (typeof explicitIssueId === "string" && byId.has(explicitIssueId)) return explicitIssueId;
-
   const active = new Set(Array.isArray(activeIssueIds) ? activeIssueIds : []);
+  if (
+    typeof explicitIssueId === "string"
+    && active.has(explicitIssueId)
+    && byId.has(explicitIssueId)
+  ) return explicitIssueId;
+
   return issues
     .map((issue, selectedIndex) => ({ issue, selectedIndex, range: asFrameRange(issue) }))
     .filter(({ issue, range }) => active.has(issue?.id) && range && savedVerdict(issue) === null)
@@ -134,11 +138,13 @@ export class ReviewPanel {
     onVerdict = null,
     onComplete = null,
     onSelectIssue = null,
+    canSubmitIssue = () => true,
   } = {}) {
     this.document = documentRef;
     this.onVerdict = typeof onVerdict === "function" ? onVerdict : async () => {};
     this.onComplete = typeof onComplete === "function" ? onComplete : async () => {};
     this.onSelectIssue = typeof onSelectIssue === "function" ? onSelectIssue : () => {};
+    this.canSubmitIssue = typeof canSubmitIssue === "function" ? canSubmitIssue : () => true;
     this.root = null;
     this.task = null;
     this.currentFrame = 0;
@@ -146,19 +152,33 @@ export class ReviewPanel {
     this.selectedReasonCodes = new Set();
     this.otherText = "";
     this.localError = "";
+    this.isBusy = false;
     this._bound = false;
+    this._clickListener = (event) => this._handleClick(event);
+    this._inputListener = (event) => this._handleInput(event);
   }
 
   mount(root) {
-    this.root = root ?? null;
+    const nextRoot = root ?? null;
+    if (this.root && this.root !== nextRoot) this.destroy();
+    this.root = nextRoot;
     if (!this.root) return this;
     if (!this._bound) {
-      this.root.addEventListener?.("click", (event) => this._handleClick(event));
-      this.root.addEventListener?.("input", (event) => this._handleInput(event));
+      this.root.addEventListener?.("click", this._clickListener);
+      this.root.addEventListener?.("input", this._inputListener);
       this._bound = true;
     }
     this.render();
     return this;
+  }
+
+  destroy() {
+    if (this.root && this._bound) {
+      this.root.removeEventListener?.("click", this._clickListener);
+      this.root.removeEventListener?.("input", this._inputListener);
+    }
+    this._bound = false;
+    this.root = null;
   }
 
   setTask(task) {
@@ -168,6 +188,23 @@ export class ReviewPanel {
     }
     this.render();
     return this.task;
+  }
+
+  /** Restore only the normalized, server-saved asset-level manual reason. */
+  setDraftFromFailureReason(failureReason) {
+    const options = Array.isArray(this.task?.reason_options) ? this.task.reason_options : [];
+    const allowedCodes = selectedOptionMap(options);
+    const requestedCodes = failureReason?.mode === "manual" && Array.isArray(failureReason.reason_codes)
+      ? failureReason.reason_codes
+      : [];
+    this.selectedReasonCodes = new Set(
+      requestedCodes.filter((code) => typeof code === "string" && allowedCodes.has(code)),
+    );
+    const normalized = normalizeReasonDraft(options, this.selectedReasonCodes, failureReason?.other_text);
+    this.otherText = normalized.requiresText ? normalized.otherText : "";
+    this.localError = "";
+    this.render();
+    return this.reasonDraft();
   }
 
   setCurrentFrame(frame) {
@@ -180,6 +217,12 @@ export class ReviewPanel {
     this.explicitIssueId = asIssues(this.task).some((issue) => issue.id === issueId) ? issueId : null;
     this.render();
     return this.explicitIssueId;
+  }
+
+  setBusy(busy) {
+    this.isBusy = Boolean(busy);
+    this.render();
+    return this.isBusy;
   }
 
   resetDraft() {
@@ -247,6 +290,21 @@ export class ReviewPanel {
       : {};
   }
 
+  completionPayload() {
+    const draft = this.reasonDraft();
+    if (draft.requiresText && !draft.valid) {
+      throw new Error("请选择“其他”后填写其他原因");
+    }
+    if (!draft.hasManualReason) return {};
+    return {
+      failure_reason: {
+        mode: "manual",
+        reason_codes: draft.reasonCodes,
+        other_text: draft.otherText,
+      },
+    };
+  }
+
   payloadForVerdict(issueId, verdict) {
     if (!SAVED_VERDICTS.has(verdict)) throw new RangeError("verdict must be pass or fail");
     if (verdict === "pass") return { verdict };
@@ -254,6 +312,7 @@ export class ReviewPanel {
   }
 
   async submit(issueId, verdict) {
+    if (this.isBusy) return false;
     try {
       const payload = this.payloadForVerdict(issueId, verdict);
       this.localError = "";
@@ -267,6 +326,7 @@ export class ReviewPanel {
   }
 
   async complete() {
+    if (this.isBusy) return false;
     try {
       this.localError = "";
       await this.onComplete();
@@ -291,26 +351,39 @@ export class ReviewPanel {
     const readOnly = task?.lease?.read_only === true;
     const gate = completionGate(task);
     const draft = this.reasonDraft();
-    const targetDisabled = readOnly || target === null;
+    const targetDisabled = readOnly || target === null || this.isBusy || !this.canSubmitIssue(target);
+    const reasonDisabled = readOnly || this.isBusy || (target === null && gate.mode !== "early_fail");
     const interval = active.length
       ? `${Math.min(...active.map((issue) => asFrameRange(issue).start))}–${Math.max(...active.map((issue) => asFrameRange(issue).end - 1))}`
       : "当前帧没有问题 Warn";
     const issueRows = active.length
-      ? active.map((issue) => {
+      ? active.map((issue, activeIndex) => {
         const isTarget = issue.id === targetId;
-        return `<li class="active-warning${isTarget ? " is-target" : ""}">
+        const verdict = savedVerdict(issue);
+        const tooltipId = `threshold-${activeIndex}`;
+        const status = verdict === "pass"
+          ? '<strong class="saved-warning-status" data-review-status="pass">✓ 已通过</strong>'
+          : verdict === "fail"
+            ? '<strong class="saved-warning-status" data-review-status="fail">已失败</strong>'
+            : isTarget
+              ? '<span class="current-warning" data-review-status="pending">当前</span>'
+              : '<span class="same-window" data-review-status="pending">同区间待复核</span>';
+        return `<li class="active-warning${isTarget ? " is-target" : ""}" data-review-status="${verdict ?? "pending"}">
           <span>${escapeHtml(issueLabel(issue))}</span>
-          <button type="button" class="threshold-question" data-threshold-tooltip title="${escapeHtml(thresholdTitle(issue.threshold))}" aria-label="${escapeHtml(issueLabel(issue))} 的阈值">?</button>
-          ${isTarget ? '<span class="current-warning">当前</span>' : '<span class="same-window">同区间待处理</span>'}
+          <span class="threshold-anchor">
+            <button type="button" class="threshold-question" aria-describedby="${tooltipId}" aria-label="${escapeHtml(issueLabel(issue))} 的阈值">?</button>
+            <span id="${tooltipId}" role="tooltip" data-threshold-tooltip>${escapeHtml(thresholdTitle(issue.threshold))}</span>
+          </span>
+          ${status}
         </li>`;
       }).join("")
       : '<li class="active-warning-empty">拖动时间针或点击色块查看相应问题。</li>';
     const statusRows = asIssues(task).map((issue, selectedIndex) => {
       const verdict = savedVerdict(issue);
-      const status = verdict === "pass" ? "已通过" : verdict === "fail" ? "未通过" : "待复核";
+      const status = verdict === "pass" ? "已通过" : verdict === "fail" ? "已失败" : "待复核";
       const marker = verdict === "pass" ? '<span data-passed-marker aria-label="已通过">✓</span>' : "";
       const selected = issue.id === targetId;
-      return `<button type="button" class="warning-status warning-status--${verdict ?? "pending"}${selected ? " is-selected" : ""}" data-action="select-status-issue" data-issue-id="${escapeHtml(issue.id)}">
+      return `<button type="button" class="warning-status warning-status--${verdict ?? "pending"}${selected ? " is-selected" : ""}" data-action="select-status-issue" data-issue-id="${escapeHtml(issue.id)}" ${this.isBusy ? "disabled" : ""}>
         <span>${marker}${selectedIndex + 1} ${escapeHtml(issueLabel(issue))} · ${frameLabel(issue)} · ${status}</span>
       </button>`;
     }).join("");
@@ -319,11 +392,11 @@ export class ReviewPanel {
       if (typeof code !== "string") return "";
       const selected = draft.reasonCodes.includes(code);
       const label = option.display_name ?? option.label ?? code;
-      return `<button type="button" class="reason-chip${selected ? " is-selected" : ""}" data-action="toggle-reason" data-reason-code="${escapeHtml(code)}" ${targetDisabled ? "disabled" : ""}>${selected ? "✓ " : ""}${escapeHtml(label)}</button>`;
+      return `<button type="button" class="reason-chip${selected ? " is-selected" : ""}" data-action="toggle-reason" data-reason-code="${escapeHtml(code)}" aria-pressed="${selected ? "true" : "false"}" ${reasonDisabled ? "disabled" : ""}>${selected ? "✓ " : ""}${escapeHtml(label)}</button>`;
     }).join("");
     const otherField = draft.requiresText
       ? `<label class="other-reason-label">请填写其他原因（必填）
-          <input data-reason-other type="text" required value="${escapeHtml(this.otherText)}" placeholder="请输入其他原因" ${targetDisabled ? "disabled" : ""}>
+          <input data-reason-other type="text" required value="${escapeHtml(this.otherText)}" placeholder="请输入其他原因" ${reasonDisabled ? "disabled" : ""}>
         </label>`
       : "";
     const overlayNotice = target?.overlay && target.overlay.status !== "ready"
@@ -346,7 +419,7 @@ export class ReviewPanel {
         <button type="button" class="fail-button" data-action="verdict-fail" ${targetDisabled ? "disabled" : ""}>Fail</button>
       </section>
       <section class="completion-action">
-        <button type="button" class="complete-button" data-action="complete-review" ${readOnly || !gate.enabled ? "disabled" : ""}>完成复核</button>
+        <button type="button" class="complete-button" data-action="complete-review" ${readOnly || !gate.enabled || this.isBusy ? "disabled" : ""}>完成复核</button>
         <span>${gate.enabled ? (gate.mode === "early_fail" ? "Fail 后可提前完成复核" : "全部通过后可完成复核") : "请先完成当前 Warn 判定"}</span>
       </section>
       <p class="panel-error" role="alert" ${this.localError ? "" : "hidden"}>${escapeHtml(this.localError)}</p>`;
@@ -356,6 +429,7 @@ export class ReviewPanel {
     const actionElement = event?.target?.closest?.("[data-action]");
     if (!actionElement || !this.root?.contains?.(actionElement)) return;
     const action = actionElement.dataset.action;
+    if (this.isBusy) return;
     if (action === "toggle-reason") {
       this.toggleReason(actionElement.dataset.reasonCode);
       return;
@@ -374,7 +448,7 @@ export class ReviewPanel {
   }
 
   _handleInput(event) {
-    if (event?.target?.matches?.("[data-reason-other]")) this.setOtherText(event.target.value);
+    if (!this.isBusy && event?.target?.matches?.("[data-reason-other]")) this.setOtherText(event.target.value);
   }
 }
 

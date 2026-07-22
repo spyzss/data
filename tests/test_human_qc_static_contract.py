@@ -47,6 +47,8 @@ def test_warn_layout_has_one_current_frame_and_required_bottom_action_order() ->
     assert html.index("data-review-panel") < html.index("data-bottom-navigation")
     assert "data-action=\"rate-decrease\"" in html
     assert "data-action=\"rate-increase\"" in html
+    assert "data-overlay-video" in html
+    assert "aria-hidden=\"true\"" in html
 
     panel = _read("review_panel.js")
     assert panel.index('data-action="verdict-pass"') < panel.index('data-action="complete-review"')
@@ -55,6 +57,14 @@ def test_warn_layout_has_one_current_frame_and_required_bottom_action_order() ->
     assert "required" in panel
     assert "data-threshold-tooltip" in panel
     assert "data-passed-marker" in panel
+    assert "aria-pressed" in panel
+    assert "aria-describedby" in panel
+    assert "canSubmitIssue" in panel
+
+    app = _read("app.js")
+    assert "canSubmitIssue" in app
+    assert "overlay-status" not in app
+    assert "setInterval" not in app
 
 
 def test_static_contracts_pass() -> None:
