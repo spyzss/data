@@ -466,6 +466,39 @@ def test_opaque_selected_issue_id_preserves_internal_write_semantics(
     assert warn.calls[-1][1][1] == raw_issue_id
 
 
+def test_opaque_selected_issue_without_machine_verdict_has_sanitized_service_error(
+    tmp_path: Path,
+) -> None:
+    raw_issue_id = "/private/traceback-command=ffmpeg"
+    report = _report()
+    issue = {**report["issues"][0], "issue_id": raw_issue_id}
+    issue.pop("severity")
+    issue.pop("verdict", None)
+    issue.pop("result_gate", None)
+    report["issues"] = [issue]
+    report["manual_review"]["candidate_issue_ids"] = [raw_issue_id]
+    report["manual_review"]["selected_issue_ids"] = [raw_issue_id]
+    report["manual_review"]["issue_reviews"] = {}
+    service, _, _, context = _service(tmp_path)
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    task = service.get_asset_task("asset-1")
+    with pytest.raises(WarnStateError) as caught:
+        service.warn_verdict(
+            "asset-1",
+            issue_id=task["issues"][0]["id"],
+            verdict="pass",
+            expected_revision=3,
+            lease_token=task["lease"]["token"],
+        )
+
+    assert str(caught.value) == "selected issue has no machine verdict"
+    assert raw_issue_id not in str(caught.value)
+    assert "/private" not in str(caught.value).lower()
+    assert "traceback" not in str(caught.value).lower()
+    assert "ffmpeg" not in str(caught.value).lower()
+
+
 def test_untrusted_selected_issue_id_error_does_not_echo_raw_value(
     tmp_path: Path,
 ) -> None:

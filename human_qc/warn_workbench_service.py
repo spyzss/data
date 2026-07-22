@@ -798,16 +798,21 @@ class WarnWorkbenchService:
         lease = self._prepare_mutation(asset_id, expected_revision, lease_token)
         raw_issue_id = self._raw_issue_id(asset_id, issue_id)
         service = self._domain_warn(asset_id, lease)
-        service.submit_verdict(
-            asset_id,
-            raw_issue_id,
-            verdict,
-            reason,
-            expected_revision,
-            lease_token,
-            reviewer=lease.reviewer,
-            failure_reason=failure_reason,
-        )
+        try:
+            service.submit_verdict(
+                asset_id,
+                raw_issue_id,
+                verdict,
+                reason,
+                expected_revision,
+                lease_token,
+                reviewer=lease.reviewer,
+                failure_reason=failure_reason,
+            )
+        except WarnStateError as exc:
+            if str(exc) != f"issue {raw_issue_id} has no machine verdict":
+                raise
+            raise WarnStateError("selected issue has no machine verdict") from None
         return self.get_asset_task(asset_id, lease_token=lease_token)
 
     def warn_complete(
