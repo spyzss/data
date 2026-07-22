@@ -21,7 +21,8 @@ import re
 import shutil
 import socket
 import tempfile
-from threading import BoundedSemaphore, RLock
+from threading import BoundedSemaphore, Event, RLock, Thread
+import time
 from typing import Literal, Protocol
 import uuid
 
@@ -32,10 +33,14 @@ _DIGEST = re.compile(r"[0-9a-f]{64}").fullmatch
 _MANIFEST_NAME = "manifest.json"
 _OWNER_NAME = ".generation.owner.json"
 _PUBLISH_LOCK_NAME = ".overlay-publish.lock"
+_PIN_ROOT_NAME = ".overlay-pins"
 _SCHEMA_VERSION = 1
-_PROCESS_INSTANCE_ID = uuid.uuid4().hex
+_PROCESS_INCARNATION = uuid.uuid4().hex
 _LOCAL_OWNER_LOCK = RLock()
 _LOCAL_OWNER_TOKENS: set[tuple[str, str]] = set()
+_MIN_LEASE_SECONDS = 0.01
+_MAX_OWNER_LEASE_SECONDS = 300.0
+_MAX_PIN_LEASE_SECONDS = 3600.0
 
 FrameInterval = tuple[int, int]
 OverlayStatus = Literal["pending", "generating", "ready", "failed"]
@@ -88,6 +93,15 @@ def _required_text(value: object, name: str) -> str:
 
 def _safe_code(value: object, fallback: str) -> str:
     return value if isinstance(value, str) and _STABLE_CODE(value) else fallback
+
+
+def _bounded_lease_seconds(value: object, name: str, maximum: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a finite number")
+    seconds = float(value)
+    if not math.isfinite(seconds) or not _MIN_LEASE_SECONDS <= seconds <= maximum:
+        raise ValueError(f"{name} must be between {_MIN_LEASE_SECONDS} and {maximum}")
+    return seconds
 
 
 def merge_frame_intervals(intervals: Iterable[FrameInterval]) -> tuple[FrameInterval, ...]:
@@ -283,6 +297,8 @@ class BoundedOverlayWorker:
         max_pending: int = 1,
         max_cache_bytes: int | None = None,
         max_ready_jobs: int | None = None,
+        owner_lease_seconds: float = 30.0,
+        pin_lease_seconds: float = 60.0,
     ) -> None:
         for name, value in (("max_workers", max_workers), ("max_pending", max_pending)):
             if not _is_int(value) or value < 0 or (name == "max_workers" and value == 0):
@@ -294,11 +310,21 @@ class BoundedOverlayWorker:
         self._capacity = BoundedSemaphore(max_workers + max_pending)
         self._max_cache_bytes = max_cache_bytes
         self._max_ready_jobs = max_ready_jobs
+        self._owner_lease_seconds = _bounded_lease_seconds(
+            owner_lease_seconds,
+            "owner_lease_seconds",
+            _MAX_OWNER_LEASE_SECONDS,
+        )
+        self._pin_lease_seconds = _bounded_lease_seconds(
+            pin_lease_seconds,
+            "pin_lease_seconds",
+            _MAX_PIN_LEASE_SECONDS,
+        )
         self._lock = RLock()
         self._inflight: dict[tuple[str, str], Future[None]] = {}
         self._scheduled: set[tuple[str, str]] = set()
         self._views: dict[tuple[str, str], OverlayJobView] = {}
-        self._pinned: set[tuple[str, str]] = set()
+        self._pin_leases: dict[tuple[str, str], tuple[str, Path]] = {}
         self._closed = False
 
     @staticmethod
@@ -670,6 +696,18 @@ class BoundedOverlayWorker:
             return {}
         return raw if isinstance(raw, Mapping) else {}
 
+    def _owner_payload(self, token: str) -> dict[str, object]:
+        heartbeat_at = time.time()
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "process_incarnation": _PROCESS_INCARNATION,
+            "token": token,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "heartbeat_at": heartbeat_at,
+            "lease_expires_at": heartbeat_at + self._owner_lease_seconds,
+        }
+
     def _owner_is_live_locked(self, request: OverlayRequest) -> bool:
         """Conservatively decide whether a durable owner marker is still live.
 
@@ -683,24 +721,42 @@ class BoundedOverlayWorker:
         owner = self._read_owner_locked(request)
         if owner is None:
             return False
-        process_instance = owner.get("process_instance")
+        process_incarnation = owner.get("process_incarnation")
         token = owner.get("token")
         pid = owner.get("pid")
         host = owner.get("host")
+        heartbeat_at = owner.get("heartbeat_at")
+        lease_expires_at = owner.get("lease_expires_at")
+        now = time.time()
         if (
-            not isinstance(process_instance, str)
+            not isinstance(process_incarnation, str)
             or not isinstance(token, str)
             or not _is_int(pid)
             or pid <= 0
             or not isinstance(host, str)
+            or isinstance(heartbeat_at, bool)
+            or not isinstance(heartbeat_at, (int, float))
+            or not math.isfinite(float(heartbeat_at))
+            or isinstance(lease_expires_at, bool)
+            or not isinstance(lease_expires_at, (int, float))
+            or not math.isfinite(float(lease_expires_at))
+            or not _MIN_LEASE_SECONDS
+            <= float(lease_expires_at) - float(heartbeat_at)
+            <= _MAX_OWNER_LEASE_SECONDS
+            or float(lease_expires_at) <= now
+            or float(lease_expires_at) > now + _MAX_OWNER_LEASE_SECONDS
         ):
             return False
         marker = (str(self._owner_path(request)), token)
-        if process_instance == _PROCESS_INSTANCE_ID:
+        if process_incarnation == _PROCESS_INCARNATION:
             with _LOCAL_OWNER_LOCK:
                 return marker in _LOCAL_OWNER_TOKENS
         if host != socket.gethostname():
             return True
+        if pid == os.getpid():
+            # The same PID with another incarnation is an old/reused marker,
+            # not a currently executing owner in this process.
+            return False
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -720,14 +776,7 @@ class BoundedOverlayWorker:
         except OSError as exc:
             raise OverlayWorkerError("overlay_cache_invalid") from exc
         token = uuid.uuid4().hex
-        payload = {
-            "schema_version": _SCHEMA_VERSION,
-            "process_instance": _PROCESS_INSTANCE_ID,
-            "token": token,
-            "pid": os.getpid(),
-            "host": socket.gethostname(),
-        }
-        self._atomic_json(owner_path, payload)
+        self._atomic_json(owner_path, self._owner_payload(token))
         with _LOCAL_OWNER_LOCK:
             _LOCAL_OWNER_TOKENS.add((str(owner_path), token))
         return token
@@ -736,9 +785,43 @@ class BoundedOverlayWorker:
         owner = self._read_owner_locked(request)
         return bool(
             owner
-            and owner.get("process_instance") == _PROCESS_INSTANCE_ID
+            and owner.get("process_incarnation") == _PROCESS_INCARNATION
             and owner.get("token") == token
         )
+
+    def _heartbeat_owner(self, request: OverlayRequest, token: str) -> None:
+        """Renew a live owner's bounded lease without blocking a renderer."""
+
+        try:
+            with self._key_lock(request, blocking=False) as acquired:
+                if acquired and self._owns_owner_locked(request, token):
+                    self._atomic_json(self._owner_path(request), self._owner_payload(token))
+        except OSError:
+            # A later observer can safely recover once the last valid lease
+            # expires; no filesystem details are exposed through the job view.
+            return
+
+    def _start_owner_heartbeat(self, request: OverlayRequest, token: str) -> tuple[Event, Thread]:
+        stop = Event()
+        interval = max(_MIN_LEASE_SECONDS, self._owner_lease_seconds / 3.0)
+
+        def renew() -> None:
+            while not stop.wait(interval):
+                self._heartbeat_owner(request, token)
+
+        thread = Thread(target=renew, name="sam3-overlay-owner-heartbeat", daemon=True)
+        thread.start()
+        return stop, thread
+
+    @staticmethod
+    def _stop_owner_heartbeat(stop: Event, thread: Thread) -> None:
+        stop.set()
+        thread.join()
+
+    @staticmethod
+    def _forget_local_owner(request: OverlayRequest, token: str) -> None:
+        with _LOCAL_OWNER_LOCK:
+            _LOCAL_OWNER_TOKENS.discard((str(request.cache_root.resolve() / request.cache_key.digest / _OWNER_NAME), token))
 
     def _release_owner(self, request: OverlayRequest, token: str) -> None:
         owner_path = self._owner_path(request)
@@ -748,8 +831,7 @@ class BoundedOverlayWorker:
                     owner_path.unlink(missing_ok=True)
                     self._fsync_directory(owner_path.parent)
         finally:
-            with _LOCAL_OWNER_LOCK:
-                _LOCAL_OWNER_TOKENS.discard((str(owner_path), token))
+            self._forget_local_owner(request, token)
 
     def _recover_if_interrupted(self, request: OverlayRequest, view: OverlayJobView) -> OverlayJobView:
         if view.status not in {"pending", "generating"}:
@@ -894,6 +976,70 @@ class BoundedOverlayWorker:
         except OSError:
             return
 
+    @staticmethod
+    def _pin_directory(root: Path, digest: str) -> Path:
+        return root / _PIN_ROOT_NAME / digest
+
+    def _pin_payload(self, request: OverlayRequest, token: str, lease_seconds: float) -> dict[str, object]:
+        now = time.time()
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "key_digest": request.cache_key.digest,
+            "process_incarnation": _PROCESS_INCARNATION,
+            "token": token,
+            "expires_at": now + lease_seconds,
+        }
+
+    def _has_live_pin(self, root: Path, digest: str) -> bool:
+        """Return whether any unexpired root-visible lease protects a job.
+
+        Callers hold the root publish lock, so removing expired leases cannot
+        race cache eviction or publication by another worker.
+        """
+
+        pin_directory = self._pin_directory(root, digest)
+        try:
+            entries = list(pin_directory.iterdir())
+        except FileNotFoundError:
+            return False
+        except OSError:
+            # An unreadable pin is treated as live: evicting visible media is
+            # riskier than declining one cache publication.
+            return True
+        now = time.time()
+        live = False
+        for path in entries:
+            if not path.is_file() or path.suffix != ".json":
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            expires_at = payload.get("expires_at") if isinstance(payload, Mapping) else None
+            valid = (
+                isinstance(payload, Mapping)
+                and payload.get("key_digest") == digest
+                and isinstance(payload.get("token"), str)
+                and isinstance(expires_at, (int, float))
+                and not isinstance(expires_at, bool)
+                and math.isfinite(float(expires_at))
+                and float(expires_at) > now
+            )
+            if valid:
+                live = True
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                return True
+        if not live:
+            try:
+                pin_directory.rmdir()
+                (root / _PIN_ROOT_NAME).rmdir()
+            except OSError:
+                pass
+        return live
+
     def _evict_for(self, request: OverlayRequest, current_job_size: int) -> bool:
         if self._max_cache_bytes is None and self._max_ready_jobs is None:
             return True
@@ -902,14 +1048,14 @@ class BoundedOverlayWorker:
             candidates = [path for path in root.iterdir() if path.is_dir() and _DIGEST(path.name)]
         except OSError:
             return False
-        current_id = self._job_id(request)
-        ready: list[tuple[float, int, Path]] = []
+        ready: list[tuple[float, int, Path, bool]] = []
         total_size = 0
+        ready_count = 0
         for path in candidates:
             if path == self._job_dir(request):
                 continue
             key = (str(root), path.name)
-            if key in self._pinned or key in self._scheduled:
+            if key in self._scheduled:
                 continue
             manifest = path / _MANIFEST_NAME
             try:
@@ -920,18 +1066,25 @@ class BoundedOverlayWorker:
                 continue
             size = self._job_size(path)
             total_size += size
+            ready_count += 1
             try:
                 modified = manifest.stat().st_mtime
             except OSError:
                 modified = 0.0
-            ready.append((modified, size, path))
+            ready.append((modified, size, path, not self._has_live_pin(root, path.name)))
         ready.sort(key=lambda item: item[0])
-        target_count = len(ready) + 1
-        while ready and (
+        target_count = ready_count + 1
+        while (
             (self._max_cache_bytes is not None and total_size + current_job_size > self._max_cache_bytes)
             or (self._max_ready_jobs is not None and target_count > self._max_ready_jobs)
         ):
-            _, size, victim = ready.pop(0)
+            victim_index = next(
+                (index for index, (_, _, _, evictable) in enumerate(ready) if evictable),
+                None,
+            )
+            if victim_index is None:
+                break
+            _, size, victim, _ = ready.pop(victim_index)
             self._safe_remove_job(root, victim)
             total_size -= size
             target_count -= 1
@@ -1102,10 +1255,24 @@ class BoundedOverlayWorker:
                 self._persist(request, final)
                 return final
 
+    def _persist_cleanup_failure(self, request: OverlayRequest, view: OverlayJobView) -> None:
+        try:
+            with self._root_publish_lock(request):
+                with self._key_lock(request) as acquired:
+                    if acquired:
+                        self._persist(request, view)
+        except BaseException:
+            return
+
     def _run(
-        self, request: OverlayRequest, initial: OverlayJobView, owner_token: str
+        self,
+        request: OverlayRequest,
+        initial: OverlayJobView,
+        owner_token: str,
+        heartbeat_stop: Event,
+        heartbeat_thread: Thread,
     ) -> None:
-        final: OverlayJobView
+        final = self._failed_view(request, "overlay_render_failed", retryable=True)
         try:
             generating: OverlayJobView | None = None
             with self._key_lock(request) as acquired:
@@ -1136,9 +1303,28 @@ class BoundedOverlayWorker:
             except BaseException:
                 pass
         finally:
-            self._release_owner(request, owner_token)
-        self._publish_view(request, final)
-        self._release_slot(request)
+            cleanup_failed = False
+            try:
+                self._stop_owner_heartbeat(heartbeat_stop, heartbeat_thread)
+            except BaseException:
+                cleanup_failed = True
+            try:
+                self._release_owner(request, owner_token)
+            except BaseException:
+                cleanup_failed = True
+            finally:
+                self._forget_local_owner(request, owner_token)
+            if cleanup_failed:
+                final = self._failed_view(
+                    request,
+                    "overlay_cleanup_failed",
+                    retryable=True,
+                )
+                self._persist_cleanup_failure(request, final)
+            try:
+                self._publish_view(request, final)
+            finally:
+                self._release_slot(request)
 
     def _schedule(self, request: OverlayRequest, previous: OverlayJobView | None) -> OverlayJobView:
         reusable = () if previous is None else tuple(
@@ -1153,6 +1339,8 @@ class BoundedOverlayWorker:
             segments=reusable or self._empty_segments(request, "pending"),
         )
         owner_token: str | None = None
+        heartbeat_stop: Event | None = None
+        heartbeat_thread: Thread | None = None
         try:
             with self._key_lock(request) as acquired:
                 if not acquired:
@@ -1177,12 +1365,32 @@ class BoundedOverlayWorker:
             # Register capacity ownership before the executor can run a very
             # fast task and release the slot on another thread.
             self._scheduled.add(job_id)
-            future = self._executor.submit(self._run, request, pending, owner_token)
+            assert owner_token is not None
+            heartbeat_stop, heartbeat_thread = self._start_owner_heartbeat(request, owner_token)
+            future = self._executor.submit(
+                self._run,
+                request,
+                pending,
+                owner_token,
+                heartbeat_stop,
+                heartbeat_thread,
+            )
         except BaseException:
-            if owner_token is not None:
-                self._release_owner(request, owner_token)
-            self._scheduled.discard(self._job_id(request))
-            self._capacity.release()
+            try:
+                if heartbeat_stop is not None and heartbeat_thread is not None:
+                    self._stop_owner_heartbeat(heartbeat_stop, heartbeat_thread)
+            except BaseException:
+                pass
+            try:
+                if owner_token is not None:
+                    self._release_owner(request, owner_token)
+            except BaseException:
+                pass
+            finally:
+                if owner_token is not None:
+                    self._forget_local_owner(request, owner_token)
+                self._scheduled.discard(self._job_id(request))
+                self._capacity.release()
             return self._failed_view(request, "overlay_render_failed", retryable=True)
         self._views[self._job_id(request)] = pending
         self._inflight[self._job_id(request)] = future
@@ -1266,15 +1474,53 @@ class BoundedOverlayWorker:
                 return self._failed_view(request, "overlay_queue_full", retryable=True)
             return self._schedule(request, current)
 
-    def pin(self, request: OverlayRequest) -> None:
-        """Prevent this ready cache entry from eviction while a media catalog pins it."""
+    def pin(self, request: OverlayRequest, *, lease_seconds: float | None = None) -> None:
+        """Create or renew this worker's root-visible cache pin lease.
 
+        Callers that keep media allowlisted for longer than the configured
+        lease renew it by calling ``pin`` again.  Expired leases are removed by
+        the next root-locked eviction pass, including in other worker
+        instances/processes.
+        """
+
+        if not isinstance(request, OverlayRequest):
+            raise TypeError("request must be an OverlayRequest")
+        seconds = self._pin_lease_seconds if lease_seconds is None else _bounded_lease_seconds(
+            lease_seconds,
+            "lease_seconds",
+            _MAX_PIN_LEASE_SECONDS,
+        )
+        job_id = self._job_id(request)
         with self._lock:
-            self._pinned.add(self._job_id(request))
+            lease = self._pin_leases.get(job_id)
+            if lease is None:
+                token = uuid.uuid4().hex
+                lease_path = self._pin_directory(
+                    self._root(request), request.cache_key.digest
+                ) / f"{_PROCESS_INCARNATION}-{token}.json"
+            else:
+                token, lease_path = lease
+            with self._root_publish_lock(request):
+                lease_path.parent.mkdir(parents=True, exist_ok=True)
+                self._atomic_json(lease_path, self._pin_payload(request, token, seconds))
+            self._pin_leases[job_id] = (token, lease_path)
 
     def unpin(self, request: OverlayRequest) -> None:
+        if not isinstance(request, OverlayRequest):
+            raise TypeError("request must be an OverlayRequest")
+        job_id = self._job_id(request)
         with self._lock:
-            self._pinned.discard(self._job_id(request))
+            lease = self._pin_leases.pop(job_id, None)
+            if lease is None:
+                return
+            _, lease_path = lease
+            with self._root_publish_lock(request):
+                try:
+                    lease_path.unlink(missing_ok=True)
+                    lease_path.parent.rmdir()
+                    lease_path.parent.parent.rmdir()
+                except OSError:
+                    pass
 
     def shutdown(self, *, wait: bool = True) -> None:
         with self._lock:

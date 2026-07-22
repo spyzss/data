@@ -373,6 +373,203 @@ def test_observer_never_recovers_a_live_cross_instance_generation(tmp_path: Path
         observer.shutdown()
 
 
+def test_owner_lease_heartbeats_keep_a_live_cross_instance_generation_active(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    renderer = BlockingRenderer()
+    request = _request(tmp_path, renderer=renderer)
+    owner = BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=1,
+        owner_lease_seconds=0.08,
+    )
+    observer = BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=1,
+        owner_lease_seconds=0.08,
+    )
+    try:
+        owner.submit(request)
+        assert renderer.started.wait(1.0)
+        time.sleep(0.20)
+
+        observed = observer.get(request)
+        assert observed.status in {"pending", "generating"}
+
+        renderer.release.set()
+        assert _wait_until_terminal(owner, request).status == "ready"
+    finally:
+        renderer.release.set()
+        owner.shutdown()
+        observer.shutdown()
+
+
+def test_expired_remote_owner_lease_recovers_as_retryable_interrupted(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(tmp_path, renderer=RecordingRenderer())
+    job_dir = request.cache_root / request.cache_key.digest
+    job_dir.mkdir(parents=True)
+    (job_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "key_digest": request.cache_key.digest,
+                "status": "generating",
+                "segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    owner_path = job_dir / ".generation.owner.json"
+    owner_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "process_incarnation": "reused-or-remote-process",
+                "token": "stale-owner-token",
+                "pid": 99999,
+                "host": "unreachable-remote-host",
+                "heartbeat_at": time.time() - 10.0,
+                "lease_expires_at": time.time() - 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=1, owner_lease_seconds=0.08)
+    try:
+        recovered = worker.get(request)
+        assert recovered.status == "failed"
+        assert recovered.code == "overlay_interrupted"
+        assert recovered.retryable is True
+        assert not owner_path.exists()
+    finally:
+        worker.shutdown()
+
+
+def test_owner_marker_with_an_unbounded_future_lease_is_not_live(tmp_path: Path) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(tmp_path, renderer=RecordingRenderer())
+    job_dir = request.cache_root / request.cache_key.digest
+    job_dir.mkdir(parents=True)
+    (job_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "key_digest": request.cache_key.digest,
+                "status": "pending",
+                "segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = time.time()
+    (job_dir / ".generation.owner.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "process_incarnation": "unbounded-stale-process",
+                "token": "unbounded-owner-token",
+                "pid": 99999,
+                "host": "unreachable-remote-host",
+                "heartbeat_at": now,
+                "lease_expires_at": now + 3600.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=1)
+    try:
+        recovered = worker.get(request)
+        assert recovered.status == "failed"
+        assert recovered.code == "overlay_interrupted"
+    finally:
+        worker.shutdown()
+
+
+def test_owner_cleanup_error_still_releases_capacity_and_returns_safe_failure(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(tmp_path, intervals=((20, 30),), renderer=RecordingRenderer())
+    next_request = _request(
+        tmp_path,
+        intervals=((40, 50),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "f" * 64,
+    )
+    worker = BoundedOverlayWorker(max_workers=1, max_pending=0)
+    original_release = worker._release_owner
+
+    def broken_release(request: object, token: str) -> None:
+        del request, token
+        raise OSError("/private/overlay-owner-cleanup")
+
+    worker._release_owner = broken_release
+    try:
+        worker.submit(request)
+        failed = _wait_until_terminal(worker, request)
+        assert failed.status == "failed"
+        assert failed.code == "overlay_cleanup_failed"
+        assert "/private" not in json.dumps(failed.to_safe_dict())
+        assert worker._job_id(request) not in worker._scheduled
+
+        worker._release_owner = original_release
+        accepted = worker.submit(next_request)
+        assert accepted.status in {"pending", "generating"}
+        assert _wait_until_terminal(worker, next_request).status == "ready"
+    finally:
+        worker._release_owner = original_release
+        worker.shutdown()
+
+
+def test_durable_pin_blocks_other_worker_eviction_until_the_lease_expires(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request_a = _request(
+        tmp_path,
+        intervals=((120, 169),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "1" * 64,
+    )
+    request_b = _request(
+        tmp_path,
+        intervals=((220, 269),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "2" * 64,
+    )
+    worker_a = BoundedOverlayWorker(max_workers=1, max_pending=1, max_ready_jobs=1)
+    worker_b = BoundedOverlayWorker(max_workers=1, max_pending=1, max_ready_jobs=1)
+    try:
+        worker_a.submit(request_a)
+        assert _wait_until_terminal(worker_a, request_a).status == "ready"
+        worker_a.pin(request_a, lease_seconds=0.10)
+
+        worker_b.submit(request_b)
+        blocked = _wait_until_terminal(worker_b, request_b)
+        assert blocked.status == "failed"
+        assert blocked.code == "overlay_cache_full"
+        assert (request_a.cache_root / request_a.cache_key.digest / "manifest.json").is_file()
+
+        time.sleep(0.16)
+        retried = worker_b.retry(request_b)
+        assert retried.status in {"pending", "generating"}
+        assert _wait_until_terminal(worker_b, request_b).status == "ready"
+        assert not (request_a.cache_root / request_a.cache_key.digest).exists()
+        assert not (request_a.cache_root / ".overlay-pins" / request_a.cache_key.digest).exists()
+    finally:
+        worker_a.shutdown()
+        worker_b.shutdown()
+
+
 def test_distinct_concurrent_jobs_publish_within_the_shared_ready_cache_limit(
     tmp_path: Path,
 ) -> None:
