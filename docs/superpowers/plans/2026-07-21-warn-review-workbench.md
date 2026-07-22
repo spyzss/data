@@ -608,7 +608,7 @@ git commit -m "feat(human-qc): build warn-only review interface"
 - Produces: `BoundedOverlayWorker.submit(request) -> OverlayJobView`
 - Produces statuses: `pending | generating | ready | failed` and allowlisted result path.
 
-- [ ] **Step 1: Write failing worker tests**
+- [x] **Step 1: Write failing worker tests**
 
 Use a fake renderer that records frame IDs and assert:
 
@@ -622,7 +622,7 @@ assert worker.submit(request).cache_hit is True
 
 Assert model/config/renderer version changes miss cache; errors become `failed` with a stable public code; max concurrent renderer calls never exceeds the configured worker count.
 
-- [ ] **Step 2: Run tests and verify Red**
+- [x] **Step 2: Run tests and verify Red**
 
 ```bash
 pytest -q tests/test_sam3_overlay_worker.py tests/test_review_evidence.py tests/test_qc_pipeline_sam3_runner.py
@@ -630,19 +630,77 @@ pytest -q tests/test_sam3_overlay_worker.py tests/test_review_evidence.py tests/
 
 Expected: FAIL because continuous overlay jobs and cache keys do not exist.
 
-- [ ] **Step 3: Implement bounded background generation**
+- [x] **Step 3: Implement bounded background generation**
 
 Use `ThreadPoolExecutor(max_workers=configured_limit)` only inside `BoundedOverlayWorker`. The HTTP layer may enqueue but never call the renderer directly. Iterate each merged half-open interval exactly once, obtain the already inference-locked segmenter from `Sam3RuntimeProvider`, write a temporary video, fsync and `os.replace` into the cache. Persist a compact manifest with cache key, intervals, status and safe relative output path.
 
-- [ ] **Step 4: Run worker tests and verify Green**
+- [x] **Step 4: Run worker tests and verify Green**
 
 Run the Step 2 command. Expected: PASS.
 
-- [ ] **Step 5: Commit Task 9**
+- [x] **Step 5: Commit Task 9**
 
 ```bash
 git add human_qc/overlay_worker.py human_qc/evidence.py qc_pipeline/sam3_runtime.py tests/test_sam3_overlay_worker.py tests/test_review_evidence.py tests/test_qc_pipeline_sam3_runner.py openspec/changes/add-human-semantic-warn-review/tasks.md
 git commit -m "feat(sam3): cache continuous issue-window overlays"
+```
+
+#### 生产接线补充（Task 9C）
+
+Task 9 的通用 worker 和资产级 provider 已完成审查，但生产启动器尚未构造
+真实 SAM3 renderer/provider。这个补充仍只覆盖 OpenSpec 10.1/10.2：不新增
+HTTP polling、retry 路由或浏览器同步（均属于 Task 10）。
+
+**Files:**
+- Create: `human_qc/sam3_overlay_renderer.py`
+- Create: `tests/test_sam3_overlay_renderer.py`
+- Modify: `tools/serve_human_qc_workbench.py`
+- Modify: `tests/test_human_qc_launcher.py`
+- Modify only if a safe recipe is unavailable: `qc_pipeline/runners/sam3_containment.py`, its focused tests
+
+- [ ] **Step 6: Write failing production renderer and launcher tests**
+
+Use a fake strict frame provider and locked segmenter. Assert every source
+frame in a merged half-open interval is rendered once, failures never publish a
+partial ready segment, and a source/model/config/mapping fingerprint change
+misses the cache. Assert the launcher rehydrates report metadata, constructs one
+worker/provider when an explicit model configuration is supplied, keeps its
+cache below the batch root, and shuts the worker down. Missing or ambiguous
+frame mapping/model inputs must produce an allowlisted unavailable/failed view;
+they must not guess direct frame indexing.
+
+- [ ] **Step 7: Run the new tests and verify Red**
+
+```bash
+pytest -q tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py tests/test_sam3_overlay_worker.py tests/test_review_evidence.py
+```
+
+Expected: FAIL because the launcher has no production renderer/provider wiring.
+
+- [ ] **Step 8: Implement strict production renderer and launcher wiring**
+
+Add a server-only renderer that uses one shared `Sam3RuntimeProvider`, decodes
+only the worker-provided half-open source intervals, invokes the inference-locked
+segmenter, and atomically writes the temporary MP4 required by
+`BoundedOverlayWorker`. Rehydrate only supplier-aware mapping/input recipes
+that the report can prove; raise stable public errors for unavailable source,
+mapping, model, decode, inference, or encoder conditions. The launcher must
+accept explicit local model/cache/bound inputs, use a cache contained by the
+asset batch root, pass `WorkerOverlayProvider` to `WarnWorkbenchService`, and
+shut down the worker in its existing `finally` path. Task GET remains enqueue/
+status-only and never renders synchronously.
+
+- [ ] **Step 9: Run focused production-overlay tests and verify Green**
+
+Run the Step 7 command plus the relevant SAM3 runner tests. Expected: PASS.
+
+- [ ] **Step 10: Commit Task 9C**
+
+```bash
+git add human_qc/sam3_overlay_renderer.py tools/serve_human_qc_workbench.py \
+  tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py \
+  qc_pipeline/runners/sam3_containment.py tests/test_qc_pipeline_sam3_runner.py
+git commit -m "feat(sam3): wire bounded overlays into warn workbench"
 ```
 
 ### Task 10: 同步播放 Overlay 并实施局部就绪门禁
