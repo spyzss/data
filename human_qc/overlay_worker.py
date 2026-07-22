@@ -1044,6 +1044,26 @@ class BoundedOverlayWorker:
             return total
         return total
 
+    @staticmethod
+    def _job_size_replacing_manifest(path: Path, manifest_size: int) -> int | None:
+        """Return the final footprint after replacing only ``manifest.json``.
+
+        Failed publication has already removed media, but owner/fence/lock files
+        can remain.  Any unreadable entry fails closed rather than undercounting
+        the cache footprint.
+        """
+
+        total = manifest_size
+        try:
+            for entry in path.iterdir():
+                if entry.name == _MANIFEST_NAME:
+                    continue
+                if entry.is_file():
+                    total += entry.stat().st_size
+        except OSError:
+            return None
+        return total
+
     def _safe_remove_job(self, root: Path, job_dir: Path) -> None:
         try:
             if job_dir.parent.resolve() != root.resolve() or _DIGEST(job_dir.name) is None:
@@ -1434,7 +1454,12 @@ class BoundedOverlayWorker:
                 separators=(",", ":"),
             ).encode("utf-8")
         )
-        if not self._evict_failed_for(request, manifest_size):
+        projected_size = self._job_size_replacing_manifest(
+            self._job_dir(request), manifest_size
+        )
+        if projected_size is None or not self._evict_failed_for(
+            request, projected_size
+        ):
             self._safe_remove_job(self._root(request), self._job_dir(request))
             return final
         try:
@@ -1448,7 +1473,7 @@ class BoundedOverlayWorker:
         request: OverlayRequest,
         candidate: OverlayJobView,
         *,
-        owner_token: str | None = None,
+        owner_token: str,
     ) -> OverlayJobView:
         """Quota-publish a failed view, or retain it safely in memory only."""
 
@@ -1458,10 +1483,8 @@ class BoundedOverlayWorker:
                 with self._key_lock(request, create=False) as acquired:
                     if not acquired:
                         return fallback
-                    if owner_token is not None and not self._owns_owner_locked(
-                        request, owner_token
-                    ):
-                        return self._parse_manifest(request) or fallback
+                    if not self._owns_owner_locked(request, owner_token):
+                        return fallback
                     return self._publish_failed_locked(request, fallback)
         except BaseException:
             return fallback
@@ -1588,7 +1611,11 @@ class BoundedOverlayWorker:
                     "overlay_cleanup_failed",
                     retryable=True,
                 )
-                final = self._publish_failed(request, final)
+                final = self._publish_failed(
+                    request,
+                    final,
+                    owner_token=owner_token,
+                )
             try:
                 self._publish_view(request, final)
             finally:

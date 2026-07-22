@@ -821,6 +821,128 @@ def test_cleanup_failure_failed_view_respects_tiny_quota(tmp_path: Path) -> None
         worker.shutdown()
 
 
+def test_cleanup_failure_quota_counts_the_remaining_owner_file_in_final_footprint(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    request = _request(
+        tmp_path,
+        intervals=((20, 21),),
+        renderer=RecordingRenderer(),
+    )
+    max_cache_bytes = 647
+    worker = BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=0,
+        max_cache_bytes=max_cache_bytes,
+    )
+    original_release = worker._release_owner
+
+    def broken_release(_request: object, _token: str) -> None:
+        raise OSError("private owner cleanup failure")
+
+    worker._release_owner = broken_release
+    try:
+        worker.submit(request)
+        failed = _wait_until_terminal(worker, request)
+        job_dir = request.cache_root / request.cache_key.digest
+
+        assert failed.status == "failed"
+        assert failed.code == "overlay_cleanup_failed"
+        assert worker.get(request).code == "overlay_cleanup_failed"
+        assert not job_dir.exists() or sum(
+            path.stat().st_size for path in job_dir.iterdir() if path.is_file()
+        ) <= max_cache_bytes
+    finally:
+        worker._release_owner = original_release
+        worker.shutdown()
+
+
+def test_stale_cleanup_failure_cannot_delete_a_successor_workers_owned_job(
+    tmp_path: Path,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    old_request = _request(
+        tmp_path,
+        intervals=((20, 21),),
+        renderer=FailingRenderer(),
+    )
+    successor_renderer = BlockingRenderer()
+    successor_request = replace(old_request, renderer=successor_renderer)
+    old_worker = BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=0,
+        owner_lease_seconds=0.03,
+    )
+    successor_worker = BoundedOverlayWorker(
+        max_workers=1,
+        max_pending=0,
+        owner_lease_seconds=0.03,
+    )
+    original_release = old_worker._release_owner
+    original_publish_failed = old_worker._publish_failed
+    cleanup_waiting = Event()
+    ownership_handoff = Barrier(2)
+    observed_cleanup_tokens: list[str | None] = []
+
+    def broken_release(_request: object, _token: str) -> None:
+        # Apply the reviewer's cleanup boundary only after the first failed
+        # manifest exists, so this test isolates stale-owner handoff semantics.
+        old_worker._max_cache_bytes = 409
+        raise OSError("private old-owner release failure")
+
+    def pause_cleanup_publication(
+        cleanup_request: object,
+        candidate: object,
+        *,
+        owner_token: str | None = None,
+    ):
+        if getattr(candidate, "code", None) == "overlay_cleanup_failed":
+            observed_cleanup_tokens.append(owner_token)
+            cleanup_waiting.set()
+            ownership_handoff.wait(timeout=2.0)
+        return original_publish_failed(
+            cleanup_request,
+            candidate,
+            owner_token=owner_token,
+        )
+
+    old_worker._release_owner = broken_release
+    old_worker._publish_failed = pause_cleanup_publication
+    try:
+        old_worker.submit(old_request)
+        assert cleanup_waiting.wait(2.0)
+
+        accepted = successor_worker.retry(successor_request)
+        assert accepted.status in {"pending", "generating"}
+        assert successor_renderer.started.wait(2.0)
+        ownership_handoff.wait(timeout=2.0)
+
+        old_failed = _wait_until_terminal(old_worker, old_request)
+        successor_renderer.release.set()
+        successor_ready = _wait_until_terminal(successor_worker, successor_request)
+        manifest_path = (
+            successor_request.cache_root
+            / successor_request.cache_key.digest
+            / "manifest.json"
+        )
+
+        assert successor_ready.status == "ready"
+        assert json.loads(manifest_path.read_text(encoding="utf-8"))["status"] == "ready"
+        assert observed_cleanup_tokens and observed_cleanup_tokens[0] is not None
+        assert old_failed.status == "failed"
+        assert old_failed.code == "overlay_cleanup_failed"
+    finally:
+        successor_renderer.release.set()
+        ownership_handoff.abort()
+        old_worker._release_owner = original_release
+        old_worker._publish_failed = original_publish_failed
+        old_worker.shutdown()
+        successor_worker.shutdown()
+
+
 def test_heartbeat_after_quota_cleanup_does_not_recreate_an_empty_job_directory(
     tmp_path: Path,
 ) -> None:

@@ -671,3 +671,89 @@ RED：`4 failed in 0.46s`。四项均稳定失败于 digest 目录仍存在：
 
 `py_compile human_qc/overlay_worker.py tests/test_sam3_overlay_worker.py` 与
 `git diff --check` 均 exit 0。
+
+---
+
+# Task 9C final-footprint and owner-handoff follow-up
+
+## 状态与范围
+
+DONE
+
+本轮仅修复 failed publication 的最终真实目录 footprint，以及 cleanup failure 与
+successor owner 交接的隔离。只修改 `human_qc/overlay_worker.py`、
+`tests/test_sam3_overlay_worker.py` 和本报告；未触碰 runner、recipe、launcher、
+HTTP、browser、OpenSpec、主计划或 `.comet`。
+
+基线：`0f2983765dba815bda5420534eb5e3308b33a047`。本轮独立提交 SHA 以最终任务
+回报中的 `git rev-parse HEAD` 为准。
+
+## Root cause
+
+1. `_publish_failed_locked()` 只把新 failed manifest 的序列化长度传给
+   `_evict_failed_for()`，而该扫描有意排除 current job。旧 manifest 会被替换，但
+   cleanup release 失败后 owner JSON 会长期残留；因此 quota 判断低估最终目录。
+   reviewer 边界在本机精确复现为 `max_cache_bytes=647`、最终目录 `650 bytes`。
+2. `_run` exception fallback 已携带原 owner token，但 cleanup-failed publication
+   仍以 `owner_token=None` 调用。旧 worker release 报错、token 失效且 successor
+   worker 接管后，旧 cleanup 可以在 key lock 内删除 successor 的新 owner、manifest
+   和 job，令 successor 最终 `overlay_interrupted`。
+
+## 最小修复与所有权语义
+
+- failed publication 在删除 media 后，以最终新 manifest 字节替换旧
+  `manifest.json`，再累加 current job 目录其余所有 regular file 的实际字节；owner
+  JSON、generation lock、render fence 均被枚举（0-byte lock/fence 也不遗漏）。任何
+  `iterdir/is_file/stat` 错误都视为 footprint unknown，fail closed 为 memory-only 并
+  清理 current job，绝不低估。
+- `_publish_failed()` 的 `owner_token` 改为必填；`_run` fallback 与 cleanup failure
+  均传原 token。调用方在 root -> key 锁内重新验证 token；mismatch 时只返回已规范化
+  的内存 failed view，不 parse/persist/discard/safe-remove，因此完全不触碰 successor
+  durable state。直接调用 `_publish_failed_locked()` 的 recovery/render 分支仍在同一
+  key lock 内先证明无 owner 或证明当前 token 所有权。
+
+## TDD RED / GREEN
+
+先只新增两个测试：
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_worker.py::test_cleanup_failure_quota_counts_the_remaining_owner_file_in_final_footprint \
+  tests/test_sam3_overlay_worker.py::test_stale_cleanup_failure_cannot_delete_a_successor_workers_owned_job
+```
+
+RED：`2 failed in 0.34s`。
+
+- footprint case 的最终目录为 `650 bytes > 647`；
+- 双 worker case 用 Barrier 保证 successor 的 BlockingRenderer 已启动、即新 owner 已
+  接管后才放行旧 cleanup。旧 cleanup 观测 token 为 `None`，随后删除 successor job，
+  successor 实际 `failed` 而非 `ready`。旧 worker 的 cleanup 阶段使用 reviewer
+  `409` byte boundary，以隔离 handoff 语义。
+
+最小实现后同一命令 GREEN：`2 passed in 0.33s`。同一 footprint + Barrier 组合连续
+运行 10 轮，十轮全部通过（单轮 0.16-0.31s）。
+
+## 最终验证
+
+```bash
+.venv/bin/python -m pytest -q tests/test_sam3_overlay_worker.py
+# 25 passed in 1.69s
+
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py \
+  tests/test_sam3_overlay_worker.py tests/test_review_evidence.py \
+  tests/test_qc_pipeline_sam3_runner.py tests/test_canonical_qc_runner_bridge.py \
+  tests/test_human_qc_media.py
+# 167 passed in 5.06s
+
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_workbench.py tests/test_human_qc_http_server.py \
+  tests/test_canonical_video_probe.py
+# 110 passed in 5.97s
+
+.venv/bin/python -m pytest -q
+# 1860 passed, 1 skipped in 113.57s
+```
+
+`py_compile human_qc/overlay_worker.py tests/test_sam3_overlay_worker.py` 与
+`git diff --check` 均 exit 0。
