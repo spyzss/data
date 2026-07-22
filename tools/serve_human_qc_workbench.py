@@ -4,18 +4,27 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from human_qc.http_server import create_http_server  # noqa: E402
+from human_qc.media import MediaCatalog  # noqa: E402
+from human_qc.sam3_overlay_renderer import (  # noqa: E402
+    OverlaySetupError,
+    ProductionOverlayRuntime,
+    UnavailableOverlayProvider,
+    build_production_overlay_runtime,
+)
 from qc_common.reviewer_lease import LeaseStore  # noqa: E402
+from qc_common.manifest_metadata import context_metadata_from_report  # noqa: E402
 from human_qc.warn_service import WarnReviewService  # noqa: E402
 from human_qc.warn_workbench_service import WarnWorkbenchService  # noqa: E402
 from qc_pipeline.context import AssetContext  # noqa: E402
@@ -33,6 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", default="acceptance")
     parser.add_argument("--lease-ttl-seconds", default=900, type=int)
     parser.add_argument("--reviewer", required=True)
+    parser.add_argument("--sam3-model", type=Path, default=None)
+    parser.add_argument(
+        "--overlay-cache-dir",
+        type=Path,
+        default=Path(".human_qc/overlay-cache"),
+    )
+    parser.add_argument("--overlay-workers", type=int, default=1)
+    parser.add_argument("--overlay-max-pending", type=int, default=1)
+    parser.add_argument("--overlay-max-cache-bytes", type=int, default=None)
+    parser.add_argument("--overlay-max-ready-jobs", type=int, default=None)
     return parser
 
 
@@ -134,6 +153,19 @@ def load_contexts(batch_root: Path, quality_archive: Path) -> list[AssetContext]
             start, end = raw_range
             if isinstance(start, int) and isinstance(end, int):
                 source_range = (start, end)
+        metadata: dict[str, Any] = {
+            "profile": report.get("profile"),
+            **context_metadata_from_report(report),
+        }
+        module = report.get("sam3_containment")
+        runtime = module.get("runtime") if isinstance(module, Mapping) else None
+        recipe = (
+            runtime.get("overlay_input_recipe")
+            if isinstance(runtime, Mapping)
+            else None
+        )
+        if isinstance(recipe, Mapping):
+            metadata["sam3_overlay_recipe"] = dict(recipe)
         contexts.append(
             AssetContext(
                 asset_id=asset_id,
@@ -141,12 +173,95 @@ def load_contexts(batch_root: Path, quality_archive: Path) -> list[AssetContext]
                 report_path=report_path,
                 source_files=source_files,
                 source_range=source_range,
-                metadata={"profile": report.get("profile")},
+                metadata=metadata,
             )
         )
     if not contexts:
         raise ValueError(f"quality archive contains no JSON reports: {archive}")
     return contexts
+
+
+@dataclass
+class WorkbenchRuntime:
+    service: WarnWorkbenchService
+    overlay_runtime: ProductionOverlayRuntime | object | None = None
+
+    @property
+    def worker(self) -> object | None:
+        return (
+            None
+            if self.overlay_runtime is None
+            else getattr(self.overlay_runtime, "worker", None)
+        )
+
+    def shutdown(self) -> None:
+        if self.overlay_runtime is None:
+            return
+        close = getattr(self.overlay_runtime, "shutdown", None)
+        if callable(close):
+            close()
+            return
+        worker = getattr(self.overlay_runtime, "worker", None)
+        shutdown = getattr(worker, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+
+
+def build_workbench_runtime(
+    *,
+    batch_root: Path,
+    quality_archive: Path,
+    reviewer: str,
+    profile: str = "acceptance",
+    lease_ttl_seconds: int = 900,
+    sam3_model: Path | None = None,
+    overlay_cache_dir: Path = Path(".human_qc/overlay-cache"),
+    overlay_workers: int = 1,
+    overlay_max_pending: int = 1,
+    overlay_max_cache_bytes: int | None = None,
+    overlay_max_ready_jobs: int | None = None,
+) -> WorkbenchRuntime:
+    contexts = load_contexts(batch_root, quality_archive)
+    reports = {context.asset_id: context.report_path for context in contexts}
+    warn = WarnReviewService(reports=reports)
+    contexts_by_id = {context.asset_id: context for context in contexts}
+    media_catalog = MediaCatalog(contexts_by_id)
+    overlay_runtime: ProductionOverlayRuntime | object | None = None
+    if sam3_model is None:
+        overlay_provider: object = UnavailableOverlayProvider(
+            "overlay_model_unavailable"
+        )
+    else:
+        try:
+            overlay_runtime = build_production_overlay_runtime(
+                contexts=contexts_by_id,
+                media_catalog=media_catalog,
+                model_path=sam3_model,
+                cache_relative=overlay_cache_dir,
+                max_workers=overlay_workers,
+                max_pending=overlay_max_pending,
+                max_cache_bytes=overlay_max_cache_bytes,
+                max_ready_jobs=overlay_max_ready_jobs,
+            )
+        except OverlaySetupError as exc:
+            overlay_provider = UnavailableOverlayProvider(exc.code)
+        else:
+            overlay_provider = overlay_runtime.provider
+    service = WarnWorkbenchService(
+        reviewer=reviewer,
+        warn_service=warn,
+        lease_store=LeaseStore(),
+        asset_contexts=contexts_by_id,
+        media_catalog=media_catalog,
+        overlay_provider=overlay_provider,
+        lease_ttl_seconds=lease_ttl_seconds,
+        profile=profile,
+    )
+    # Force report loading at process start so malformed review state fails
+    # before the first browser request.
+    for context in contexts:
+        warn.get_task(context.asset_id)
+    return WorkbenchRuntime(service=service, overlay_runtime=overlay_runtime)
 
 
 def build_workbench_service(
@@ -156,43 +271,61 @@ def build_workbench_service(
     reviewer: str,
     profile: str = "acceptance",
     lease_ttl_seconds: int = 900,
+    sam3_model: Path | None = None,
+    overlay_cache_dir: Path = Path(".human_qc/overlay-cache"),
+    overlay_workers: int = 1,
+    overlay_max_pending: int = 1,
+    overlay_max_cache_bytes: int | None = None,
+    overlay_max_ready_jobs: int | None = None,
 ) -> WarnWorkbenchService:
-    contexts = load_contexts(batch_root, quality_archive)
-    reports = {context.asset_id: context.report_path for context in contexts}
-    warn = WarnReviewService(reports=reports)
-    service = WarnWorkbenchService(
+    """Compatibility wrapper for callers that only need the facade object."""
+
+    return build_workbench_runtime(
+        batch_root=batch_root,
+        quality_archive=quality_archive,
         reviewer=reviewer,
-        warn_service=warn,
-        lease_store=LeaseStore(),
-        asset_contexts={context.asset_id: context for context in contexts},
-        lease_ttl_seconds=lease_ttl_seconds,
         profile=profile,
-    )
-    # Force report loading at process start so malformed review state fails
-    # before the first browser request.
-    for context in contexts:
-        warn.get_task(context.asset_id)
-    return service
+        lease_ttl_seconds=lease_ttl_seconds,
+        sam3_model=sam3_model,
+        overlay_cache_dir=overlay_cache_dir,
+        overlay_workers=overlay_workers,
+        overlay_max_pending=overlay_max_pending,
+        overlay_max_cache_bytes=overlay_max_cache_bytes,
+        overlay_max_ready_jobs=overlay_max_ready_jobs,
+    ).service
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    service = build_workbench_service(
+    runtime = build_workbench_runtime(
         batch_root=args.batch_root,
         quality_archive=args.quality_archive,
         reviewer=args.reviewer,
         profile=args.profile,
         lease_ttl_seconds=args.lease_ttl_seconds,
+        sam3_model=args.sam3_model,
+        overlay_cache_dir=args.overlay_cache_dir,
+        overlay_workers=args.overlay_workers,
+        overlay_max_pending=args.overlay_max_pending,
+        overlay_max_cache_bytes=args.overlay_max_cache_bytes,
+        overlay_max_ready_jobs=args.overlay_max_ready_jobs,
     )
-    server = create_http_server(args.host, args.port, service)
-    LOGGER.info("Serving human QC workbench at http://%s:%s", args.host, server.server_port)
+    server = None
     try:
+        server = create_http_server(args.host, args.port, runtime.service)
+        LOGGER.info(
+            "Serving human QC workbench at http://%s:%s",
+            args.host,
+            server.server_port,
+        )
         server.serve_forever()
     except KeyboardInterrupt:
         LOGGER.info("Shutting down")
     finally:
-        server.server_close()
+        if server is not None:
+            server.server_close()
+        runtime.shutdown()
     return 0
 
 
