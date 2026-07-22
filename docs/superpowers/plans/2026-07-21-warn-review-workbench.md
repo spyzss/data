@@ -448,7 +448,7 @@ git commit -m "feat(human-qc): expose warn-only full-video API"
 - Produces: `frameToPercent(frame, totalFrames)` and `pointerToFrame(event, track, totalFrames)`
 - Produces: `WarningTimeline` DOM controller with `onSeek(frame)` callback.
 
-- [ ] **Step 1: Write failing Node tests**
+- [x] **Step 1: Write failing Node tests**
 
 Use the canonical overlap fixture:
 
@@ -465,7 +465,7 @@ assert.deepEqual(activeWarningsAtFrame(warnings, 169).map(x => x.id), ["shake"])
 
 Assert narrow blocks return `showLabel=false`, popover rows stay clickable, Warning clicks seek to their own start, and track/playhead dragging emits exact frames.
 
-- [ ] **Step 2: Run tests and verify Red**
+- [x] **Step 2: Run tests and verify Red**
 
 ```bash
 node --test human_qc/static/warning_timeline.test.mjs
@@ -473,15 +473,15 @@ node --test human_qc/static/warning_timeline.test.mjs
 
 Expected: FAIL because the module does not exist.
 
-- [ ] **Step 3: Implement interval sweep and DOM controller**
+- [x] **Step 3: Implement interval sweep and DOM controller**
 
 Sort by `(startFrame, selectedIndex)`, merge only when `next.startFrame < current.endFrameExclusive`, calculate `leftPercent` and `widthPercent` from `totalFrames`, and retain all child Warning objects on each visual group. Keep the popover open while either block or popover has pointer/focus; clicking a row calls only `onSeek(row.startFrame)`.
 
-- [ ] **Step 4: Run Node tests and verify Green**
+- [x] **Step 4: Run Node tests and verify Green**
 
 Run the Step 2 command. Expected: PASS.
 
-- [ ] **Step 5: Commit Task 6**
+- [x] **Step 5: Commit Task 6**
 
 ```bash
 git add human_qc/static/warning_timeline.js human_qc/static/warning_timeline.test.mjs human_qc/static/package.json openspec/changes/add-human-semantic-warn-review/tasks.md
