@@ -7,6 +7,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from qc_common.config import LoadedQcConfig
 from qc_common.manual_review import semantic_eligibility
@@ -92,7 +93,12 @@ def _pending_dto(value: object | None) -> dict[str, Any] | None:
     return result
 
 
-def semantic_task_dto(value: object, *, video_url: str | None = None) -> dict[str, Any]:
+def semantic_task_dto(
+    value: object,
+    *,
+    video_url: str | None = None,
+    editable: bool = False,
+) -> dict[str, Any]:
     """Return the explicit public semantic DTO allowlist.
 
     The domain view deliberately contains server paths, hashes, source
@@ -122,6 +128,7 @@ def semantic_task_dto(value: object, *, video_url: str | None = None) -> dict[st
         "revision": revision,
         "report_revision": revision,
         "task_type": "semantic_calibration",
+        "editable": bool(editable),
         "video_url": video_url,
         "semantic": semantic,
     }
@@ -141,6 +148,7 @@ class SemanticCalibrationApplication:
         config: LoadedQcConfig | None = None,
         registry_factory: Callable[[AssetContext, LoadedQcConfig], ModuleRegistry] | None = None,
         video_paths: Mapping[str, str | Path] | None = None,
+        video_roots: Mapping[str, str | Path] | None = None,
     ) -> None:
         if isinstance(lease_ttl_seconds, bool) or not isinstance(lease_ttl_seconds, int) or lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be a positive integer")
@@ -151,20 +159,39 @@ class SemanticCalibrationApplication:
         self.profile = profile
         self.config = config
         self.registry_factory = registry_factory or build_default_registry
-        self._video_paths = {
-            str(asset_id): Path(path).resolve()
-            for asset_id, path in (video_paths or {}).items()
-        }
+        self._video_paths: dict[str, Path] = {}
+        self._video_roots: dict[str, Path] = {}
+        explicit_roots = {str(asset_id): Path(path) for asset_id, path in (video_roots or {}).items()}
+        for raw_asset_id, raw_path in (video_paths or {}).items():
+            asset_id = str(raw_asset_id)
+            context = self.asset_contexts.get(asset_id)
+            root_value = explicit_roots.get(asset_id)
+            if root_value is None and context is not None:
+                root_value = context.batch_root
+            if root_value is None:
+                raise ValueError(f"semantic video root is required for {asset_id}")
+            root = root_value.resolve()
+            candidate = Path(raw_path)
+            unresolved = candidate if candidate.is_absolute() else root / candidate
+            absolute = unresolved.absolute()
+            try:
+                absolute.resolve().relative_to(root)
+            except ValueError as exc:
+                raise ValueError("semantic video must stay inside configured video root") from exc
+            self._video_paths[asset_id] = absolute
+            self._video_roots[asset_id] = root
         for asset_id, context in self.asset_contexts.items():
             source = context.source_files.get("video")
             raw_path = source.get("path") if isinstance(source, Mapping) else None
             if isinstance(raw_path, str) and raw_path:
-                candidate = (context.batch_root / raw_path).resolve()
+                root = context.batch_root.resolve()
+                candidate = (context.batch_root / raw_path).absolute()
                 try:
-                    candidate.relative_to(context.batch_root.resolve())
+                    candidate.resolve().relative_to(root)
                 except ValueError as exc:
                     raise ValueError("semantic video must stay inside batch root") from exc
                 self._video_paths.setdefault(asset_id, candidate)
+                self._video_roots.setdefault(asset_id, root)
 
     def _asset_ids(self) -> tuple[str, ...]:
         getter = getattr(self.domain_service, "asset_ids", None)
@@ -219,45 +246,64 @@ class SemanticCalibrationApplication:
                 report = self._require_eligible(asset_id, persisted=False)
             except SemanticEligibilityError:
                 continue
+            if report is None or not self._is_editable_report(report):
+                continue
             semantic = report.get("semantic_calibration") if isinstance(report, Mapping) else None
             rows.append(
                 {
                     "asset_id": asset_id,
-                    "state": semantic.get("state", "not_started") if isinstance(semantic, Mapping) else "preview",
+                    "state": semantic.get("state", "not_started") if isinstance(semantic, Mapping) else "not_started",
                     "report_revision": int(report.get("report_revision", 0)) if isinstance(report, Mapping) else 0,
+                    "editable": True,
                 }
             )
         return rows
 
     def get_task(self, asset_id: str) -> dict[str, Any]:
-        self._require_eligible(asset_id, persisted=False)
+        report = self._require_eligible(asset_id, persisted=False)
         view = self.domain_service.get_task(asset_id)
         if self._recover_resume(asset_id):
             view = self.domain_service.get_task(asset_id)
+            report = self._report(asset_id)
+        editable = report is not None and self._is_editable_report(report)
         video_url = (
-            f"/api/semantic/assets/{asset_id}/video"
-            if asset_id in self._video_paths
+            f"/api/semantic/assets/{quote(asset_id, safe='')}/video"
+            if report is not None and asset_id in self._video_paths
             else None
         )
-        return semantic_task_dto(view, video_url=video_url)
+        return semantic_task_dto(view, video_url=video_url, editable=editable)
+
+    @staticmethod
+    def _is_editable_report(report: Mapping[str, Any]) -> bool:
+        pipeline = report.get("pipeline_state")
+        semantic = report.get("semantic_calibration")
+        return bool(
+            isinstance(pipeline, Mapping)
+            and pipeline.get("status") == "awaiting_external"
+            and pipeline.get("next_module") == "semantic_consistency"
+            and not (isinstance(semantic, Mapping) and semantic.get("state") == "completed")
+        )
 
     def semantic_video_path(self, asset_id: str) -> Path:
         """Resolve the configured browser video without exposing its path."""
 
         if asset_id not in self._asset_ids():
             raise KeyError(asset_id)
+        report = self._require_eligible(asset_id, persisted=False)
+        if report is None:
+            raise SemanticEligibilityError("semantic video requires a persisted report")
         try:
-            path = self._video_paths[asset_id]
+            configured = self._video_paths[asset_id]
+            root = self._video_roots[asset_id]
         except KeyError as exc:
+            raise KeyError(asset_id) from exc
+        path = configured.resolve()
+        try:
+            path.relative_to(root.resolve())
+        except ValueError as exc:
             raise KeyError(asset_id) from exc
         if not path.is_file():
             raise FileNotFoundError(path)
-        context = self.asset_contexts.get(asset_id)
-        if context is not None:
-            try:
-                path.relative_to(context.batch_root.resolve())
-            except ValueError as exc:
-                raise KeyError(asset_id) from exc
         return path
 
     def current_revision(self, asset_id: str) -> int | None:

@@ -112,9 +112,9 @@ export class SemanticCalibrationApp {
     const value = await this.requestJson(`/api/semantic/assets/${encodeURIComponent(nextAssetId)}/task`);
     this.assetId = nextAssetId;
     this.task = value?.task ?? value;
-    this.state = "ready";
+    this.state = this.task?.editable === false ? "read_only" : "ready";
     this.render();
-    await this.acquireLease();
+    if (this.task?.editable !== false) await this.acquireLease();
     return this.task;
   }
 
@@ -129,6 +129,7 @@ export class SemanticCalibrationApp {
       { method: "POST", body: { reviewer } },
     );
     this.lease = value?.lease ?? null;
+    this.state = "ready";
     this.startLeaseRenewal();
     this.render();
     return this.lease;
@@ -136,16 +137,26 @@ export class SemanticCalibrationApp {
 
   async renewLease() {
     if (!this.assetId || !this.lease?.token) throw new Error("lease is not acquired");
-    const value = await this.requestJson(
-      `/api/semantic/assets/${encodeURIComponent(this.assetId)}/lease/renew`,
-      {
-        method: "POST",
-        body: { expected_revision: this.revision(), lease_token: this.lease.token },
-      },
-    );
-    this.lease = value?.lease ?? this.lease;
-    this.render();
-    return this.lease;
+    try {
+      const value = await this.requestJson(
+        `/api/semantic/assets/${encodeURIComponent(this.assetId)}/lease/renew`,
+        {
+          method: "POST",
+          body: { expected_revision: this.revision(), lease_token: this.lease.token },
+        },
+      );
+      this.lease = value?.lease ?? this.lease;
+      this.render();
+      return this.lease;
+    } catch (error) {
+      if ([409, 423].includes(error?.status)) {
+        this.stopLeaseRenewal();
+        this.lease = null;
+        this.state = "read_only";
+        this.render();
+      }
+      throw error;
+    }
   }
 
   async releaseLease({ keepalive = false } = {}) {
@@ -181,9 +192,7 @@ export class SemanticCalibrationApp {
   startLeaseRenewal() {
     this.stopLeaseRenewal();
     if (!(this.leaseRenewIntervalMs > 0) || typeof this.setIntervalFn !== "function") return;
-    this.leaseTimer = this.setIntervalFn(() => this.renewLease().catch((error) => {
-      if ([409, 423].includes(error?.status)) this.stopLeaseRenewal();
-    }), this.leaseRenewIntervalMs);
+    this.leaseTimer = this.setIntervalFn(() => this.renewLease().catch(() => {}), this.leaseRenewIntervalMs);
     this.leaseTimer?.unref?.();
   }
 
@@ -220,6 +229,9 @@ export class SemanticCalibrationApp {
     });
     this.root.querySelector?.("[data-asset-select]")?.addEventListener?.("change", (event) => {
       if (event.currentTarget?.value) this.loadAsset(event.currentTarget.value).catch(() => {});
+    });
+    this.root.querySelector?.('[data-action="reacquire-lease"]')?.addEventListener?.("click", () => {
+      this.acquireLease().catch(() => {});
     });
   }
 
@@ -258,10 +270,15 @@ export class SemanticCalibrationApp {
     const reviewerGate = this.root.querySelector?.("[data-reviewer-gate]");
     const workbench = this.root.querySelector?.("[data-workbench]");
     const selector = this.root.querySelector?.("[data-asset-select]");
+    const reacquire = this.root.querySelector?.('[data-action="reacquire-lease"]');
     if (asset) asset.textContent = this.assetId ?? "—";
     if (reviewer) reviewer.textContent = this.reviewer || "—";
     if (reviewerGate) reviewerGate.hidden = Boolean(this.reviewer);
     if (workbench) workbench.hidden = !this.reviewer;
+    if (reacquire) {
+      reacquire.hidden = !(this.task?.editable !== false && !this.lease?.token && this.assetId);
+      reacquire.disabled = this.task?.editable === false;
+    }
     if (selector && this.assets.length && this.document?.createElement) {
       const options = this.assets.map((item) => {
         const option = this.document.createElement("option");
@@ -312,7 +329,8 @@ export class SemanticCalibrationApp {
         onComplete: () => this.completeAndRelease(),
       });
     }
-    this.adapter.render?.(this.task, stage);
+    const editable = this.task?.editable !== false && Boolean(this.lease?.token);
+    this.adapter.render?.({ ...this.task, editable }, stage);
   }
 }
 

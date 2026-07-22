@@ -67,6 +67,38 @@ test("blocked deep links retain a stable server error", async () => {
 });
 
 
+test("completed and reportless deep links render read-only without acquiring a lease", async () => {
+  for (const state of ["completed", "preview"]) {
+    const calls = [];
+    let rendered = null;
+    const stage = {};
+    const root = { querySelector(selector) { return selector === "[data-semantic-stage]" ? stage : null; } };
+    const app = new SemanticCalibrationApp({
+      root,
+      reviewer: "alice",
+      locationRef: { search: `?asset_id=${state}` },
+      fetcher: async (path) => {
+        calls.push(path);
+        if (path === "/api/semantic/assets") return response({ assets: [] });
+        if (path.endsWith("/task")) {
+          return response({ task: { asset_id: state, revision: 4, editable: false, semantic: { report_state: state } } });
+        }
+        throw new Error(`unexpected ${path}`);
+      },
+      adapterFactory: () => ({ render(task) { rendered = task; } }),
+    });
+    await app.start();
+    assert.deepEqual(calls, [
+      "/api/semantic/assets",
+      `/api/semantic/assets/${state}/task`,
+    ]);
+    assert.equal(app.lease, null);
+    assert.equal(app.state, "read_only");
+    assert.equal(rendered.editable, false);
+  }
+});
+
+
 test("task load auto-acquires, periodically renews, and complete finally releases", async () => {
   const calls = [];
   let renewCallback = null;
@@ -119,6 +151,48 @@ test("task load auto-acquires, periodically renews, and complete finally release
     "/api/semantic/assets/asset-1/lease/release",
   ]);
   assert.equal(app.lease, null);
+});
+
+
+test("renew conflicts clear the stale lease and allow reacquiring without dropping the task", async () => {
+  const calls = [];
+  const rendered = [];
+  const stage = {};
+  const root = { querySelector(selector) { return selector === "[data-semantic-stage]" ? stage : null; } };
+  const app = new SemanticCalibrationApp({
+    root,
+    reviewer: "alice",
+    fetcher: async (path) => {
+      calls.push(path);
+      if (path.endsWith("/lease/renew")) {
+        return response({ error: { code: "lease_invalid", message: "stale" } }, false, 423);
+      }
+      if (path.endsWith("/lease/acquire")) {
+        return response({ lease: { token: "fresh-token", reviewer: "alice" } });
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+    adapterFactory: () => ({ render(task) { rendered.push(task); } }),
+  });
+  app.assetId = "asset-1";
+  app.task = { asset_id: "asset-1", revision: 4, editable: true, semantic: { pending_edit: null } };
+  app.lease = { token: "stale-token", reviewer: "alice" };
+  app.render();
+
+  await assert.rejects(() => app.renewLease(), /stale/);
+  assert.equal(app.task.asset_id, "asset-1");
+  assert.equal(app.lease, null);
+  assert.equal(app.state, "read_only");
+  assert.equal(rendered.at(-1).editable, false);
+
+  await app.acquireLease();
+  assert.equal(app.lease.token, "fresh-token");
+  assert.equal(app.state, "ready");
+  assert.equal(rendered.at(-1).editable, true);
+  assert.deepEqual(calls, [
+    "/api/semantic/assets/asset-1/lease/renew",
+    "/api/semantic/assets/asset-1/lease/acquire",
+  ]);
 });
 
 

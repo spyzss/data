@@ -56,13 +56,58 @@ const task = {
 test("warn model keeps machine fields and half-open evidence read-only", () => {
   const model = buildWarnIssueModel(task, "warn-1");
   assert.equal(model.issueId, "warn-1");
+  assert.equal(model.reason, "关节速度超过阈值");
   assert.deepEqual(model.metrics, { joint_velocity_max: 1.4 });
   assert.deepEqual(model.threshold, { operator: ">", value: 1.0 });
   assert.deepEqual(model.window, { startFrame: 30, endFrameExclusive: 43 });
+  assert.equal(model.overlayUrl, "/media/asset-1/warn-1.png");
   const markup = renderWarnMarkup(task, "warn-1");
   assert.match(markup, /30–42/);
+  assert.match(markup, /关节速度超过阈值/);
+  assert.match(markup, /joint_velocity_max/);
+  assert.match(markup, /data-action="toggle-overlay"/);
   assert.match(markup, /data-action="verdict-pass"/);
   assert.match(markup, /data-action="verdict-fail"/);
+  assert.doesNotMatch(markup, /timeline-track|semantic-text-slot|boundary-handle/);
+});
+
+
+test("warn markup follows video-first rationale-then-decision flow", () => {
+  const markup = renderWarnMarkup(task, "warn-1");
+  assert.match(markup, /class="warn-rationale"/);
+  assert.match(markup, /class="warn-decision"/);
+  assert.ok(markup.indexOf("warn-rationale") < markup.indexOf("warn-decision"));
+  assert.match(markup, /data-action="verdict-pass"/);
+  assert.match(markup, /data-action="verdict-fail"/);
+  assert.doesNotMatch(markup, /class="warn-layout"/);
+  assert.doesNotMatch(markup, /<pre[^>]*data-machine-metrics/);
+});
+
+
+test("warn markup renders every sampled SAM3 overlay image in server order", () => {
+  const sampled = structuredClone(task);
+  sampled.evidence[0].overlay_images = [
+    { frame: 120, url: "/media/frame-120.png" },
+    { frame: 144, url: "/media/frame-144.png" },
+    { frame: 188, url: "/media/frame-188.png" },
+  ];
+  const markup = renderWarnMarkup(sampled, "warn-1");
+  assert.equal((markup.match(/class="warn-overlay-sample"/g) || []).length, 3);
+  assert.ok(markup.indexOf("frame-120.png") < markup.indexOf("frame-188.png"));
+});
+
+
+test("warn model converts inclusive canonical context end when evidence projection degrades", () => {
+  const degraded = structuredClone(task);
+  degraded.evidence = [];
+  const issue = degraded.warn.selected_issues["warn-1"];
+  delete issue.start_frame;
+  delete issue.end_frame_exclusive;
+  issue.context = { start_frame: 30, end_frame: 42 };
+  assert.deepEqual(buildWarnIssueModel(degraded, "warn-1").window, {
+    startFrame: 30,
+    endFrameExclusive: 43,
+  });
 });
 
 
@@ -90,6 +135,15 @@ test("adapter submits verdict for the explicitly selected issue", async () => {
 test("human application treats only warning work as editable", () => {
   assert.equal(stageTypeForTask(task), "warn_review");
   assert.equal(stageTypeForTask({ task_type: "completed", warn: { state: "completed" } }), "completed");
+});
+
+
+test("status exposes the active task type on the app shell", () => {
+  const root = { dataset: {}, querySelector: () => null };
+  const app = new WorkbenchApp({ root });
+  app.task = task;
+  app.renderStatus();
+  assert.equal(root.dataset.taskType, "warn_review");
 });
 
 
@@ -213,6 +267,24 @@ test("missing clip clears stale video and reveals the placeholder", () => {
   assert.equal(video.src, "");
   assert.equal(video.currentTime, 0);
   assert.equal(placeholder.hidden, false);
+});
+
+
+test("configured warn evidence video hides the opaque media placeholder", () => {
+  const video = {
+    src: "",
+    currentTime: 9,
+    dataset: {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const placeholder = { hidden: false };
+  const adapter = new WarnReviewAdapter({ video, videoPlaceholder: placeholder });
+  adapter.task = task;
+  adapter.configureVideo(buildWarnIssueModel(task, "warn-1"));
+  assert.equal(video.src, "/media/asset-1/warn-1.mp4");
+  assert.equal(video.currentTime, 0);
+  assert.equal(placeholder.hidden, true);
 });
 
 
