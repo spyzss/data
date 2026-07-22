@@ -321,6 +321,15 @@ class SemanticCalibrationRequestHandler(BaseHTTPRequestHandler):
     def _method_not_allowed(self, *, send_body: bool = True) -> None:
         asset_id, _ = _parts(self.path)
         allowed = self._allowed_methods()
+        if not allowed:
+            self._send_error(
+                HTTPStatus.NOT_FOUND,
+                "not_found",
+                "unknown endpoint",
+                asset_id,
+                send_body=send_body,
+            )
+            return
         self._send_error(
             HTTPStatus.METHOD_NOT_ALLOWED,
             "method_not_allowed",

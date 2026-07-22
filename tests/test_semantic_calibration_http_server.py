@@ -209,20 +209,53 @@ def test_stable_conflicts_do_not_leak_internal_details(running_server) -> None:
     assert status == 423 and value["error"]["code"] == "lease_held"
 
 
-@pytest.mark.parametrize("method", ["OPTIONS", "PUT", "PATCH", "DELETE", "TRACE", "BREW"])
-def test_unsupported_methods_return_stable_json_405(running_server, method: str) -> None:
+@pytest.mark.parametrize(
+    "method,path,allowed",
+    [
+        ("OPTIONS", "/api/semantic/assets/asset-1/task", "GET"),
+        ("PUT", "/api/semantic/assets/asset-1/lease/acquire", "POST"),
+        ("PATCH", "/api/semantic/assets/asset-1/task", "GET"),
+        ("DELETE", "/api/semantic/assets/asset-1/lease/release", "POST"),
+        ("TRACE", "/api/semantic/assets/asset-1/video", "GET"),
+        ("BREW", "/api/semantic/assets/asset-1/complete", "POST"),
+    ],
+)
+def test_unsupported_methods_on_known_routes_return_json_405_with_allow(
+    running_server, method: str, path: str, allowed: str
+) -> None:
     _, server = running_server
-    status, content_type, raw = _raw_request(
+    response = _raw_request_details(
         server,
         method,
-        "/api/semantic/assets/asset-1/task",
+        path,
         b"{}",
         {"Content-Type": "application/json"},
     )
-    value = json.loads(raw)
-    assert status == 405
-    assert content_type.startswith("application/json")
+    value = json.loads(response["body"])
+    assert response["status"] == 405
+    assert response["content_type"].startswith("application/json")
+    assert response["allow"] == allowed
     assert value["error"]["code"] == "method_not_allowed"
+
+
+@pytest.mark.parametrize("method", ["HEAD", "OPTIONS", "PUT", "PATCH", "DELETE", "TRACE"])
+def test_unsupported_methods_on_unknown_semantic_paths_return_404(
+    running_server, method: str
+) -> None:
+    _, server = running_server
+    response = _raw_request_details(
+        server,
+        method,
+        "/api/semantic/assets/asset-1/not-a-route",
+        b"{}" if method != "HEAD" else b"",
+        {"Content-Type": "application/json"},
+    )
+    assert response["status"] == 404
+    assert response["content_type"].startswith("application/json")
+    if method == "HEAD":
+        assert response["body"] == b""
+    else:
+        assert json.loads(response["body"])["error"]["code"] == "not_found"
 
 
 def test_head_returns_stable_json_media_type_and_405_without_a_body(running_server) -> None:
