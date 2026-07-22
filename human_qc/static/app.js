@@ -1,67 +1,107 @@
 /**
- * Small application shell for the human QC workbench.
+ * Canonical Warn-only application shell.
  *
- * WorkbenchApp owns transport, reviewer lease and the current server task.
- * Domain adapters receive a task snapshot and never reach into another
- * adapter's DOM. A failed 409/423 response is retained as an error; the
- * previous task is deliberately left untouched until the reviewer refreshes.
+ * The transport boundary is intentionally narrow: Task 5 owns the DTO and
+ * lease lifecycle, while this browser shell only consumes the safe `/api/warn`
+ * projection.  A timeline seek cannot mutate review state; verdict mutations
+ * always carry the revision and lease token returned by the current task.
  */
 
-import { WarnReviewAdapter } from "./warn_adapter.js";
+import { ReviewPanel, completionGate, nextDecisionTarget } from "./review_panel.js";
+import { VideoController } from "./video_controller.js";
+import { WarningTimeline } from "./warning_timeline.js";
 
-export function mutationControlsDisabled(task) {
-  return false;
-}
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
-export function stageTypeForTask(task) {
-  const taskType = String(task?.task_type ?? "");
-  if (taskType !== "warn_review") return taskType;
-  const warn = task?.warn ?? {};
-  const candidates = Array.isArray(warn.candidate_issue_ids) ? warn.candidate_issue_ids : null;
-  if (["completed", "not_required", "skipped_due_to_fail"].includes(warn.state)) return "completed";
-  if (candidates && !candidates.length) return "completed";
-  return taskType;
-}
+const clampFrame = (frame, totalFrames) => {
+  const total = Number(totalFrames);
+  if (!Number.isInteger(total) || total <= 0) return 0;
+  const requested = Number(frame);
+  const normalized = Number.isFinite(requested) ? Math.trunc(requested) : 0;
+  return Math.min(Math.max(normalized, 0), total - 1);
+};
 
-function responseError(response, body) {
-  const detail = body?.error ?? {};
-  const error = new Error(detail.message || `request failed (${response.status})`);
-  error.code = detail.code || (response.status === 423 ? "lease_invalid" : "request_failed");
-  error.status = response.status;
-  error.currentRevision = detail.current_revision ?? null;
+const responseError = (response, body) => {
+  const detail = isObject(body?.error) ? body.error : {};
+  const error = new Error(
+    typeof detail.message === "string" && detail.message ? detail.message : `request failed (${response.status})`,
+  );
+  error.code = typeof detail.code === "string" ? detail.code : "request_failed";
+  error.status = Number(response.status) || 0;
   return error;
+};
+
+const taskFromEnvelope = (value) => (isObject(value?.task) ? value.task : value);
+
+const canonicalTask = (task) => (
+  isObject(task)
+  && typeof task.asset_id === "string"
+  && Number.isInteger(task.report_revision)
+  && isObject(task.video)
+  && Array.isArray(task.issues)
+  && isObject(task.lease)
+);
+
+const issueRange = (issue) => {
+  const start = Number(issue?.frame_range?.start_frame);
+  const end = Number(issue?.frame_range?.end_frame_exclusive);
+  return Number.isInteger(start) && Number.isInteger(end) && end > start ? { start, end } : null;
+};
+
+const savedVerdict = (issue) => (
+  issue?.review?.verdict === "pass" || issue?.review?.verdict === "fail"
+    ? issue.review.verdict
+    : null
+);
+
+const earliestPendingIssue = (task) => (Array.isArray(task?.issues) ? task.issues : [])
+  .map((issue, selectedIndex) => ({ issue, selectedIndex, range: issueRange(issue) }))
+  .filter(({ issue, range }) => range && savedVerdict(issue) === null)
+  .sort((left, right) => left.range.start - right.range.start || left.selectedIndex - right.selectedIndex)[0]?.issue ?? null;
+
+export function activeIssueIdsAtFrame(task, frame) {
+  const target = Number.isFinite(Number(frame)) ? Math.trunc(Number(frame)) : 0;
+  return (Array.isArray(task?.issues) ? task.issues : [])
+    .filter((issue) => {
+      const range = issueRange(issue);
+      return range && range.start <= target && target < range.end;
+    })
+    .map((issue) => issue.id);
 }
 
-export class WorkbenchApp {
+export class WarnReviewApp {
   constructor({
     baseUrl = "",
     fetcher = globalThis.fetch?.bind(globalThis),
     documentRef = globalThis.document,
     root = null,
-    reviewer = "",
-    adapterFactory = null,
-    warnAdapterFactory = null,
-    leaseRenewIntervalMs = 240000,
-    onNavigate = null,
+    panelFactory = (options) => new ReviewPanel(options),
+    timelineFactory = (options) => new WarningTimeline(options),
+    videoControllerFactory = (options) => new VideoController(options),
   } = {}) {
     this.baseUrl = String(baseUrl).replace(/\/$/, "");
     this.fetcher = fetcher;
     this.document = documentRef;
     this.root = root;
-    this.reviewer = reviewer;
-    this.warnAdapterFactory = warnAdapterFactory ?? adapterFactory ?? ((options) => new WarnReviewAdapter(options));
-    this.leaseRenewIntervalMs = Number(leaseRenewIntervalMs) || 0;
-    this.onNavigate = onNavigate;
+    this.panelFactory = panelFactory;
+    this.timelineFactory = timelineFactory;
+    this.videoControllerFactory = videoControllerFactory;
     this.task = null;
     this.assetId = null;
-    this.lease = null;
-    this.adapter = null;
-    this.adapterType = null;
+    this.assets = [];
+    this.currentFrame = 0;
+    this.explicitIssueId = null;
     this.lastError = null;
-    this.loading = false;
-    this.onTask = null;
-    this.leaseTimer = null;
-    this.chromeBound = false;
+    this.videoController = null;
+    this.timeline = null;
+    this.panel = this.panelFactory({
+      documentRef: this.document,
+      onVerdict: (issueId, verdict, payload) => this.submitVerdict(issueId, verdict, payload),
+      onComplete: () => this.completeReview(),
+      onSelectIssue: (issueId) => this._acceptStatusSelection(issueId),
+    });
+    this._mediaKey = null;
+    this._chromeBound = false;
   }
 
   endpoint(path) {
@@ -79,8 +119,7 @@ export class WorkbenchApp {
     try {
       response = await this.fetcher(this.endpoint(path), options);
     } catch (error) {
-      this.lastError = { code: "network_error", message: String(error?.message ?? error) };
-      this.renderStatus();
+      this._setError("network_error", String(error?.message ?? error), 0);
       throw error;
     }
     let value = null;
@@ -91,252 +130,306 @@ export class WorkbenchApp {
     }
     if (!response.ok) {
       const error = responseError(response, value);
-      this.lastError = {
-        code: error.code,
-        message: error.message,
-        status: error.status,
-        current_revision: error.currentRevision,
-      };
-      this.renderStatus();
-      // Do not call applyServerTask here: a stale/conflicting response must
-      // never replace the reviewer's current task snapshot.
+      this._setError(error.code, error.message, error.status);
+      // A 409/423 response is only an error envelope.  Never replace a safe
+      // local server snapshot with one while the operator is looking at it.
       throw error;
     }
     this.lastError = null;
     return value;
   }
 
+  async listAssets() {
+    const value = await this.requestJson("/api/warn/assets");
+    const assets = Array.isArray(value?.assets)
+      ? value.assets.filter((assetId) => typeof assetId === "string" && assetId)
+      : [];
+    this.assets = [...new Set(assets)];
+    this.render();
+    return this.assets;
+  }
+
   async requestTask(assetId) {
-    const value = await this.requestJson(`/api/assets/${encodeURIComponent(assetId)}/task`);
-    const task = value?.task ?? value;
+    const value = await this.requestJson(`/api/warn/assets/${encodeURIComponent(assetId)}/task`);
+    const task = taskFromEnvelope(value);
     this.applyServerTask(task);
     return task;
   }
 
+  /** Direct asset switching intentionally discards only local unsaved drafts. */
   async loadAsset(assetId) {
-    if (!assetId) throw new Error("assetId is required");
-    if (mutationControlsDisabled(this.task)) {
-      const error = new Error("pending edit must be confirmed or cancelled before navigation");
-      error.code = "pending_lock";
-      this.lastError = { code: error.code, message: error.message };
-      throw error;
-    }
-    const nextAssetId = String(assetId);
-    if (this.assetId !== nextAssetId) {
-      this.stopLeaseRenewal();
-      this.lease = null;
-      this.renderStatus();
-    }
-    return this.requestTask(nextAssetId);
+    if (typeof assetId !== "string" || !assetId) throw new Error("assetId is required");
+    this.resetDraft();
+    return this.requestTask(assetId);
+  }
+
+  async start() {
+    const assets = await this.listAssets();
+    if (assets.length) await this.loadAsset(assets[0]);
+    return this.task;
   }
 
   applyServerTask(task) {
-    if (!task || typeof task !== "object") throw new Error("server task must be an object");
+    if (!canonicalTask(task)) throw new TypeError("server task must be a canonical Warn task DTO");
     this.task = task;
-    this.assetId = task.asset_id ?? this.assetId;
-    if (task.lease_token && !this.lease) this.lease = { token: task.lease_token };
-    this.advanceStage(task);
-    this.onTask?.(task);
-    return task;
-  }
-
-  advanceStage(serverTask = this.task) {
-    if (!serverTask || typeof serverTask !== "object") throw new Error("server task must be an object");
-    this.task = serverTask;
-    this.assetId = serverTask.asset_id ?? this.assetId;
-    const nextType = stageTypeForTask(serverTask);
-    if (nextType !== this.adapterType) {
-      this.adapter?.destroy?.();
-      this.adapter = null;
-      this.adapterType = nextType;
+    this.assetId = task.asset_id;
+    if (!Array.isArray(this.assets) || !this.assets.includes(this.assetId)) {
+      this.assets = [...this.assets, this.assetId];
     }
+    if (!task.issues.some((issue) => issue.id === this.explicitIssueId)) this.explicitIssueId = null;
+    this._configureMedia(task);
+    this._configureTimeline(task);
+    this.panel.setTask(task);
+    this.panel.setExplicitIssueId(this.explicitIssueId);
+    this.panel.setCurrentFrame(this.currentFrame);
     this.render();
-    return nextType;
-  }
-
-  async acquireLease(reviewer = this.reviewer) {
-    if (!reviewer) throw new Error("reviewer is required");
-    const value = await this.requestJson(`/api/assets/${encodeURIComponent(this.assetId)}/lease/acquire`, {
-      method: "POST",
-      body: { reviewer },
-    });
-    this.lease = value?.lease ?? null;
-    this.startLeaseRenewal();
-    this.renderStatus();
-    return this.lease;
-  }
-
-  async renewLease(ttlSeconds = undefined) {
-    if (!this.assetId || !this.lease?.token || !this.task) throw new Error("lease is not acquired");
-    const body = {
-      expected_revision: this.revision(),
-      lease_token: this.lease.token,
-    };
-    if (ttlSeconds !== undefined) body.ttl_seconds = ttlSeconds;
-    const value = await this.requestJson(`/api/assets/${encodeURIComponent(this.assetId)}/lease/renew`, {
-      method: "POST",
-      body,
-    });
-    this.lease = value?.lease ?? this.lease;
-    this.renderStatus();
-    return this.lease;
-  }
-
-  revision() {
-    return Number(this.task?.revision ?? this.task?.report_revision ?? 0);
-  }
-
-  mutationBody(payload = {}) {
-    if (!this.lease?.token) throw new Error("lease is not acquired");
-    return {
-      ...payload,
-      expected_revision: this.revision(),
-      lease_token: this.lease.token,
-    };
-  }
-
-  async mutate(path, payload = {}) {
-    const value = await this.requestJson(path, { method: "POST", body: this.mutationBody(payload) });
-    const task = value?.task ?? value;
-    this.applyServerTask(task);
     return task;
   }
 
-  async submitWarnVerdict(issueId, verdict, reason = "") {
-    return this.mutate(
-      `/api/assets/${encodeURIComponent(this.assetId)}/warn/${encodeURIComponent(issueId)}/verdict`,
-      { verdict, reason },
+  setCurrentFrame(frame, { fromVideo = false } = {}) {
+    const totalFrames = this.task?.video?.total_frames;
+    this.currentFrame = clampFrame(frame, totalFrames);
+    if (!fromVideo) this.videoController?.seekToFrame(this.currentFrame);
+    this.timeline?.setCurrentFrame(this.currentFrame);
+    this.panel.setCurrentFrame(this.currentFrame);
+    this._renderVideoState();
+    return this.currentFrame;
+  }
+
+  /** Timeline and popover calls are seek-only by contract. */
+  seekFromTimeline(frame) {
+    return this.setCurrentFrame(frame);
+  }
+
+  _acceptStatusSelection(issueId) {
+    this.explicitIssueId = this.task?.issues?.some((issue) => issue.id === issueId) ? issueId : null;
+    this.panel.setExplicitIssueId(this.explicitIssueId);
+    return this.explicitIssueId;
+  }
+
+  selectIssueFromStatus(issueId) {
+    return this._acceptStatusSelection(issueId);
+  }
+
+  defaultDecisionTarget() {
+    return nextDecisionTarget(
+      this.task,
+      activeIssueIdsAtFrame(this.task, this.currentFrame),
+      this.explicitIssueId,
     );
   }
 
-  async completeWarn() {
-    return this.mutate(`/api/assets/${encodeURIComponent(this.assetId)}/warn/complete`);
+  revision() {
+    return Number(this.task?.report_revision ?? 0);
+  }
+
+  mutationBody(payload) {
+    const lease = this.task?.lease;
+    if (lease?.read_only === true || typeof lease?.token !== "string" || !lease.token) {
+      throw new Error("当前任务为只读，不能提交判定");
+    }
+    return {
+      expected_revision: this.revision(),
+      lease_token: lease.token,
+      ...payload,
+    };
+  }
+
+  async submitDefaultVerdict(verdict) {
+    const issueId = this.defaultDecisionTarget();
+    if (!issueId) throw new Error("当前帧没有待复核的 Warn");
+    return this.submitVerdict(issueId, verdict);
+  }
+
+  async submitVerdict(issueId, verdict, suppliedPayload = null) {
+    if (!this.task || !this.assetId) throw new Error("尚未加载 Warn 任务");
+    const target = this.task.issues.find((issue) => issue.id === issueId);
+    if (!target) throw new Error("当前 Warn 不存在");
+    const payload = suppliedPayload ?? this.panel.payloadForVerdict(issueId, verdict);
+    const value = await this.requestJson(
+      `/api/warn/assets/${encodeURIComponent(this.assetId)}/issues/${encodeURIComponent(issueId)}/verdict`,
+      { method: "POST", body: this.mutationBody(payload) },
+    );
+    if (verdict === "pass") this.explicitIssueId = null;
+    this.applyServerTask(taskFromEnvelope(value));
+    // Pass should expose the next pending active warning after the returned
+    // snapshot is consumed.  Moving the source cursor—not an explicit status
+    // selection—to that warning's start preserves the timeline's seek-only
+    // semantics.  Fail remains inspectable until the operator explicitly
+    // presses 完成复核.
+    if (verdict === "pass") {
+      const next = earliestPendingIssue(this.task);
+      const range = issueRange(next);
+      if (range) this.setCurrentFrame(range.start);
+    }
+    this.panel.setExplicitIssueId(this.explicitIssueId);
+    this.panel.resetDraft();
+    this.render();
+    return this.task;
+  }
+
+  async completeReview() {
+    if (!this.task || !this.assetId) throw new Error("尚未加载 Warn 任务");
+    const gate = completionGate(this.task);
+    if (!gate.enabled || !gate.mode) throw new Error("请先完成当前 Warn 判定");
+    const payload = { completion_mode: gate.mode };
+    const failureReason = this.task.failure_reason;
+    if (gate.mode === "early_fail" && isObject(failureReason) && Array.isArray(failureReason.reason_codes)) {
+      payload.failure_reason = {
+        reason_codes: failureReason.reason_codes,
+        other_text: typeof failureReason.other_text === "string" ? failureReason.other_text : null,
+      };
+    }
+    const value = await this.requestJson(
+      `/api/warn/assets/${encodeURIComponent(this.assetId)}/complete`,
+      { method: "POST", body: this.mutationBody(payload) },
+    );
+    this.applyServerTask(taskFromEnvelope(value));
+    this.resetDraft();
+    await this.loadNextAsset();
+    return this.task;
+  }
+
+  async loadNextAsset() {
+    // Navigation never carries an unsaved local reason draft across assets,
+    // including while the lightweight asset-list request is in flight.
+    this.resetDraft();
+    const assets = await this.listAssets();
+    const currentIndex = assets.indexOf(this.assetId);
+    const next = currentIndex >= 0 ? assets[currentIndex + 1] : assets[0];
+    if (!next) return null;
+    return this.loadAsset(next);
+  }
+
+  async loadPreviousAsset() {
+    this.resetDraft();
+    const assets = await this.listAssets();
+    const currentIndex = assets.indexOf(this.assetId);
+    const previous = currentIndex > 0 ? assets[currentIndex - 1] : null;
+    if (!previous) return null;
+    return this.loadAsset(previous);
+  }
+
+  resetDraft() {
+    this.explicitIssueId = null;
+    this.panel.setExplicitIssueId(null);
+    this.panel.resetDraft();
   }
 
   mount(root = this.root ?? this.document?.querySelector?.("#app")) {
-    this.root = root;
-    if (!root) return this;
-    this.bindChrome();
+    this.root = root ?? null;
+    if (!this.root) return this;
+    const video = this.root.querySelector?.("[data-video]");
+    const videoRoot = this.root.querySelector?.("[data-video-root]");
+    const panelRoot = this.root.querySelector?.("[data-review-panel]");
+    const timelineRoot = this.root.querySelector?.("[data-warning-timeline]");
+    if (video && videoRoot && !this.videoController) {
+      this.videoController = this.videoControllerFactory({
+        video,
+        root: videoRoot,
+        documentRef: this.document,
+        onFrameChange: (frame) => this.setCurrentFrame(frame, { fromVideo: true }),
+        onPlaybackStateChange: () => this._renderVideoState(),
+      });
+    }
+    if (panelRoot) this.panel.mount(panelRoot);
+    if (timelineRoot && this.task) this._configureTimeline(this.task);
+    this._bindChrome();
     this.render();
     return this;
   }
 
   render() {
-    if (!this.root || !this.document) return;
-    const task = this.task;
-    const stage = this.root.querySelector?.("[data-workbench-stage]");
-    if (!stage) return;
-    const taskType = this.adapterType ?? stageTypeForTask(task);
-    if (taskType === "warn_review") {
-      this.adapter ??= this.warnAdapterFactory({
-        onVerdict: (issueId, verdict, reason) => this.submitWarnVerdict(issueId, verdict, reason),
-        onComplete: () => this.completeWarn(),
-        video: this.root.querySelector?.("[data-video]") ?? null,
-        videoPlaceholder: this.root.querySelector?.("[data-video-placeholder]") ?? null,
-      });
-      this.adapter.render(task, stage);
-    } else if (taskType === "completed") {
-      stage.innerHTML = '<div class="empty-stage" data-task-completed>当前资产的人工复核已完成，可以进入下一条。</div>';
-    } else if (taskType === "error") {
-      stage.innerHTML = '<div class="empty-stage" data-task-error>当前资产处理失败，请查看服务端错误后刷新。</div>';
-    } else {
-      stage.innerHTML = '<div class="empty-stage">当前任务没有可用的复核阶段。</div>';
-    }
-    this.renderStatus();
-  }
-
-  renderStatus() {
     if (!this.root) return;
-    const currentTaskType = this.task ? stageTypeForTask(this.task) : "";
-    if (this.root.dataset) this.root.dataset.taskType = currentTaskType || "idle";
-    const set = (selector, value) => {
+    const setText = (selector, text) => {
       const element = this.root.querySelector?.(selector);
-      if (element) element.textContent = value;
+      if (element) element.textContent = text;
     };
-    set("[data-asset-id]", this.assetId || "未加载资产");
-    set("[data-revision]", this.task ? `revision ${this.revision()}` : "revision —");
-    set("[data-reviewer]", this.reviewer || "reviewer —");
-    set("[data-lease-status]", this.lease?.expires_at ? "已获取" : "未获取");
-    const progress = this.root.querySelector?.("[data-progress]");
-    if (progress && this.task) progress.textContent = this.task.task_type || "—";
-    const taskLabels = {
-      warn_review: "Warn Review",
-      completed: "Completed",
-      error: "Error",
-    };
-    set("[data-task-kind]", taskLabels[currentTaskType] || "—");
-    set("[data-stage-title]", {
-      warn_review: "Warn 复核",
-      completed: "人工复核已完成",
-      error: "任务处理失败",
-    }[currentTaskType] || "人工复核");
-    set("[data-inspector-note]", "观看问题片段后选择 Pass 或 Fail；机器信息仅供参考。");
+    setText("[data-asset-id]", this.assetId ?? "未加载资产");
+    setText("[data-revision]", this.task ? `revision ${this.revision()}` : "revision —");
     const error = this.root.querySelector?.("[data-save-error]");
     if (error) {
-      error.textContent = this.lastError?.message || "";
+      error.textContent = this.lastError?.message ?? "";
       error.hidden = !this.lastError;
+    }
+    const previous = this.root.querySelector?.('[data-action="previous-asset"]');
+    const next = this.root.querySelector?.('[data-action="next-asset"]');
+    const currentIndex = this.assets.indexOf(this.assetId);
+    if (previous) previous.disabled = currentIndex <= 0;
+    if (next) next.disabled = currentIndex < 0 || currentIndex >= this.assets.length - 1;
+    this._renderVideoState();
+  }
+
+  _setError(code, message, status) {
+    this.lastError = { code, message, status };
+    this.render();
+  }
+
+  _configureMedia(task) {
+    if (!this.videoController || !task?.video) return;
+    const mediaKey = `${task.asset_id}|${task.video.url}|${task.video.fps}|${task.video.total_frames}`;
+    if (mediaKey === this._mediaKey) return;
+    this._mediaKey = mediaKey;
+    this.currentFrame = 0;
+    this.videoController.setMedia(task.video);
+    const placeholder = this.root?.querySelector?.("[data-video-placeholder]");
+    if (placeholder) placeholder.hidden = true;
+  }
+
+  _configureTimeline(task) {
+    const root = this.root?.querySelector?.("[data-warning-timeline]");
+    const totalFrames = task?.video?.total_frames;
+    if (!root || !Number.isInteger(totalFrames) || totalFrames <= 0) return;
+    const options = {
+      warnings: task.issues,
+      totalFrames,
+      currentFrame: this.currentFrame,
+      onSeek: (frame) => this.seekFromTimeline(frame),
+      documentRef: this.document,
+    };
+    if (!this.timeline) {
+      this.timeline = this.timelineFactory(options);
+      this.timeline.mount(root);
+    } else {
+      this.timeline.setWarnings(task.issues, totalFrames);
+      this.timeline.setCurrentFrame(this.currentFrame);
     }
   }
 
-  setMutationLock(locked) {
+  _renderVideoState() {
     if (!this.root) return;
-    this.root.querySelectorAll?.("[data-mutation-control], [data-navigation-control]").forEach((element) => {
-      if (element.dataset.action === "confirm-pending" || element.dataset.action === "cancel-pending") return;
-      element.disabled = Boolean(locked);
-    });
+    const rate = this.videoController?.playbackRate ?? 1;
+    const frame = this.task ? String(this.currentFrame) : "—";
+    const rateElement = this.root.querySelector?.("[data-playback-rate]");
+    const frameElement = this.root.querySelector?.("[data-current-frame]");
+    if (rateElement) rateElement.textContent = `${rate}×`;
+    if (frameElement) frameElement.textContent = frame;
   }
 
-  bindChrome() {
-    if (this.chromeBound || !this.root) return;
-    this.chromeBound = true;
-    this.root.querySelector?.('[data-action="refresh"]')?.addEventListener("click", () => {
-      if (this.assetId) this.requestTask(this.assetId).catch(() => {});
+  _bindChrome() {
+    if (this._chromeBound || !this.root) return;
+    this._chromeBound = true;
+    const bind = (selector, handler) => this.root.querySelector?.(selector)?.addEventListener("click", () => {
+      Promise.resolve(handler()).catch((error) => this._setError(error?.code ?? "request_failed", String(error?.message ?? error), error?.status ?? 0));
     });
-    this.root.querySelector?.('[data-action="acquire-lease"]')?.addEventListener("click", () => {
-      this.acquireLease().catch(() => {});
-    });
-    ["previous-asset", "next-asset"].forEach((action) => {
-      this.root.querySelector?.(`[data-action="${action}"]`)?.addEventListener("click", (event) => {
-        const id = event.currentTarget?.dataset?.assetId;
-        if (id) this.onNavigate?.(id, action);
-      });
-    });
-  }
-
-  startLeaseRenewal() {
-    this.stopLeaseRenewal();
-    if (!(this.leaseRenewIntervalMs > 0)) return;
-    this.leaseTimer = setInterval(() => {
-      this.renewLease().catch((error) => {
-        // A lease conflict or stale revision requires a refresh instead of a
-        // background retry that could overwrite the reviewer's task.
-        if ([409, 423].includes(error?.status)) this.stopLeaseRenewal();
-      });
-    }, this.leaseRenewIntervalMs);
-    this.leaseTimer?.unref?.();
-  }
-
-  stopLeaseRenewal() {
-    if (this.leaseTimer) clearInterval(this.leaseTimer);
-    this.leaseTimer = null;
+    bind('[data-action="refresh"]', () => this.assetId ? this.requestTask(this.assetId) : this.start());
+    bind('[data-action="rate-decrease"]', () => this.videoController?.decreaseRate());
+    bind('[data-action="rate-increase"]', () => this.videoController?.increaseRate());
+    bind('[data-action="previous-asset"]', () => this.loadPreviousAsset());
+    bind('[data-action="next-asset"]', () => this.loadNextAsset());
   }
 }
 
-export default WorkbenchApp;
+export default WarnReviewApp;
 
-// Browser bootstrap. Keeping this at the edge means the class remains usable
-// from tests and embedding applications without a global singleton.
 if (typeof window !== "undefined" && window.document) {
-  window.WorkbenchApp = WorkbenchApp;
+  window.WarnReviewApp = WarnReviewApp;
   window.addEventListener("DOMContentLoaded", () => {
     const root = window.document.querySelector("#app");
     if (!root) return;
-    const app = new WorkbenchApp({
-      documentRef: window.document,
-      root,
-      reviewer: root.dataset.reviewer || "",
-    });
-    window.humanQcWorkbench = app;
+    const app = new WarnReviewApp({ documentRef: window.document, root });
+    window.humanQcWarnReview = app;
     app.mount(root);
+    app.start().catch((error) => app._setError(error?.code ?? "request_failed", String(error?.message ?? error), error?.status ?? 0));
   }, { once: true });
 }

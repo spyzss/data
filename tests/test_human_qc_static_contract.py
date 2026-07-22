@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 import subprocess
 
 
@@ -12,29 +11,53 @@ def _read(name: str) -> str:
     return (STATIC / name).read_text(encoding="utf-8")
 
 
-def test_human_static_bundle_is_warn_only() -> None:
-    source = "\n".join(_read(name) for name in ("app.js", "index.html", "warn_adapter.js"))
-    assert "semantic_adapter" not in source
-    assert "SemanticCalibration" not in source
-    assert "completeSemantic" not in source
-    assert "语义" not in source
-    assert "共享边界" not in source
-    assert "相邻任务之间的" not in source
-    assert 'data-action="verdict-pass"' in _read("warn_adapter.js")
-    assert 'data-action="verdict-fail"' in _read("warn_adapter.js")
+def test_human_static_bundle_is_canonical_warn_only() -> None:
+    assert not (STATIC / "warn_adapter.js").exists()
+    source = "\n".join(
+        _read(name)
+        for name in (
+            "app.js",
+            "index.html",
+            "review_panel.js",
+            "warning_timeline.js",
+            "video_controller.js",
+        )
+    )
+    for forbidden in (
+        "semantic_adapter",
+        "SemanticCalibration",
+        "completeSemantic",
+        "/api/assets/",
+        "acquire-lease",
+        "获取编辑锁",
+        "warn_adapter",
+        "data-action=\"step-back\"",
+        "data-action=\"step-forward\"",
+    ):
+        assert forbidden not in source
+    assert "/api/warn/assets" in _read("app.js")
+    assert "Warn 复核" in _read("index.html")
 
 
-def test_machine_issue_fields_remain_read_only() -> None:
-    warn = _read("warn_adapter.js")
-    assert "data-machine-reason" in warn
-    assert "data-machine-metrics" in warn
-    assert "data-machine-threshold" in warn
-    assert not re.search(r"<(?:input|textarea)[^>]+data-machine-", warn)
-    assert "issue.severity =" not in warn
-    assert "issue.observed_value =" not in warn
+def test_warn_layout_has_one_current_frame_and_required_bottom_action_order() -> None:
+    html = _read("index.html")
+    assert html.count("data-current-frame") == 1
+    assert html.index("data-video-root") < html.index("data-warning-timeline")
+    assert html.index("data-warning-timeline") < html.index("data-review-panel")
+    assert html.index("data-review-panel") < html.index("data-bottom-navigation")
+    assert "data-action=\"rate-decrease\"" in html
+    assert "data-action=\"rate-increase\"" in html
+
+    panel = _read("review_panel.js")
+    assert panel.index('data-action="verdict-pass"') < panel.index('data-action="complete-review"')
+    assert "data-action=\"verdict-fail\"" in panel
+    assert "data-reason-other" in panel
+    assert "required" in panel
+    assert "data-threshold-tooltip" in panel
+    assert "data-passed-marker" in panel
 
 
-def test_warn_node_contracts_pass() -> None:
+def test_static_contracts_pass() -> None:
     result = subprocess.run(
         ["node", "--test", *sorted(str(path) for path in STATIC.glob("*.test.mjs"))],
         cwd=STATIC.parents[1],
