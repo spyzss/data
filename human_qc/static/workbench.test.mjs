@@ -161,6 +161,182 @@ test("overlay polling replaces only the selected issue status without reloading 
 });
 
 
+test("an unchanged generating overlay uses bounded exponential backoff instead of resetting each poll", async () => {
+  const initial = canonicalTask({
+    issues: canonicalTask().issues.map((issue) => (
+      issue.id === "exposure"
+        ? { ...issue, overlay: { status: "generating", segments: [] } }
+        : issue
+    )),
+  });
+  const timers = [];
+  const app = new WarnReviewApp({
+    scheduler: {
+      setTimeout(fn, delay) {
+        const timer = { fn, delay };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout(timer) {
+        const index = timers.indexOf(timer);
+        if (index >= 0) timers.splice(index, 1);
+      },
+    },
+    random: () => 0.5,
+    fetcher: async (path) => {
+      if (path.endsWith("/task")) return { ok: true, status: 200, json: async () => ({ task: initial }) };
+      if (path.endsWith("/status")) return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          asset_id: "asset-1",
+          issue_id: "exposure",
+          overlay: { status: "generating", segments: [] },
+        }),
+      };
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+
+  await app.loadAsset("asset-1");
+  assert.deepEqual(timers.map((timer) => timer.delay), [1000]);
+  await timers.shift().fn();
+  assert.deepEqual(timers.map((timer) => timer.delay), [2000]);
+  await timers.shift().fn();
+  assert.deepEqual(timers.map((timer) => timer.delay), [4000]);
+  await timers.shift().fn();
+  assert.deepEqual(timers.map((timer) => timer.delay), [5000]);
+  app.destroy();
+});
+
+
+test("a retry 503 honours Retry-After without replacing the local failed view or issuing a second POST", async () => {
+  const initial = canonicalTask({
+    issues: canonicalTask().issues.map((issue) => (
+      issue.id === "exposure"
+        ? { ...issue, overlay: { status: "failed", retryable: true, segments: [] } }
+        : issue
+    )),
+  });
+  const timers = [];
+  const calls = [];
+  let now = 0;
+  const app = new WarnReviewApp({
+    now: () => now,
+    scheduler: {
+      setTimeout(fn, delay) {
+        const timer = { fn, delay };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout(timer) {
+        const index = timers.indexOf(timer);
+        if (index >= 0) timers.splice(index, 1);
+      },
+    },
+    random: () => 0.5,
+    fetcher: async (path, options = {}) => {
+      calls.push({ path, method: options.method });
+      if (path.endsWith("/task")) return { ok: true, status: 200, json: async () => ({ task: initial }) };
+      if (path.endsWith("/retry")) return {
+        ok: false,
+        status: 503,
+        headers: { get: (name) => (name === "Retry-After" ? "2" : null) },
+        json: async () => ({ error: { code: "internal", message: "private worker error" } }),
+      };
+      if (path.endsWith("/status")) return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          asset_id: "asset-1",
+          issue_id: "exposure",
+          overlay: { status: "ready", segments: [] },
+        }),
+      };
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+
+  await app.loadAsset("asset-1");
+  await app.retryOverlay("exposure");
+  assert.equal(app.task.issues[0].overlay.status, "failed");
+  assert.equal(app._overlayRetrying.has("exposure"), true);
+  assert.deepEqual(timers.map((timer) => timer.delay), [2000]);
+  await app.retryOverlay("exposure");
+  assert.equal(calls.filter(({ path }) => path.endsWith("/retry")).length, 1);
+
+  now = 2000;
+  await timers.shift().fn();
+  assert.equal(app.task.issues[0].overlay.status, "ready");
+  assert.equal(app._overlayRetrying.has("exposure"), false);
+  assert.equal(calls.filter(({ path }) => path.endsWith("/retry")).length, 1);
+  app.destroy();
+});
+
+
+test("status transport failures and 5xx show a safe retry notice without clearing the local reason draft or reloading", async () => {
+  const initial = canonicalTask({
+    issues: canonicalTask().issues.map((issue) => (
+      issue.id === "exposure"
+        ? { ...issue, overlay: { status: "generating", segments: [] } }
+        : issue
+    )),
+  });
+  const timers = [];
+  const calls = [];
+  let statusAttempts = 0;
+  const app = new WarnReviewApp({
+    scheduler: {
+      setTimeout(fn, delay) {
+        const timer = { fn, delay };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout(timer) {
+        const index = timers.indexOf(timer);
+        if (index >= 0) timers.splice(index, 1);
+      },
+    },
+    random: () => 0.5,
+    fetcher: async (path) => {
+      calls.push(path);
+      if (path.endsWith("/task")) return { ok: true, status: 200, json: async () => ({ task: initial }) };
+      if (path.endsWith("/status")) {
+        statusAttempts += 1;
+        if (statusAttempts === 1) throw new Error("private upstream failure");
+        return {
+          ok: false,
+          status: 503,
+          json: async () => ({ error: { code: "internal", message: "private worker failure" } }),
+        };
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+
+  await app.loadAsset("asset-1");
+  app.panel.toggleReason("occlusion");
+  await timers.shift().fn();
+  assert.deepEqual(app.lastError, {
+    code: "overlay_status_unavailable",
+    message: "状态暂时无法更新，正在重试",
+    status: 0,
+  });
+  assert.deepEqual(app.panel.reasonDraft().reasonCodes, ["occlusion"]);
+  assert.deepEqual(calls.filter((path) => path.endsWith("/task")), ["/api/warn/assets/asset-1/task"]);
+  assert.deepEqual(timers.map((timer) => timer.delay), [2000]);
+  await timers.shift().fn();
+  assert.deepEqual(app.lastError, {
+    code: "overlay_status_unavailable",
+    message: "状态暂时无法更新，正在重试",
+    status: 503,
+  });
+  assert.deepEqual(app.panel.reasonDraft().reasonCodes, ["occlusion"]);
+  assert.deepEqual(timers.map((timer) => timer.delay), [4000]);
+  app.destroy();
+});
+
+
 test("completion only opens for a saved fail or when every warning has passed", () => {
   const onePass = applySavedReview(canonicalTask(), "exposure", "pass");
   assert.deepEqual(completionGate(onePass), { enabled: false, mode: null });

@@ -14,6 +14,23 @@ import { OverlayController } from "./overlay_controller.js";
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
+const OVERLAY_RETRY_MESSAGE = "状态暂时无法更新，正在重试";
+
+const retryAfterMs = (response) => {
+  const raw = response?.headers?.get?.("Retry-After");
+  const seconds = typeof raw === "string" ? Number(raw.trim()) : Number(raw);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.min(5000, Math.max(500, Math.round(seconds * 1000)));
+};
+
+const sameOverlayProjection = (left, right) => {
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+};
+
 const clampFrame = (frame, totalFrames) => {
   const total = Number(totalFrames);
   if (!Number.isInteger(total) || total <= 0) return 0;
@@ -29,6 +46,7 @@ const responseError = (response, body) => {
   );
   error.code = typeof detail.code === "string" ? detail.code : "request_failed";
   error.status = Number(response.status) || 0;
+  error.retryAfterMs = retryAfterMs(response);
   return error;
 };
 
@@ -83,6 +101,7 @@ export class WarnReviewApp {
     canSubmitIssue = () => true,
     scheduler = globalThis,
     random = Math.random,
+    now = () => Date.now(),
   } = {}) {
     this.baseUrl = String(baseUrl).replace(/\/$/, "");
     this.fetcher = fetcher;
@@ -95,6 +114,7 @@ export class WarnReviewApp {
     this.canSubmitIssue = typeof canSubmitIssue === "function" ? canSubmitIssue : () => true;
     this.scheduler = scheduler && typeof scheduler.setTimeout === "function" ? scheduler : globalThis;
     this.random = typeof random === "function" ? random : Math.random;
+    this.now = typeof now === "function" ? now : () => Date.now();
     this.task = null;
     this.assetId = null;
     this.assets = [];
@@ -111,6 +131,7 @@ export class WarnReviewApp {
     this._overlayPollDelay = 1000;
     this._overlayAbort = null;
     this._overlayRetrying = new Set();
+    this._overlayRetryCooldown = new Map();
     this.panel = this.panelFactory({
       documentRef: this.document,
       onVerdict: (issueId, verdict, payload) => this.submitVerdict(issueId, verdict, payload),
@@ -502,9 +523,43 @@ export class WarnReviewApp {
   }
 
   _overlayIssuesToPoll() {
+    const now = Number(this.now()) || 0;
     return (Array.isArray(this.task?.issues) ? this.task.issues : []).filter((issue) => (
-      issue?.overlay && ["pending", "generating"].includes(issue.overlay.status) && typeof issue.id === "string"
+      issue?.overlay
+      && typeof issue.id === "string"
+      && (
+        ["pending", "generating"].includes(issue.overlay.status)
+        || (
+          issue.overlay.status === "failed"
+          && issue.overlay.retryable === true
+          && (this._overlayRetryCooldown.get(issue.id)?.releaseAt ?? Infinity) <= now
+        )
+      )
     ));
+  }
+
+  _nextOverlayCooldownDelay() {
+    const now = Number(this.now()) || 0;
+    const delays = [...this._overlayRetryCooldown.values()]
+      .map((value) => Number(value?.releaseAt) - now)
+      .filter((delay) => Number.isFinite(delay) && delay > 0);
+    return delays.length ? Math.min(...delays) : null;
+  }
+
+  _releaseOverlayRetry(issueId) {
+    this._overlayRetryCooldown.delete(issueId);
+    this._overlayRetrying.delete(issueId);
+    this.panel.setRetryPending?.(issueId, false);
+  }
+
+  _setOverlayRetryNotice(status = 0) {
+    this._setError("overlay_status_unavailable", OVERLAY_RETRY_MESSAGE, Number(status) || 0);
+  }
+
+  _clearOverlayRetryNotice() {
+    if (this.lastError?.code !== "overlay_status_unavailable") return;
+    this.lastError = null;
+    this.render();
   }
 
   _invalidateOverlayPoll() {
@@ -513,14 +568,22 @@ export class WarnReviewApp {
     this._overlayPollTimer = null;
     this._overlayAbort?.abort?.();
     this._overlayAbort = null;
+    for (const issueId of this._overlayRetrying) this.panel.setRetryPending?.(issueId, false);
+    this._overlayRetrying.clear();
+    this._overlayRetryCooldown.clear();
   }
 
   _scheduleOverlayPoll({ reset = false } = {}) {
-    if (!this.task || !this.assetId || !this._overlayIssuesToPoll().length) return;
+    if (!this.task || !this.assetId) return;
+    const issues = this._overlayIssuesToPoll();
+    const cooldownDelay = this._nextOverlayCooldownDelay();
+    if (!issues.length && cooldownDelay === null) return;
     if (reset) this._overlayPollDelay = 1000;
     if (this._overlayPollTimer !== null) return;
     const jitter = 0.8 + Math.min(Math.max(Number(this.random()) || 0.5, 0), 1) * 0.4;
-    const delay = Math.round(Math.min(5000, Math.max(500, this._overlayPollDelay)) * jitter);
+    const delay = !issues.length && cooldownDelay !== null
+      ? Math.round(cooldownDelay)
+      : Math.round(Math.min(5000, Math.max(500, this._overlayPollDelay)) * jitter);
     const generation = this._overlayPollGeneration;
     this._overlayPollTimer = this.scheduler.setTimeout(() => {
       this._overlayPollTimer = null;
@@ -528,23 +591,25 @@ export class WarnReviewApp {
     }, delay);
   }
 
-  async _overlayRequest(path, signal) {
+  async _overlayRequest(path, { method = "GET", body = undefined, signal = undefined } = {}) {
     if (typeof this.fetcher !== "function") throw new Error("fetch is not available");
-    const response = await this.fetcher(this.endpoint(path), {
-      method: "GET",
-      signal,
-      headers: { Accept: "application/json" },
-    });
-    let body = null;
-    try { body = await response.json(); } catch { body = null; }
-    if (!response.ok) throw responseError(response, body);
-    return body;
+    const options = { method, signal, headers: { Accept: "application/json" } };
+    if (body !== undefined) {
+      options.headers["Content-Type"] = "application/json";
+      options.body = JSON.stringify(body);
+    }
+    const response = await this.fetcher(this.endpoint(path), options);
+    let value = null;
+    try { value = await response.json(); } catch { value = null; }
+    if (!response.ok) throw responseError(response, value);
+    return { body: value, retryAfterMs: retryAfterMs(response) };
   }
 
   _replaceIssueOverlay(assetId, issueId, overlay) {
     if (assetId !== this.assetId || !this.task || !isObject(overlay)) return false;
     const index = this.task.issues.findIndex((issue) => issue.id === issueId);
     if (index < 0) return false;
+    if (sameOverlayProjection(this.task.issues[index].overlay, overlay)) return false;
     const issues = this.task.issues.map((issue, candidate) => (
       candidate === index ? { ...issue, overlay } : issue
     ));
@@ -563,22 +628,33 @@ export class WarnReviewApp {
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     this._overlayAbort = controller;
     let changed = false;
+    const releasedRetries = new Set();
     try {
       for (const issue of this._overlayIssuesToPoll()) {
-        const value = await this._overlayRequest(
+        const response = await this._overlayRequest(
           `/api/warn/assets/${encodeURIComponent(assetId)}/overlays/${encodeURIComponent(issue.id)}/status`,
-          controller?.signal,
+          { signal: controller?.signal },
         );
+        const value = response.body;
         if (generation !== this._overlayPollGeneration || this.assetId !== assetId) return;
         if (value?.asset_id !== assetId || value?.issue_id !== issue.id || !isObject(value?.overlay)) continue;
         changed = this._replaceIssueOverlay(assetId, issue.id, value.overlay) || changed;
+        if (this._overlayRetryCooldown.has(issue.id)) releasedRetries.add(issue.id);
       }
       this._overlayPollDelay = changed ? 1000 : Math.min(5000, this._overlayPollDelay * 2);
+      this._clearOverlayRetryNotice();
     } catch (error) {
       if (generation !== this._overlayPollGeneration || error?.name === "AbortError") return;
       this._overlayPollDelay = Math.min(5000, this._overlayPollDelay * 2);
+      this._setOverlayRetryNotice(error?.status);
     } finally {
       if (this._overlayAbort?.signal === controller?.signal) this._overlayAbort = null;
+      for (const issueId of releasedRetries) this._releaseOverlayRetry(issueId);
+      if (releasedRetries.size === 0) {
+        for (const issue of this._overlayIssuesToPoll()) {
+          if (this._overlayRetryCooldown.has(issue.id)) this._releaseOverlayRetry(issue.id);
+        }
+      }
     }
     if (generation === this._overlayPollGeneration) this._scheduleOverlayPoll();
   }
@@ -589,20 +665,36 @@ export class WarnReviewApp {
     if (issue?.overlay?.status !== "failed" || issue.overlay.retryable !== true) return null;
     this._overlayRetrying.add(issueId);
     this.panel.setRetryPending?.(issueId, true);
+    let waitingForRetryAfter = false;
     try {
-      const value = await this.requestJson(
+      const response = await this._overlayRequest(
         `/api/warn/assets/${encodeURIComponent(this.assetId)}/overlays/${encodeURIComponent(issueId)}/retry`,
         { method: "POST", body: this.mutationBody({}) },
       );
+      const value = response.body;
       if (value?.asset_id === this.assetId && value?.issue_id === issueId && isObject(value?.overlay)) {
         this._replaceIssueOverlay(this.assetId, issueId, value.overlay);
         this._overlayPollDelay = 1000;
         this._scheduleOverlayPoll({ reset: true });
       }
       return value;
+    } catch (error) {
+      if (Number(error?.status) === 503) {
+        waitingForRetryAfter = true;
+        const delay = error.retryAfterMs ?? 1000;
+        this._overlayRetryCooldown.set(issueId, { releaseAt: (Number(this.now()) || 0) + delay });
+        this._setOverlayRetryNotice(error.status);
+        this._scheduleOverlayPoll();
+        return null;
+      }
+      if (!Number(error?.status) || Number(error.status) >= 500) {
+        this._setOverlayRetryNotice(error?.status);
+        return null;
+      }
+      this._setError(error.code ?? "request_failed", error.message ?? "请求失败", error.status);
+      return null;
     } finally {
-      this._overlayRetrying.delete(issueId);
-      this.panel.setRetryPending?.(issueId, false);
+      if (!waitingForRetryAfter) this._releaseOverlayRetry(issueId);
     }
   }
 

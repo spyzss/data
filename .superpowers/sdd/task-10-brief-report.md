@@ -55,3 +55,23 @@ node --check human_qc/static/app.js human_qc/static/overlay_controller.js \
 git diff --check
 # success
 ```
+
+## 终审修复（最小范围）
+
+- 同一 issue 的 `generating` 状态仅在 overlay 安全投影实际变化时重置轮询；连续同值响应按 `1000 → 2000 → 4000 → 5000ms` 退避。
+- retry 返回 `503` 时只读取 `Retry-After` 响应头这一安全 metadata；本地仍保留 failed/busy 视图，冷却期内保持单飞，期满后继续 status 轮询并解锁。
+- status 网络错误或 `5xx` 不暴露响应 body，只展示“状态暂时无法更新，正在重试”，且不会 reload task 或清空人工原因草稿。
+
+```text
+node --test human_qc/static/*.test.mjs
+# 57 passed
+
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_static_contract.py \
+  tests/test_human_qc_workbench.py \
+  tests/test_human_qc_http_server.py
+# 34 passed
+
+git diff --check
+# success
+```
