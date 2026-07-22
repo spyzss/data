@@ -1,0 +1,906 @@
+"""Bounded, durable generation for continuous SAM3 overlay segments.
+
+This module intentionally has no HTTP or browser dependencies.  A caller may
+submit a complete asset-level set of source-frame intervals, then poll its
+in-memory/durable view.  Rendering always happens in the bounded executor;
+callers never wait for a renderer or receive filesystem details.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import tempfile
+from threading import BoundedSemaphore, RLock
+from typing import Literal, Protocol
+
+
+_STATUS = frozenset({"pending", "generating", "ready", "failed"})
+_STABLE_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}").fullmatch
+_DIGEST = re.compile(r"[0-9a-f]{64}").fullmatch
+_MANIFEST_NAME = "manifest.json"
+_SCHEMA_VERSION = 1
+
+FrameInterval = tuple[int, int]
+OverlayStatus = Literal["pending", "generating", "ready", "failed"]
+
+
+class OverlayWorkerError(RuntimeError):
+    """A stable, public-safe overlay worker failure."""
+
+
+class OverlayRenderError(OverlayWorkerError):
+    """A renderer may use this to select one stable public error code."""
+
+
+class OverlayCacheFullError(OverlayWorkerError):
+    """The configured cache cannot make room for another completed result."""
+
+
+class OverlayRenderer(Protocol):
+    """Render one complete, half-open source-frame interval to ``output_path``.
+
+    Implementations must iterate every source frame in ``[start, end)`` exactly
+    once.  Keeping the interval boundary at the worker means a caller cannot
+    accidentally feed a renderer duplicate overlap frames.
+    """
+
+    def render_interval(
+        self,
+        request: "OverlayRequest",
+        start_frame: int,
+        end_frame_exclusive: int,
+        output_path: Path,
+    ) -> None: ...
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _required_text(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _safe_code(value: object, fallback: str) -> str:
+    return value if isinstance(value, str) and _STABLE_CODE(value) else fallback
+
+
+def merge_frame_intervals(intervals: Iterable[FrameInterval]) -> tuple[FrameInterval, ...]:
+    """Normalize non-empty half-open source-frame intervals.
+
+    Overlap *and adjacency* are joined.  Adjacent ranges have no source-frame
+    gap and therefore belong in one encoded video segment.
+    """
+
+    if isinstance(intervals, (str, bytes, Mapping)):
+        raise TypeError("intervals must be an iterable of frame pairs")
+    parsed: list[FrameInterval] = []
+    try:
+        iterator = iter(intervals)
+    except TypeError as exc:
+        raise TypeError("intervals must be iterable") from exc
+    for interval in iterator:
+        if isinstance(interval, (str, bytes, Mapping)):
+            raise TypeError("each interval must be a two-item sequence")
+        try:
+            start, end = interval
+        except (TypeError, ValueError) as exc:
+            raise TypeError("each interval must be a two-item sequence") from exc
+        if not _is_int(start) or not _is_int(end):
+            raise TypeError("frame bounds must be integers")
+        if start < 0 or end <= start:
+            raise ValueError("frame interval must be non-negative and non-empty")
+        parsed.append((start, end))
+    if not parsed:
+        return ()
+    parsed.sort()
+    result: list[FrameInterval] = []
+    current_start, current_end = parsed[0]
+    for start, end in parsed[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+            continue
+        result.append((current_start, current_end))
+        current_start, current_end = start, end
+    result.append((current_start, current_end))
+    return tuple(result)
+
+
+@dataclass(frozen=True)
+class OverlayCacheKey:
+    """All inputs that can change rendered pixels participate in cache identity."""
+
+    source_sha256: str
+    intervals: tuple[FrameInterval, ...]
+    model_hash: str
+    config_hash: str
+    input_fingerprint_hash: str
+    renderer_version: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_sha256", _required_text(self.source_sha256, "source_sha256"))
+        object.__setattr__(self, "intervals", merge_frame_intervals(self.intervals))
+        if not self.intervals:
+            raise ValueError("intervals must not be empty")
+        for name in (
+            "model_hash",
+            "config_hash",
+            "input_fingerprint_hash",
+            "renderer_version",
+        ):
+            object.__setattr__(self, name, _required_text(getattr(self, name), name))
+
+    @property
+    def digest(self) -> str:
+        payload = {
+            "source_sha256": self.source_sha256,
+            "intervals": self.intervals,
+            "model_hash": self.model_hash,
+            "config_hash": self.config_hash,
+            "input_fingerprint_hash": self.input_fingerprint_hash,
+            "renderer_version": self.renderer_version,
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class OverlayRequest:
+    """Server-side-only request used by :class:`BoundedOverlayWorker`."""
+
+    asset_id: str
+    cache_root: Path
+    source_sha256: str
+    intervals: tuple[FrameInterval, ...]
+    fps: float
+    total_frames: int
+    model_hash: str
+    config_hash: str
+    input_fingerprint_hash: str
+    renderer_version: str
+    renderer: OverlayRenderer | object | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "asset_id", _required_text(self.asset_id, "asset_id"))
+        object.__setattr__(self, "cache_root", Path(self.cache_root))
+        if isinstance(self.fps, bool) or not isinstance(self.fps, (int, float)):
+            raise TypeError("fps must be a positive finite number")
+        if not math.isfinite(float(self.fps)) or float(self.fps) <= 0:
+            raise ValueError("fps must be a positive finite number")
+        object.__setattr__(self, "fps", float(self.fps))
+        if not _is_int(self.total_frames) or self.total_frames <= 0:
+            raise ValueError("total_frames must be a positive integer")
+        normalized = merge_frame_intervals(self.intervals)
+        if not normalized:
+            raise ValueError("intervals must not be empty")
+        if any(end > self.total_frames for _, end in normalized):
+            raise ValueError("frame interval is outside total_frames")
+        object.__setattr__(self, "intervals", normalized)
+        if not callable(getattr(self.renderer, "render_interval", None)):
+            raise TypeError("renderer must expose render_interval")
+
+    @property
+    def cache_key(self) -> OverlayCacheKey:
+        return OverlayCacheKey(
+            source_sha256=self.source_sha256,
+            intervals=self.intervals,
+            model_hash=self.model_hash,
+            config_hash=self.config_hash,
+            input_fingerprint_hash=self.input_fingerprint_hash,
+            renderer_version=self.renderer_version,
+        )
+
+
+@dataclass(frozen=True)
+class OverlaySegmentView:
+    """One opaque continuous MP4 segment; ``path`` remains server-side only."""
+
+    start_frame: int
+    end_frame_exclusive: int
+    status: OverlayStatus
+    overlay_id: str
+    path: Path | None = None
+    code: str | None = None
+    retryable: bool = False
+
+    def to_safe_dict(self) -> dict[str, object]:
+        return {
+            "start_frame": self.start_frame,
+            "end_frame_exclusive": self.end_frame_exclusive,
+            "status": self.status,
+            "overlay_id": self.overlay_id,
+            "code": self.code,
+            "retryable": self.retryable,
+        }
+
+
+@dataclass(frozen=True)
+class OverlayJobView:
+    """Internal job state.  Only ``to_safe_dict`` is browser-safe."""
+
+    cache_key: OverlayCacheKey
+    status: OverlayStatus
+    segments: tuple[OverlaySegmentView, ...]
+    cache_hit: bool = False
+    deduplicated: bool = False
+    code: str | None = None
+    retryable: bool = False
+
+    def to_safe_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "cache_hit": self.cache_hit,
+            "deduplicated": self.deduplicated,
+            "code": self.code,
+            "retryable": self.retryable,
+            "segments": [segment.to_safe_dict() for segment in self.segments],
+        }
+
+
+class BoundedOverlayWorker:
+    """A process-local single-flight worker with a durable, validated cache.
+
+    The semaphore covers both running workers and the executor's waiting work,
+    avoiding ``ThreadPoolExecutor``'s otherwise unbounded submission queue.
+    A file lock around generation prevents two server processes from publishing
+    the same cache key concurrently; this class itself still owns in-memory
+    single-flight state only for its process.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_workers: int = 1,
+        max_pending: int = 1,
+        max_cache_bytes: int | None = None,
+        max_ready_jobs: int | None = None,
+    ) -> None:
+        for name, value in (("max_workers", max_workers), ("max_pending", max_pending)):
+            if not _is_int(value) or value < 0 or (name == "max_workers" and value == 0):
+                raise ValueError(f"{name} must be a valid non-negative integer")
+        for name, value in (("max_cache_bytes", max_cache_bytes), ("max_ready_jobs", max_ready_jobs)):
+            if value is not None and (not _is_int(value) or value < 0):
+                raise ValueError(f"{name} must be a non-negative integer or None")
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="sam3-overlay")
+        self._capacity = BoundedSemaphore(max_workers + max_pending)
+        self._max_cache_bytes = max_cache_bytes
+        self._max_ready_jobs = max_ready_jobs
+        self._lock = RLock()
+        self._inflight: dict[tuple[str, str], Future[None]] = {}
+        self._views: dict[tuple[str, str], OverlayJobView] = {}
+        self._pinned: set[tuple[str, str]] = set()
+        self._closed = False
+
+    @staticmethod
+    def _root(request: OverlayRequest) -> Path:
+        return request.cache_root.resolve()
+
+    def _job_id(self, request: OverlayRequest) -> tuple[str, str]:
+        return (str(self._root(request)), request.cache_key.digest)
+
+    def _job_dir(self, request: OverlayRequest) -> Path:
+        return self._root(request) / request.cache_key.digest
+
+    def _manifest_path(self, request: OverlayRequest) -> Path:
+        return self._job_dir(request) / _MANIFEST_NAME
+
+    @staticmethod
+    def _overlay_id(key: OverlayCacheKey, index: int) -> str:
+        return f"overlay-{key.digest[:24]}-{index}"
+
+    def _empty_segments(self, request: OverlayRequest, status: OverlayStatus) -> tuple[OverlaySegmentView, ...]:
+        return tuple(
+            OverlaySegmentView(
+                start_frame=start,
+                end_frame_exclusive=end,
+                status=status,
+                overlay_id=self._overlay_id(request.cache_key, index),
+            )
+            for index, (start, end) in enumerate(request.intervals)
+        )
+
+    def _failed_view(
+        self,
+        request: OverlayRequest,
+        code: str,
+        *,
+        retryable: bool,
+        segments: tuple[OverlaySegmentView, ...] | None = None,
+    ) -> OverlayJobView:
+        normalized_code = _safe_code(code, "overlay_render_failed")
+        if segments is None:
+            segments = tuple(
+                replace(
+                    segment,
+                    status="failed",
+                    code=normalized_code,
+                    retryable=retryable,
+                )
+                for segment in self._empty_segments(request, "failed")
+            )
+        return OverlayJobView(
+            cache_key=request.cache_key,
+            status="failed",
+            segments=segments,
+            code=normalized_code,
+            retryable=retryable,
+        )
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def _atomic_json(cls, path: Path, payload: Mapping[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, raw_temp = tempfile.mkstemp(
+            prefix=".manifest-", suffix=".tmp", dir=path.parent
+        )
+        temporary = Path(raw_temp)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            cls._fsync_directory(path.parent)
+        except Exception:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _safe_relative(job_dir: Path, path: Path | None) -> str | None:
+        if path is None:
+            return None
+        try:
+            relative = path.resolve().relative_to(job_dir.resolve())
+        except (OSError, ValueError) as exc:
+            raise OverlayWorkerError("overlay_cache_invalid") from exc
+        if len(relative.parts) != 1 or relative.name in {"", ".", ".."}:
+            raise OverlayWorkerError("overlay_cache_invalid")
+        return relative.name
+
+    def _manifest_payload(self, request: OverlayRequest, view: OverlayJobView) -> dict[str, object]:
+        job_dir = self._job_dir(request)
+        segments: list[dict[str, object]] = []
+        for segment in view.segments:
+            relative = self._safe_relative(job_dir, segment.path)
+            size_bytes: int | None = None
+            if segment.path is not None:
+                try:
+                    size_bytes = segment.path.stat().st_size
+                except OSError:
+                    relative = None
+            segments.append(
+                {
+                    "start_frame": segment.start_frame,
+                    "end_frame_exclusive": segment.end_frame_exclusive,
+                    "status": segment.status,
+                    "overlay_id": segment.overlay_id,
+                    "relative_path": relative,
+                    "size_bytes": size_bytes,
+                    "code": segment.code,
+                    "retryable": segment.retryable,
+                }
+            )
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "key_digest": request.cache_key.digest,
+            "status": view.status,
+            "code": view.code,
+            "retryable": view.retryable,
+            "segments": segments,
+        }
+
+    def _persist(self, request: OverlayRequest, view: OverlayJobView) -> None:
+        self._atomic_json(self._manifest_path(request), self._manifest_payload(request, view))
+
+    def _parse_manifest(self, request: OverlayRequest) -> OverlayJobView | None:
+        path = self._manifest_path(request)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+        if not isinstance(raw, Mapping):
+            return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+        if raw.get("schema_version") != _SCHEMA_VERSION or raw.get("key_digest") != request.cache_key.digest:
+            return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+        status = raw.get("status")
+        if status not in _STATUS:
+            return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+        raw_segments = raw.get("segments")
+        if not isinstance(raw_segments, list):
+            return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+        by_interval: dict[FrameInterval, Mapping[str, object]] = {}
+        for value in raw_segments:
+            if not isinstance(value, Mapping):
+                return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+            start = value.get("start_frame")
+            end = value.get("end_frame_exclusive")
+            if not _is_int(start) or not _is_int(end) or (start, end) not in request.intervals:
+                return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+            by_interval[(start, end)] = value
+        if status == "ready" and set(by_interval) != set(request.intervals):
+            return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+        job_dir = self._job_dir(request)
+        segments: list[OverlaySegmentView] = []
+        for index, interval in enumerate(request.intervals):
+            value = by_interval.get(interval)
+            if value is None:
+                segment_status: OverlayStatus = "pending" if status != "failed" else "failed"
+                segments.append(
+                    OverlaySegmentView(
+                        *interval,
+                        status=segment_status,
+                        overlay_id=self._overlay_id(request.cache_key, index),
+                        code=("overlay_interrupted" if segment_status == "failed" else None),
+                        retryable=segment_status == "failed",
+                    )
+                )
+                continue
+            segment_status = value.get("status")
+            if segment_status not in _STATUS:
+                return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+            overlay_id = value.get("overlay_id")
+            if not isinstance(overlay_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", overlay_id):
+                return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+            code = value.get("code")
+            stable_code = code if isinstance(code, str) and _STABLE_CODE(code) else None
+            retryable = value.get("retryable") is True
+            candidate: Path | None = None
+            if segment_status == "ready":
+                relative = value.get("relative_path")
+                size = value.get("size_bytes")
+                if not isinstance(relative, str) or not _is_int(size) or size <= 0:
+                    return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+                candidate = (job_dir / relative).resolve()
+                try:
+                    candidate.relative_to(job_dir.resolve())
+                    stat = candidate.stat()
+                except (OSError, ValueError):
+                    return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+                if not candidate.is_file() or stat.st_size != size:
+                    return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+            segments.append(
+                OverlaySegmentView(
+                    *interval,
+                    status=segment_status,
+                    overlay_id=overlay_id,
+                    path=candidate,
+                    code=stable_code,
+                    retryable=retryable,
+                )
+            )
+        all_ready = all(segment.status == "ready" for segment in segments)
+        if status == "ready" and not all_ready:
+            return self._failed_view(request, "overlay_cache_invalid", retryable=True)
+        stable_code = raw.get("code")
+        return OverlayJobView(
+            cache_key=request.cache_key,
+            status=status,
+            segments=tuple(segments),
+            code=(stable_code if isinstance(stable_code, str) and _STABLE_CODE(stable_code) else None),
+            retryable=raw.get("retryable") is True,
+        )
+
+    def _recover_if_interrupted(self, request: OverlayRequest, view: OverlayJobView) -> OverlayJobView:
+        if view.status not in {"pending", "generating"}:
+            return view
+        interrupted_segments = tuple(
+            segment
+            if segment.status == "ready"
+            else replace(
+                segment,
+                status="failed",
+                code="overlay_interrupted",
+                retryable=True,
+            )
+            for segment in view.segments
+        )
+        recovered = self._failed_view(
+            request,
+            "overlay_interrupted",
+            retryable=True,
+            segments=interrupted_segments,
+        )
+        self._persist(request, recovered)
+        return recovered
+
+    def _load_durable(self, request: OverlayRequest, *, recover: bool) -> OverlayJobView | None:
+        view = self._parse_manifest(request)
+        if view is not None and recover:
+            view = self._recover_if_interrupted(request, view)
+        return view
+
+    @contextmanager
+    def _key_lock(self, request: OverlayRequest):
+        """Use an advisory per-key lock for cross-process cache publication."""
+
+        job_dir = self._job_dir(request)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = job_dir / ".generation.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except ImportError:  # pragma: no cover - Unix worker deployment uses fcntl.
+                pass
+            yield
+        finally:
+            try:
+                try:
+                    import fcntl
+
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except ImportError:  # pragma: no cover
+                    pass
+            finally:
+                os.close(descriptor)
+
+    def _publish_view(self, request: OverlayRequest, view: OverlayJobView) -> None:
+        with self._lock:
+            self._views[self._job_id(request)] = view
+
+    def _release_slot(self, request: OverlayRequest) -> None:
+        with self._lock:
+            future = self._inflight.pop(self._job_id(request), None)
+        if future is not None:
+            self._capacity.release()
+
+    def _segment_filename(self, index: int, interval: FrameInterval) -> str:
+        start, end = interval
+        return f"segment-{index:03d}-{start}-{end}.mp4"
+
+    @staticmethod
+    def _fsync_file(path: Path) -> None:
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+
+    def _temporary_segment(self, job_dir: Path, filename: str) -> Path:
+        descriptor, raw_temp = tempfile.mkstemp(
+            # Keep the final media suffix: FFmpeg selects a muxer from it when
+            # a concrete renderer does not pass an explicit ``-f`` argument.
+            prefix=f".{filename}.", suffix=".partial.mp4", dir=job_dir
+        )
+        os.close(descriptor)
+        return Path(raw_temp)
+
+    @staticmethod
+    def _exception_code(exc: BaseException) -> str:
+        if isinstance(exc, OverlayCacheFullError):
+            return "overlay_cache_full"
+        if isinstance(exc, OverlayRenderError):
+            return _safe_code(str(exc), "overlay_render_failed")
+        return "overlay_render_failed"
+
+    @staticmethod
+    def _job_size(path: Path) -> int:
+        total = 0
+        try:
+            for entry in path.iterdir():
+                if entry.is_file() and not entry.name.startswith(".generation.lock"):
+                    total += entry.stat().st_size
+        except OSError:
+            return total
+        return total
+
+    def _safe_remove_job(self, root: Path, job_dir: Path) -> None:
+        try:
+            if job_dir.parent.resolve() != root.resolve() or _DIGEST(job_dir.name) is None:
+                return
+            shutil.rmtree(job_dir)
+        except OSError:
+            return
+
+    def _evict_for(self, request: OverlayRequest, current_job_size: int) -> bool:
+        if self._max_cache_bytes is None and self._max_ready_jobs is None:
+            return True
+        root = self._root(request)
+        try:
+            candidates = [path for path in root.iterdir() if path.is_dir() and _DIGEST(path.name)]
+        except OSError:
+            return False
+        current_id = self._job_id(request)
+        ready: list[tuple[float, int, Path]] = []
+        total_size = 0
+        for path in candidates:
+            if path == self._job_dir(request):
+                continue
+            key = (str(root), path.name)
+            if key in self._pinned or key in self._inflight:
+                continue
+            manifest = path / _MANIFEST_NAME
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, Mapping) or data.get("status") != "ready":
+                continue
+            size = self._job_size(path)
+            total_size += size
+            try:
+                modified = manifest.stat().st_mtime
+            except OSError:
+                modified = 0.0
+            ready.append((modified, size, path))
+        ready.sort(key=lambda item: item[0])
+        target_count = len(ready) + 1
+        while ready and (
+            (self._max_cache_bytes is not None and total_size + current_job_size > self._max_cache_bytes)
+            or (self._max_ready_jobs is not None and target_count > self._max_ready_jobs)
+        ):
+            _, size, victim = ready.pop(0)
+            self._safe_remove_job(root, victim)
+            total_size -= size
+            target_count -= 1
+        if self._max_cache_bytes is not None and total_size + current_job_size > self._max_cache_bytes:
+            return False
+        return self._max_ready_jobs is None or target_count <= self._max_ready_jobs
+
+    def _render(self, request: OverlayRequest, initial: OverlayJobView) -> OverlayJobView:
+        job_dir = self._job_dir(request)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        reusable = {
+            (segment.start_frame, segment.end_frame_exclusive): segment
+            for segment in initial.segments
+            if segment.status == "ready" and segment.path is not None and segment.path.is_file()
+        }
+        generating = OverlayJobView(
+            cache_key=request.cache_key,
+            status="generating",
+            segments=tuple(
+                reusable.get(interval)
+                or OverlaySegmentView(
+                    *interval,
+                    status="generating",
+                    overlay_id=self._overlay_id(request.cache_key, index),
+                )
+                for index, interval in enumerate(request.intervals)
+            ),
+        )
+        self._persist(request, generating)
+        produced: list[OverlaySegmentView] = []
+        for index, interval in enumerate(request.intervals):
+            cached = reusable.get(interval)
+            if cached is not None:
+                produced.append(cached)
+                continue
+            start, end = interval
+            final = job_dir / self._segment_filename(index, interval)
+            temporary = self._temporary_segment(job_dir, final.name)
+            try:
+                renderer = request.renderer
+                assert renderer is not None
+                renderer.render_interval(request, start, end, temporary)
+                if not temporary.is_file() or temporary.stat().st_size <= 0:
+                    raise OverlayRenderError("overlay_render_failed")
+                self._fsync_file(temporary)
+                os.replace(temporary, final)
+                self._fsync_directory(job_dir)
+                produced.append(
+                    OverlaySegmentView(
+                        start,
+                        end,
+                        "ready",
+                        self._overlay_id(request.cache_key, index),
+                        path=final,
+                    )
+                )
+            except BaseException as exc:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                code = self._exception_code(exc)
+                produced.append(
+                    OverlaySegmentView(
+                        start,
+                        end,
+                        "failed",
+                        self._overlay_id(request.cache_key, index),
+                        code=code,
+                        retryable=True,
+                    )
+                )
+        if all(segment.status == "ready" for segment in produced):
+            if not self._evict_for(request, self._job_size(job_dir)):
+                for segment in produced:
+                    if segment.path is not None:
+                        try:
+                            segment.path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                failed_segments = tuple(
+                    replace(
+                        segment,
+                        status="failed",
+                        path=None,
+                        code="overlay_cache_full",
+                        retryable=True,
+                    )
+                    for segment in produced
+                )
+                return self._failed_view(
+                    request,
+                    "overlay_cache_full",
+                    retryable=True,
+                    segments=failed_segments,
+                )
+            return OverlayJobView(
+                cache_key=request.cache_key,
+                status="ready",
+                segments=tuple(produced),
+            )
+        code = next(
+            (segment.code for segment in produced if segment.status == "failed" and segment.code),
+            "overlay_render_failed",
+        )
+        return self._failed_view(
+            request,
+            code,
+            retryable=True,
+            segments=tuple(produced),
+        )
+
+    def _run(self, request: OverlayRequest, initial: OverlayJobView) -> None:
+        try:
+            with self._key_lock(request):
+                durable = self._load_durable(request, recover=False)
+                if durable is not None and durable.status == "ready":
+                    final = replace(durable, cache_hit=True)
+                else:
+                    final = self._render(request, initial)
+                    self._persist(request, final)
+        except BaseException:
+            final = self._failed_view(request, "overlay_render_failed", retryable=True)
+            try:
+                self._persist(request, final)
+            except BaseException:
+                pass
+        self._publish_view(request, final)
+        self._release_slot(request)
+
+    def _schedule(self, request: OverlayRequest, previous: OverlayJobView | None) -> OverlayJobView:
+        reusable = () if previous is None else tuple(
+            segment
+            if segment.status == "ready"
+            else replace(segment, status="pending", code=None, retryable=False, path=None)
+            for segment in previous.segments
+        )
+        pending = OverlayJobView(
+            cache_key=request.cache_key,
+            status="pending",
+            segments=reusable or self._empty_segments(request, "pending"),
+        )
+        try:
+            self._persist(request, pending)
+            future = self._executor.submit(self._run, request, pending)
+        except BaseException:
+            self._capacity.release()
+            return self._failed_view(request, "overlay_render_failed", retryable=True)
+        self._views[self._job_id(request)] = pending
+        self._inflight[self._job_id(request)] = future
+        return pending
+
+    def submit(self, request: OverlayRequest) -> OverlayJobView:
+        """Enqueue a job without waiting for SAM3, ffmpeg, or a future."""
+
+        if not isinstance(request, OverlayRequest):
+            raise TypeError("request must be an OverlayRequest")
+        job_id = self._job_id(request)
+        with self._lock:
+            if self._closed:
+                raise OverlayWorkerError("overlay_worker_closed")
+            current = self._views.get(job_id)
+            if current is not None and job_id in self._inflight:
+                return replace(current, deduplicated=True)
+            if current is None:
+                current = self._load_durable(request, recover=True)
+                if current is not None:
+                    self._views[job_id] = current
+            if current is not None:
+                if current.status == "ready":
+                    return replace(current, cache_hit=True)
+                if current.status == "failed":
+                    return current
+            if not self._capacity.acquire(blocking=False):
+                return self._failed_view(request, "overlay_queue_full", retryable=True)
+            return self._schedule(request, current)
+
+    def get(self, request: OverlayRequest) -> OverlayJobView:
+        """Return the current durable view; an old generating manifest is retryable."""
+
+        if not isinstance(request, OverlayRequest):
+            raise TypeError("request must be an OverlayRequest")
+        job_id = self._job_id(request)
+        with self._lock:
+            current = self._views.get(job_id)
+            if current is not None:
+                return current
+            durable = self._load_durable(request, recover=True)
+            if durable is None:
+                return self._failed_view(request, "overlay_not_found", retryable=True)
+            self._views[job_id] = durable
+            return durable
+
+    def retry(self, request: OverlayRequest) -> OverlayJobView:
+        """Retry only a durable, retryable failed job; never rerender ready media."""
+
+        if not isinstance(request, OverlayRequest):
+            raise TypeError("request must be an OverlayRequest")
+        job_id = self._job_id(request)
+        with self._lock:
+            if self._closed:
+                raise OverlayWorkerError("overlay_worker_closed")
+            current = self._views.get(job_id) or self._load_durable(request, recover=True)
+            if current is None:
+                return self._failed_view(request, "overlay_not_found", retryable=True)
+            self._views[job_id] = current
+            if job_id in self._inflight:
+                return replace(current, deduplicated=True)
+            if current.status == "ready":
+                return replace(current, cache_hit=True)
+            if current.status != "failed" or not current.retryable:
+                return current
+            if not self._capacity.acquire(blocking=False):
+                return self._failed_view(request, "overlay_queue_full", retryable=True)
+            return self._schedule(request, current)
+
+    def pin(self, request: OverlayRequest) -> None:
+        """Prevent this ready cache entry from eviction while a media catalog pins it."""
+
+        with self._lock:
+            self._pinned.add(self._job_id(request))
+
+    def unpin(self, request: OverlayRequest) -> None:
+        with self._lock:
+            self._pinned.discard(self._job_id(request))
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        with self._lock:
+            self._closed = True
+        self._executor.shutdown(wait=wait, cancel_futures=False)
+
+
+__all__ = [
+    "BoundedOverlayWorker",
+    "FrameInterval",
+    "OverlayCacheFullError",
+    "OverlayCacheKey",
+    "OverlayJobView",
+    "OverlayRenderError",
+    "OverlayRequest",
+    "OverlaySegmentView",
+    "OverlayWorkerError",
+    "merge_frame_intervals",
+]
