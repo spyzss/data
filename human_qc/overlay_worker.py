@@ -697,14 +697,18 @@ class BoundedOverlayWorker:
         )
         return recovered
 
-    def _read_owner_locked(self, request: OverlayRequest) -> Mapping[str, object] | None:
+    @staticmethod
+    def _read_owner_path_locked(owner_path: Path) -> Mapping[str, object] | None:
         try:
-            raw = json.loads(self._owner_path(request).read_text(encoding="utf-8"))
+            raw = json.loads(owner_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
         except (OSError, json.JSONDecodeError):
             return {}
         return raw if isinstance(raw, Mapping) else {}
+
+    def _read_owner_locked(self, request: OverlayRequest) -> Mapping[str, object] | None:
+        return self._read_owner_path_locked(self._owner_path(request))
 
     def _owner_payload(self, token: str) -> dict[str, object]:
         heartbeat_at = time.time()
@@ -718,7 +722,7 @@ class BoundedOverlayWorker:
             "lease_expires_at": heartbeat_at + self._owner_lease_seconds,
         }
 
-    def _owner_is_live_locked(self, request: OverlayRequest) -> bool:
+    def _owner_path_is_live_locked(self, owner_path: Path) -> bool:
         """Conservatively decide whether a durable owner marker is still live.
 
         A marker created by this interpreter is tracked by an instance token,
@@ -728,7 +732,7 @@ class BoundedOverlayWorker:
         clobbering a renderer on a shared cache mount.
         """
 
-        owner = self._read_owner_locked(request)
+        owner = self._read_owner_path_locked(owner_path)
         if owner is None:
             return False
         process_incarnation = owner.get("process_incarnation")
@@ -757,7 +761,7 @@ class BoundedOverlayWorker:
             or float(lease_expires_at) > now + _MAX_OWNER_LEASE_SECONDS
         ):
             return False
-        marker = (str(self._owner_path(request)), token)
+        marker = (str(owner_path), token)
         if process_incarnation == _PROCESS_INCARNATION:
             with _LOCAL_OWNER_LOCK:
                 return marker in _LOCAL_OWNER_TOKENS
@@ -774,6 +778,9 @@ class BoundedOverlayWorker:
         except PermissionError:
             return True
         return True
+
+    def _owner_is_live_locked(self, request: OverlayRequest) -> bool:
+        return self._owner_path_is_live_locked(self._owner_path(request))
 
     def _claim_owner_locked(self, request: OverlayRequest) -> str | None:
         """Atomically claim durable generation ownership or observe a live peer."""
@@ -884,16 +891,15 @@ class BoundedOverlayWorker:
         return view
 
     @contextmanager
-    def _key_lock(
+    def _job_directory_lock(
         self,
-        request: OverlayRequest,
+        job_dir: Path,
         *,
         blocking: bool = True,
         create: bool = True,
     ):
-        """Acquire only a short per-key state lock, never a renderer lock."""
+        """Acquire one digest directory's short state lock."""
 
-        job_dir = self._job_dir(request)
         if create:
             job_dir.mkdir(parents=True, exist_ok=True)
         lock_path = job_dir / ".generation.lock"
@@ -930,6 +936,23 @@ class BoundedOverlayWorker:
                     pass
             finally:
                 os.close(descriptor)
+
+    @contextmanager
+    def _key_lock(
+        self,
+        request: OverlayRequest,
+        *,
+        blocking: bool = True,
+        create: bool = True,
+    ):
+        """Acquire only a short per-key state lock, never a renderer lock."""
+
+        with self._job_directory_lock(
+            self._job_dir(request),
+            blocking=blocking,
+            create=create,
+        ) as acquired:
+            yield acquired
 
     @contextmanager
     def _render_fence(self, request: OverlayRequest, *, blocking: bool = True):
@@ -1088,6 +1111,36 @@ class BoundedOverlayWorker:
             return False
         return False
 
+    def _remove_terminal_victim(
+        self,
+        root: Path,
+        job_dir: Path,
+        *,
+        expected_status: OverlayStatus,
+    ) -> bool:
+        """Delete an unchanged terminal victim under root -> victim-key order.
+
+        The caller already holds the root publication lock.  A scan snapshot
+        cannot authorize deletion after a retry has installed a new owner or
+        changed the manifest, so both are revalidated under the victim key.
+        """
+
+        with self._job_directory_lock(job_dir, create=False) as acquired:
+            if not acquired:
+                return False
+            manifest = job_dir / _MANIFEST_NAME
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return False
+            if not isinstance(data, Mapping) or data.get("status") != expected_status:
+                return False
+            if self._owner_path_is_live_locked(job_dir / _OWNER_NAME):
+                return False
+            if expected_status == "ready" and self._has_live_pin(root, job_dir.name):
+                return False
+            return self._safe_remove_job(root, job_dir)
+
     def _discard_job_media(self, request: OverlayRequest) -> None:
         """Remove every material media product from a non-ready job."""
 
@@ -1241,7 +1294,11 @@ class BoundedOverlayWorker:
             if victim_index is None:
                 break
             _, size, victim, _, victim_is_ready = ready.pop(victim_index)
-            if self._safe_remove_job(root, victim):
+            if self._remove_terminal_victim(
+                root,
+                victim,
+                expected_status="ready" if victim_is_ready else "failed",
+            ):
                 total_size -= size
                 if victim_is_ready:
                     target_count -= 1
@@ -1309,8 +1366,12 @@ class BoundedOverlayWorker:
             )
             if victim_index is None:
                 return False
-            _, _, size, victim, _ = terminal.pop(victim_index)
-            if self._safe_remove_job(root, victim):
+            priority, _, size, victim, _ = terminal.pop(victim_index)
+            if self._remove_terminal_victim(
+                root,
+                victim,
+                expected_status="ready" if priority else "failed",
+            ):
                 total_size -= size
         return True
 

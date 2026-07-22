@@ -6,7 +6,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
-from threading import Barrier, BrokenBarrierError, Event, Lock
+from threading import Barrier, BrokenBarrierError, Event, Lock, Thread
 import time
 
 import pytest
@@ -387,7 +387,6 @@ def test_ready_publication_accounts_for_the_larger_final_manifest_before_quota(
 ) -> None:
     from human_qc.overlay_worker import BoundedOverlayWorker
 
-    max_cache_bytes = 1600
     request = _request(
         tmp_path,
         intervals=((0, 1), (2, 3), (4, 5), (6, 7), (8, 9)),
@@ -396,16 +395,43 @@ def test_ready_publication_accounts_for_the_larger_final_manifest_before_quota(
     worker = BoundedOverlayWorker(
         max_workers=1,
         max_pending=0,
-        max_cache_bytes=max_cache_bytes,
     )
+    original_publish = worker._publish_rendered
+    observed: dict[str, int] = {}
+
+    def publish_at_dynamic_boundary(
+        publish_request: object,
+        candidate: object,
+        owner_token: str,
+    ):
+        if getattr(candidate, "status", None) == "ready":
+            job_dir = request.cache_root / request.cache_key.digest
+            generating_bytes = worker._job_footprint(job_dir)
+            projected_bytes = worker._job_footprint(
+                job_dir,
+                manifest_size=worker._manifest_size(request, candidate),
+            )
+            assert generating_bytes is not None
+            assert projected_bytes is not None
+            assert generating_bytes < projected_bytes
+            observed["generating_bytes"] = generating_bytes
+            observed["projected_bytes"] = projected_bytes
+            observed["max_cache_bytes"] = projected_bytes - 1
+            worker._max_cache_bytes = projected_bytes - 1
+        return original_publish(publish_request, candidate, owner_token)
+
+    worker._publish_rendered = publish_at_dynamic_boundary
     try:
         worker.submit(request)
         terminal = _wait_until_terminal(worker, request)
 
         assert terminal.status == "failed"
         assert terminal.code == "overlay_cache_full"
-        assert _regular_file_bytes(request.cache_root) <= max_cache_bytes
+        assert observed["generating_bytes"] <= observed["max_cache_bytes"]
+        assert observed["projected_bytes"] > observed["max_cache_bytes"]
+        assert _regular_file_bytes(request.cache_root) <= observed["max_cache_bytes"]
     finally:
+        worker._publish_rendered = original_publish
         worker.shutdown()
 
 
@@ -653,8 +679,16 @@ def test_tiny_quota_cleanup_reports_that_a_current_failed_job_was_not_removed(
         assert failed.status == "failed"
         assert job_dir.exists()
         assert _regular_file_bytes(job_dir) > 1
+        manifest_path = job_dir / "manifest.json"
+        manifest_before_remove = manifest_path.read_bytes()
+        persisted_status = json.loads(
+            manifest_before_remove.decode("utf-8")
+        )["status"]
+        assert persisted_status in {"pending", "generating"}
         assert worker._safe_remove_job(request.cache_root, job_dir) is False
         assert job_dir.exists()
+        assert manifest_path.read_bytes() == manifest_before_remove
+        assert persisted_status not in {"ready", "failed"}
     finally:
         worker.shutdown()
 
@@ -665,7 +699,6 @@ def test_failed_eviction_does_not_deduct_bytes_when_victim_deletion_fails(
 ) -> None:
     from human_qc import overlay_worker
 
-    max_cache_bytes = 700
     first = _request(
         tmp_path,
         intervals=((0, 1),),
@@ -681,11 +714,12 @@ def test_failed_eviction_does_not_deduct_bytes_when_victim_deletion_fails(
     worker = overlay_worker.BoundedOverlayWorker(
         max_workers=1,
         max_pending=0,
-        max_cache_bytes=max_cache_bytes,
     )
     original_rmtree = overlay_worker.shutil.rmtree
+    original_evict_failed = worker._evict_failed_for
     first_job_dir = first.cache_root / first.cache_key.digest
     failed_deletions = 0
+    observed: dict[str, int] = {}
 
     def fail_first_victim(path: object) -> None:
         nonlocal failed_deletions
@@ -694,10 +728,32 @@ def test_failed_eviction_does_not_deduct_bytes_when_victim_deletion_fails(
             raise OSError("private failed-victim deletion failure")
         original_rmtree(path)
 
+    def evict_at_dynamic_boundary(
+        request: object,
+        current_job_size: int,
+    ) -> bool:
+        if request.cache_key.digest == second.cache_key.digest:
+            existing_bytes = worker._job_footprint(first_job_dir)
+            owner_bytes = (
+                second.cache_root
+                / second.cache_key.digest
+                / ".generation.owner.json"
+            ).stat().st_size
+            assert existing_bytes is not None
+            terminal_current_bytes = current_job_size - owner_bytes
+            max_cache_bytes = max(existing_bytes, current_job_size)
+            assert existing_bytes + terminal_current_bytes > max_cache_bytes
+            observed["existing_bytes"] = existing_bytes
+            observed["current_job_size"] = current_job_size
+            observed["max_cache_bytes"] = max_cache_bytes
+            worker._max_cache_bytes = max_cache_bytes
+        return original_evict_failed(request, current_job_size)
+
     try:
         worker.submit(first)
         assert _wait_until_terminal(worker, first).status == "failed"
         assert first_job_dir.is_dir()
+        worker._evict_failed_for = evict_at_dynamic_boundary
         monkeypatch.setattr(overlay_worker.shutil, "rmtree", fail_first_victim)
 
         worker.submit(second)
@@ -705,9 +761,135 @@ def test_failed_eviction_does_not_deduct_bytes_when_victim_deletion_fails(
 
         assert failed_deletions == 1
         assert first_job_dir.is_dir()
-        assert _regular_file_bytes(first.cache_root) <= max_cache_bytes
+        assert observed["existing_bytes"] <= observed["max_cache_bytes"]
+        assert observed["current_job_size"] <= observed["max_cache_bytes"]
+        assert _regular_file_bytes(first.cache_root) <= observed["max_cache_bytes"]
     finally:
+        worker._evict_failed_for = original_evict_failed
         worker.shutdown()
+
+
+@pytest.mark.parametrize("eviction_helper", ("ready", "failed"))
+def test_eviction_rechecks_a_terminal_victim_after_a_successor_retry_starts(
+    tmp_path: Path,
+    eviction_helper: str,
+) -> None:
+    from human_qc.overlay_worker import BoundedOverlayWorker
+
+    failed_request = _request(
+        tmp_path,
+        intervals=((0, 1),),
+        renderer=FailingRenderer(),
+        source_sha256="sha256:" + "7" * 64,
+    )
+    successor_renderer = BlockingRenderer()
+    successor_request = replace(failed_request, renderer=successor_renderer)
+    eviction_request = _request(
+        tmp_path,
+        intervals=((2, 3),),
+        renderer=RecordingRenderer(),
+        source_sha256="sha256:" + "8" * 64,
+    )
+    owner = BoundedOverlayWorker(max_workers=1, max_pending=0)
+    evictor = BoundedOverlayWorker(max_workers=1, max_pending=0)
+    snapshot_reached = Barrier(2)
+    resume_eviction = Barrier(2)
+    eviction_results: list[bool] = []
+    eviction_errors: list[BaseException] = []
+    eviction_thread: Thread | None = None
+    original_footprint = evictor._job_footprint
+    victim_job_dir = failed_request.cache_root / failed_request.cache_key.digest
+    paused = False
+
+    def pause_after_terminal_snapshot(
+        path: Path,
+        *,
+        manifest_size: int | None = None,
+    ) -> int | None:
+        nonlocal paused
+        result = original_footprint(path, manifest_size=manifest_size)
+        if path == victim_job_dir and manifest_size is None and not paused:
+            paused = True
+            snapshot_reached.wait(timeout=2.0)
+            resume_eviction.wait(timeout=2.0)
+        return result
+
+    def run_eviction(current_job_size: int) -> None:
+        try:
+            with evictor._root_publish_lock(eviction_request):
+                if eviction_helper == "ready":
+                    eviction_results.append(
+                        evictor._evict_for(eviction_request, current_job_size)
+                    )
+                else:
+                    eviction_results.append(
+                        evictor._evict_failed_for(
+                            eviction_request,
+                            current_job_size,
+                        )
+                    )
+        except BaseException as exc:
+            eviction_errors.append(exc)
+
+    try:
+        owner.submit(failed_request)
+        assert _wait_until_terminal(owner, failed_request).status == "failed"
+        victim_size = original_footprint(victim_job_dir)
+        assert victim_size is not None and victim_size > 0
+        evictor._max_cache_bytes = victim_size
+        if eviction_helper == "ready":
+            evictor._max_ready_jobs = 1
+        evictor._job_footprint = pause_after_terminal_snapshot
+
+        eviction_thread = Thread(
+            target=run_eviction,
+            args=(victim_size,),
+            name=f"{eviction_helper}-eviction-race",
+        )
+        eviction_thread.start()
+        snapshot_reached.wait(timeout=2.0)
+
+        accepted = owner.retry(successor_request)
+        assert accepted.status in {"pending", "generating"}
+        assert successor_renderer.started.wait(2.0)
+        active_manifest = json.loads(
+            (victim_job_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+        assert active_manifest["status"] == "generating"
+        assert (victim_job_dir / ".generation.owner.json").is_file()
+
+        resume_eviction.wait(timeout=2.0)
+        eviction_thread.join(timeout=2.0)
+        assert not eviction_thread.is_alive()
+        successor_renderer.release.set()
+        successor_terminal = _wait_until_terminal(owner, successor_request)
+        manifest_path = victim_job_dir / "manifest.json"
+        persisted_status = (
+            json.loads(manifest_path.read_text(encoding="utf-8"))["status"]
+            if manifest_path.is_file()
+            else None
+        )
+        ready_count = sum(
+            json.loads(path.read_text(encoding="utf-8")).get("status") == "ready"
+            for path in failed_request.cache_root.glob("*/manifest.json")
+        )
+
+        assert (
+            eviction_errors,
+            eviction_results,
+            successor_terminal.status,
+            persisted_status,
+            ready_count,
+        ) == ([], [False], "ready", "ready", 1)
+    finally:
+        snapshot_reached.abort()
+        resume_eviction.abort()
+        successor_renderer.release.set()
+        if eviction_thread is not None:
+            eviction_thread.join(timeout=2.0)
+        evictor._job_footprint = original_footprint
+        owner.shutdown()
+        evictor.shutdown()
 
 
 def test_ready_eviction_does_not_release_a_slot_when_victim_deletion_fails(

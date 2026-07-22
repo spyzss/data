@@ -846,3 +846,83 @@ browser、OpenSpec、主计划或 `.comet`。
 
 全量 pytest 在任务中断前已经正常 exit 0；中断发生在读取 completion verification
 说明时，不存在被截断或仍运行的 pytest 进程。
+
+---
+
+# Task 9C eviction-victim revalidation follow-up
+
+## 状态与范围
+
+DONE
+
+本轮只修复 terminal eviction 扫描快照与同 key successor retry 之间的 TOCTOU；同时
+把两个环境敏感 quota 测试改为运行时投影边界，并明确 current removal 失败时不得把
+超额 terminal manifest 落盘。只修改 `human_qc/overlay_worker.py`、
+`tests/test_sam3_overlay_worker.py` 和本报告；未触碰 Task 10、runner、recipe、launcher、
+HTTP、browser、OpenSpec、主计划或 `.comet`。
+
+基线：`9fdb258b48eb85942c1bf135b2a77f585f1fff68`。本轮独立提交 SHA 以最终任务
+回报中的 `git rev-parse HEAD` 为准。
+
+## Root cause 与锁序
+
+`_evict_for()` 和 `_evict_failed_for()` 在 root publication lock 下扫描 terminal
+manifest/footprint，但真正删除 victim 前没有获取 victim key lock。retry 只需 key lock、
+不取 root，所以可以在 eviction 扫描完成后把同一 digest 从 durable failed 改为新的
+owner + pending/generating job。旧 eviction 仍按 failed 快照调用 `rmtree()`，随后错误
+扣减旧 size；ready helper 还可能按旧状态调整 ready count。正在渲染的 temporary media、
+owner 和 manifest 被删除，successor 最终只剩内存 failed/缺失 durable state。
+
+修复后的顺序始终为：
+
+1. publication/测试调用方先持有 root publication lock；
+2. `_remove_terminal_victim()` 再获取 path-based victim key lock；
+3. 锁内重读 manifest，要求 status 与扫描快照完全一致，并确认没有有效 live owner；
+4. ready victim 再重检 root-visible pin；
+5. 只有 `_safe_remove_job()` 确认目录已不存在时才扣 bytes/ready count。
+
+状态、owner、pin 或删除结果任一变化都只会跳过该旧 victim，不扣账；循环继续尝试其他
+候选，仍不满足 quota/count 时 fail closed。`_key_lock(request)` 复用同一个
+`_job_directory_lock(path)`；retry/schedule 仍只有 key、绝不获取 root，因此没有
+key -> root 反序。
+
+## TDD RED / GREEN
+
+参数化并发测试同时覆盖 ready `_evict_for()` 与 failed `_evict_failed_for()`：B 持 root，
+读取 A 的 durable failed 与 footprint 后用双 Barrier 暂停；A retry 在 victim key lock 内
+写入新 owner/pending/generating，并确认 `BlockingRenderer` 已启动，再放行 B。
+
+只改测试后的聚焦结果为 `2 failed, 3 passed in 0.49s`。两个 helper 的实际结果均为：
+
+- eviction 错误返回 `True`，即按过期快照宣称回收成功；
+- active successor digest 被删除；
+- A 最终为 failed，durable manifest 缺失，ready count 为 0；
+- 期望是 eviction `False`、A/durable manifest 均 ready、ready count 为 1。
+
+同一选择中的三个 Minor 回归已通过：五段 ready quota 在运行时设为最终
+`projected_bytes - 1`；failed victim deletion fault 的 quota 由 existing/current 实际
+footprint 动态构造；current deletion fault 明确验证磁盘 manifest 保持
+pending/generating，未变成超额 ready/failed terminal。
+
+最小实现后同一聚焦选择 `5 passed in 0.46s`，worker 全文件
+`37 passed in 1.83s`。ready/failed 两个 Barrier case 独立并行重复 10 轮，十轮均为
+`2 passed`（单轮 0.41-0.50s）。
+
+## 最终验证
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/test_sam3_overlay_renderer.py tests/test_human_qc_launcher.py \
+  tests/test_sam3_overlay_worker.py tests/test_review_evidence.py \
+  tests/test_qc_pipeline_sam3_runner.py tests/test_canonical_qc_runner_bridge.py \
+  tests/test_human_qc_media.py
+# 179 passed in 5.18s
+
+.venv/bin/python -m pytest -q \
+  tests/test_human_qc_workbench.py tests/test_human_qc_http_server.py \
+  tests/test_canonical_video_probe.py
+# 110 passed in 5.80s
+
+.venv/bin/python -m pytest -q
+# 1872 passed, 1 skipped in 114.20s
+```
