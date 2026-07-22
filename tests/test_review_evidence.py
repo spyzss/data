@@ -630,3 +630,182 @@ def test_asset_overlay_projection_drops_unsafe_pending_segment_identifier(
     segment = task["issues"][0]["overlay"]["segments"][0]
     assert segment["overlay_id"] is None
     assert "/private/" not in json.dumps(task)
+
+
+def test_asset_overlay_requires_complete_segment_coverage_before_ready_or_url(
+    tmp_path: Path,
+) -> None:
+    from human_qc.media import MediaNotFoundError
+    from human_qc.warn_workbench_service import (
+        FrameRangeDto,
+        OverlayHandle,
+        OverlaySegmentHandle,
+    )
+    from tests.test_human_qc_workbench import _service
+
+    partial = tmp_path / "overlays" / "partial.mp4"
+    partial.parent.mkdir()
+    partial.write_bytes(b"partial")
+
+    class Provider:
+        def get_asset_overlays(self, _asset_id, selected):
+            return {
+                selected[0].issue_id: OverlayHandle(
+                    status="ready",
+                    segments=(
+                        OverlaySegmentHandle(
+                            frame_range=FrameRangeDto(120, 150),
+                            status="ready",
+                            overlay_id="partial-120-150",
+                            path=partial,
+                        ),
+                    ),
+                )
+            }
+
+    service, _, _, context = _service(tmp_path)
+    report = json.loads(context.report_path.read_text(encoding="utf-8"))
+    report["issues"] = [
+        {
+            "issue_id": "sam3-full-window",
+            "code": "containment",
+            "module": "sam3_containment",
+            "context": {"start_frame": 120, "end_frame": 168},
+        }
+    ]
+    report["manual_review"]["selected_issue_ids"] = ["sam3-full-window"]
+    report["manual_review"]["candidate_issue_ids"] = ["sam3-full-window"]
+    report["manual_review"]["issue_reviews"] = {}
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    service.overlay_provider = Provider()
+
+    overlay = service.get_asset_task("asset-1")["issues"][0]["overlay"]
+
+    assert overlay["status"] != "ready"
+    assert overlay["url"] is None
+    assert overlay["segments"][0]["url"] is None
+    with pytest.raises(MediaNotFoundError, match="media_not_found"):
+        service.overlay_media("asset-1", "partial-120-150")
+
+
+def test_asset_overlay_accepts_adjacent_ready_segments_that_fully_cover_issue(
+    tmp_path: Path,
+) -> None:
+    from human_qc.warn_workbench_service import (
+        FrameRangeDto,
+        OverlayHandle,
+        OverlaySegmentHandle,
+    )
+    from tests.test_human_qc_workbench import _service
+
+    first = tmp_path / "overlays" / "first.mp4"
+    second = tmp_path / "overlays" / "second.mp4"
+    first.parent.mkdir()
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    class Provider:
+        def get_asset_overlays(self, _asset_id, selected):
+            return {
+                selected[0].issue_id: OverlayHandle(
+                    status="ready",
+                    segments=(
+                        OverlaySegmentHandle(
+                            frame_range=FrameRangeDto(120, 150),
+                            status="ready",
+                            overlay_id="first-120-150",
+                            path=first,
+                        ),
+                        OverlaySegmentHandle(
+                            frame_range=FrameRangeDto(150, 169),
+                            status="ready",
+                            overlay_id="second-150-169",
+                            path=second,
+                        ),
+                    ),
+                )
+            }
+
+    service, _, _, context = _service(tmp_path)
+    report = json.loads(context.report_path.read_text(encoding="utf-8"))
+    report["issues"] = [
+        {
+            "issue_id": "sam3-full-window",
+            "code": "containment",
+            "module": "sam3_containment",
+            "context": {"start_frame": 120, "end_frame": 168},
+        }
+    ]
+    report["manual_review"]["selected_issue_ids"] = ["sam3-full-window"]
+    report["manual_review"]["candidate_issue_ids"] = ["sam3-full-window"]
+    report["manual_review"]["issue_reviews"] = {}
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    service.overlay_provider = Provider()
+
+    overlay = service.get_asset_task("asset-1")["issues"][0]["overlay"]
+
+    assert overlay["status"] == "ready"
+    assert overlay["url"] is None
+    assert [segment["url"] for segment in overlay["segments"]] == [
+        "/media/assets/asset-1/overlays/first-120-150",
+        "/media/assets/asset-1/overlays/second-150-169",
+    ]
+
+
+def test_asset_overlay_provider_accepts_only_explicit_continuous_sam3_contract(
+    tmp_path: Path,
+) -> None:
+    from tests.test_human_qc_workbench import _service
+
+    class Provider:
+        def __init__(self) -> None:
+            self.selected = []
+
+        def get_asset_overlays(self, _asset_id, selected):
+            self.selected.append(selected)
+            return {}
+
+    service, _, _, context = _service(tmp_path)
+    report = json.loads(context.report_path.read_text(encoding="utf-8"))
+    report["issues"] = [
+        {
+            "issue_id": "continuous-sam3",
+            "code": "continuous",
+            "module": "sam3_containment",
+            "context": {"start_frame": 120, "end_frame": 168},
+        },
+        {
+            "issue_id": "not-continuous",
+            "code": "not_continuous",
+            "module": "not_sam3_continuous",
+            "context": {"start_frame": 200, "end_frame": 220},
+        },
+        {
+            "issue_id": "still-image",
+            "code": "still",
+            "module": "sam3_containment",
+            "evidence_type": "combined_overlay",
+            "context": {"start_frame": 300, "end_frame": 320},
+        },
+    ]
+    report["manual_review"]["selected_issue_ids"] = [
+        "continuous-sam3",
+        "not-continuous",
+        "still-image",
+    ]
+    report["manual_review"]["candidate_issue_ids"] = list(
+        report["manual_review"]["selected_issue_ids"]
+    )
+    report["manual_review"]["issue_reviews"] = {}
+    context.report_path.write_text(json.dumps(report), encoding="utf-8")
+    provider = Provider()
+    service.overlay_provider = provider
+
+    task = service.get_asset_task("asset-1")
+
+    assert [[entry.issue_id for entry in selected] for selected in provider.selected] == [
+        ["continuous-sam3"]
+    ]
+    assert task["issues"][0]["overlay"]["status"] == "pending"
+    assert task["issues"][1]["overlay"] is None
+    assert task["issues"][2]["overlay"] is None

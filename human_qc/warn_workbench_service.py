@@ -49,6 +49,9 @@ _THRESHOLD_OPERATORS = frozenset({"<", "<=", ">", ">=", "==", "!="})
 _REVIEW_VERDICTS = frozenset({"pass", "fail", "warn"})
 _AUDIT_ACTIONS = frozenset({"resubmitted", "failure_reason_changed"})
 _OVERLAY_STATUSES = frozenset({"pending", "generating", "ready", "failed"})
+_CONTINUOUS_SAM3_MODULES = frozenset({"sam3_containment"})
+_CONTINUOUS_SAM3_EVIDENCE_TYPES = frozenset({"sam3_continuous"})
+_CONTINUOUS_SAM3_FLAGS = ("continuous_sam3", "sam3_continuous")
 
 
 class InvalidIssueRangeError(WarnStateError):
@@ -183,6 +186,56 @@ class OverlaySegmentHandle:
     retryable: bool = False
 
 
+def _relevant_overlay_segments(
+    frame_range: FrameRangeDto,
+    segments: Sequence[OverlaySegmentHandle],
+) -> tuple[OverlaySegmentHandle, ...]:
+    return tuple(
+        segment
+        for segment in segments
+        if segment.frame_range.start_frame < frame_range.end_frame_exclusive
+        and frame_range.start_frame < segment.frame_range.end_frame_exclusive
+    )
+
+
+def _segments_cover_issue(
+    frame_range: FrameRangeDto,
+    segments: Sequence[OverlaySegmentHandle],
+) -> bool:
+    """Return whether the half-open union covers every frame of an issue."""
+
+    cursor = frame_range.start_frame
+    for start, end in sorted(
+        (
+            (
+                max(frame_range.start_frame, segment.frame_range.start_frame),
+                min(frame_range.end_frame_exclusive, segment.frame_range.end_frame_exclusive),
+            )
+            for segment in segments
+        )
+    ):
+        if end <= cursor:
+            continue
+        if start > cursor:
+            return False
+        cursor = max(cursor, end)
+        if cursor >= frame_range.end_frame_exclusive:
+            return True
+    return False
+
+
+def _combined_overlay_status(
+    segments: Sequence[OverlaySegmentHandle], *, fully_covered: bool
+) -> Literal["pending", "generating", "ready", "failed"]:
+    if any(segment.status == "failed" for segment in segments):
+        return "failed"
+    if any(segment.status == "generating" for segment in segments):
+        return "generating"
+    if segments and all(segment.status == "ready" for segment in segments):
+        return "ready" if fully_covered else "failed"
+    return "pending"
+
+
 @dataclass(frozen=True)
 class OverlayIssueInput:
     """The only selected SAM3 data passed from the facade to an asset provider.
@@ -260,28 +313,23 @@ class WorkerOverlayProvider:
     def _issue_handle(
         frame_range: FrameRangeDto, segments: tuple[OverlaySegmentHandle, ...]
     ) -> OverlayHandle:
-        relevant = tuple(
-            segment
-            for segment in segments
-            if segment.frame_range.start_frame < frame_range.end_frame_exclusive
-            and frame_range.start_frame < segment.frame_range.end_frame_exclusive
-        )
+        relevant = _relevant_overlay_segments(frame_range, segments)
         if not relevant:
             return OverlayHandle("failed", code="overlay_unavailable", retryable=True)
-        if all(segment.status == "ready" for segment in relevant):
-            status: Literal["pending", "generating", "ready", "failed"] = "ready"
-        elif any(segment.status == "failed" for segment in relevant):
-            status = "failed"
-        elif any(segment.status == "generating" for segment in relevant):
-            status = "generating"
-        else:
-            status = "pending"
+        fully_covered = _segments_cover_issue(frame_range, relevant)
+        status = _combined_overlay_status(relevant, fully_covered=fully_covered)
         failed = next((segment for segment in relevant if segment.status == "failed"), None)
         return OverlayHandle(
             status,
-            code=failed.code if failed is not None else None,
+            code=(
+                failed.code
+                if failed is not None
+                else "overlay_incomplete" if not fully_covered else None
+            ),
             segments=relevant,
-            retryable=any(segment.retryable for segment in relevant),
+            retryable=(
+                any(segment.retryable for segment in relevant) or not fully_covered
+            ),
         )
 
     def get_asset_overlays(
@@ -449,14 +497,23 @@ def _safe_code(value: object) -> str | None:
 
 
 def _is_sam3_issue(issue: Mapping[str, Any]) -> bool:
-    """Classify trusted report issues without consulting browser-facing text."""
+    """Require the server-side continuous-SAM3 contract, never substrings."""
 
-    values: list[object] = [
-        issue.get("module"),
-        issue.get("producer"),
-        issue.get("evidence_type"),
-        issue.get("kind"),
-    ]
+    for field in _CONTINUOUS_SAM3_FLAGS:
+        explicit = issue.get(field)
+        if isinstance(explicit, bool):
+            return explicit
+
+    evidence_types: list[str] = []
+    modules: list[str] = []
+
+    def add_token(value: object, target: list[str]) -> None:
+        if isinstance(value, str):
+            target.append(value.casefold())
+
+    add_token(issue.get("evidence_type"), evidence_types)
+    add_token(issue.get("kind"), evidence_types)
+    add_token(issue.get("module"), modules)
     evidence = issue.get("evidence")
     if isinstance(evidence, Mapping):
         evidence = [evidence]
@@ -465,13 +522,17 @@ def _is_sam3_issue(issue: Mapping[str, Any]) -> bool:
     ):
         for row in evidence:
             if isinstance(row, Mapping):
-                values.extend(
-                    row.get(key)
-                    for key in ("module", "producer", "evidence_type", "kind")
-                )
-    return any(
-        isinstance(value, str) and "sam3" in value.lower() for value in values
-    )
+                add_token(row.get("evidence_type", row.get("kind")), evidence_types)
+                add_token(row.get("module"), modules)
+
+    # A declared evidence type is authoritative: sampled/still overlays do
+    # not become continuous media merely because their issue module is SAM3.
+    if evidence_types:
+        return any(
+            evidence_type in _CONTINUOUS_SAM3_EVIDENCE_TYPES
+            for evidence_type in evidence_types
+        )
+    return any(module in _CONTINUOUS_SAM3_MODULES for module in modules)
 
 
 def _public_issue_id(value: str) -> str:
@@ -852,10 +913,14 @@ class WarnWorkbenchService:
         )
 
     def _overlay_segment_dto(
-        self, asset_id: str, value: OverlaySegmentHandle
+        self,
+        asset_id: str,
+        value: OverlaySegmentHandle,
+        *,
+        expose_ready_url: bool,
     ) -> OverlaySegmentDto:
         url: str | None = None
-        if value.status == "ready":
+        if value.status == "ready" and expose_ready_url:
             if not isinstance(value.overlay_id, str) or not isinstance(
                 value.path, (str, Path)
             ):
@@ -873,18 +938,6 @@ class WarnWorkbenchService:
             code=value.code,
             retryable=value.retryable,
         )
-
-    @staticmethod
-    def _combined_overlay_status(
-        segments: Sequence[OverlaySegmentHandle],
-    ) -> Literal["pending", "generating", "ready", "failed"]:
-        if segments and all(segment.status == "ready" for segment in segments):
-            return "ready"
-        if any(segment.status == "failed" for segment in segments):
-            return "failed"
-        if any(segment.status == "generating" for segment in segments):
-            return "generating"
-        return "pending"
 
     def _overlay_from_value(
         self,
@@ -917,12 +970,7 @@ class WarnWorkbenchService:
             handles = tuple(
                 self._overlay_segment_handle(segment) for segment in raw_segments
             )
-            relevant = tuple(
-                segment
-                for segment in handles
-                if segment.frame_range.start_frame < frame_range.end_frame_exclusive
-                and frame_range.start_frame < segment.frame_range.end_frame_exclusive
-            )
+            relevant = _relevant_overlay_segments(frame_range, handles)
             if not relevant:
                 return OverlayDto(
                     "failed",
@@ -931,14 +979,22 @@ class WarnWorkbenchService:
                     "overlay_unavailable",
                     retryable=True,
                 )
-            status = self._combined_overlay_status(relevant)
+            fully_covered = _segments_cover_issue(frame_range, relevant)
+            status = _combined_overlay_status(
+                relevant, fully_covered=fully_covered
+            )
             failed = next(
                 (segment for segment in relevant if segment.status == "failed"), None
             )
             if failed is not None:
                 code = failed.code or code
+            elif not fully_covered:
+                code = "overlay_incomplete"
             segment_dtos = tuple(
-                self._overlay_segment_dto(asset_id, segment) for segment in relevant
+                self._overlay_segment_dto(
+                    asset_id, segment, expose_ready_url=status == "ready"
+                )
+                for segment in relevant
             )
             url = (
                 segment_dtos[0].url
@@ -951,7 +1007,11 @@ class WarnWorkbenchService:
                 url,
                 code,
                 segment_dtos,
-                retryable or any(segment.retryable for segment in relevant),
+                (
+                    retryable
+                    or any(segment.retryable for segment in relevant)
+                    or not fully_covered
+                ),
             )
 
         url: str | None = None
