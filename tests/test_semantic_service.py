@@ -325,6 +325,45 @@ def test_semantic_task_is_blocked_while_manual_review_is_incomplete(tmp_path: Pa
     assert service.report_path(ASSET_ID).read_bytes() == before_report
 
 
+def test_assets_only_service_gates_derived_persisted_manual_review(tmp_path: Path) -> None:
+    report = make_v2_report(status="awaiting_external")
+    report["pipeline_state"]["next_module"] = "semantic_consistency"
+    report["manual_review"].update(
+        {
+            "state": "queued",
+            "candidate_issue_ids": ["warn-1"],
+            "required": True,
+            "selected_issue_ids": [],
+            "selected_issue_id": None,
+            "issue_reviews": {},
+            "completed_at": None,
+        }
+    )
+    hdf5_path, _ = _write_asset(tmp_path, report=report)
+    service = SemanticCalibrationService(
+        assets={ASSET_ID: hdf5_path},
+        leases={ASSET_ID: LEASE},
+    )
+
+    with pytest.raises(TaskStateError, match="manual|eligible|blocked"):
+        service.get_task(ASSET_ID)
+
+
+def test_assets_only_service_allows_reportless_read_only_preview(tmp_path: Path) -> None:
+    hdf5_path, report_path = _write_asset(tmp_path)
+    report_path.unlink()
+    service = SemanticCalibrationService(
+        assets={ASSET_ID: hdf5_path},
+        leases={ASSET_ID: LEASE},
+    )
+
+    task = service.get_task(ASSET_ID)
+
+    assert task.asset_id == ASSET_ID
+    assert task.report_state == "not_started"
+    assert task.timeline.boundaries == (0, 51, 123, 195)
+
+
 def test_completed_semantic_task_read_rechecks_manual_terminal_state(tmp_path: Path) -> None:
     service = _service(tmp_path)
     service.complete(ASSET_ID, expected_revision=1, lease_token=LEASE)
@@ -351,6 +390,53 @@ def test_completed_semantic_task_read_rechecks_manual_terminal_state(tmp_path: P
     )
     with pytest.raises(TaskStateError, match="manual|eligible|blocked"):
         restarted.get_task(ASSET_ID)
+
+
+@pytest.mark.parametrize("pipeline_status", ["running", "awaiting_external", "stopped"])
+def test_completed_semantic_history_is_readable_after_pipeline_moves_downstream(
+    tmp_path: Path,
+    pipeline_status: str,
+) -> None:
+    service = _service(tmp_path)
+    service.complete(
+        ASSET_ID,
+        expected_revision=1,
+        lease_token=LEASE,
+        advance_pipeline=False,
+    )
+    report_path = service.report_path(ASSET_ID)
+    report = load_asset_qc_report(report_path)
+    assert report is not None
+    report["pipeline_state"].update(
+        {
+            "status": pipeline_status,
+            "last_completed_module": "semantic_consistency",
+            "next_module": None if pipeline_status == "stopped" else "duplicate_check",
+            "stop_reason": "downstream_failure" if pipeline_status == "stopped" else None,
+        }
+    )
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    restarted = SemanticCalibrationService(
+        assets={ASSET_ID: service._assets[ASSET_ID]},
+        reports={ASSET_ID: report_path},
+        leases={ASSET_ID: LEASE},
+    )
+
+    task = restarted.get_task(ASSET_ID)
+
+    assert task.report_state == "completed"
+    assert task.pipeline_state == pipeline_status
+    idempotent = restarted.complete(
+        ASSET_ID,
+        expected_revision=task.report_revision,
+        lease_token=LEASE,
+    )
+    assert idempotent.report_state == "completed"
+    with pytest.raises(TaskStateError, match="pipeline|semantic|editable"):
+        restarted.begin_boundary_edit(
+            ASSET_ID,
+            boundary_request(1, 60, revision=task.report_revision),
+        )
 
 
 @pytest.mark.parametrize("action", ["confirm", "cancel"])
