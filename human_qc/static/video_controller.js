@@ -253,7 +253,14 @@ export class VideoController {
     const sourceFrame = Number.isFinite(seconds) ? Math.round(seconds * this.fps) : 0;
     const nextFrame = clampFrame(sourceFrame, this.totalFrames);
     if (this._pendingFrame !== null) {
-      if (!isSettledSeek || nextFrame !== this._pendingFrame) return this.currentFrame;
+      if (!isSettledSeek) return this.currentFrame;
+      // A previous seek can still emit `seeked` while the latest request is
+      // in flight.  Keep suppressing that event, but let the latest terminal
+      // seek reconcile to the native frame even when a decoder clamps it away
+      // from the requested source-frame coordinate.
+      if (nextFrame !== this._pendingFrame && this.video.seeking !== false) {
+        return this.currentFrame;
+      }
       this._pendingFrame = null;
     }
     if (nextFrame === this.currentFrame) return this.currentFrame;

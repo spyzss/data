@@ -392,6 +392,25 @@ test("keeps the newest pending seek visible while older timeupdate and seeked ev
 });
 
 
+test("settles the newest seek to a clamped native frame when media lands adjacent to the request", () => {
+  const frames = [];
+  const { controller, video } = createController({ onFrameChange: (frame) => frames.push(frame) });
+  controller.setMedia(canonicalVideo({ total_frames: 300 }));
+
+  controller.seekToFrame(142);
+  video.seeking = false;
+  video.currentTime = 141 / 30;
+  video.dispatch("seeked");
+  assert.equal(controller.currentFrame, 141);
+  assert.equal(frames.at(-1), 141);
+
+  video.currentTime = 142 / 30;
+  video.dispatch("timeupdate");
+  assert.equal(controller.currentFrame, 142);
+  assert.equal(frames.at(-1), 142);
+});
+
+
 test("queues the newest source-frame seek until metadata is available", () => {
   const frames = [];
   const { controller, video } = createController({ onFrameChange: (frame) => frames.push(frame) });
